@@ -1,0 +1,8 @@
+node_modules/
+dist/
+target/
+.turbo/
+*.log
+.DS_Store
+/tmp-data/
+pnpm-debug.log*
