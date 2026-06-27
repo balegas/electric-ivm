@@ -83,3 +83,57 @@ export function randomSeed(): number {
   const f = new Faker({ locale: en, randomizer: r })
   return f.seed()
 }
+
+import type { LeafOp, Predicate, ShapeDef } from '@electric-lite/protocol'
+
+const ALL_OPS: LeafOp[] = ['eq', 'neq', 'lt', 'lte', 'gt', 'gte']
+
+/**
+ * Generate `count` random shapes (table + random predicate) for fuzzing. Uses a faker seeded
+ * independently of the op stream so adding shapes doesn't perturb op generation. Predicate
+ * literals are drawn from each column's domain so shapes are non-trivially populated.
+ */
+export function randomShapeDefs(schema: Schema, seed: number, count: number): ShapeDef[] {
+  const randomizer = generateMersenne53Randomizer()
+  const f = new Faker({ locale: en, randomizer })
+  f.seed(seed)
+  const tableNames = Object.keys(schema.tables)
+
+  function genValue(type: TableDef['columns'][string]['type']): Value {
+    switch (type) {
+      case 'int':
+        return f.number.int({ min: 0, max: 1000 })
+      case 'float':
+        return f.number.float({ min: 0, max: 1000, fractionDigits: 4 })
+      case 'text':
+        return f.helpers.arrayElement(['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot'])
+      case 'bool':
+        return f.datatype.boolean()
+    }
+  }
+
+  function leaf(def: TableDef): Predicate {
+    const cols = Object.entries(def.columns)
+    const [col, c] = f.helpers.arrayElement(cols)
+    // bool columns only get eq/neq (ordering is uninteresting); others get any op.
+    const op = c.type === 'bool' ? f.helpers.arrayElement<LeafOp>(['eq', 'neq']) : f.helpers.arrayElement(ALL_OPS)
+    return { col, op, value: genValue(c.type) }
+  }
+
+  function pred(def: TableDef, depth: number): Predicate {
+    if (depth <= 0 || f.datatype.boolean(0.55)) return leaf(def)
+    const kind = f.helpers.arrayElement(['and', 'or', 'not'] as const)
+    if (kind === 'not') return { not: pred(def, depth - 1) }
+    const n = f.number.int({ min: 2, max: 3 })
+    const parts = Array.from({ length: n }, () => pred(def, depth - 1))
+    return kind === 'and' ? { and: parts } : { or: parts }
+  }
+
+  return Array.from({ length: count }, () => {
+    const table = f.helpers.arrayElement(tableNames)
+    const def = schema.tables[table]!
+    // ~20% match-all shapes, otherwise a random predicate of depth up to 2.
+    const where = f.datatype.boolean(0.2) ? undefined : pred(def, 2)
+    return where ? { table, where } : { table }
+  })
+}
