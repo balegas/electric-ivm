@@ -1,0 +1,20 @@
+{
+  "name": "@electric-lite/conformance",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@electric-lite/protocol": "workspace:*",
+    "@durable-streams/server": "^0.3.7",
+    "@durable-streams/client": "^0.2.6",
+    "@durable-streams/state": "^0.3.1",
+    "@tanstack/db": "^0.6.12",
+    "@electric-sql/pglite": "^0.5.3",
+    "@faker-js/faker": "^10.5.0",
+    "@trpc/client": "^11.18.0",
+    "zod": "^4.4.3"
+  }
+}

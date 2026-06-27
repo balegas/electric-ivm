@@ -4,9 +4,20 @@ Date: 2026-06-27. Derived from the seven briefs in `docs/superpowers/research/`.
 These pin the spec's abstractions to real, verified APIs.
 
 ## Pinned versions
-- Rust: `dbsp = 0.299.0` (MSRV 1.93.1; we have 1.96.0). Companions: `rkyv`, `size-of`,
-  `feldera-macros`, `ordered-float` (feature `rkyv_64`), `serde`. **Pin rkyv/size-of/
-  feldera-macros to the versions dbsp itself uses** (mismatched rkyv majors won't compile).
+- Rust (VERIFIED to compile + run the filter spike on Rust 1.96 / arm64 macOS):
+  ```toml
+  dbsp = "0.299"
+  rkyv = { version = "0.7", default-features = false, features = ["std", "size_64", "validation"] }
+  size_of = { package = "feldera-size-of", version = "0.1.7", features = ["ordered-float"] }
+  feldera-macros = "0.299"
+  ordered-float = { version = "3", features = ["rkyv_64", "rkyv_ck"] }
+  anyhow = "1"
+  ```
+  Gotchas that bit us (all resolved): dbsp uses **`feldera-size-of`** (not upstream `size-of`,
+  which fails E0570 on fn-pointer ABIs), renamed to `size_of` because its `SizeOf` derive emits
+  `size_of::` paths; rkyv needs `default-features=false` (its default `size_32` is mutually
+  exclusive with dbsp's `size_64`); ordered-float must be **3.x** to match feldera-size-of's
+  `SizeOf for OrderedFloat` impl; `.iter()` on output needs `use dbsp::IndexedZSetReader`.
 - Engine HTTP: `axum` + `tokio`; durable-streams client: `reqwest`.
 - TS: `@trpc/server`/`@trpc/client` 11.18, `zod` 4, `@durable-streams/state` 0.3.1 (+`/db`
   subpath), `@tanstack/db` 0.6.12, `@durable-streams/server` 0.3.7 (Node test server),
