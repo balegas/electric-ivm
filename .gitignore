@@ -6,3 +6,6 @@ target/
 .DS_Store
 /tmp-data/
 pnpm-debug.log*
+
+# playwright-mcp output
+.playwright-mcp/
