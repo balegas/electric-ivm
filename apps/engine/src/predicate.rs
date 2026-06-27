@@ -75,6 +75,10 @@ impl CompiledPredicate {
             }
             CompiledPredicate::And(ps) => ps.iter().all(|p| p.eval(row)),
             CompiledPredicate::Or(ps) => ps.iter().any(|p| p.eval(row)),
+            // KNOWN LIMITATION (safe under the current no-null contract): this is two-valued, so
+            // `NOT (col = x)` on a NULL cell yields true here but NULL (excluded) in Postgres. The
+            // simulator never generates nulls, so engine and oracle agree today. Introducing nulls
+            // requires three-valued logic (a null-derived leaf must keep the row out under NOT).
             CompiledPredicate::Not(p) => !p.eval(row),
         }
     }

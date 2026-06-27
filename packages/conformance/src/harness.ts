@@ -27,9 +27,9 @@ function repoRoot(): string {
 }
 
 let engineBuilt = false
-/** Build the engine binary once per process (fast incremental rebuild if already built). */
+/** Build the engine binary once per process. Skipped when the vitest globalSetup already built it. */
 export function buildEngine(): void {
-  if (engineBuilt) return
+  if (engineBuilt || process.env.ELECTRIC_LITE_ENGINE_PREBUILT === '1') return
   execFileSync('cargo', ['build', '-p', 'electric-lite-engine'], { cwd: repoRoot(), stdio: 'inherit' })
   engineBuilt = true
 }
@@ -114,6 +114,39 @@ export async function applyOp(h: Harness, table: string, ev: ChangeEvent): Promi
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+async function tableTail(dsUrl: string, table: string): Promise<string | null> {
+  const res = await fetch(`${dsUrl}/table/${table}`, { method: 'HEAD' })
+  if (!res.ok) return null
+  return res.headers.get('stream-next-offset')
+}
+
+async function engineTableOffset(engineUrl: string, table: string): Promise<string | null> {
+  const res = await fetch(`${engineUrl}/tables/${encodeURIComponent(table)}/offset`)
+  if (res.status === 404) return null
+  if (!res.ok) throw new Error(`engine offset ${table} -> ${res.status}`)
+  return ((await res.json()) as { offset: string }).offset
+}
+
+/**
+ * Wait until the engine has processed every table stream up to its current tail. This is the
+ * convergence barrier: without it, a freshly-empty shape can read `[] == []` before the engine
+ * has done any work and pass spuriously. Durable-streams offsets are zero-padded, lexicographically
+ * comparable tokens, so a string `>=` is a valid "has reached the tail" check.
+ */
+export async function drainEngine(h: Harness, timeoutMs = 15000): Promise<void> {
+  for (const table of Object.keys(h.schema.tables)) {
+    const tail = await tableTail(h.dsUrl, table)
+    if (!tail) continue
+    const start = Date.now()
+    while (Date.now() - start < timeoutMs) {
+      const off = await engineTableOffset(h.engineUrl, table)
+      if (off === null) break // no tailer -> no shape on this table -> nothing to drain
+      if (off >= tail) break
+      await sleep(25)
+    }
+  }
+}
 
 export interface ConvergenceTarget {
   shape: ShapeMaterialization

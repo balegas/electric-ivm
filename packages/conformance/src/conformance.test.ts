@@ -4,7 +4,7 @@
 import type { Schema, ShapeDef } from '@electric-lite/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { compareShapeSets, formatCompare } from './compare.js'
-import { applyOp, bootHarness, type Harness, waitForConvergence } from './harness.js'
+import { applyOp, bootHarness, drainEngine, type Harness, waitForConvergence } from './harness.js'
 import { createSimulator, randomSeed } from './simulator.js'
 
 const schema: Schema = {
@@ -44,6 +44,7 @@ describe('conformance: equality filters (M1)', () => {
     for (const { table, ev } of createSimulator(schema, { seed }).take(150)) {
       await applyOp(h, table, ev)
     }
+    await drainEngine(h)
 
     for (let i = 0; i < defs.length; i++) {
       const res = await waitForConvergence(h, { shape: shapes[i]!, def: defs[i]!, columns: COLUMNS, pk: 'id' })

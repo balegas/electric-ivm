@@ -38,6 +38,10 @@ pub struct ShapeRecord {
 
 struct TailerHandle {
     cmd_tx: mpsc::UnboundedSender<TailerCmd>,
+    /// Offset up to which all table-stream envelopes have been processed AND fanned to every
+    /// shape. Published after a batch is fully processed; a harness can poll this to know the
+    /// engine has caught up to the stream tail (a sound convergence barrier).
+    processed: Arc<std::sync::Mutex<String>>,
 }
 
 enum TailerCmd {
@@ -112,6 +116,13 @@ impl Engine {
     pub async fn get_shape(&self, id: &str) -> Option<ShapeRecord> {
         self.state.lock().await.shapes.get(id).cloned()
     }
+
+    /// The offset up to which the table's tailer has processed, or `None` if no tailer exists
+    /// (no shape registered on the table yet).
+    pub async fn table_offset(&self, table: &str) -> Option<String> {
+        let st = self.state.lock().await;
+        st.tailers.get(table).map(|t| t.processed.lock().unwrap().clone())
+    }
 }
 
 struct ShapeActor {
@@ -121,11 +132,17 @@ struct ShapeActor {
 
 fn spawn_tailer(ds: DsClient, ts: TableSchema) -> TailerHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    tokio::spawn(tailer_loop(ds, ts, cmd_rx));
-    TailerHandle { cmd_tx }
+    let processed = Arc::new(std::sync::Mutex::new("-1".to_string()));
+    tokio::spawn(tailer_loop(ds, ts, cmd_rx, processed.clone()));
+    TailerHandle { cmd_tx, processed }
 }
 
-async fn tailer_loop(ds: DsClient, ts: TableSchema, mut cmd_rx: mpsc::UnboundedReceiver<TailerCmd>) {
+async fn tailer_loop(
+    ds: DsClient,
+    ts: TableSchema,
+    mut cmd_rx: mpsc::UnboundedReceiver<TailerCmd>,
+    processed: Arc<std::sync::Mutex<String>>,
+) {
     let table_path = format!("table/{}", ts.name);
     let mut offset = "-1".to_string();
     let mut table_state: HashMap<Value, Row> = HashMap::new();
@@ -147,11 +164,16 @@ async fn tailer_loop(ds: DsClient, ts: TableSchema, mut cmd_rx: mpsc::UnboundedR
             },
             res = ds.read(&table_path, &off, true) => match res {
                 Ok(rr) => {
+                    let next = rr.next_offset.clone();
                     if let Some(n) = rr.next_offset { offset = n; }
                     for env in rr.envelopes {
                         if let Err(e) = process_envelope(&ds, &ts, &mut table_state, &shapes, env).await {
                             tracing::error!("process_envelope failed: {e:#}");
                         }
+                    }
+                    // Publish the processed offset only after the whole batch is fanned out.
+                    if let Some(n) = next {
+                        *processed.lock().unwrap() = n;
                     }
                 }
                 Err(e) => {

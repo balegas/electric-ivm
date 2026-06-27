@@ -8,7 +8,7 @@
 import type { Schema } from '@electric-lite/protocol'
 import { describe, expect, it } from 'vitest'
 import { formatCompare } from './compare.js'
-import { applyOp, bootHarness, waitForConvergence } from './harness.js'
+import { applyOp, bootHarness, drainEngine, waitForConvergence } from './harness.js'
 import { createSimulator, randomSeed, randomShapeDefs } from './simulator.js'
 
 const schema: Schema = {
@@ -45,6 +45,9 @@ describe('conformance fuzz: random predicates vs oracle', () => {
           for (const { table, ev } of createSimulator(schema, { seed }).take(OPS)) {
             await applyOp(h, table, ev)
           }
+          // Barrier: ensure the engine consumed the whole op stream before comparing, so an
+          // empty-result shape can't pass by reading [] before the engine has done any work.
+          await drainEngine(h)
 
           for (let s = 0; s < defs.length; s++) {
             const def = defs[s]!

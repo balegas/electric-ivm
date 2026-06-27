@@ -106,6 +106,18 @@ child process (built once via `cargo build`, spawned per suite) pointed at the D
 and given a control-plane port. Harness boots all, runs, tears down; prints faker seed on
 failure.
 
+## Known limitations (deliberate, documented)
+- **No-null contract.** Columns are populated; predicates assume non-null literals. The Rust/TS
+  evaluators are two-valued, which diverges from Postgres only for `NOT` over a NULL cell. The
+  simulator never emits nulls, so engine and oracle agree. Adding nulls needs three-valued logic.
+- **Conformance soundness needs a drain barrier.** The oracle is synchronous but the engine tails
+  the stream asynchronously, so a freshly-empty shape can read `[] == []` before the engine has
+  done any work. The harness calls `drainEngine()` (polls the engine's processed table offset via
+  `GET /tables/:name/offset` until it reaches the stream tail) before comparing. Without it,
+  empty-result shapes would pass spuriously.
+- **Restart idempotency** to shape streams (deterministic `Producer-Seq`) is not yet implemented;
+  M1–M3 use fresh streams per run.
+
 ## Open items to verify empirically during build
 1. Node `DurableStreamTestServer` stream-path prefix + `port:0` ephemeral behavior.
 2. dbsp companion crate versions that compile together (start from `cargo add dbsp`, then add

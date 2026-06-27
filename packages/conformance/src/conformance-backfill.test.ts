@@ -6,7 +6,7 @@
 import type { Schema, ShapeDef } from '@electric-lite/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { formatCompare } from './compare.js'
-import { applyOp, bootHarness, type Harness, waitForConvergence } from './harness.js'
+import { applyOp, bootHarness, drainEngine, type Harness, waitForConvergence } from './harness.js'
 import { createSimulator, randomSeed } from './simulator.js'
 
 const schema: Schema = {
@@ -42,6 +42,7 @@ describe('conformance: late shape registration (backfill)', () => {
     }
     const def: ShapeDef = { table: 'users', where: { col: 'score', op: 'gt', value: 500 } }
     const shape = await h.client.shape(def) // first shape -> tailer reads the backlog
+    await drainEngine(h)
     const res = await waitForConvergence(h, { shape, def, columns: COLUMNS, pk: 'id' })
     expect(res.equal, `seed=${seed}\n${formatCompare(res)}`).toBe(true)
   }, 60000)
@@ -54,6 +55,7 @@ describe('conformance: late shape registration (backfill)', () => {
     for (const { table, ev } of createSimulator(schema, { seed }).take(120)) {
       await applyOp(h, table, ev)
     }
+    await drainEngine(h)
     expect((await waitForConvergence(h, { shape: warm, def: warmDef, columns: COLUMNS, pk: 'id' })).equal).toBe(true)
 
     // Now register a NEW shape after data exists -> must backfill from current table state.

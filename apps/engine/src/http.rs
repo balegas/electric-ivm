@@ -17,6 +17,7 @@ pub fn router(engine: Engine) -> Router {
         .route("/schema", post(define_schema))
         .route("/shapes", post(create_shape))
         .route("/shapes/{id}", get(get_shape).delete(drop_shape))
+        .route("/tables/{name}/offset", get(table_offset))
         .with_state(engine)
 }
 
@@ -80,6 +81,16 @@ async fn drop_shape(
 ) -> Result<Json<serde_json::Value>, AppError> {
     engine.drop_shape(&id).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn table_offset(
+    State(engine): State<Engine>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    match engine.table_offset(&name).await {
+        Some(offset) => Ok(Json(serde_json::json!({ "offset": offset }))),
+        None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("no tailer for table {name}") }),
+    }
 }
 
 struct AppError {
