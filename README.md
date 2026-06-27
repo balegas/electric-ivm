@@ -73,6 +73,18 @@ pnpm demo
 (`done = false AND priority >= 3`) while writing through the schema-derived API. You'll see rows
 enter and leave the shape live as todos are completed, re-prioritised, and deleted.
 
+### Web UI
+
+```bash
+pnpm demo:web        # boots the stack + a Vite dev server; open http://localhost:5173
+```
+
+A React app (`examples/web/`) that materializes shapes live with **stream-db + TanStack DB**
+(`@tanstack/react-db`'s `useLiveQuery`). Edit todos on the left; the right panel is the live shape
+`done = false AND priority >= 3`, re-rendered as the engine's dbsp circuit emits deltas. `start.ts`
+runs durable-streams + engine + API on fixed ports and Vite proxies `/api` and `/ds` to them (no
+CORS). The browser reaches electric-lite only through the public client + API.
+
 ### Using it in code
 
 ```ts

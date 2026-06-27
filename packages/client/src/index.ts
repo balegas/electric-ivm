@@ -16,6 +16,8 @@ export interface ShapeHandle {
 
 export interface ShapeMaterialization {
   handle: ShapeHandle
+  /** The underlying TanStack DB collection (usable with @tanstack/react-db's useLiveQuery). */
+  collection: unknown
   /** Current materialized rows (declared columns + virtual props). */
   currentRows(): Row[]
   /** Resolve once an event bearing `txid` has been consumed (append-then-read determinism). */
@@ -56,7 +58,14 @@ function zodRowSchema(def: TableDef): z.ZodType {
   return z.object(shape).loose()
 }
 
-export function createClient(opts: { apiUrl: string; schema: Schema }): ElectricLiteClient {
+export function createClient(opts: {
+  apiUrl: string
+  schema: Schema
+  /** Override the durable-streams base URL for shape reads (e.g. '/ds' behind a dev proxy). */
+  dsBaseUrl?: string
+  /** Live mode passed to stream-db. 'long-poll' is the most proxy-friendly. Default true (SSE). */
+  liveMode?: boolean | 'sse' | 'long-poll'
+}): ElectricLiteClient {
   const trpc = createTRPCClient<AppRouter>({ links: [httpBatchLink({ url: opts.apiUrl })] })
   const open: ShapeMaterialization[] = []
 
@@ -92,16 +101,20 @@ export function createClient(opts: { apiUrl: string; schema: Schema }): Electric
       const state = createStateSchema({
         [def.table]: { schema: zodRowSchema(tableDef), type: def.table, primaryKey: tableDef.primaryKey },
       })
+      const streamUrl = opts.dsBaseUrl
+        ? `${opts.dsBaseUrl.replace(/\/$/, '')}/${handle.streamPath}`
+        : handle.streamUrl
       const db = createStreamDB({
-        streamOptions: { url: handle.streamUrl, contentType: 'application/json' },
+        streamOptions: { url: streamUrl, contentType: 'application/json' },
         state,
-        live: true,
+        live: opts.liveMode ?? true,
       })
       await db.preload()
       const collection = db.collections[def.table]
 
       const mat: ShapeMaterialization = {
         handle,
+        collection,
         currentRows: () => collection.toArray as Row[],
         awaitTxId: (txid, timeoutMs) => db.utils.awaitTxId(txid, timeoutMs),
         subscribe: (cb) => {
