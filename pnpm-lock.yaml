@@ -48,6 +48,15 @@ importers:
         specifier: ^4.4.3
         version: 4.4.3
 
+  packages/oracle:
+    dependencies:
+      '@electric-lite/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      '@electric-sql/pglite':
+        specifier: ^0.5.3
+        version: 0.5.3
+
   packages/protocol: {}
 
 packages:
