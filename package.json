@@ -13,7 +13,8 @@
     "test:fuzz": "vitest run packages/conformance/src/conformance-fuzz.test.ts",
     "engine:build": "cargo build -p electric-lite-engine",
     "engine:test": "cargo test -p electric-lite-engine",
-    "loop": "bash scripts/conformance-loop.sh"
+    "loop": "bash scripts/conformance-loop.sh",
+    "demo": "pnpm --filter @electric-lite/examples demo"
   },
   "devDependencies": {
     "typescript": "^5.7.2",

@@ -62,6 +62,44 @@ pnpm install            # JS deps; allows native builds (lmdb for the test serve
 pnpm engine:build       # cargo build -p electric-lite-engine
 ```
 
+## Try it
+
+```bash
+pnpm install && pnpm engine:build
+pnpm demo
+```
+
+`examples/todos-demo.ts` boots the whole stack and runs a live "active high-priority todos" shape
+(`done = false AND priority >= 3`) while writing through the schema-derived API. You'll see rows
+enter and leave the shape live as todos are completed, re-prioritised, and deleted.
+
+### Using it in code
+
+```ts
+import { createClient } from '@electric-lite/client'
+
+const client = createClient({ apiUrl, schema })   // schema: { tables: { todos: { columns, primaryKey } } }
+await client.defineSchema(schema)
+
+// 1. define a live shape (one table + a WHERE over its columns)
+const shape = await client.shape({
+  table: 'todos',
+  where: { and: [{ col: 'done', op: 'eq', value: false }, { col: 'priority', op: 'gte', value: 3 }] },
+})
+
+// 2. read the current set, and subscribe to live changes
+shape.currentRows()                                  // Row[]
+const off = shape.subscribe((changes) => { /* insert/update/delete batches */ })
+
+// 3. write through the schema-derived ingestion API; the shape updates live
+await client.tables.todos.insert({ id: 1, title: 'Ship it', priority: 5, done: false })
+await client.tables.todos.update({ id: 1, title: 'Ship it', priority: 5, done: true })  // leaves the shape
+await client.tables.todos.delete(1)
+```
+
+In production you run the real `durable-streams-server`, the engine binary, and the API server as
+separate processes and point the client at the API URL; the demo just colocates them for convenience.
+
 ## Tests
 
 ```bash
