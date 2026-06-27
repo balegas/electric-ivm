@@ -47,12 +47,9 @@ function zodRowSchema(def: TableDef): z.ZodType {
   const shape: Record<string, z.ZodTypeAny> = {}
   for (const [col, c] of Object.entries(def.columns)) {
     // pk is validated as its declared type here, then the dispatcher stringifies it on the row.
-    shape[col] =
-      c.type === 'bool'
-        ? z.boolean()
-        : c.type === 'text'
-          ? z.string()
-          : z.number()
+    const base = c.type === 'bool' ? z.boolean() : c.type === 'text' ? z.string() : z.number()
+    // Non-pk columns are nullable (the pk is never null); allow null cells to materialize.
+    shape[col] = col === def.primaryKey ? base : base.nullable()
   }
   // be permissive about extra/loose fields the stream layer may add
   return z.object(shape).loose()

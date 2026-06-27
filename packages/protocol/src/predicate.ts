@@ -13,38 +13,63 @@ import {
 /**
  * Reference evaluator: does `row` satisfy `pred`?
  *
- * Two-valued logic with the convention that any comparison against a `null`/absent cell
- * is `false`. This matches Postgres `WHERE` semantics as long as cells are non-null, which
- * is the M1/M2 contract (the simulator populates every column). Null three-valued logic is
- * a deliberate, documented gap deferred past M2.
+ * SQL three-valued logic (TRUE / FALSE / UNKNOWN). Any comparison with a NULL/absent operand is
+ * UNKNOWN; AND/OR follow the SQL truth tables; `NOT UNKNOWN = UNKNOWN`. A row is included iff the
+ * predicate is TRUE — matching Postgres `WHERE` exactly, including the `NOT (col = x)` over NULL
+ * case. Mirrors the Rust engine's `predicate::CompiledPredicate::matches`.
  */
 export function evaluate(pred: Predicate, row: Row): boolean {
-  if (isLeaf(pred)) {
-    const cell = row[pred.col]
-    return compare(cell, pred.op, pred.value)
+  return evalTri(pred, row) === true
+}
+
+/** Three-valued result: `true`, `false`, or `null` (UNKNOWN). */
+type Tri = boolean | null
+
+function evalTri(pred: Predicate, row: Row): Tri {
+  if (isLeaf(pred)) return compare(row[pred.col], pred.op, pred.value)
+  if (isAnd(pred)) {
+    // FALSE dominates; else UNKNOWN if any UNKNOWN; else TRUE (empty AND => TRUE).
+    let acc: Tri = true
+    for (const p of pred.and) {
+      const r = evalTri(p, row)
+      if (r === false) return false
+      if (r === null) acc = null
+    }
+    return acc
   }
-  if (isAnd(pred)) return pred.and.every((p) => evaluate(p, row))
-  if (isOr(pred)) return pred.or.some((p) => evaluate(p, row))
-  if (isNot(pred)) return !evaluate(pred.not, row)
-  // Exhaustiveness guard.
+  if (isOr(pred)) {
+    // TRUE dominates; else UNKNOWN if any UNKNOWN; else FALSE (empty OR => FALSE).
+    let acc: Tri = false
+    for (const p of pred.or) {
+      const r = evalTri(p, row)
+      if (r === true) return true
+      if (r === null) acc = null
+    }
+    return acc
+  }
+  if (isNot(pred)) {
+    const r = evalTri(pred.not, row)
+    return r === null ? null : !r
+  }
   throw new Error(`unknown predicate node: ${JSON.stringify(pred)}`)
 }
 
-function compare(cell: Value | undefined, op: LeafOp, value: Value): boolean {
-  if (cell === null || cell === undefined) return false
+function compare(cell: Value | undefined, op: LeafOp, value: Value): Tri {
+  // Any NULL operand => UNKNOWN.
+  if (cell === null || cell === undefined || value === null) return null
   switch (op) {
     case 'eq':
       return cell === value
     case 'neq':
       return cell !== value
     case 'lt':
-      return value !== null && cell < value
+      return cell < value
     case 'lte':
-      return value !== null && cell <= value
+      return cell <= value
     case 'gt':
-      return value !== null && cell > value
+      return cell > value
     case 'gte':
-      return value !== null && cell >= value
+      return cell >= value
   }
 }
 

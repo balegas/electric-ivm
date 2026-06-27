@@ -55,6 +55,19 @@ describe('evaluate', () => {
     expect(evaluate({ col: 'missing', op: 'eq', value: 1 }, alice)).toBe(false)
     expect(evaluate({ col: 'name', op: 'eq', value: null }, { name: null })).toBe(false)
   })
+
+  it('uses SQL three-valued logic for nulls', () => {
+    const r: Row = { id: 1, name: null, age: null, active: true, score: 1 }
+    // leaf over null -> UNKNOWN -> excluded (eq and neq alike)
+    expect(evaluate({ col: 'name', op: 'eq', value: 'Alice' }, r)).toBe(false)
+    expect(evaluate({ col: 'name', op: 'neq', value: 'Alice' }, r)).toBe(false)
+    // NOT(eq) over null -> NOT UNKNOWN = UNKNOWN -> excluded (the fix; was true under two-valued)
+    expect(evaluate({ not: { col: 'name', op: 'eq', value: 'Alice' } }, r)).toBe(false)
+    // AND: TRUE AND UNKNOWN = UNKNOWN -> excluded
+    expect(evaluate({ and: [{ col: 'active', op: 'eq', value: true }, { col: 'age', op: 'gt', value: 18 }] }, r)).toBe(false)
+    // OR: TRUE OR UNKNOWN = TRUE -> included
+    expect(evaluate({ or: [{ col: 'active', op: 'eq', value: true }, { col: 'age', op: 'gt', value: 18 }] }, r)).toBe(true)
+  })
 })
 
 describe('validatePredicate', () => {

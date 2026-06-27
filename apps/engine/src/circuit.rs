@@ -42,7 +42,7 @@ fn run(pred: Arc<CompiledPredicate>, mut rx: mpsc::UnboundedReceiver<Req>) {
     let build = move |circuit: &mut RootCircuit| -> Result<(ZSetHandle<Row>, OutputHandle<OrdZSet<Row>>)> {
         let (stream, input) = circuit.add_input_zset::<Row>();
         let p = pred.clone();
-        let filtered = stream.filter(move |row| p.eval(row));
+        let filtered = stream.filter(move |row| p.matches(row));
         Ok((input, filtered.output()))
     };
     let (circuit, (input, output)) = match RootCircuit::build(build) {

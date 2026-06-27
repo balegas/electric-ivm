@@ -66,35 +66,86 @@ impl CompiledPredicate {
         }
     }
 
-    pub fn eval(&self, row: &Row) -> bool {
+    /// Filter membership under SQL `WHERE` semantics: a row is included iff the predicate is TRUE.
+    /// UNKNOWN (from a NULL operand) and FALSE both exclude the row.
+    pub fn matches(&self, row: &Row) -> bool {
+        self.eval(row) == Tri::True
+    }
+
+    /// Three-valued evaluation (TRUE / FALSE / UNKNOWN), mirroring Postgres so the engine and the
+    /// pglite oracle agree even in the presence of NULLs.
+    fn eval(&self, row: &Row) -> Tri {
         match self {
-            CompiledPredicate::MatchAll => true,
+            CompiledPredicate::MatchAll => Tri::True,
             CompiledPredicate::Cmp { col, op, value } => {
                 let cell = row.0.get(*col).unwrap_or(&Value::Null);
                 cmp(cell, *op, value)
             }
-            CompiledPredicate::And(ps) => ps.iter().all(|p| p.eval(row)),
-            CompiledPredicate::Or(ps) => ps.iter().any(|p| p.eval(row)),
-            // KNOWN LIMITATION (safe under the current no-null contract): this is two-valued, so
-            // `NOT (col = x)` on a NULL cell yields true here but NULL (excluded) in Postgres. The
-            // simulator never generates nulls, so engine and oracle agree today. Introducing nulls
-            // requires three-valued logic (a null-derived leaf must keep the row out under NOT).
-            CompiledPredicate::Not(p) => !p.eval(row),
+            // AND: FALSE dominates; else UNKNOWN if any UNKNOWN; else TRUE (empty AND => TRUE).
+            CompiledPredicate::And(ps) => {
+                let mut acc = Tri::True;
+                for p in ps {
+                    match p.eval(row) {
+                        Tri::False => return Tri::False,
+                        Tri::Unknown => acc = Tri::Unknown,
+                        Tri::True => {}
+                    }
+                }
+                acc
+            }
+            // OR: TRUE dominates; else UNKNOWN if any UNKNOWN; else FALSE (empty OR => FALSE).
+            CompiledPredicate::Or(ps) => {
+                let mut acc = Tri::False;
+                for p in ps {
+                    match p.eval(row) {
+                        Tri::True => return Tri::True,
+                        Tri::Unknown => acc = Tri::Unknown,
+                        Tri::False => {}
+                    }
+                }
+                acc
+            }
+            // NOT TRUE = FALSE, NOT FALSE = TRUE, NOT UNKNOWN = UNKNOWN. The UNKNOWN case is the fix
+            // that makes `NOT (col = x)` over a NULL cell keep the row out, exactly as Postgres does.
+            CompiledPredicate::Not(p) => p.eval(row).not(),
         }
     }
 }
 
-/// Compare a cell against a literal under SQL-ish two-valued semantics: a `null` cell never
-/// matches (mirrors `@electric-lite/protocol`'s evaluator and Postgres for non-null literals).
-fn cmp(cell: &Value, op: LeafOp, value: &Value) -> bool {
-    if matches!(cell, Value::Null) {
-        return false;
+/// SQL three-valued truth value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tri {
+    True,
+    False,
+    Unknown,
+}
+
+impl Tri {
+    fn from_bool(b: bool) -> Tri {
+        if b { Tri::True } else { Tri::False }
     }
-    match op {
+    fn not(self) -> Tri {
+        match self {
+            Tri::True => Tri::False,
+            Tri::False => Tri::True,
+            Tri::Unknown => Tri::Unknown,
+        }
+    }
+}
+
+/// Compare a cell against a literal under SQL three-valued semantics: any NULL operand yields
+/// UNKNOWN (mirrors Postgres and `@electric-lite/protocol`'s evaluator).
+fn cmp(cell: &Value, op: LeafOp, value: &Value) -> Tri {
+    if matches!(cell, Value::Null) || matches!(value, Value::Null) {
+        return Tri::Unknown;
+    }
+    let truth = match op {
         LeafOp::Eq => cell == value,
         LeafOp::Neq => cell != value,
         LeafOp::Lt | LeafOp::Lte | LeafOp::Gt | LeafOp::Gte => {
-            let Some(ord) = ordering(cell, value) else { return false };
+            // A type mismatch has no ordering; treat as UNKNOWN (literals are column-typed, so this
+            // does not arise in practice).
+            let Some(ord) = ordering(cell, value) else { return Tri::Unknown };
             // TEST-ONLY: the `off_by_one_cmp` fault makes `<=`/`>=` strict, so rows exactly on a
             // boundary literal are mishandled. No-op unless ELECTRIC_LITE_FAULT=off_by_one_cmp.
             let off_by_one = matches!(crate::fault::active(), crate::fault::Fault::OffByOneCmp);
@@ -106,7 +157,8 @@ fn cmp(cell: &Value, op: LeafOp, value: &Value) -> bool {
                 _ => unreachable!(),
             }
         }
-    }
+    };
+    Tri::from_bool(truth)
 }
 
 fn ordering(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
@@ -142,13 +194,13 @@ mod tests {
         let ts = users();
         let p: PredicateJson = serde_json::from_value(serde_json::json!({"col":"active","op":"eq","value":true})).unwrap();
         let cp = CompiledPredicate::compile(&p, &ts).unwrap();
-        assert!(cp.eval(&row(&ts, serde_json::json!({"id":1,"name":"a","age":20,"active":true}))));
-        assert!(!cp.eval(&row(&ts, serde_json::json!({"id":2,"name":"b","age":20,"active":false}))));
+        assert!(cp.matches(&row(&ts, serde_json::json!({"id":1,"name":"a","age":20,"active":true}))));
+        assert!(!cp.matches(&row(&ts, serde_json::json!({"id":2,"name":"b","age":20,"active":false}))));
 
         let p2: PredicateJson = serde_json::from_value(serde_json::json!({"col":"age","op":"gte","value":18})).unwrap();
         let cp2 = CompiledPredicate::compile(&p2, &ts).unwrap();
-        assert!(cp2.eval(&row(&ts, serde_json::json!({"id":1,"name":"a","age":18,"active":true}))));
-        assert!(!cp2.eval(&row(&ts, serde_json::json!({"id":2,"name":"b","age":17,"active":true}))));
+        assert!(cp2.matches(&row(&ts, serde_json::json!({"id":1,"name":"a","age":18,"active":true}))));
+        assert!(!cp2.matches(&row(&ts, serde_json::json!({"id":2,"name":"b","age":17,"active":true}))));
     }
 
     #[test]
@@ -161,15 +213,48 @@ mod tests {
             ]
         })).unwrap();
         let cp = CompiledPredicate::compile(&p, &ts).unwrap();
-        assert!(cp.eval(&row(&ts, serde_json::json!({"id":1,"name":"alice","age":20,"active":true}))));
-        assert!(!cp.eval(&row(&ts, serde_json::json!({"id":2,"name":"bob","age":20,"active":true}))));
-        assert!(!cp.eval(&row(&ts, serde_json::json!({"id":3,"name":"alice","age":20,"active":false}))));
+        assert!(cp.matches(&row(&ts, serde_json::json!({"id":1,"name":"alice","age":20,"active":true}))));
+        assert!(!cp.matches(&row(&ts, serde_json::json!({"id":2,"name":"bob","age":20,"active":true}))));
+        assert!(!cp.matches(&row(&ts, serde_json::json!({"id":3,"name":"alice","age":20,"active":false}))));
     }
 
     #[test]
     fn match_all_when_no_predicate() {
         let ts = users();
         let cp = CompiledPredicate::compile_opt(None, &ts).unwrap();
-        assert!(cp.eval(&row(&ts, serde_json::json!({"id":1,"name":"a","age":1,"active":false}))));
+        assert!(cp.matches(&row(&ts, serde_json::json!({"id":1,"name":"a","age":1,"active":false}))));
+    }
+
+    #[test]
+    fn three_valued_null_logic() {
+        let ts = users();
+        let compile = |j: serde_json::Value| {
+            CompiledPredicate::compile(&serde_json::from_value::<PredicateJson>(j).unwrap(), &ts).unwrap()
+        };
+        // Rows with a NULL `name` / NULL `age`.
+        let null_name = row(&ts, serde_json::json!({"id":1,"name":null,"age":20,"active":true}));
+        let null_age_active = row(&ts, serde_json::json!({"id":2,"name":"a","age":null,"active":true}));
+        let null_age_inactive = row(&ts, serde_json::json!({"id":3,"name":"a","age":null,"active":false}));
+
+        // Leaf over NULL -> UNKNOWN -> excluded (eq and neq alike).
+        assert!(!compile(serde_json::json!({"col":"name","op":"eq","value":"alpha"})).matches(&null_name));
+        assert!(!compile(serde_json::json!({"col":"name","op":"neq","value":"alpha"})).matches(&null_name));
+
+        // THE FIX: NOT(name = 'alpha') over a NULL name is NOT UNKNOWN = UNKNOWN -> excluded.
+        // The old two-valued evaluator wrongly returned true here and would have leaked the row.
+        let not_eq = compile(serde_json::json!({"not":{"col":"name","op":"eq","value":"alpha"}}));
+        assert!(!not_eq.matches(&null_name));
+        // ...but NOT(name = 'alpha') over a concrete non-match is TRUE.
+        assert!(not_eq.matches(&row(&ts, serde_json::json!({"id":9,"name":"bob","age":20,"active":true}))));
+
+        // AND: TRUE AND UNKNOWN = UNKNOWN -> excluded; FALSE AND UNKNOWN = FALSE -> excluded.
+        let and = compile(serde_json::json!({"and":[{"col":"active","op":"eq","value":true},{"col":"age","op":"gt","value":18}]}));
+        assert!(!and.matches(&null_age_active));
+        assert!(!and.matches(&null_age_inactive));
+
+        // OR: TRUE OR UNKNOWN = TRUE -> included; FALSE OR UNKNOWN = UNKNOWN -> excluded.
+        let or = compile(serde_json::json!({"or":[{"col":"active","op":"eq","value":true},{"col":"age","op":"gt","value":100}]}));
+        assert!(or.matches(&null_age_active));
+        assert!(!or.matches(&null_age_inactive));
     }
 }
