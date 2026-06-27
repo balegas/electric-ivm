@@ -79,4 +79,26 @@ describe('conformance: equality filters (M1)', () => {
     expect(res.equal, formatCompare(res)).toBe(true)
     expect(shape.currentRows().some((r) => String(r.id) === '101')).toBe(false)
   }, 60000)
+
+  it('schema-derived per-table API (tables.users.insert/delete) drives the system', async () => {
+    const def: ShapeDef = { table: 'users', where: { col: 'active', op: 'eq', value: true } }
+    const shape = await h.client.shape(def)
+
+    // insert via the derived API; oracle gets the same change
+    const row = { id: 201, name: 'alpha', age: 25, active: true, score: 1.0 }
+    await h.oracle.applyChange('users', { op: 'insert', pk: 201, row })
+    const { txid } = await h.client.tables.users.insert(row)
+    await shape.awaitTxId(txid, 10000)
+    let res = compareShapeSets(COLUMNS, 'id', await h.oracle.queryShape(def), shape.currentRows())
+    expect(res.equal, formatCompare(res)).toBe(true)
+    expect(shape.currentRows().some((r) => String(r.id) === '201')).toBe(true)
+
+    // delete via the derived API
+    await h.oracle.applyChange('users', { op: 'delete', pk: 201 })
+    const { txid: t2 } = await h.client.tables.users.delete(201)
+    await shape.awaitTxId(t2, 10000)
+    res = compareShapeSets(COLUMNS, 'id', await h.oracle.queryShape(def), shape.currentRows())
+    expect(res.equal, formatCompare(res)).toBe(true)
+    expect(shape.currentRows().some((r) => String(r.id) === '201')).toBe(false)
+  }, 60000)
 })

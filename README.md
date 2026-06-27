@@ -99,5 +99,8 @@ Tunables (env): `FUZZ_SEEDS`, `FUZZ_SHAPES`, `FUZZ_OPS`, `SEED`.
 
 - **M1 — equality filters:** done. Engine, API, client, oracle, and the live propagation path.
 - **M2 — richer predicates:** comparisons + `and/or/not`, validated by the fuzz loop.
-- **M3 — robustness:** late-shape backfill (implemented), restart idempotency, typed per-table API,
-  long fuzz runs — in progress.
+- **M3 — robustness:** done — late-shape backfill (both paths), a sound convergence barrier
+  (`drainEngine` via the engine's processed-offset endpoint), the schema-derived per-table
+  ingestion API (`client.tables.<table>.insert/update/delete`), and long fuzz runs.
+- **Deferred (documented in `docs/superpowers/specs/`):** engine restart idempotency
+  (deterministic `Producer-Seq`) and three-valued NULL logic (the simulator generates no nulls).

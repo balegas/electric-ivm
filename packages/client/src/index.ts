@@ -25,9 +25,18 @@ export interface ShapeMaterialization {
   close(): Promise<void>
 }
 
+/** Per-table ingestion helpers derived from the schema (pk read from the row's pk column). */
+export interface TableApi {
+  insert(row: Row, txid?: string): Promise<{ txid: string }>
+  update(row: Row, txid?: string): Promise<{ txid: string }>
+  delete(pk: Value, txid?: string): Promise<{ txid: string }>
+}
+
 export interface ElectricLiteClient {
   defineSchema(schema: Schema): Promise<unknown>
   write(input: { table: string; op: Op; pk: Value; row?: Row; txid?: string }): Promise<{ txid: string }>
+  /** Schema-derived typed ingestion API, one entry per table. */
+  tables: Record<string, TableApi>
   shape(def: ShapeDef): Promise<ShapeMaterialization>
   close(): Promise<void>
 }
@@ -51,10 +60,25 @@ export function createClient(opts: { apiUrl: string; schema: Schema }): Electric
   const trpc = createTRPCClient<AppRouter>({ links: [httpBatchLink({ url: opts.apiUrl })] })
   const open: ShapeMaterialization[] = []
 
+  const write = (input: { table: string; op: Op; pk: Value; row?: Row; txid?: string }) =>
+    trpc.ingest.write.mutate(input)
+
+  // Derive a typed ingestion helper per table from the schema.
+  const tables: Record<string, TableApi> = {}
+  for (const [table, tdef] of Object.entries(opts.schema.tables)) {
+    const pkCol = tdef.primaryKey
+    tables[table] = {
+      insert: (row, txid) => write({ table, op: 'insert', pk: row[pkCol] ?? null, row, txid }),
+      update: (row, txid) => write({ table, op: 'update', pk: row[pkCol] ?? null, row, txid }),
+      delete: (pk, txid) => write({ table, op: 'delete', pk, txid }),
+    }
+  }
+
   return {
     defineSchema: (schema) => trpc.schema.define.mutate({ schema }),
 
-    write: (input) => trpc.ingest.write.mutate(input),
+    write,
+    tables,
 
     async shape(def) {
       const tableDef = opts.schema.tables[def.table]
