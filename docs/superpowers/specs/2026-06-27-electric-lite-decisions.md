@@ -79,6 +79,17 @@ On-stream JSON item shape (what `createStreamDB` consumes):
   pass `server.baseUrl` to the engine subprocess + API + client. **Confirm the Node server's
   stream path prefix empirically** (Rust server uses `/v1/stream/<path>`; Node may differ).
 
+## D5b — Verified empirically (smoke test)
+- Node `DurableStreamTestServer` auto-creates a stream on `PUT ${base}/${path}` (201) at **any
+  path, no `/v1/stream` prefix**; slashes in the path are fine (`table/users`). Append = `POST`
+  a JSON array (204, opaque `Stream-Next-Offset` like `..._0000000000000216`); `GET ?offset=-1`
+  returns the JSON array (server adds `headers.offset` to each item); `createStreamDB` with
+  `live:true` materializes and receives live appends.
+- **PK is stringified on materialization.** `createStreamDB` sets `value[primaryKey] = event.key`
+  (a string), so a row sent as `{id:1}` materializes as `{id:"1"}`. The oracle (pglite) returns
+  `{id:1}`. ⇒ The conformance comparator keys rows by `String(pk)` and compares **non-pk**
+  declared columns by value (those keep their JS types: text→string, bool→boolean, num→number).
+
 ## D6 — Oracle & client comparison
 - pglite `PGlite.create('memory://')`; DDL/DML/SELECT from `@electric-lite/protocol`
   compilers; int/text/bool/float round-trip to JS primitives exactly.
