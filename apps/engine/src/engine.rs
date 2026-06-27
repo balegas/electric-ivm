@@ -12,7 +12,6 @@ use tokio::sync::{Mutex, mpsc};
 
 use std::sync::atomic::Ordering;
 
-use crate::circuit::CircuitActor;
 use crate::ds::{DsClient, Envelope, EnvelopeHeaders};
 use crate::family::FamilyActor;
 use crate::metrics::{Timer, metrics};
@@ -154,9 +153,24 @@ impl Engine {
     }
 }
 
-struct ShapeActor {
-    actor: CircuitActor,
+/// A non-shareable shape (range / OR / NOT / inequality / match-all). Its predicate is a stateless
+/// filter, so it needs no dbsp circuit or OS thread — it is evaluated directly on each delta. This
+/// is what lets standalone shapes scale far past the old one-thread-per-shape ceiling.
+struct StandaloneShape {
+    pred: Arc<CompiledPredicate>,
     stream_path: String,
+}
+
+/// Evaluate a stateless WHERE filter directly on a Z-set delta. A filter has no incremental state
+/// (unlike a join), so running it in dbsp would only add a thread + channel round-trip + a per-shape
+/// clone of the delta. `translate_output` downstream groups by primary key, so emitting the matching
+/// `(row, weight)` pairs here is equivalent to what the old per-shape filter circuit produced.
+fn eval_standalone(pred: &CompiledPredicate, delta: &[Tup2<Row, ZWeight>]) -> Vec<(Row, ZWeight)> {
+    delta
+        .iter()
+        .filter(|t| pred.matches(&t.0))
+        .map(|t| (t.0.clone(), t.1))
+        .collect()
 }
 
 /// A shared circuit for all shapes whose predicate is the same equality template (see
@@ -176,7 +190,7 @@ fn spawn_tailer(ds: DsClient, ts: TableSchema) -> TailerHandle {
 
 fn publish_stats(
     stats: &std::sync::Mutex<TableStats>,
-    shapes: &HashMap<String, ShapeActor>,
+    shapes: &HashMap<String, StandaloneShape>,
     families: &HashMap<Vec<usize>, Family>,
 ) {
     let mut fams: Vec<FamilyStat> = families
@@ -198,7 +212,7 @@ async fn tailer_loop(
     let mut offset = "-1".to_string();
     let mut table_state: HashMap<Value, Row> = HashMap::new();
     // Standalone per-shape filter circuits (non-equality predicates), keyed by shape id.
-    let mut shapes: HashMap<String, ShapeActor> = HashMap::new();
+    let mut shapes: HashMap<String, StandaloneShape> = HashMap::new();
     // Shared family circuits, keyed by the equality template's (sorted) column indices.
     let mut families: HashMap<Vec<usize>, Family> = HashMap::new();
     // Reverse lookup for removal: shape id -> (template key cols, numeric id, key tuple).
@@ -271,7 +285,7 @@ async fn add_shape_routed(
     ds: &DsClient,
     ts: &TableSchema,
     table_state: &HashMap<Value, Row>,
-    shapes: &mut HashMap<String, ShapeActor>,
+    shapes: &mut HashMap<String, StandaloneShape>,
     families: &mut HashMap<Vec<usize>, Family>,
     family_of: &mut HashMap<String, (Vec<usize>, u64, Row)>,
     shape_id: String,
@@ -346,23 +360,23 @@ async fn add_shape(
     table_state: &HashMap<Value, Row>,
     stream_path: String,
     pred: Arc<CompiledPredicate>,
-) -> Result<ShapeActor> {
-    let actor = CircuitActor::spawn(pred)?;
-    // Backfill: feed the table's current rows as inserts so the new shape reflects existing data.
+) -> Result<StandaloneShape> {
+    // Backfill: emit the table's current matching rows as inserts so the new shape reflects data.
     if !table_state.is_empty() {
-        let delta: Vec<Tup2<Row, ZWeight>> =
-            table_state.values().map(|r| Tup2(r.clone(), 1)).collect();
-        let out = actor.process(delta).await?;
-        let envs = translate_output(ts, out, None);
-        ds.append(&stream_path, &envs).await?;
+        let out: Vec<(Row, ZWeight)> =
+            table_state.values().filter(|r| pred.matches(r)).map(|r| (r.clone(), 1)).collect();
+        if !out.is_empty() {
+            let envs = translate_output(ts, out, None);
+            ds.append(&stream_path, &envs).await?;
+        }
     }
-    Ok(ShapeActor { actor, stream_path })
+    Ok(StandaloneShape { pred, stream_path })
 }
 
 async fn process_envelope(
     ts: &TableSchema,
     table_state: &mut HashMap<Value, Row>,
-    shapes: &HashMap<String, ShapeActor>,
+    shapes: &HashMap<String, StandaloneShape>,
     families: &HashMap<Vec<usize>, Family>,
     env: Envelope,
     pending: &mut HashMap<String, Vec<Envelope>>,
@@ -373,9 +387,9 @@ async fn process_envelope(
     }
     metrics().envelopes.fetch_add(1, Ordering::Relaxed);
     let _t = Timer::new(&metrics().process_envelope);
-    // Standalone per-shape circuits: each filters the delta independently.
+    // Standalone shapes: evaluate each stateless filter directly on the delta (no thread, no clone).
     for shape in shapes.values() {
-        let out = shape.actor.process(delta.clone()).await?;
+        let out = eval_standalone(&shape.pred, &delta);
         if out.is_empty() {
             continue;
         }
@@ -548,42 +562,41 @@ mod tests {
         }
     }
 
-    /// End-to-end (sans HTTP): change event -> input delta -> circuit -> output envelopes,
+    /// End-to-end (sans HTTP): change event -> input delta -> direct filter eval -> output envelopes,
     /// exercising enter / update / leave for a `WHERE active = true` shape.
-    #[tokio::test]
-    async fn change_to_shape_envelope_enter_update_leave() {
+    #[test]
+    fn change_to_shape_envelope_enter_update_leave() {
         let ts = users();
-        let pred = Arc::new(CompiledPredicate::compile_opt(
+        let pred = CompiledPredicate::compile_opt(
             Some(&serde_json::from_value(serde_json::json!({"col":"active","op":"eq","value":true})).unwrap()),
             &ts,
-        ).unwrap());
-        let actor = CircuitActor::spawn(pred).unwrap();
+        ).unwrap();
         let mut table_state = HashMap::new();
 
         // enter: insert an active row -> upsert envelope
         let (delta, _) = apply_envelope(&ts, &mut table_state, &env("insert", "1", Some(serde_json::json!({"id":1,"name":"a","active":true})))).unwrap();
-        let envs = translate_output(&ts, actor.process(delta).await.unwrap(), None);
+        let envs = translate_output(&ts, eval_standalone(&pred, &delta), None);
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].headers.operation, "upsert");
         assert_eq!(envs[0].key, "1");
 
         // update within shape (name change, still active) -> upsert with new value
         let (delta, _) = apply_envelope(&ts, &mut table_state, &env("update", "1", Some(serde_json::json!({"id":1,"name":"a2","active":true})))).unwrap();
-        let envs = translate_output(&ts, actor.process(delta).await.unwrap(), None);
+        let envs = translate_output(&ts, eval_standalone(&pred, &delta), None);
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].headers.operation, "upsert");
         assert_eq!(envs[0].value.as_ref().unwrap()["name"], "a2");
 
         // leave: becomes inactive -> delete envelope
         let (delta, _) = apply_envelope(&ts, &mut table_state, &env("update", "1", Some(serde_json::json!({"id":1,"name":"a2","active":false})))).unwrap();
-        let envs = translate_output(&ts, actor.process(delta).await.unwrap(), None);
+        let envs = translate_output(&ts, eval_standalone(&pred, &delta), None);
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].headers.operation, "delete");
         assert_eq!(envs[0].key, "1");
 
         // a non-matching insert produces no shape envelope
         let (delta, _) = apply_envelope(&ts, &mut table_state, &env("insert", "2", Some(serde_json::json!({"id":2,"name":"b","active":false})))).unwrap();
-        let envs = translate_output(&ts, actor.process(delta).await.unwrap(), None);
+        let envs = translate_output(&ts, eval_standalone(&pred, &delta), None);
         assert_eq!(envs.len(), 0);
     }
 }

@@ -13,7 +13,7 @@
 //   BENCH_REGCONC  shape-registration concurrency                  (default 64)
 
 import { execFile, spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { appendFileSync, existsSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
@@ -24,9 +24,20 @@ import { createClient } from '@electric-lite/client'
 import type { Schema } from '@electric-lite/protocol'
 
 const execFileP = promisify(execFile)
+// Durable, line-buffered logging so results survive even if the run is backgrounded or killed.
+const OUTFILE = process.env.BENCH_OUT ?? join(dirname(fileURLToPath(import.meta.url)), '..', 'results.txt')
+const log = (line = '') => {
+  process.stdout.write(`${line}\n`)
+  try {
+    appendFileSync(OUTFILE, `${line}\n`)
+  } catch {
+    /* ignore */
+  }
+}
 const env = (k: string, d: number) => (process.env[k] ? Number(process.env[k]) : d)
 const SHAPES = env('BENCH_SHAPES', 1000)
 const SUBS = Math.min(env('BENCH_SUBS', 100), SHAPES)
+const STANDALONE = env('BENCH_STANDALONE', 0) // non-equality shapes (each its own circuit today)
 const DURATION = env('BENCH_DURATION', 10)
 const CONC = env('BENCH_CONC', 64)
 const REGCONC = env('BENCH_REGCONC', 64)
@@ -88,8 +99,19 @@ async function sampleRss(pid: number): Promise<{ rssMb: number; cpu: number }> {
   }
 }
 
+/** OS thread count of the engine process (macOS `ps -M` lists one line per thread). */
+async function threadCount(pid: number): Promise<number> {
+  try {
+    const { stdout } = await execFileP('ps', ['-M', '-p', String(pid)])
+    return Math.max(0, stdout.trim().split('\n').length - 1) // minus the header row
+  } catch {
+    return 0
+  }
+}
+
 async function main() {
-  console.log(`\n=== electric-lite bench: ${SHAPES} shapes, ${SUBS} subscribers, ${DURATION}s load, conc=${CONC} ===\n`)
+  writeFileSync(OUTFILE, "")
+  log(`\n=== electric-lite bench: ${SHAPES} shapes, ${SUBS} subscribers, ${DURATION}s load, conc=${CONC} ===\n`)
   // Engine must be built in release for a meaningful benchmark.
   if (!existsSync(join(repoRoot(), 'target', 'release', 'electric-lite-engine'))) {
     console.error('Build the release engine first: cargo build --release -p electric-lite-engine')
@@ -112,12 +134,24 @@ async function main() {
     registered++
   })
   const regMs = now() - regStart
+  log(`registered ${registered} equality shapes in ${(regMs / 1000).toFixed(1)}s (${Math.round(registered / (regMs / 1000))}/s)`)
+
+  // --- 1b. Register STANDALONE (non-equality) shapes: each `seq > k` is its own circuit today. ---
+  if (STANDALONE > 0) {
+    const sStart = now()
+    await runPool(STANDALONE, REGCONC, async (k) => {
+      await client.shape({ table: 'users', where: { col: 'seq', op: 'gt', value: k * 1000 } })
+    })
+    const sMs = now() - sStart
+    log(`registered ${STANDALONE} standalone shapes in ${(sMs / 1000).toFixed(1)}s (${Math.round(STANDALONE / (sMs / 1000))}/s)`)
+  }
+
   const afterReg = await sampleRss(pid)
+  const threads = await threadCount(pid)
   const fams = await (await fetch(`${engine.url}/tables/users/families`)).json()
-  console.log(
-    `registered ${registered} shapes in ${(regMs / 1000).toFixed(1)}s ` +
-      `(${Math.round(registered / (regMs / 1000))}/s); families=${fams.families.length} ` +
-      `standalone=${fams.standalone}; engine RSS=${afterReg.rssMb.toFixed(0)}MB`,
+  log(
+    `topology: families=${fams.families.length} (eq shapes), standalone=${fams.standalone}; ` +
+      `engine threads=${threads}; RSS=${afterReg.rssMb.toFixed(0)}MB`,
   )
 
   // --- 2. Subscribe a sample for end-to-end latency (these are extra shapes on the same family). ---
@@ -181,18 +215,18 @@ async function main() {
   // --- Report ---
   latencies.sort((a, b) => a - b)
   const usMs = (us: number) => (us / 1000).toFixed(2)
-  console.log(`\n--- throughput ---`)
-  console.log(`firehose writes:   ${firehoseWrites} in ${(loadMs / 1000).toFixed(1)}s = ${Math.round(firehoseWrites / (loadMs / 1000))}/s`)
-  console.log(`engine envelopes:  ${metrics.counters.envelopes_processed} processed, ${metrics.counters.shape_appends} shape appends`)
-  console.log(`\n--- end-to-end write->shape latency (subscribed shapes, ${latencies.length} probes) ---`)
-  console.log(`p50=${pct(latencies, 0.5).toFixed(1)}ms  p99=${pct(latencies, 0.99).toFixed(1)}ms  max=${pct(latencies, 1).toFixed(1)}ms`)
-  console.log(`\n--- engine stage latencies (from /metrics) ---`)
-  console.log(`process_envelope: p50=${usMs(metrics.process_envelope_us.p50_us)}ms p99=${usMs(metrics.process_envelope_us.p99_us)}ms max=${usMs(metrics.process_envelope_us.max_us)}ms`)
-  console.log(`family_step:      p50=${usMs(metrics.family_step_us.p50_us)}ms p99=${usMs(metrics.family_step_us.p99_us)}ms max=${usMs(metrics.family_step_us.max_us)}ms`)
-  console.log(`append:           p50=${usMs(metrics.append_us.p50_us)}ms p99=${usMs(metrics.append_us.p99_us)}ms max=${usMs(metrics.append_us.max_us)}ms`)
-  console.log(`\n--- resources (engine process) ---`)
-  console.log(`RSS: reg=${afterReg.rssMb.toFixed(0)}MB  load start=${rssTrace[0]?.toFixed(0)}MB  peak=${Math.max(...rssTrace).toFixed(0)}MB  end=${rssTrace.at(-1)?.toFixed(0)}MB`)
-  console.log(`CPU: avg=${(cpuTrace.reduce((a, b) => a + b, 0) / Math.max(1, cpuTrace.length)).toFixed(0)}%  peak=${Math.max(...cpuTrace).toFixed(0)}%`)
+  log(`\n--- throughput ---`)
+  log(`firehose writes:   ${firehoseWrites} in ${(loadMs / 1000).toFixed(1)}s = ${Math.round(firehoseWrites / (loadMs / 1000))}/s`)
+  log(`engine envelopes:  ${metrics.counters.envelopes_processed} processed, ${metrics.counters.shape_appends} shape appends`)
+  log(`\n--- end-to-end write->shape latency (subscribed shapes, ${latencies.length} probes) ---`)
+  log(`p50=${pct(latencies, 0.5).toFixed(1)}ms  p99=${pct(latencies, 0.99).toFixed(1)}ms  max=${pct(latencies, 1).toFixed(1)}ms`)
+  log(`\n--- engine stage latencies (from /metrics) ---`)
+  log(`process_envelope: p50=${usMs(metrics.process_envelope_us.p50_us)}ms p99=${usMs(metrics.process_envelope_us.p99_us)}ms max=${usMs(metrics.process_envelope_us.max_us)}ms`)
+  log(`family_step:      p50=${usMs(metrics.family_step_us.p50_us)}ms p99=${usMs(metrics.family_step_us.p99_us)}ms max=${usMs(metrics.family_step_us.max_us)}ms`)
+  log(`append:           p50=${usMs(metrics.append_us.p50_us)}ms p99=${usMs(metrics.append_us.p99_us)}ms max=${usMs(metrics.append_us.max_us)}ms`)
+  log(`\n--- resources (engine process) ---`)
+  log(`RSS: reg=${afterReg.rssMb.toFixed(0)}MB  load start=${rssTrace[0]?.toFixed(0)}MB  peak=${Math.max(...rssTrace).toFixed(0)}MB  end=${rssTrace.at(-1)?.toFixed(0)}MB`)
+  log(`CPU: avg=${(cpuTrace.reduce((a, b) => a + b, 0) / Math.max(1, cpuTrace.length)).toFixed(0)}%  peak=${Math.max(...cpuTrace).toFixed(0)}%`)
 
   await client.close().catch(() => {})
   await api.close().catch(() => {})
