@@ -95,11 +95,14 @@ fn cmp(cell: &Value, op: LeafOp, value: &Value) -> bool {
         LeafOp::Neq => cell != value,
         LeafOp::Lt | LeafOp::Lte | LeafOp::Gt | LeafOp::Gte => {
             let Some(ord) = ordering(cell, value) else { return false };
+            // TEST-ONLY: the `off_by_one_cmp` fault makes `<=`/`>=` strict, so rows exactly on a
+            // boundary literal are mishandled. No-op unless ELECTRIC_LITE_FAULT=off_by_one_cmp.
+            let off_by_one = matches!(crate::fault::active(), crate::fault::Fault::OffByOneCmp);
             match op {
                 LeafOp::Lt => ord.is_lt(),
-                LeafOp::Lte => ord.is_le(),
+                LeafOp::Lte => if off_by_one { ord.is_lt() } else { ord.is_le() },
                 LeafOp::Gt => ord.is_gt(),
-                LeafOp::Gte => ord.is_ge(),
+                LeafOp::Gte => if off_by_one { ord.is_gt() } else { ord.is_ge() },
                 _ => unreachable!(),
             }
         }

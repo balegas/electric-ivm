@@ -18,6 +18,11 @@ async fn main() -> Result<()> {
         .context("ELECTRIC_LITE_DS_URL must be set to the durable-streams server base URL")?;
     let bind = std::env::var("ELECTRIC_LITE_BIND").unwrap_or_else(|_| "127.0.0.1:0".to_string());
 
+    // TEST-ONLY: surface an injected fault so a faulted run is never silent (no-op when unset).
+    if electric_lite_engine::fault::active() != electric_lite_engine::fault::Fault::None {
+        tracing::warn!("ELECTRIC_LITE_FAULT active: {:?}", electric_lite_engine::fault::active());
+    }
+
     let engine = Engine::new(DsClient::new(ds_url.clone()));
     let app = router(engine);
 

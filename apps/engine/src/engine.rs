@@ -289,8 +289,11 @@ pub(crate) fn translate_output(ts: &TableSchema, out: Vec<(Row, ZWeight)>, txid:
             headers: EnvelopeHeaders { operation: "upsert".into(), txid: txid.clone(), offset: None },
         });
     }
+    // TEST-ONLY: the `drop_deletes` fault suppresses "leave" envelopes so rows that exit a shape
+    // linger in the client. No-op unless ELECTRIC_LITE_FAULT=drop_deletes (see `fault`).
+    let drop_deletes = matches!(crate::fault::active(), crate::fault::Fault::DropDeletes);
     for pk in &neg {
-        if pos.contains_key(pk) {
+        if pos.contains_key(pk) || drop_deletes {
             continue;
         }
         envs.push(Envelope {

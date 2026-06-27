@@ -9,6 +9,7 @@
 pub mod circuit;
 pub mod ds;
 pub mod engine;
+pub mod fault;
 pub mod http;
 pub mod predicate;
 pub mod schema;

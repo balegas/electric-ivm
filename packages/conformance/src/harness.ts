@@ -38,13 +38,16 @@ function engineBin(): string {
   return join(repoRoot(), 'target', 'debug', 'electric-lite-engine')
 }
 
-async function spawnEngine(dsUrl: string): Promise<{ url: string; proc: ChildProcess }> {
+async function spawnEngine(dsUrl: string, fault?: string): Promise<{ url: string; proc: ChildProcess }> {
   const proc = spawn(engineBin(), [], {
     env: {
       ...process.env,
       ELECTRIC_LITE_DS_URL: dsUrl,
       ELECTRIC_LITE_BIND: '127.0.0.1:0',
       ELECTRIC_LITE_LOG: process.env.ELECTRIC_LITE_LOG ?? 'warn',
+      // TEST-ONLY negative control: deliberately corrupt the engine to prove the harness catches
+      // bugs. Unset in every normal boot, so this changes nothing for fault-free tests.
+      ...(fault ? { ELECTRIC_LITE_FAULT: fault } : {}),
     },
     stdio: ['ignore', 'pipe', 'inherit'],
   })
@@ -78,11 +81,16 @@ export interface Harness {
   shutdown(): Promise<void>
 }
 
-export async function bootHarness(schema: Schema): Promise<Harness> {
+export interface BootOptions {
+  /** TEST-ONLY: inject an engine fault (e.g. 'drop_deletes', 'off_by_one_cmp') for negative controls. */
+  fault?: string
+}
+
+export async function bootHarness(schema: Schema, opts: BootOptions = {}): Promise<Harness> {
   buildEngine()
   const server = new DurableStreamTestServer({ port: 0 })
   const dsUrl = await server.start()
-  const { url: engineUrl, proc } = await spawnEngine(dsUrl)
+  const { url: engineUrl, proc } = await spawnEngine(dsUrl, opts.fault)
   const api = await createApiServer({ dsUrl, engineUrl })
   const oracle = await createOracle(schema)
   const client = createClient({ apiUrl: api.url, schema })
@@ -153,6 +161,13 @@ export interface ConvergenceTarget {
   def: ShapeDef
   columns: string[]
   pk: string
+}
+
+/** One-shot comparison of the client-materialized set against the oracle (no polling). */
+export async function snapshotCompare(h: Harness, target: ConvergenceTarget): Promise<CompareResult> {
+  const oracleRows: Row[] = await h.oracle.queryShape(target.def)
+  const clientRows = target.shape.currentRows()
+  return compareShapeSets(target.columns, target.pk, oracleRows, clientRows)
 }
 
 /** Poll until the client-materialized set equals the oracle's, or the timeout elapses. */
