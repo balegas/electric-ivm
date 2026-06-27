@@ -12,6 +12,7 @@ pub mod engine;
 pub mod family;
 pub mod fault;
 pub mod http;
+pub mod metrics;
 pub mod predicate;
 pub mod schema;
 pub mod value;

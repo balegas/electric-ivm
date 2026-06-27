@@ -15,7 +15,8 @@
     "engine:test": "cargo test -p electric-lite-engine",
     "loop": "bash scripts/conformance-loop.sh",
     "demo": "pnpm --filter @electric-lite/examples demo",
-    "demo:web": "pnpm --filter @electric-lite/web start"
+    "demo:web": "pnpm --filter @electric-lite/web start",
+    "bench": "pnpm --filter @electric-lite/bench bench"
   },
   "devDependencies": {
     "typescript": "^5.7.2",

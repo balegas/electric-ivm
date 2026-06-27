@@ -100,6 +100,24 @@ importers:
         specifier: ^6.0.0
         version: 6.4.3(tsx@4.22.4)
 
+  packages/bench:
+    dependencies:
+      '@durable-streams/server':
+        specifier: ^0.3.7
+        version: 0.3.7(@tanstack/db@0.6.12(typescript@5.9.3))
+      '@electric-lite/api':
+        specifier: workspace:*
+        version: link:../../apps/api
+      '@electric-lite/client':
+        specifier: workspace:*
+        version: link:../client
+      '@electric-lite/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      tsx:
+        specifier: ^4.19.2
+        version: 4.22.4
+
   packages/client:
     dependencies:
       '@durable-streams/state':

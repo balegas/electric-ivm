@@ -10,9 +10,12 @@ use dbsp::ZWeight;
 use dbsp::utils::Tup2;
 use tokio::sync::{Mutex, mpsc};
 
+use std::sync::atomic::Ordering;
+
 use crate::circuit::CircuitActor;
 use crate::ds::{DsClient, Envelope, EnvelopeHeaders};
 use crate::family::FamilyActor;
+use crate::metrics::{Timer, metrics};
 use crate::predicate::{CompiledPredicate, PredicateJson};
 use crate::schema::{Schema, TableSchema, compile_schema};
 use crate::value::{Row, Value};
@@ -236,12 +239,17 @@ async fn tailer_loop(
                 Ok(rr) => {
                     let next = rr.next_offset.clone();
                     if let Some(n) = rr.next_offset { offset = n; }
+                    // Process the whole read batch, collecting shape-stream appends, then flush them
+                    // concurrently. Appends (HTTP round-trips) dominate, so coalescing per stream and
+                    // parallelizing is the main throughput/latency lever.
+                    let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
                     for env in rr.envelopes {
-                        if let Err(e) = process_envelope(&ds, &ts, &mut table_state, &shapes, &families, env).await {
+                        if let Err(e) = process_envelope(&ts, &mut table_state, &shapes, &families, env, &mut pending).await {
                             tracing::error!("process_envelope failed: {e:#}");
                         }
                     }
-                    // Publish the processed offset only after the whole batch is fanned out.
+                    flush_pending(&ds, pending).await;
+                    // Publish the processed offset only after the whole batch is fanned out + flushed.
                     if let Some(n) = next {
                         *processed.lock().unwrap() = n;
                     }
@@ -321,7 +329,11 @@ async fn emit_family_output(
         if let Some(stream_path) = fam.shapes.get(&sid) {
             let envs = translate_output(ts, rows, txid.clone());
             if !envs.is_empty() {
-                ds.append(stream_path, &envs).await?;
+                {
+                    let _a = Timer::new(&metrics().append);
+                    ds.append(stream_path, &envs).await?;
+                }
+                metrics().shape_appends.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -348,17 +360,19 @@ async fn add_shape(
 }
 
 async fn process_envelope(
-    ds: &DsClient,
     ts: &TableSchema,
     table_state: &mut HashMap<Value, Row>,
     shapes: &HashMap<String, ShapeActor>,
     families: &HashMap<Vec<usize>, Family>,
     env: Envelope,
+    pending: &mut HashMap<String, Vec<Envelope>>,
 ) -> Result<()> {
     let (delta, txid) = apply_envelope(ts, table_state, &env)?;
     if delta.is_empty() {
         return Ok(());
     }
+    metrics().envelopes.fetch_add(1, Ordering::Relaxed);
+    let _t = Timer::new(&metrics().process_envelope);
     // Standalone per-shape circuits: each filters the delta independently.
     for shape in shapes.values() {
         let out = shape.actor.process(delta.clone()).await?;
@@ -366,17 +380,69 @@ async fn process_envelope(
             continue;
         }
         let envs = translate_output(ts, out, txid.clone());
-        ds.append(&shape.stream_path, &envs).await?;
+        pending.entry(shape.stream_path.clone()).or_default().extend(envs);
     }
     // Shared family circuits: one join per template fans the delta to all its shapes.
     for fam in families.values() {
-        let out = fam.actor.step(delta.clone(), vec![]).await?;
+        let out = {
+            let _s = Timer::new(&metrics().family_step);
+            fam.actor.step(delta.clone(), vec![]).await?
+        };
+        metrics().family_steps.fetch_add(1, Ordering::Relaxed);
         if out.is_empty() {
             continue;
         }
-        emit_family_output(ds, ts, fam, out, txid.clone()).await?;
+        collect_family_output(ts, fam, out, txid.clone(), pending);
     }
     Ok(())
+}
+
+/// Demultiplex a family circuit's output by shape and stage each shape's envelopes for flushing.
+fn collect_family_output(
+    ts: &TableSchema,
+    fam: &Family,
+    out: Vec<(u64, Row, ZWeight)>,
+    txid: Option<String>,
+    pending: &mut HashMap<String, Vec<Envelope>>,
+) {
+    let mut by_shape: HashMap<u64, Vec<(Row, ZWeight)>> = HashMap::new();
+    for (sid, row, w) in out {
+        by_shape.entry(sid).or_default().push((row, w));
+    }
+    for (sid, rows) in by_shape {
+        if let Some(stream_path) = fam.shapes.get(&sid) {
+            let envs = translate_output(ts, rows, txid.clone());
+            if !envs.is_empty() {
+                pending.entry(stream_path.clone()).or_default().extend(envs);
+            }
+        }
+    }
+}
+
+/// Flush the batch's staged appends, bounded-concurrently. Each envelope keeps its own txid, so
+/// `awaitTxId` semantics are preserved; only the HTTP round-trips are coalesced + parallelized.
+async fn flush_pending(ds: &DsClient, pending: HashMap<String, Vec<Envelope>>) {
+    const CAP: usize = 32; // bound in-flight appends so we don't swamp the storage server
+    let mut items: Vec<(String, Vec<Envelope>)> = pending.into_iter().collect();
+    while !items.is_empty() {
+        let take = items.len().min(CAP);
+        let batch = items.split_off(items.len() - take);
+        let mut set = tokio::task::JoinSet::new();
+        for (path, envs) in batch {
+            let ds = ds.clone();
+            set.spawn(async move {
+                let _t = Timer::new(&metrics().append);
+                let res = ds.append(&path, &envs).await;
+                metrics().shape_appends.fetch_add(1, Ordering::Relaxed);
+                res
+            });
+        }
+        while let Some(j) = set.join_next().await {
+            if let Ok(Err(e)) = j {
+                tracing::error!("append failed: {e:#}");
+            }
+        }
+    }
 }
 
 /// Apply a table change event to `table_state` and return the resulting input Z-set delta

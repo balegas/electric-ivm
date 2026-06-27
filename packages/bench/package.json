@@ -1,0 +1,16 @@
+{
+  "name": "@electric-lite/bench",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bench": "tsx src/run.ts"
+  },
+  "dependencies": {
+    "@electric-lite/protocol": "workspace:*",
+    "@electric-lite/api": "workspace:*",
+    "@electric-lite/client": "workspace:*",
+    "@durable-streams/server": "^0.3.7",
+    "tsx": "^4.19.2"
+  }
+}
