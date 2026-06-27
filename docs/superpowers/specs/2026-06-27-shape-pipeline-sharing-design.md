@@ -1,7 +1,10 @@
 # electric-lite — shape pipeline sharing (equality-first)
 
-Status: **design approved, implementation gated** on the conformance suite (incl. NULL/three-valued
-work) being green. No engine code starts before then.
+Status: **IMPLEMENTED** (phases 1–4). Equality shapes now share one dbsp family circuit per
+template; the full conformance suite (84 tests) stays green vs pglite, and a dedicated test proves
+24 shapes are served by 2 family circuits + 2 standalone. Step 5 (subsume `table_state`) remains an
+optional, deferred optimization. Code: `apps/engine/src/family.rs`, `predicate.rs::equality_template`,
+`engine.rs` (routing + `GET /tables/:name/families`); test: `conformance-sharing.test.ts`.
 
 ## Problem
 
@@ -127,13 +130,19 @@ same shapes via both the shared and standalone paths and assert identical materi
 
 ## Implementation sequencing (after conformance is green)
 
-1. Predicate templating + qualification (pure function, unit-tested) — no behavior change.
-2. Family circuit (`index_by` + `Params` equi-join + demux) behind the existing `create_shape`
-   routing; standalone path untouched.
-3. Wire add/drop shape to `Params` deltas; preserve the offset/barrier invariant.
-4. Conformance fixtures asserting shared == standalone == oracle; extend fuzz to register many
-   same-template shapes.
-5. (Optional) subsume `table_state` into the data arrangement.
+1. ✅ Predicate templating + qualification (`CompiledPredicate::equality_template`, unit-tested) —
+   no behavior change.
+2. ✅ Family circuit (`family.rs`: `map_index` + `Params` equi-join + demux) via
+   `Runtime::init_circuit` (the join needs a runtime/spines, unlike a plain `filter`).
+3. ✅ `create_shape` routing: equality shapes → shared family (add = `Params` insert with backfill
+   from the join, drop = `Params` delete, family discarded when empty); everything else → standalone
+   filter. The per-table processed-offset barrier is preserved (families are fed and appended within
+   `process_envelope`, before the offset is published).
+4. ✅ Verification: the existing conformance suite already exercises equality shapes (now via
+   families) and stays green vs pglite; `conformance-sharing.test.ts` additionally asserts shared
+   correctness **and** the topology (24 shapes → 2 families + 2 standalone) via
+   `GET /tables/:name/families`.
+5. ⛔ (Optional, deferred) subsume `table_state` into the data arrangement.
 
 ## Out of scope / future
 
