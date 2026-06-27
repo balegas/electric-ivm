@@ -1,0 +1,77 @@
+// tRPC router: the public, schema-derived write/read API.
+
+import { initTRPC, TRPCError } from '@trpc/server'
+import { z } from 'zod'
+import type { ElectricCore } from './core.js'
+
+export interface Context {
+  core: ElectricCore
+}
+
+const t = initTRPC.context<Context>().create()
+
+const valueSchema = z.union([z.number(), z.string(), z.boolean(), z.null()])
+const rowSchema = z.record(z.string(), valueSchema)
+const columnType = z.enum(['int', 'text', 'bool', 'float'])
+const leafOp = z.enum(['eq', 'neq', 'lt', 'lte', 'gt', 'gte'])
+
+const schemaSchema = z.object({
+  tables: z.record(
+    z.string(),
+    z.object({
+      columns: z.record(z.string(), z.object({ type: columnType })),
+      primaryKey: z.string(),
+    }),
+  ),
+})
+
+// Recursive predicate AST: leaf | and | or | not.
+const predicateSchema: z.ZodType = z.lazy(() =>
+  z.union([
+    z.object({ col: z.string(), op: leafOp, value: valueSchema }),
+    z.object({ and: z.array(predicateSchema) }),
+    z.object({ or: z.array(predicateSchema) }),
+    z.object({ not: predicateSchema }),
+  ]),
+)
+
+export const appRouter = t.router({
+  schema: t.router({
+    define: t.procedure
+      .input(z.object({ schema: schemaSchema }))
+      .mutation(async ({ input, ctx }) => {
+        await ctx.core.defineSchema(input.schema as Parameters<ElectricCore['defineSchema']>[0])
+        return { ok: true as const }
+      }),
+  }),
+
+  ingest: t.router({
+    write: t.procedure
+      .input(
+        z.object({
+          table: z.string(),
+          op: z.enum(['insert', 'update', 'delete']),
+          pk: valueSchema,
+          row: rowSchema.optional(),
+          txid: z.string().optional(),
+        }),
+      )
+      .mutation(async ({ input, ctx }) => ctx.core.write(input)),
+  }),
+
+  shapes: t.router({
+    create: t.procedure
+      .input(z.object({ table: z.string(), where: predicateSchema.optional() }))
+      .mutation(async ({ input, ctx }) =>
+        ctx.core.createShape({ table: input.table, where: input.where as never }),
+      ),
+
+    get: t.procedure.input(z.object({ id: z.string() })).query(async ({ input, ctx }) => {
+      const handle = await ctx.core.getShape(input.id)
+      if (!handle) throw new TRPCError({ code: 'NOT_FOUND', message: `shape ${input.id} not found` })
+      return handle
+    }),
+  }),
+})
+
+export type AppRouter = typeof appRouter

@@ -1,0 +1,17 @@
+{
+  "name": "@electric-lite/api",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@electric-lite/protocol": "workspace:*",
+    "@trpc/server": "^11.18.0",
+    "zod": "^4.4.3"
+  }
+}

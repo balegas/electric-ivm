@@ -18,6 +18,39 @@ importers:
         specifier: ^3.0.0
         version: 3.2.6(tsx@4.22.4)
 
+  apps/api:
+    dependencies:
+      '@electric-lite/protocol':
+        specifier: workspace:*
+        version: link:../../packages/protocol
+      '@trpc/server':
+        specifier: ^11.18.0
+        version: 11.18.0(typescript@5.9.3)
+      zod:
+        specifier: ^4.4.3
+        version: 4.4.3
+
+  packages/client:
+    dependencies:
+      '@durable-streams/state':
+        specifier: ^0.3.1
+        version: 0.3.1(@tanstack/db@0.6.12(typescript@5.9.3))
+      '@electric-lite/api':
+        specifier: workspace:*
+        version: link:../../apps/api
+      '@electric-lite/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      '@tanstack/db':
+        specifier: ^0.6.12
+        version: 0.6.12(typescript@5.9.3)
+      '@trpc/client':
+        specifier: ^11.18.0
+        version: 11.18.0(@trpc/server@11.18.0(typescript@5.9.3))(typescript@5.9.3)
+      zod:
+        specifier: ^4.4.3
+        version: 4.4.3
+
   packages/conformance:
     dependencies:
       '@durable-streams/client':
@@ -29,6 +62,15 @@ importers:
       '@durable-streams/state':
         specifier: ^0.3.1
         version: 0.3.1(@tanstack/db@0.6.12(typescript@5.9.3))
+      '@electric-lite/api':
+        specifier: workspace:*
+        version: link:../../apps/api
+      '@electric-lite/client':
+        specifier: workspace:*
+        version: link:../client
+      '@electric-lite/oracle':
+        specifier: workspace:*
+        version: link:../oracle
       '@electric-lite/protocol':
         specifier: workspace:*
         version: link:../protocol
