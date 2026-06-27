@@ -30,3 +30,15 @@ feldera-macros = "0.299"
 # OrderedFloat). rkyv_64 matches rkyv's size_64; rkyv_ck adds the validation/CheckBytes impl.
 ordered-float = { version = "3", features = ["rkyv_64", "rkyv_ck"] }
 anyhow = "1"
+
+# Service layer: control-plane HTTP + durable-streams client + async runtime.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+# http to a localhost durable-streams server only -> no TLS backend needed.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
