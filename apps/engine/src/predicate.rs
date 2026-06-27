@@ -66,6 +66,38 @@ impl CompiledPredicate {
         }
     }
 
+    /// Sharing template: if this predicate is a pure conjunction of **non-null equality** leaves
+    /// over **distinct columns**, return the `(column index, literal)` pairs sorted by column
+    /// index. Shapes with equal column-index sets share one family circuit (see
+    /// `docs/superpowers/specs/2026-06-27-shape-pipeline-sharing-design.md`).
+    ///
+    /// Returns `None` for everything else — ranges, `neq`, `OR`, `NOT`, `MatchAll`, a `col = NULL`
+    /// literal (SQL `= NULL` is UNKNOWN, never a key match), or a duplicate column (`a=1 AND a=2`,
+    /// a degenerate contradiction) — all of which keep using a standalone per-shape circuit.
+    pub fn equality_template(&self) -> Option<Vec<(usize, Value)>> {
+        fn collect(p: &CompiledPredicate, acc: &mut Vec<(usize, Value)>) -> bool {
+            match p {
+                CompiledPredicate::Cmp { col, op: LeafOp::Eq, value }
+                    if !matches!(value, Value::Null) =>
+                {
+                    acc.push((*col, value.clone()));
+                    true
+                }
+                CompiledPredicate::And(ps) => ps.iter().all(|p| collect(p, acc)),
+                _ => false,
+            }
+        }
+        let mut acc = Vec::new();
+        if !collect(self, &mut acc) || acc.is_empty() {
+            return None;
+        }
+        acc.sort_by(|a, b| a.0.cmp(&b.0));
+        if acc.windows(2).any(|w| w[0].0 == w[1].0) {
+            return None; // duplicate column — degenerate, not a shareable single key
+        }
+        Some(acc)
+    }
+
     /// Filter membership under SQL `WHERE` semantics: a row is included iff the predicate is TRUE.
     /// UNKNOWN (from a NULL operand) and FALSE both exclude the row.
     pub fn matches(&self, row: &Row) -> bool {
@@ -223,6 +255,51 @@ mod tests {
         let ts = users();
         let cp = CompiledPredicate::compile_opt(None, &ts).unwrap();
         assert!(cp.matches(&row(&ts, serde_json::json!({"id":1,"name":"a","age":1,"active":false}))));
+    }
+
+    #[test]
+    fn equality_template_extraction() {
+        let ts = users();
+        let tpl = |j: serde_json::Value| {
+            CompiledPredicate::compile(&serde_json::from_value::<PredicateJson>(j).unwrap(), &ts)
+                .unwrap()
+                .equality_template()
+        };
+        let cols = |t: &TableSchema, names: &[&str]| {
+            names.iter().map(|n| t.column_index(n).unwrap()).collect::<Vec<_>>()
+        };
+
+        // single equality qualifies
+        let t = tpl(serde_json::json!({"col":"name","op":"eq","value":"alice"})).unwrap();
+        assert_eq!(t.iter().map(|(c, _)| *c).collect::<Vec<_>>(), cols(&ts, &["name"]));
+        assert_eq!(t[0].1, Value::Text("alice".into()));
+
+        // AND of equalities -> sorted by column index, distinct columns
+        let t = tpl(serde_json::json!({"and":[
+            {"col":"name","op":"eq","value":"a"}, {"col":"active","op":"eq","value":true}
+        ]})).unwrap();
+        let mut want = cols(&ts, &["name", "active"]);
+        want.sort();
+        assert_eq!(t.iter().map(|(c, _)| *c).collect::<Vec<_>>(), want);
+
+        // nested And flattens
+        assert!(tpl(serde_json::json!({"and":[
+            {"and":[{"col":"name","op":"eq","value":"a"}]}, {"col":"age","op":"eq","value":1}
+        ]})).is_some());
+
+        // non-qualifying shapes -> None
+        assert!(tpl(serde_json::json!({"col":"age","op":"gte","value":18})).is_none()); // range
+        assert!(tpl(serde_json::json!({"col":"name","op":"neq","value":"a"})).is_none()); // neq
+        assert!(tpl(serde_json::json!({"or":[{"col":"name","op":"eq","value":"a"}]})).is_none()); // or
+        assert!(tpl(serde_json::json!({"not":{"col":"name","op":"eq","value":"a"}})).is_none()); // not
+        assert!(tpl(serde_json::json!({"and":[
+            {"col":"name","op":"eq","value":"a"}, {"col":"age","op":"gt","value":1}
+        ]})).is_none()); // mixed eq + range
+        assert!(tpl(serde_json::json!({"and":[
+            {"col":"age","op":"eq","value":1}, {"col":"age","op":"eq","value":2}
+        ]})).is_none()); // duplicate column
+        // MatchAll
+        assert!(CompiledPredicate::MatchAll.equality_template().is_none());
     }
 
     #[test]
