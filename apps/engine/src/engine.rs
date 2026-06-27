@@ -43,6 +43,23 @@ struct TailerHandle {
     /// shape. Published after a batch is fully processed; a harness can poll this to know the
     /// engine has caught up to the stream tail (a sound convergence barrier).
     processed: Arc<std::sync::Mutex<String>>,
+    /// Current circuit topology (shared families + standalone count), for tests/observability.
+    stats: Arc<std::sync::Mutex<TableStats>>,
+}
+
+/// Per-table circuit topology: the shared family circuits (one per equality template) and the
+/// count of standalone per-shape circuits. Exposed via `GET /tables/{name}/families` so a test can
+/// prove that many same-template shapes share one circuit rather than spawning N.
+#[derive(Clone, Default, serde::Serialize)]
+pub struct TableStats {
+    pub families: Vec<FamilyStat>,
+    pub standalone: usize,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct FamilyStat {
+    pub key_cols: Vec<usize>,
+    pub shapes: usize,
 }
 
 enum TailerCmd {
@@ -125,6 +142,13 @@ impl Engine {
         let st = self.state.lock().await;
         st.tailers.get(table).map(|t| t.processed.lock().unwrap().clone())
     }
+
+    /// The table's current circuit topology (shared families + standalone count), or `None` if no
+    /// tailer exists.
+    pub async fn table_stats(&self, table: &str) -> Option<TableStats> {
+        let st = self.state.lock().await;
+        st.tailers.get(table).map(|t| t.stats.lock().unwrap().clone())
+    }
 }
 
 struct ShapeActor {
@@ -142,8 +166,22 @@ struct Family {
 fn spawn_tailer(ds: DsClient, ts: TableSchema) -> TailerHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let processed = Arc::new(std::sync::Mutex::new("-1".to_string()));
-    tokio::spawn(tailer_loop(ds, ts, cmd_rx, processed.clone()));
-    TailerHandle { cmd_tx, processed }
+    let stats = Arc::new(std::sync::Mutex::new(TableStats::default()));
+    tokio::spawn(tailer_loop(ds, ts, cmd_rx, processed.clone(), stats.clone()));
+    TailerHandle { cmd_tx, processed, stats }
+}
+
+fn publish_stats(
+    stats: &std::sync::Mutex<TableStats>,
+    shapes: &HashMap<String, ShapeActor>,
+    families: &HashMap<Vec<usize>, Family>,
+) {
+    let mut fams: Vec<FamilyStat> = families
+        .iter()
+        .map(|(k, f)| FamilyStat { key_cols: k.clone(), shapes: f.shapes.len() })
+        .collect();
+    fams.sort_by(|a, b| a.key_cols.cmp(&b.key_cols));
+    *stats.lock().unwrap() = TableStats { families: fams, standalone: shapes.len() };
 }
 
 async fn tailer_loop(
@@ -151,6 +189,7 @@ async fn tailer_loop(
     ts: TableSchema,
     mut cmd_rx: mpsc::UnboundedReceiver<TailerCmd>,
     processed: Arc<std::sync::Mutex<String>>,
+    stats: Arc<std::sync::Mutex<TableStats>>,
 ) {
     let table_path = format!("table/{}", ts.name);
     let mut offset = "-1".to_string();
@@ -174,6 +213,7 @@ async fn tailer_loop(
                     ).await {
                         tracing::error!("add_shape failed: {e:#}");
                     }
+                    publish_stats(&stats, &shapes, &families);
                 }
                 Some(TailerCmd::RemoveShape { shape_id }) => {
                     if shapes.remove(&shape_id).is_none()
@@ -188,6 +228,7 @@ async fn tailer_loop(
                             families.remove(&key_cols); // discard the now-unused family + its trace
                         }
                     }
+                    publish_stats(&stats, &shapes, &families);
                 }
                 None => break,
             },

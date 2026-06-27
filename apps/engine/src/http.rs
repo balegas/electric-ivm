@@ -7,7 +7,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use crate::engine::{Engine, ShapeRecord};
+use crate::engine::{Engine, ShapeRecord, TableStats};
 use crate::predicate::PredicateJson;
 use crate::schema::Schema;
 
@@ -18,6 +18,7 @@ pub fn router(engine: Engine) -> Router {
         .route("/shapes", post(create_shape))
         .route("/shapes/{id}", get(get_shape).delete(drop_shape))
         .route("/tables/{name}/offset", get(table_offset))
+        .route("/tables/{name}/families", get(table_families))
         .with_state(engine)
 }
 
@@ -89,6 +90,16 @@ async fn table_offset(
 ) -> Result<Json<serde_json::Value>, AppError> {
     match engine.table_offset(&name).await {
         Some(offset) => Ok(Json(serde_json::json!({ "offset": offset }))),
+        None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("no tailer for table {name}") }),
+    }
+}
+
+async fn table_families(
+    State(engine): State<Engine>,
+    Path(name): Path<String>,
+) -> Result<Json<TableStats>, AppError> {
+    match engine.table_stats(&name).await {
+        Some(stats) => Ok(Json(stats)),
         None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("no tailer for table {name}") }),
     }
 }
