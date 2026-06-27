@@ -1,0 +1,21 @@
+{
+  "name": "electric-lite",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.15.1",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:conformance": "vitest run --project conformance",
+    "typecheck": "tsc -b",
+    "lint": "echo \"(lint not configured)\""
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "vitest": "^3.0.0",
+    "tsx": "^4.19.2"
+  }
+}
