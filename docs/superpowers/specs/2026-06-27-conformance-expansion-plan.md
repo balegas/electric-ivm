@@ -74,11 +74,25 @@ Tests:
 3. **Pure-TS unit control.** `compareShapeSets` on a deliberately mutated set returns
    `equal:false` with the expected `missing`/`extra`/`mismatched` — guards the comparator itself.
 
+## Covered: NULL three-valued logic
+
+Previously deferred, now closed. Non-pk columns are nullable by contract (the oracle DDL emits no
+`NOT NULL`; the engine stores `Value::Null`; the client zod schema makes non-pk columns
+`.nullable()`). The engine evaluator (`predicate.rs`) and the protocol reference evaluator
+(`predicate.ts`) both implement SQL three-valued logic:
+
+- any comparison with a NULL operand → UNKNOWN (row excluded),
+- `AND`/`OR` follow the SQL truth tables (FALSE dominates AND, TRUE dominates OR, UNKNOWN otherwise),
+- `NOT UNKNOWN = UNKNOWN` — so `NOT (col = x)` over a NULL cell keeps the row out, matching Postgres.
+
+Coverage: `conformance-nulls.test.ts` (deterministic fixtures with NULLs in every column incl. an
+all-null row, the headline `NOT(eq)`/`NOT(gt)`-over-null cases, AND/OR with null operands, and
+match-all materializing null cells) plus a NULL-enabled fuzz (simulator `nullProb` ~35%, depth-3
+predicates) — all compared row-for-row to pglite. Unit proofs: `predicate.rs`
+`three_valued_null_logic` and `protocol.test.ts` "uses SQL three-valued logic".
+
 ## Deferred (explicitly out of scope)
 
-- **NULL three-valued logic.** `NOT (col = x)` over a NULL cell diverges from Postgres
-  (`predicate.rs` comment). The simulator generates no nulls; engine and oracle agree today.
-  Documented as a known gap; a real fix needs three-valued logic on both sides.
 - **Engine restart idempotency** (deterministic `Producer-Seq`) — unchanged from prior status.
 
 ## Harness changes

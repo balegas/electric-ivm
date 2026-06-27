@@ -16,6 +16,8 @@ export interface SimulatorOptions {
   pkSpace?: number
   /** Relative weights for op selection. Defaults: insert 5, update 4, delete 2. */
   weights?: { insert: number; update: number; delete: number }
+  /** Probability a non-pk cell is generated as NULL (exercises three-valued logic). Default 0. */
+  nullProb?: number
 }
 
 export interface Simulator {
@@ -30,6 +32,7 @@ export function createSimulator(schema: Schema, opts: SimulatorOptions): Simulat
   f.seed(opts.seed)
   const pkSpace = opts.pkSpace ?? 24
   const weights = opts.weights ?? { insert: 5, update: 4, delete: 2 }
+  const nullProb = opts.nullProb ?? 0
   const tableNames = Object.keys(schema.tables)
 
   function genValue(type: TableDef['columns'][string]['type']): Value {
@@ -48,7 +51,12 @@ export function createSimulator(schema: Schema, opts: SimulatorOptions): Simulat
   function genRow(def: TableDef, pk: number): Row {
     const row: Row = {}
     for (const [col, c] of Object.entries(def.columns)) {
-      row[col] = col === def.primaryKey ? pk : genValue(c.type)
+      if (col === def.primaryKey) {
+        row[col] = pk
+      } else {
+        // pk is never null; other cells become NULL with probability nullProb.
+        row[col] = nullProb > 0 && f.datatype.boolean(nullProb) ? null : genValue(c.type)
+      }
     }
     return row
   }
