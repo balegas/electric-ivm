@@ -93,20 +93,40 @@ const ALL_OPS: LeafOp[] = ['eq', 'neq', 'lt', 'lte', 'gt', 'gte']
  * independently of the op stream so adding shapes doesn't perturb op generation. Predicate
  * literals are drawn from each column's domain so shapes are non-trivially populated.
  */
-export function randomShapeDefs(schema: Schema, seed: number, count: number): ShapeDef[] {
+export interface ShapeGenOptions {
+  /** Max predicate nesting depth. Default 2 (preserves the original behaviour). */
+  maxDepth?: number
+  /** Occasionally draw boundary/edge literals (min/max/0/negative/empty string). Default false. */
+  edgeLiterals?: boolean
+  /** Occasionally emit empty `and` (tautology) / `or` (contradiction). Default false. */
+  emptyCombinators?: boolean
+}
+
+export function randomShapeDefs(
+  schema: Schema,
+  seed: number,
+  count: number,
+  opts: ShapeGenOptions = {},
+): ShapeDef[] {
   const randomizer = generateMersenne53Randomizer()
   const f = new Faker({ locale: en, randomizer })
   f.seed(seed)
   const tableNames = Object.keys(schema.tables)
+  const maxDepth = opts.maxDepth ?? 2
 
   function genValue(type: TableDef['columns'][string]['type']): Value {
+    // With edgeLiterals, ~30% of the time pick a boundary/edge value to stress comparison edges.
+    // Text edges stay within the collation-safe lowercase + empty-string domain.
+    const edge = opts.edgeLiterals && f.datatype.boolean(0.3)
     switch (type) {
       case 'int':
-        return f.number.int({ min: 0, max: 1000 })
+        return edge ? f.helpers.arrayElement([0, -1, 1, 1000, -1000]) : f.number.int({ min: 0, max: 1000 })
       case 'float':
-        return f.number.float({ min: 0, max: 1000, fractionDigits: 4 })
+        return edge ? f.helpers.arrayElement([0, -0.5, 0.5, 1000, -1000]) : f.number.float({ min: 0, max: 1000, fractionDigits: 4 })
       case 'text':
-        return f.helpers.arrayElement(['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot'])
+        return edge
+          ? f.helpers.arrayElement(['', 'alpha', 'zeta'])
+          : f.helpers.arrayElement(['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot'])
       case 'bool':
         return f.datatype.boolean()
     }
@@ -124,6 +144,10 @@ export function randomShapeDefs(schema: Schema, seed: number, count: number): Sh
     if (depth <= 0 || f.datatype.boolean(0.55)) return leaf(def)
     const kind = f.helpers.arrayElement(['and', 'or', 'not'] as const)
     if (kind === 'not') return { not: pred(def, depth - 1) }
+    // Occasionally emit an empty combinator: `and:[]` == TRUE, `or:[]` == FALSE.
+    if (opts.emptyCombinators && f.datatype.boolean(0.06)) {
+      return kind === 'and' ? { and: [] } : { or: [] }
+    }
     const n = f.number.int({ min: 2, max: 3 })
     const parts = Array.from({ length: n }, () => pred(def, depth - 1))
     return kind === 'and' ? { and: parts } : { or: parts }
@@ -132,8 +156,8 @@ export function randomShapeDefs(schema: Schema, seed: number, count: number): Sh
   return Array.from({ length: count }, () => {
     const table = f.helpers.arrayElement(tableNames)
     const def = schema.tables[table]!
-    // ~20% match-all shapes, otherwise a random predicate of depth up to 2.
-    const where = f.datatype.boolean(0.2) ? undefined : pred(def, 2)
+    // ~20% match-all shapes, otherwise a random predicate up to maxDepth.
+    const where = f.datatype.boolean(0.2) ? undefined : pred(def, maxDepth)
     return where ? { table, where } : { table }
   })
 }
