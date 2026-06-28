@@ -34,6 +34,7 @@ const log = (line = '') => {
     /* ignore */
   }
 }
+let enginePidForCleanup = 0 // set after the engine spawns, used by the error handler
 const env = (k: string, d: number) => (process.env[k] ? Number(process.env[k]) : d)
 const SHAPES = env('BENCH_SHAPES', 1000)
 const SUBS = Math.min(env('BENCH_SUBS', 100), SHAPES)
@@ -83,6 +84,19 @@ async function spawnEngine(dsUrl: string) {
   return { url, proc }
 }
 
+// Create a shape directly on the engine (create-only: ensures the shape stream + registers it in
+// the tailer, so every write fans out to it) WITHOUT opening a client-side live subscription. This
+// is what lets us register 100k shapes — client.shape() would hold a long-poll connection per shape
+// and exhaust ephemeral ports. Only the measured SUBS sample gets a real subscription.
+async function createShape(engineUrl: string, where: Record<string, unknown>): Promise<void> {
+  const res = await fetch(`${engineUrl}/shapes`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ table: 'users', where }),
+  })
+  if (!res.ok) throw new Error(`create shape -> ${res.status}: ${await res.text()}`)
+}
+
 function pct(sorted: number[], q: number): number {
   if (sorted.length === 0) return 0
   const i = Math.min(sorted.length - 1, Math.ceil(q * sorted.length) - 1)
@@ -90,23 +104,32 @@ function pct(sorted: number[], q: number): number {
 }
 
 async function sampleRss(pid: number): Promise<{ rssMb: number; cpu: number }> {
-  try {
-    const { stdout } = await execFileP('ps', ['-o', 'rss=,%cpu=', '-p', String(pid)])
-    const [rss, cpu] = stdout.trim().split(/\s+/).map(Number)
-    return { rssMb: (rss ?? 0) / 1024, cpu: cpu ?? 0 }
-  } catch {
-    return { rssMb: 0, cpu: 0 }
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const { stdout } = await execFileP('ps', ['-o', 'rss=,%cpu=', '-p', String(pid)])
+      const [rss, cpu] = stdout.trim().split(/\s+/).map(Number)
+      if (rss) return { rssMb: rss / 1024, cpu: cpu ?? 0 }
+    } catch {
+      /* retry */
+    }
+    await sleep(50)
   }
+  return { rssMb: 0, cpu: 0 }
 }
 
 /** OS thread count of the engine process (macOS `ps -M` lists one line per thread). */
 async function threadCount(pid: number): Promise<number> {
-  try {
-    const { stdout } = await execFileP('ps', ['-M', '-p', String(pid)])
-    return Math.max(0, stdout.trim().split('\n').length - 1) // minus the header row
-  } catch {
-    return 0
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const { stdout } = await execFileP('ps', ['-M', '-p', String(pid)])
+      const n = stdout.trim().split('\n').length - 1 // minus the header row
+      if (n > 0) return n
+    } catch {
+      /* retry */
+    }
+    await sleep(50)
   }
+  return 0
 }
 
 async function main() {
@@ -125,22 +148,25 @@ async function main() {
   const client = createClient({ apiUrl: api.url, schema, liveMode: 'long-poll' })
   await client.defineSchema(schema)
   const pid = engine.proc.pid!
+  enginePidForCleanup = pid
 
   // --- 1. Register SHAPES equality shapes (tenant = k); they share one family circuit. ---
   const regStart = now()
   let registered = 0
   await runPool(SHAPES, REGCONC, async (k) => {
-    await client.shape({ table: 'users', where: { col: 'tenant', op: 'eq', value: k } })
+    await createShape(engine.url, { col: 'tenant', op: 'eq', value: k })
     registered++
   })
   const regMs = now() - regStart
   log(`registered ${registered} equality shapes in ${(regMs / 1000).toFixed(1)}s (${Math.round(registered / (regMs / 1000))}/s)`)
 
-  // --- 1b. Register STANDALONE (non-equality) shapes: each `seq > k` is its own circuit today. ---
+  // --- 1b. Register STANDALONE (non-equality) shapes: each is a distinct range filter. Thresholds
+  // sit above the firehose's seq range so every write is *evaluated* against all K predicates
+  // (the O(K)/write cost we want to measure) without exploding append fan-out. ---
   if (STANDALONE > 0) {
     const sStart = now()
     await runPool(STANDALONE, REGCONC, async (k) => {
-      await client.shape({ table: 'users', where: { col: 'seq', op: 'gt', value: k * 1000 } })
+      await createShape(engine.url, { col: 'seq', op: 'gt', value: 100_000_000 + k })
     })
     const sMs = now() - sStart
     log(`registered ${STANDALONE} standalone shapes in ${(sMs / 1000).toFixed(1)}s (${Math.round(STANDALONE / (sMs / 1000))}/s)`)
@@ -251,5 +277,11 @@ async function runPool(n: number, conc: number, fn: (i: number) => Promise<void>
 
 main().catch((e) => {
   console.error(e)
+  // Best-effort: don't leave the spawned engine orphaned on error.
+  try {
+    enginePidForCleanup && process.kill(enginePidForCleanup, 'SIGKILL')
+  } catch {
+    /* already gone */
+  }
   process.exit(1)
 })

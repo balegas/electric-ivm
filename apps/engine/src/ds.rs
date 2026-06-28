@@ -60,10 +60,14 @@ impl DsClient {
             .send()
             .await
             .with_context(|| format!("PUT {path}"))?;
-        if res.status().is_success() {
+        let status = res.status();
+        // Drain the body so the connection returns to reqwest's pool. Skipping this leaks one socket
+        // per call, which exhausts ephemeral ports when creating many shape streams.
+        let body = res.text().await.unwrap_or_default();
+        if status.is_success() {
             Ok(())
         } else {
-            bail!("PUT {path} -> {}", res.status())
+            bail!("PUT {path} -> {status}: {body}")
         }
     }
 
@@ -80,11 +84,12 @@ impl DsClient {
             .send()
             .await
             .with_context(|| format!("POST {path}"))?;
-        if res.status().is_success() {
+        let status = res.status();
+        // Drain the body so the connection can be pooled and reused (avoids a socket leak per append).
+        let body = res.text().await.unwrap_or_default();
+        if status.is_success() {
             Ok(())
         } else {
-            let status = res.status();
-            let body = res.text().await.unwrap_or_default();
             bail!("POST {path} -> {status}: {body}")
         }
     }
