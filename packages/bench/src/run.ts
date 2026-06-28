@@ -42,6 +42,15 @@ const STANDALONE = env('BENCH_STANDALONE', 0) // non-equality shapes (each its o
 const DURATION = env('BENCH_DURATION', 10)
 const CONC = env('BENCH_CONC', 64)
 const REGCONC = env('BENCH_REGCONC', 64)
+// Firehose writes only to tenants in [0, HOTSET) so the load phase touches a bounded set of shape
+// streams (connections stay pooled) instead of churning sockets across all SHAPES streams. All SHAPES
+// shapes are still registered and active in the family join, so per-write cost reflects the full
+// shape count. Defaults to the whole keyspace; set it to scale shapes past the local port limit.
+const HOTSET = Math.min(env('BENCH_HOTSET', SHAPES), SHAPES)
+// Optional chunked registration: register CHUNK shapes, pause CHUNK_PAUSE seconds to let TIME_WAIT
+// drain, repeat. Lets registration exceed the ~16k ephemeral-port ceiling without sysctl changes.
+const CHUNK = env('BENCH_CHUNK', 0)
+const CHUNK_PAUSE = env('BENCH_CHUNK_PAUSE', 35)
 
 const schema: Schema = {
   tables: {
@@ -153,10 +162,20 @@ async function main() {
   // --- 1. Register SHAPES equality shapes (tenant = k); they share one family circuit. ---
   const regStart = now()
   let registered = 0
-  await runPool(SHAPES, REGCONC, async (k) => {
+  const registerOne = async (k: number) => {
     await createShape(engine.url, { col: 'tenant', op: 'eq', value: k })
     registered++
-  })
+  }
+  if (CHUNK > 0) {
+    for (let base = 0; base < SHAPES; base += CHUNK) {
+      const n = Math.min(CHUNK, SHAPES - base)
+      await runPool(n, REGCONC, async (i) => registerOne(base + i))
+      log(`  registered ${registered}/${SHAPES}${base + n < SHAPES ? ` (pause ${CHUNK_PAUSE}s for TIME_WAIT drain)` : ''}`)
+      if (base + n < SHAPES) await sleep(CHUNK_PAUSE * 1000)
+    }
+  } else {
+    await runPool(SHAPES, REGCONC, registerOne)
+  }
   const regMs = now() - regStart
   log(`registered ${registered} equality shapes in ${(regMs / 1000).toFixed(1)}s (${Math.round(registered / (regMs / 1000))}/s)`)
 
@@ -222,12 +241,13 @@ async function main() {
     }
   })()
 
-  // Firehose: CONC workers upserting random rows across the whole shape keyspace.
+  // Firehose: CONC workers upserting rows within the bounded hot set of tenants (so load touches a
+  // small set of streams). Each write still flows through the family join against all SHAPES params.
   const firehose = Array.from({ length: CONC }, () =>
     (async () => {
       while (now() < deadline) {
-        const pk = 1 + Math.floor(Math.random() * SHAPES * 4)
-        const tenant = pk % SHAPES
+        const tenant = Math.floor(Math.random() * HOTSET)
+        const pk = 1 + tenant + HOTSET * Math.floor(Math.random() * 40) // bounded pk space, tenant = pk's slot
         await client.tables.users.update({ id: pk, tenant, seq: seq++, active: pk % 2 === 0 }).catch(() => {})
         firehoseWrites++
       }
@@ -241,7 +261,7 @@ async function main() {
   // --- Report ---
   latencies.sort((a, b) => a - b)
   const usMs = (us: number) => (us / 1000).toFixed(2)
-  log(`\n--- throughput ---`)
+  log(`\n--- throughput (firehose hot set = ${HOTSET} of ${SHAPES} shapes) ---`)
   log(`firehose writes:   ${firehoseWrites} in ${(loadMs / 1000).toFixed(1)}s = ${Math.round(firehoseWrites / (loadMs / 1000))}/s`)
   log(`engine envelopes:  ${metrics.counters.envelopes_processed} processed, ${metrics.counters.shape_appends} shape appends`)
   log(`\n--- end-to-end write->shape latency (subscribed shapes, ${latencies.length} probes) ---`)

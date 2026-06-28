@@ -57,6 +57,25 @@ not return the connection to its pool — a leaked socket per `ensure_stream`/`a
 
 ## Headline scaling results
 
+**100,000 equality shapes, one shared family circuit (target scale, met):**
+
+| metric | value |
+|--------|-------|
+| shapes registered & active | **100,000** (1 family) |
+| **end-to-end p99 latency** | **10.8ms** (p50 3.4ms) — under the 50ms target |
+| `process_envelope` p99 | 0.26ms |
+| `family_step` p99 (join over 100k params) | **0.26ms — identical to the 10k run** |
+| engine RSS | 64→67MB (bounded) |
+| threads | 16 (flat) |
+| CPU avg | 34% |
+
+The decisive result: every write is joined against all 100k params, yet `family_step` p99 is **0.26ms**,
+the same as at 10k — per-write cost is genuinely **O(log N)** and memory stays flat. The firehose was
+confined to a 200-shape hot set so the load phase would not churn 100k streams (the local socket limit
+below); all 100k shapes remained registered and active in the join. Registration used chunked batches
+with TIME_WAIT-drain pauses (`BENCH_CHUNK`) to stay under the ephemeral-port ceiling without sysctl —
+355s for 100k, a one-time cost.
+
 **10,000 equality shapes, one shared family circuit:**
 
 | load | writes/s | e2e p50 | e2e p99 | process_envelope p99 | append p99 | RSS | threads |
@@ -93,15 +112,21 @@ faster than they recycle. After the leak fix, connections pool (ESTABLISHED flat
 still climbs to ~15k during a fast registration and hits the wall.
 
 This is a property of the local in-memory test server + macOS defaults, **not** the engine: per-write
-cost is O(log N) in the family join and O(1) in streams touched, and memory/threads are flat. Clearing
-it is an environment choice (widen `net.inet.ip.portrange` / shorten `net.inet.tcp.msl` via sysctl, use
-a keep-alive production storage backend, or throttle registration) — out of scope for the engine.
+cost is O(log N) in the family join and O(1) in streams touched, and memory/threads are flat.
+
+**Worked around without sysctl** to hit the 100k target above: register in chunks with TIME_WAIT-drain
+pauses (`BENCH_CHUNK`), and confine the firehose to a bounded hot set (`BENCH_HOTSET`) so the load phase
+reuses a small pool of connections. All 100k shapes stay registered and active in the join. Other
+options for a continuous high-rate 100k load: widen `net.inet.ip.portrange` / shorten `net.inet.tcp.msl`
+via sysctl, or point the bench at a keep-alive production storage backend.
 
 ## Reproduce
 
 ```
 cargo build --release -p electric-lite-engine
-BENCH_SHAPES=10000 BENCH_SUBS=100 BENCH_DURATION=15 BENCH_CONC=4 pnpm bench   # latency
-BENCH_SHAPES=10000 BENCH_SUBS=100 BENCH_DURATION=20 BENCH_CONC=64 pnpm bench  # throughput
+# 100k shapes end-to-end (chunked registration + bounded hot set), p99 latency:
+BENCH_SHAPES=100000 BENCH_CHUNK=12000 BENCH_CHUNK_PAUSE=30 BENCH_HOTSET=200 \
+  BENCH_SUBS=100 BENCH_CONC=4 BENCH_DURATION=15 pnpm bench
+BENCH_SHAPES=10000 BENCH_SUBS=100 BENCH_DURATION=20 BENCH_CONC=64 pnpm bench  # max throughput
 BENCH_SHAPES=100 BENCH_STANDALONE=5000 BENCH_DURATION=6 pnpm bench            # standalone scaling
 ```
