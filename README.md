@@ -12,6 +12,10 @@ Deliberately simpler than Electric:
   no cross-table queries.
 - Query expressivity is limited and grows pragmatically: column comparisons (`eq neq lt lte gt
   gte`) combined with `and` / `or` / `not`.
+- Two optional knobs keep large shapes cheap to sync: **`columns`** (output projection — sync only
+  the columns a view needs; the pk is always included) and **`orderBy` + `limit`** (a backfill
+  window — read only the first *N* rows in order, the basis for cursor/keyset pagination). Both
+  affect what is *synced*, not what is *matched*; omitting them syncs the full matching set.
 
 ## Design in three layers
 
@@ -103,8 +107,9 @@ conformance suite asserts the two always agree.
 There are two query layers, and they do different jobs:
 
 - The **server-side shape predicate** (engine) decides *what crosses the network* — one table + a
-  `WHERE` over its columns. It's the sync boundary: only matching rows are materialized on the client,
-  and the engine maintains that set incrementally as Postgres changes.
+  `WHERE` over its columns, optionally narrowed by a `columns` projection and an `orderBy`+`limit`
+  window. It's the sync boundary: only matching rows (and only the projected columns) are materialized
+  on the client, and the engine maintains that set incrementally as Postgres changes.
 - A **client-side live query** (TanStack DB `useLiveQuery`) runs *over the already-materialized
   collection* for the things the shape predicate can't express — ordering (`ORDER BY`), text search
   (`ilike`/`LIKE`), and any finer filtering — without re-syncing. Because it's a live query, it's
@@ -113,8 +118,11 @@ There are two query layers, and they do different jobs:
 
 So: shape = *what you sync*, live query = *how you present it*. The example apps follow this split —
 the engine filters by status/priority/id; the client orders by date/kanban-order and searches by text
-in the live query. (Ordering/`LIKE` are deliberately not part of the shape model; this is also the
-seam where windowed/infinite-scroll sync would slot in — see the partial-sync notes.)
+in the live query. **Windowed / infinite-scroll sync** uses the `orderBy`+`limit` window: the browse
+list syncs one ordered page at a time and loads the next page on scroll by folding a keyset cursor
+(`col < lastSeen OR (col = lastSeen AND id < lastId)`) into the shape's `WHERE` — so each page is a
+bounded range query, no stateful top-N operator. The render layer is **virtualized** (only on-screen
+rows are mounted), so a 20k-row view stays a few dozen DOM nodes.
 
 > Postgres is the default source of record. The engine can also run **without** Postgres — writes
 > append directly to `table/<name>` through the tRPC `ingest.write` API — which is how the

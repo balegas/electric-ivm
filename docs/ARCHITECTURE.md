@@ -391,8 +391,12 @@ There are **two query layers** with different jobs, and keeping them distinct is
 sync a bounded set yet still present it flexibly:
 
 1. **Server-side shape predicate** (the engine, §4) — *what crosses the network*. One table + a
-   `WHERE` over its columns (eq/neq/lt/lte/gt/gte + and/or/not). The engine maintains exactly this set
-   on the client's `shape/<id>` stream, incrementally, as Postgres changes. This is the sync boundary:
+   `WHERE` over its columns (eq/neq/lt/lte/gt/gte + and/or/not), optionally narrowed by two knobs that
+   bound *what is synced* (not what is matched): an output **`columns` projection** (sync only the
+   columns a view needs; the pk is always included — e.g. the browse list drops a large `description`
+   it never renders) and an **`orderBy`+`limit` window** (read only the first *N* rows in order — the
+   engine appends the pk as a tiebreaker for a total order). The engine maintains exactly this set on
+   the client's `shape/<id>` stream, incrementally, as Postgres changes. This is the sync boundary:
    rows outside the predicate are never materialized.
 2. **Client-side live query** (`@tanstack/react-db`'s `useLiveQuery` over the materialized TanStack DB
    collection) — *how the synced set is presented*. Ordering (`orderBy`), text search (`ilike`/`like`),
@@ -401,11 +405,15 @@ sync a bounded set yet still present it flexibly:
    refinement — e.g. typing in a search box — updates the rendered rows **without changing the
    engine-side shape or re-syncing**.
 
-The split is deliberate: ordering and `LIKE`-style search are intentionally **not** part of the shape
-model (§ the shape predicate is an unordered-set filter), because they are presentation concerns over
-an already-synced set, and pushing them server-side would couple sync to view state. It is also the
-natural seam for windowed / infinite-scroll sync: a value-range shape bounds *what* syncs while the
-live query handles ordering within the loaded window.
+The split is deliberate: text `LIKE`-style search and presentation ordering stay client-side (they are
+view concerns over an already-synced set, and pushing them server-side would couple sync to view
+state). The `orderBy`+`limit` window is the **sync-bounding** counterpart — it powers windowed /
+infinite-scroll sync: the client syncs one ordered page, then loads the next by folding a keyset cursor
+(`col < lastSeen OR (col = lastSeen AND id < lastId)`) into the shape's `WHERE`, so each page is a
+bounded range query — no stateful top-N operator in the engine. A page is a backfill bound, not a
+live-maintained top-N: live changes matching the predicate still flow into a loaded page. The example
+apps pair this with a **virtualized** render layer (only on-screen rows are mounted), so a 20k-row view
+holds a few dozen DOM nodes; see `examples/linearlite` (`lib/Virtual.tsx`, `components/IssueList.tsx`).
 
 **Binding pattern (the example apps).** `useShapeCollection(def)` creates the engine-side shape and
 returns its live collection (async; `null` while loading or when `def` is `null`), recreating it when
