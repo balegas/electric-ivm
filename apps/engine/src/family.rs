@@ -7,15 +7,65 @@
 //! shape is a delete. See `docs/superpowers/specs/2026-06-27-shape-pipeline-sharing-design.md`.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
 use anyhow::{Result, anyhow};
-use dbsp::circuit::CircuitConfig;
+use dbsp::circuit::{
+    CircuitConfig, CircuitStorageConfig, StorageCacheConfig, StorageConfig, StorageOptions,
+};
 use dbsp::utils::Tup2;
 use dbsp::{IndexedZSetReader, OrdZSet, OutputHandle, RootCircuit, Runtime, ZSetHandle, ZWeight};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::value::{Row, Value};
+
+/// Per-process counter giving each family a distinct on-disk storage subdirectory.
+static FAMILY_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Build the dbsp circuit config for a family. In-memory by default; if `ELECTRIC_LITE_STORAGE_DIR`
+/// is set, the family's join traces + params arrangement spill to on-disk batch files paged through
+/// a cache (OS page cache by default, or dbsp's internal LRU via `ELECTRIC_LITE_STORAGE_CACHE=feldera`),
+/// bounding RAM at the cost of disk-read tail latency on cache misses. Other knobs:
+///   ELECTRIC_LITE_STORAGE_MIN_BYTES  spill threshold per batch (default dbsp 10 MiB; 0 = spill all)
+///   ELECTRIC_LITE_STORAGE_CACHE_MIB  internal-cache budget in MiB (FelderaCache only)
+///   ELECTRIC_LITE_MAX_RSS_MB         process memory target driving pressure-based spilling
+fn circuit_config() -> CircuitConfig {
+    let base = match std::env::var("ELECTRIC_LITE_STORAGE_DIR") {
+        Ok(d) if !d.is_empty() => d,
+        _ => return CircuitConfig::with_workers(1), // in-memory (default)
+    };
+    // Scope by pid so multiple engine processes sharing one base dir don't collide on the dirlock.
+    let dir = format!("{base}/{}/family-{}", std::process::id(), FAMILY_SEQ.fetch_add(1, Ordering::Relaxed));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::error!("storage dir {dir} create failed: {e:#}; using in-memory");
+        return CircuitConfig::with_workers(1);
+    }
+    let env_usize = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<usize>().ok());
+    let cache = match std::env::var("ELECTRIC_LITE_STORAGE_CACHE").as_deref() {
+        Ok("feldera") => StorageCacheConfig::FelderaCache,
+        _ => StorageCacheConfig::PageCache,
+    };
+    let storage = StorageConfig { path: dir.clone(), cache };
+    let options = StorageOptions {
+        min_storage_bytes: env_usize("ELECTRIC_LITE_STORAGE_MIN_BYTES"),
+        cache_mib: env_usize("ELECTRIC_LITE_STORAGE_CACHE_MIB"),
+        ..Default::default() // backend = local filesystem
+    };
+    match CircuitStorageConfig::for_config(storage, options) {
+        Ok(sc) => {
+            let mut cfg = CircuitConfig::with_workers(1).with_storage(Some(sc));
+            if let Some(mb) = std::env::var("ELECTRIC_LITE_MAX_RSS_MB").ok().and_then(|s| s.parse::<u64>().ok()) {
+                cfg = cfg.with_max_rss_bytes(Some(mb * 1024 * 1024));
+            }
+            cfg
+        }
+        Err(e) => {
+            tracing::error!("dbsp storage setup failed: {e:#}; using in-memory");
+            CircuitConfig::with_workers(1)
+        }
+    }
+}
 
 /// Params element: `(key_tuple, shape_id)`. `shape_id` is the numeric id; the tailer maps it back
 /// to a stream path for demultiplexing.
@@ -74,9 +124,10 @@ fn run(key_cols: Arc<Vec<usize>>, mut rx: mpsc::UnboundedReceiver<Req>) {
         Ok((data_in, params_in, joined.output()))
     };
     // The join uses traces/spines, which require a DBSP runtime (a plain `RootCircuit::build` has
-    // none). One worker keeps the per-family circuit single-threaded and deterministic.
+    // none). One worker keeps the per-family circuit single-threaded and deterministic. The config
+    // is in-memory unless storage is enabled via env (see `circuit_config`).
     let (mut circuit, (data_in, params_in, output)) =
-        match Runtime::init_circuit(CircuitConfig::from(1usize), build) {
+        match Runtime::init_circuit(circuit_config(), build) {
             Ok(x) => x,
             Err(e) => {
                 tracing::error!("failed to build family circuit: {e:#}");

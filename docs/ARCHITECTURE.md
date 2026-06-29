@@ -259,7 +259,47 @@ not the engine. So the highest-leverage items target the append/storage path and
 
 ---
 
-## 10. File map
+## 10. Running dbsp from disk (memory beyond RAM)
+
+dbsp 0.299 has a full storage subsystem: on-disk columnar batch files (`trace/ord/file/`) paged
+through a cache, with a per-batch spill threshold and memory-pressure-driven spilling. It is wired
+into `FamilyActor` (`family.rs::circuit_config`) and **disabled by default** (in-memory). When enabled,
+a family's join data trace + Params arrangement spill to disk instead of living wholly in RAM — this is
+the lever for the table-copy-per-family amplification (§8). It does **not** touch `table_state` (our own
+`HashMap`), which stays in RAM until separately moved to an embedded KV.
+
+Enabled via env (per-family subdirs are created under the base dir, scoped by pid):
+
+| env var | effect |
+|---------|--------|
+| `ELECTRIC_LITE_STORAGE_DIR` | base dir; **presence enables storage**. Unset = in-memory. |
+| `ELECTRIC_LITE_STORAGE_CACHE` | `page` (default, OS page cache) or `feldera` (dbsp's internal LRU) |
+| `ELECTRIC_LITE_STORAGE_CACHE_MIB` | LRU budget in MiB (FelderaCache only) |
+| `ELECTRIC_LITE_STORAGE_MIN_BYTES` | per-batch spill threshold (dbsp default 10 MiB; `0` spills everything) |
+| `ELECTRIC_LITE_MAX_RSS_MB` | process memory target driving pressure-based spilling |
+
+**Verified:** conformance stays 84-green with storage forced fully on-disk (`MIN_BYTES=0`); `.feldera`
+batch files + dirlocks are written. Output is identical — storage is transparent.
+
+**A/B at 5,000 shapes, moderate load (measured):**
+
+| config | e2e p99 | RSS peak | notes |
+|--------|---------|----------|-------|
+| in-memory (default) | 8.2ms | 42MB | baseline |
+| on-disk, PageCache, `MIN_BYTES=0` | 7.4ms | **556MB** | pathological — forcing every tiny batch to disk makes mmap'd pages + write buffers count toward RSS |
+| on-disk, FelderaCache 64 MiB, default threshold | 7.5ms | **34MB** | nothing spills (working set < 10 MiB); behaves like in-memory |
+
+**Takeaways / caveats:**
+- It is **not** a free memory win on small data. With the default threshold, small traces stay in RAM
+  (no spill) — same as in-memory. With `MIN_BYTES=0` + PageCache, RSS *grows* (page cache + buffers).
+- The memory-bounding benefit materializes only when the **working set exceeds RAM**, using a sensible
+  `MIN_BYTES` plus a bounded `FelderaCache` budget: RAM is then capped near the cache size at the cost of
+  disk-read **p99** spikes on cache misses (p50 stays flat if the hot set fits the cache).
+- Spilled family subdirs are not yet garbage-collected on family drop (families are long-lived; minor).
+- A benchmark driving a working set larger than the cache (wide rows / many rows) is the right next
+  step to plot the cache-size-vs-p99 curve — not yet done.
+
+## 11. File map
 
 | path | role |
 |------|------|
