@@ -15,12 +15,19 @@
 //! `on_table_delta`, added in a later step). This file (step 6) is the pure in-memory core: node
 //! maintenance + the [`SubqueryEval`] read view. No Postgres, no streams yet.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use crate::predicate::{CompiledPredicate, SubqueryEval, SubquerySig};
+use anyhow::{Context, Result};
+use dbsp::ZWeight;
+use dbsp::utils::Tup2;
+
+use crate::ds::DsClient;
+use crate::predicate::{
+    CompiledPredicate, PredicateJson, SubqueryCollector, SubqueryEval, SubquerySig, subquery_sig,
+};
 use crate::schema::TableSchema;
-use crate::value::Value;
+use crate::value::{Row, Value};
 
 /// Direction of a value-membership change on a node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +56,8 @@ pub struct SubqueryNode {
     pub pk_col: usize,
     /// The inner predicate; may reference deeper nodes (evaluated via [`SubqueryEval`]).
     pub pred: Arc<CompiledPredicate>,
+    /// The inner `where` as raw JSON (for seeding SQL, which must emit nested `IN (SELECT …)`).
+    pub where_json: Option<PredicateJson>,
     /// `pg_current_wal_lsn()` at the node's backfill snapshot; inner deltas with commit LSN strictly
     /// `< seed_lsn` are already counted and are skipped.
     pub seed_lsn: u64,
@@ -75,6 +84,7 @@ impl SubqueryNode {
             proj_col,
             pk_col,
             pred,
+            where_json: None,
             seed_lsn,
             contributors: HashMap::new(),
             pk_value: HashMap::new(),
@@ -151,24 +161,505 @@ pub struct Edge {
     pub negated: bool,
 }
 
+/// A registered outer subquery shape: an ordinary materialized shape whose predicate contains
+/// `IN (SELECT …)`. The engine emits `upsert`/`delete` envelopes to `stream_path` as membership
+/// changes (from outer-row deltas and from inner-set flips).
+pub struct SubqueryShape {
+    pub shape_id: String,
+    pub outer_table: String,
+    pub stream_path: String,
+    /// The outer predicate (with `InSubquery` leaves resolving against this registry's nodes).
+    pub pred: Arc<CompiledPredicate>,
+    pub out_cols: Option<Arc<Vec<usize>>>,
+    /// `pg_current_wal_lsn()` of the shape's backfill; outer deltas with commit LSN `< seed_lsn` are
+    /// already in the backfill and skipped.
+    pub seed_lsn: u64,
+}
+
+/// A `TableSchema` lookup shared with the engine's compiled schema.
+pub type SchemaMap = Arc<HashMap<String, TableSchema>>;
+
 /// The cross-table registry of subquery nodes + shapes + edges. Implements [`SubqueryEval`] so a
-/// predicate's subquery leaves resolve against the maintained node sets.
-#[derive(Default)]
+/// predicate's subquery leaves resolve against the maintained node sets. One per engine, behind a
+/// `tokio::Mutex`; every table tailer calls [`on_table_delta`](Self::on_table_delta).
 pub struct SubqueryRegistry {
     /// Nodes by canonical signature (shared across identical subqueries).
     pub nodes: HashMap<SubquerySig, SubqueryNode>,
     /// Edges from each node to its dependents.
     pub edges: Vec<Edge>,
+    /// Registered outer subquery shapes by engine shape id.
+    pub shapes: HashMap<String, SubqueryShape>,
+    /// Nodes created but not yet seeded from Postgres (deepest-first).
+    pending_seed: Vec<SubquerySig>,
+    ds: DsClient,
+    pg_url: Option<String>,
+    schemas: SchemaMap,
 }
 
 impl SubqueryRegistry {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(ds: DsClient, pg_url: Option<String>) -> Self {
+        SubqueryRegistry {
+            nodes: HashMap::new(),
+            edges: Vec::new(),
+            shapes: HashMap::new(),
+            pending_seed: Vec::new(),
+            ds,
+            pg_url,
+            schemas: Arc::new(HashMap::new()),
+        }
+    }
+
+    pub fn set_schemas(&mut self, schemas: SchemaMap) {
+        self.schemas = schemas;
+    }
+
+    /// Does any node's inner table or any shape's outer table equal `table`? (Fast skip for tailers of
+    /// tables not involved in any subquery.)
+    pub fn touches(&self, table: &str) -> bool {
+        self.nodes.values().any(|n| n.inner_table == table)
+            || self.shapes.values().any(|s| s.outer_table == table)
+    }
+
+    /// All tables a node's signature transitively reads (its inner table + its children's). Used by the
+    /// engine to spawn tailers so every involved table's deltas reach the registry.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
     }
 
     /// Outgoing edges for a node signature.
-    pub fn edges_of<'a>(&'a self, sig: &'a SubquerySig) -> impl Iterator<Item = &'a Edge> + 'a {
-        self.edges.iter().filter(move |e| &e.node_sig == sig)
+    fn edges_of(&self, sig: &SubquerySig) -> Vec<Edge> {
+        self.edges.iter().filter(|e| &e.node_sig == sig).cloned().collect()
+    }
+
+    // --- registration -------------------------------------------------------------------------
+
+    /// Register an outer subquery shape: compile the outer predicate (creating/deduping nodes + edges),
+    /// seed any new nodes from Postgres, backfill the shape, and record it. Idempotent per shape id.
+    pub async fn create_subquery_shape(
+        &mut self,
+        shape_id: &str,
+        outer_table: &str,
+        stream_path: &str,
+        where_json: &PredicateJson,
+        out_cols: Option<Arc<Vec<usize>>>,
+    ) -> Result<()> {
+        let outer_ts =
+            self.schemas.get(outer_table).cloned().context("subquery shape: unknown outer table")?;
+        // 1. Compile the outer predicate, discovering/deduping nodes (deepest-first) + node edges.
+        let pred = Arc::new(CompiledPredicate::compile_with(where_json, &outer_ts, self)?);
+        // 2. Record shape-level edges (the outer predicate's `IN` leaves).
+        for (col, sig, negated) in collect_in_leaves(&pred) {
+            self.edges.push(Edge {
+                node_sig: sig,
+                dependent: Dependent::Shape(shape_id.to_string()),
+                connecting_col: col,
+                negated,
+            });
+        }
+        // 3. Seed newly-created nodes from Postgres (Postgres evaluates nested subqueries natively).
+        self.seed_pending_nodes().await?;
+        // 4. Backfill the outer shape and append its initial members.
+        let (wsql, params) = crate::sql::predicate_json_to_sql(where_json, 1);
+        let bf = {
+            let url = self.pg_url.clone().context("subquery shape backfill requires postgres")?;
+            let client = crate::pg::connect(&url).await?;
+            crate::pg::backfill_where(&client, &outer_ts, Some((wsql, params))).await?
+        };
+        let seed_lsn = crate::pg::lsn_to_u64(&bf.seed_lsn);
+        let out: Vec<(Row, ZWeight)> = bf.rows.iter().map(|r| (r.clone(), 1)).collect();
+        if !out.is_empty() {
+            let envs = crate::engine::translate_output(
+                &outer_ts,
+                out,
+                None,
+                out_cols.as_deref().map(Vec::as_slice),
+            );
+            self.ds.append(stream_path, &envs).await?;
+        }
+        // 5. Record the shape.
+        self.shapes.insert(
+            shape_id.to_string(),
+            SubqueryShape {
+                shape_id: shape_id.to_string(),
+                outer_table: outer_table.to_string(),
+                stream_path: stream_path.to_string(),
+                pred,
+                out_cols,
+                seed_lsn,
+            },
+        );
+        Ok(())
+    }
+
+    /// Seed every node queued in `pending_seed` (deepest-first) from a Postgres snapshot.
+    async fn seed_pending_nodes(&mut self) -> Result<()> {
+        let pending = std::mem::take(&mut self.pending_seed);
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let url = self.pg_url.clone().context("subquery node seeding requires postgres")?;
+        let client = crate::pg::connect(&url).await?;
+        for sig in pending {
+            let (inner_table, where_json, proj_col) = {
+                let n = self.nodes.get(&sig).context("seed: node vanished")?;
+                (n.inner_table.clone(), n.where_json.clone(), n.proj_col)
+            };
+            let ts = self.schemas.get(&inner_table).cloned().context("seed: unknown inner table")?;
+            let wsql = where_json.as_ref().map(|w| crate::sql::predicate_json_to_sql(w, 1));
+            let bf = crate::pg::backfill_where(&client, &ts, wsql).await?;
+            let seed_lsn = crate::pg::lsn_to_u64(&bf.seed_lsn);
+            let node = self.nodes.get_mut(&sig).context("seed: node vanished")?;
+            node.seed_lsn = seed_lsn;
+            for r in &bf.rows {
+                let pk = ts.pk_of(r).map(Value::to_key_string).unwrap_or_default();
+                let pv = r.0.get(proj_col).cloned().unwrap_or(Value::Null);
+                node.reconcile_row(&pk, Some(pv));
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove a subquery shape: drop its edges and decref the nodes it referenced (removing nodes whose
+    /// refcount hits zero, and their edges, recursively).
+    pub fn drop_subquery_shape(&mut self, shape_id: &str) {
+        let Some(shape) = self.shapes.remove(shape_id) else { return };
+        // Sigs this shape pointed at, then drop the shape's edges.
+        let sigs: Vec<SubquerySig> = collect_in_leaves(&shape.pred).into_iter().map(|(_, s, _)| s).collect();
+        self.edges.retain(|e| !matches!(&e.dependent, Dependent::Shape(id) if id == shape_id));
+        for sig in sigs {
+            self.decref_node(&sig);
+        }
+    }
+
+    fn decref_node(&mut self, sig: &SubquerySig) {
+        let Some(node) = self.nodes.get_mut(sig) else { return };
+        node.refcount = node.refcount.saturating_sub(1);
+        if node.refcount > 0 {
+            return;
+        }
+        // Refcount hit zero: gather child sigs, remove the node + its incoming/outgoing edges, recurse.
+        let child_sigs: Vec<SubquerySig> =
+            collect_in_leaves(&node.pred).into_iter().map(|(_, s, _)| s).collect();
+        self.nodes.remove(sig);
+        self.edges
+            .retain(|e| &e.node_sig != sig && !matches!(&e.dependent, Dependent::Node(s) if s == sig));
+        for c in child_sigs {
+            self.decref_node(&c);
+        }
+    }
+
+    // --- live maintenance ---------------------------------------------------------------------
+
+    /// Process one table delta: update affected nodes, emit outer-shape deltas, and propagate inner-set
+    /// flips to dependents (querying back the affected rows). Appends move envelopes synchronously, so
+    /// the caller's processed-offset barrier still implies convergence. `lsn` is the change's commit
+    /// LSN (0 = unknown/never skip).
+    pub async fn on_table_delta(
+        &mut self,
+        ts: &TableSchema,
+        delta: &[Tup2<Row, ZWeight>],
+        lsn: u64,
+        txid: Option<String>,
+    ) -> Result<()> {
+        let table = ts.name.clone();
+        // Work queue of (node sig, flip) pairs to propagate (BFS up the dependency DAG).
+        let mut work: VecDeque<(SubquerySig, Flip)> = VecDeque::new();
+
+        // 1. Nodes whose inner table is this table: reconcile from the delta, collect flips.
+        let node_sigs: Vec<SubquerySig> =
+            self.nodes.iter().filter(|(_, n)| n.inner_table == table).map(|(s, _)| s.clone()).collect();
+        for sig in node_sigs {
+            let seed_lsn = self.nodes.get(&sig).map(|n| n.seed_lsn).unwrap_or(0);
+            if lsn != 0 && lsn < seed_lsn {
+                continue;
+            }
+            let evals = self.node_present_values(&sig, ts, delta);
+            for f in self.apply_node_flips(&sig, evals) {
+                work.push_back((sig.clone(), f));
+            }
+        }
+
+        // 2. Subquery shapes whose outer table is this table: evaluate the filter on the delta + append.
+        let shape_ids: Vec<String> = self
+            .shapes
+            .iter()
+            .filter(|(_, s)| s.outer_table == table)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in shape_ids {
+            let seed_lsn = self.shapes.get(&id).map(|s| s.seed_lsn).unwrap_or(0);
+            if lsn != 0 && lsn < seed_lsn {
+                continue;
+            }
+            self.emit_shape_delta(&id, ts, delta, txid.clone()).await?;
+        }
+
+        // 3. Propagate flips up the DAG.
+        while let Some((sig, flip)) = work.pop_front() {
+            for edge in self.edges_of(&sig) {
+                // A NULL-value flip only matters to negated dependents (SQL `NOT IN` with NULL). It can
+                // shift *every* dependent row, so re-derive the dependent fully; non-negated dependents
+                // are unaffected by a NULL in the set, so skip.
+                if matches!(flip.value, Value::Null) {
+                    if edge.negated {
+                        self.rederive_dependent(&edge, txid.clone(), &mut work).await?;
+                    }
+                    continue;
+                }
+                match &edge.dependent {
+                    Dependent::Shape(id) => {
+                        self.move_shape_for_value(id, edge.connecting_col, &flip.value, txid.clone()).await?;
+                    }
+                    Dependent::Node(parent_sig) => {
+                        let new_flips = self
+                            .reconcile_parent_for_value(parent_sig, edge.connecting_col, &flip.value)
+                            .await?;
+                        for f in new_flips {
+                            work.push_back((parent_sig.clone(), f));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// For each inner-row pk touched by `delta`, its desired contribution (`Some(proj)` if the row now
+    /// matches the node predicate, else `None`). Immutable (reads node sets for `matches_ctx`).
+    fn node_present_values(
+        &self,
+        sig: &SubquerySig,
+        ts: &TableSchema,
+        delta: &[Tup2<Row, ZWeight>],
+    ) -> Vec<(String, Option<Value>)> {
+        let (pred, proj) = match self.nodes.get(sig) {
+            Some(n) => (n.pred.clone(), n.proj_col),
+            None => return Vec::new(),
+        };
+        // The +1 row (if any) is the row's new state; a pk seen only with -1 was deleted.
+        let mut newrow: HashMap<String, Row> = HashMap::new();
+        let mut seen: Vec<String> = Vec::new();
+        for Tup2(row, w) in delta {
+            let pk = ts.pk_of(row).map(Value::to_key_string).unwrap_or_default();
+            if !seen.contains(&pk) {
+                seen.push(pk.clone());
+            }
+            if *w > 0 {
+                newrow.insert(pk, row.clone());
+            }
+        }
+        seen.into_iter()
+            .map(|pk| match newrow.get(&pk) {
+                Some(r) => {
+                    let pv = if pred.matches_ctx(r, self) {
+                        Some(r.0.get(proj).cloned().unwrap_or(Value::Null))
+                    } else {
+                        None
+                    };
+                    (pk, pv)
+                }
+                None => (pk, None),
+            })
+            .collect()
+    }
+
+    /// Apply reconciliations to a node, returning the resulting flips. Mutable.
+    fn apply_node_flips(&mut self, sig: &SubquerySig, evals: Vec<(String, Option<Value>)>) -> Vec<Flip> {
+        let Some(node) = self.nodes.get_mut(sig) else { return Vec::new() };
+        let mut flips = Vec::new();
+        for (pk, pv) in evals {
+            flips.extend(node.reconcile_row(&pk, pv));
+        }
+        flips
+    }
+
+    /// A parent node's value `v` was referenced by a flipped child; re-evaluate the parent's inner rows
+    /// with `connecting_col = v` and reconcile them, returning the parent's resulting flips.
+    async fn reconcile_parent_for_value(
+        &mut self,
+        parent_sig: &SubquerySig,
+        connecting_col: usize,
+        value: &Value,
+    ) -> Result<Vec<Flip>> {
+        let inner_table = match self.nodes.get(parent_sig) {
+            Some(n) => n.inner_table.clone(),
+            None => return Ok(Vec::new()),
+        };
+        let ts = self.schemas.get(&inner_table).cloned().context("parent node: unknown table")?;
+        let rows = self.query_candidates(&ts, connecting_col, value).await?;
+        let (pred, proj) = {
+            let n = self.nodes.get(parent_sig).context("parent node vanished")?;
+            (n.pred.clone(), n.proj_col)
+        };
+        let evals: Vec<(String, Option<Value>)> = rows
+            .iter()
+            .map(|r| {
+                let pk = ts.pk_of(r).map(Value::to_key_string).unwrap_or_default();
+                let pv = if pred.matches_ctx(r, self) {
+                    Some(r.0.get(proj).cloned().unwrap_or(Value::Null))
+                } else {
+                    None
+                };
+                (pk, pv)
+            })
+            .collect();
+        Ok(self.apply_node_flips(parent_sig, evals))
+    }
+
+    /// An inner-set value `v` flipped for an outer shape: query the outer rows with `connecting_col = v`,
+    /// re-evaluate the full shape predicate, and append `upsert` (matches) / `delete` (doesn't) by pk.
+    async fn move_shape_for_value(
+        &self,
+        shape_id: &str,
+        connecting_col: usize,
+        value: &Value,
+        txid: Option<String>,
+    ) -> Result<()> {
+        let Some(shape) = self.shapes.get(shape_id) else { return Ok(()) };
+        let ts = self.schemas.get(&shape.outer_table).cloned().context("shape: unknown table")?;
+        let rows = self.query_candidates(&ts, connecting_col, value).await?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let pred = shape.pred.clone();
+        let out: Vec<(Row, ZWeight)> = rows
+            .into_iter()
+            .map(|r| {
+                let w: ZWeight = if pred.matches_ctx(&r, self) { 1 } else { -1 };
+                (r, w)
+            })
+            .collect();
+        let envs = crate::engine::translate_output(&ts, out, txid, shape.out_cols.as_deref().map(Vec::as_slice));
+        if !envs.is_empty() {
+            self.ds.append(&shape.stream_path, &envs).await?;
+        }
+        Ok(())
+    }
+
+    /// Evaluate a subquery shape's predicate over a delta on its own (outer) table and append the
+    /// resulting enter/update/leave envelopes — the subquery-aware analog of the standalone filter path.
+    async fn emit_shape_delta(
+        &self,
+        shape_id: &str,
+        ts: &TableSchema,
+        delta: &[Tup2<Row, ZWeight>],
+        txid: Option<String>,
+    ) -> Result<()> {
+        let Some(shape) = self.shapes.get(shape_id) else { return Ok(()) };
+        let pred = shape.pred.clone();
+        let out: Vec<(Row, ZWeight)> =
+            delta.iter().filter(|t| pred.matches_ctx(&t.0, self)).map(|t| (t.0.clone(), t.1)).collect();
+        if out.is_empty() {
+            return Ok(());
+        }
+        let envs = crate::engine::translate_output(ts, out, txid, shape.out_cols.as_deref().map(Vec::as_slice));
+        if !envs.is_empty() {
+            self.ds.append(&shape.stream_path, &envs).await?;
+        }
+        Ok(())
+    }
+
+    /// Re-derive a dependent fully (used for NULL flips on negated edges): re-query every candidate row
+    /// of the dependent's table and reconcile/emit. Rare (projections are typically non-null).
+    async fn rederive_dependent(
+        &mut self,
+        edge: &Edge,
+        txid: Option<String>,
+        work: &mut VecDeque<(SubquerySig, Flip)>,
+    ) -> Result<()> {
+        match &edge.dependent {
+            Dependent::Shape(id) => {
+                let (outer_table, pred, stream_path, out_cols) = match self.shapes.get(id) {
+                    Some(s) => (s.outer_table.clone(), s.pred.clone(), s.stream_path.clone(), s.out_cols.clone()),
+                    None => return Ok(()),
+                };
+                let ts = self.schemas.get(&outer_table).cloned().context("rederive: unknown table")?;
+                let rows = self.query_all(&ts).await?;
+                let out: Vec<(Row, ZWeight)> = rows
+                    .into_iter()
+                    .map(|r| { let w: ZWeight = if pred.matches_ctx(&r, self) { 1 } else { -1 }; (r, w) })
+                    .collect();
+                let envs = crate::engine::translate_output(&ts, out, txid, out_cols.as_deref().map(Vec::as_slice));
+                if !envs.is_empty() {
+                    self.ds.append(&stream_path, &envs).await?;
+                }
+            }
+            Dependent::Node(parent_sig) => {
+                let inner_table = match self.nodes.get(parent_sig) {
+                    Some(n) => n.inner_table.clone(),
+                    None => return Ok(()),
+                };
+                let ts = self.schemas.get(&inner_table).cloned().context("rederive: unknown table")?;
+                let rows = self.query_all(&ts).await?;
+                let (pred, proj) = {
+                    let n = self.nodes.get(parent_sig).context("rederive: node vanished")?;
+                    (n.pred.clone(), n.proj_col)
+                };
+                let evals: Vec<(String, Option<Value>)> = rows
+                    .iter()
+                    .map(|r| {
+                        let pk = ts.pk_of(r).map(Value::to_key_string).unwrap_or_default();
+                        let pv = if pred.matches_ctx(r, self) { Some(r.0.get(proj).cloned().unwrap_or(Value::Null)) } else { None };
+                        (pk, pv)
+                    })
+                    .collect();
+                for f in self.apply_node_flips(parent_sig, evals) {
+                    work.push_back((parent_sig.clone(), f));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Query candidate rows of `ts` where `col = value` (current Postgres state).
+    async fn query_candidates(&self, ts: &TableSchema, col: usize, value: &Value) -> Result<Vec<Row>> {
+        let url = self.pg_url.clone().context("subquery query-back requires postgres")?;
+        let client = crate::pg::connect(&url).await?;
+        let where_sql = value_eq_sql(&ts.columns[col].0, value);
+        let bf = crate::pg::backfill_where(&client, ts, Some(where_sql)).await?;
+        Ok(bf.rows)
+    }
+
+    /// Query all rows of `ts` (for full re-derive).
+    async fn query_all(&self, ts: &TableSchema) -> Result<Vec<Row>> {
+        let url = self.pg_url.clone().context("subquery query-back requires postgres")?;
+        let client = crate::pg::connect(&url).await?;
+        let bf = crate::pg::backfill_where(&client, ts, None).await?;
+        Ok(bf.rows)
+    }
+}
+
+impl SubqueryCollector for SubqueryRegistry {
+    /// Discover (or dedupe) a subquery node: compile its inner predicate (recursively collecting deeper
+    /// nodes), record its child edges, and queue it for seeding. Returns the canonical signature.
+    fn collect(&mut self, table: &str, project: &str, where_: Option<&PredicateJson>) -> Result<SubquerySig> {
+        let sig = subquery_sig(table, project, where_);
+        if let Some(n) = self.nodes.get_mut(&sig) {
+            n.refcount += 1;
+            return Ok(sig);
+        }
+        let inner_ts = self.schemas.get(table).cloned().context("subquery: unknown inner table")?;
+        let inner_pred = match where_ {
+            Some(w) => CompiledPredicate::compile_with(w, &inner_ts, self)?,
+            None => CompiledPredicate::MatchAll,
+        };
+        // Record edges from each child node to THIS node (so a child flip re-derives this node's rows).
+        for (col, child_sig, negated) in collect_in_leaves(&inner_pred) {
+            self.edges.push(Edge {
+                node_sig: child_sig,
+                dependent: Dependent::Node(sig.clone()),
+                connecting_col: col,
+                negated,
+            });
+        }
+        let proj_col = inner_ts.column_index(project)?;
+        let mut node =
+            SubqueryNode::new(sig.clone(), table.to_string(), proj_col, inner_ts.pk_index, Arc::new(inner_pred), 0);
+        node.where_json = where_.cloned();
+        node.refcount = 1;
+        self.nodes.insert(sig.clone(), node);
+        self.pending_seed.push(sig.clone());
+        Ok(sig)
     }
 }
 
@@ -181,9 +672,68 @@ impl SubqueryEval for SubqueryRegistry {
     }
 }
 
-/// Build a `TableSchema` lookup that the registry uses for seeding/SQL/evaluation. Shared with the
-/// engine's compiled schema (`Arc<HashMap<String, TableSchema>>`).
-pub type SchemaMap = Arc<HashMap<String, TableSchema>>;
+/// Find all `IN (SELECT …)` leaves in a compiled predicate: `(connecting column index, node sig,
+/// negated)` for each. Used to record dependency edges.
+pub fn collect_in_leaves(p: &CompiledPredicate) -> Vec<(usize, SubquerySig, bool)> {
+    let mut out = Vec::new();
+    fn go(p: &CompiledPredicate, out: &mut Vec<(usize, SubquerySig, bool)>) {
+        match p {
+            CompiledPredicate::And(v) | CompiledPredicate::Or(v) => v.iter().for_each(|c| go(c, out)),
+            CompiledPredicate::Not(b) => go(b, out),
+            CompiledPredicate::InSubquery { col, sig, negated } => out.push((*col, sig.clone(), *negated)),
+            _ => {}
+        }
+    }
+    go(p, &mut out);
+    out
+}
+
+/// Does a JSON predicate contain any `IN (SELECT …)` subquery?
+pub fn predicate_has_subquery(p: &PredicateJson) -> bool {
+    match p {
+        PredicateJson::In { .. } => true,
+        PredicateJson::And { and } => and.iter().any(predicate_has_subquery),
+        PredicateJson::Or { or } => or.iter().any(predicate_has_subquery),
+        PredicateJson::Not { not } => predicate_has_subquery(not),
+        PredicateJson::Leaf { .. } => false,
+    }
+}
+
+/// Every table referenced by a JSON predicate's subqueries (inner tables, recursively).
+pub fn referenced_tables(p: &PredicateJson) -> Vec<String> {
+    let mut out = Vec::new();
+    fn go(p: &PredicateJson, out: &mut Vec<String>) {
+        match p {
+            PredicateJson::In { subquery, .. } => {
+                if !out.contains(&subquery.table) {
+                    out.push(subquery.table.clone());
+                }
+                if let Some(w) = &subquery.where_ {
+                    go(w, out);
+                }
+            }
+            PredicateJson::And { and } => and.iter().for_each(|c| go(c, out)),
+            PredicateJson::Or { or } => or.iter().for_each(|c| go(c, out)),
+            PredicateJson::Not { not } => go(not, out),
+            PredicateJson::Leaf { .. } => {}
+        }
+    }
+    go(p, &mut out);
+    out
+}
+
+/// Build a `WHERE col = value` fragment + params for a move query-back. Text is parameterized; other
+/// scalars are inlined (mirrors the SQL emitter). NULL never reaches here (handled by full re-derive).
+fn value_eq_sql(col: &str, value: &Value) -> (String, Vec<String>) {
+    let name = crate::pg::quote_ident(col);
+    match value {
+        Value::Null => (format!("{name} IS NULL"), Vec::new()),
+        Value::Int(i) => (format!("{name} = {i}"), Vec::new()),
+        Value::Float(f) => (format!("{name} = {}", f.0), Vec::new()),
+        Value::Bool(b) => (format!("{name} = {}", if *b { "true" } else { "false" }), Vec::new()),
+        Value::Text(s) => (format!("{name} = $1"), vec![s.clone()]),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -244,7 +794,7 @@ mod tests {
 
     #[test]
     fn registry_eval_reads_node_sets() {
-        let mut reg = SubqueryRegistry::new();
+        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
         let mut n = node();
         n.reconcile_row("a", Some(Value::Int(1)));
         n.reconcile_row("b", Some(Value::Null));

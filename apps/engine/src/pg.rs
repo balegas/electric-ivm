@@ -125,11 +125,37 @@ pub async fn backfill(client: &Client, ts: &TableSchema, filter: Option<&Compile
 }
 
 async fn backfill_in_txn(client: &Client, ts: &TableSchema, filter: Option<&CompiledPredicate>) -> Result<Backfill> {
-    let seed_lsn: String = client.query_one("select pg_current_wal_lsn()::text", &[]).await?.get(0);
     // Push the shape's predicate into the SELECT so only matching rows are read. Text literals are
     // bound parameters; numeric/bool/null are inlined (see `crate::sql`). The engine still applies
     // `matches()` afterward, so the SQL only needs to be a sound superset filter.
-    let (where_clause, params) = match filter.and_then(|p| crate::sql::predicate_to_sql(p, ts)) {
+    let where_sql = filter.and_then(|p| crate::sql::predicate_to_sql(p, ts));
+    backfill_where_in_txn(client, ts, where_sql).await
+}
+
+/// Like [`backfill`], but with a **prebuilt** `WHERE` fragment + params (from the JSON SQL emitter) —
+/// used for subquery shapes/nodes, whose `IN (SELECT …)` SQL the compiled-predicate emitter can't
+/// reconstruct. `where_sql = None` reads the whole table.
+pub async fn backfill_where(
+    client: &Client,
+    ts: &TableSchema,
+    where_sql: Option<(String, Vec<String>)>,
+) -> Result<Backfill> {
+    client
+        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .await
+        .context("begin backfill snapshot")?;
+    let result = backfill_where_in_txn(client, ts, where_sql).await;
+    client.batch_execute("COMMIT").await.ok();
+    result
+}
+
+async fn backfill_where_in_txn(
+    client: &Client,
+    ts: &TableSchema,
+    where_sql: Option<(String, Vec<String>)>,
+) -> Result<Backfill> {
+    let seed_lsn: String = client.query_one("select pg_current_wal_lsn()::text", &[]).await?.get(0);
+    let (where_clause, params) = match where_sql {
         Some((w, ps)) => (format!(" where {w}"), ps),
         None => (String::new(), Vec::new()),
     };
