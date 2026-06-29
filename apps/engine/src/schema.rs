@@ -90,10 +90,23 @@ impl TableSchema {
 
     /// Serialize a `Row` back to a JSON object keyed by column name.
     pub fn row_to_json(&self, row: &Row) -> serde_json::Value {
-        let mut m = serde_json::Map::with_capacity(self.columns.len());
-        for (i, (cname, _)) in self.columns.iter().enumerate() {
-            let v = row.0.get(i).cloned().unwrap_or(Value::Null);
-            m.insert(cname.clone(), v.to_json());
+        self.row_to_json_cols(row, None)
+    }
+
+    /// Serialize a row to a JSON object. With `cols = Some(indices)` only those columns are emitted
+    /// (a shape's output projection); `None` emits the full row. Used to keep large unused columns out
+    /// of a shape's stream (e.g. the list view never reads `description`).
+    pub fn row_to_json_cols(&self, row: &Row, cols: Option<&[usize]>) -> serde_json::Value {
+        let mut m = serde_json::Map::with_capacity(cols.map_or(self.columns.len(), <[usize]>::len));
+        let mut emit = |i: usize| {
+            if let Some((cname, _)) = self.columns.get(i) {
+                let v = row.0.get(i).cloned().unwrap_or(Value::Null);
+                m.insert(cname.clone(), v.to_json());
+            }
+        };
+        match cols {
+            Some(cols) => cols.iter().for_each(|&i| emit(i)),
+            None => (0..self.columns.len()).for_each(emit),
         }
         serde_json::Value::Object(m)
     }

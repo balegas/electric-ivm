@@ -71,7 +71,7 @@ export function createCore(opts: CoreOptions): ElectricCore {
     async createShape(def) {
       return engineJson<ShapeHandle>('/shapes', {
         method: 'POST',
-        body: JSON.stringify({ table: def.table, where: def.where ?? null }),
+        body: JSON.stringify({ table: def.table, where: def.where ?? null, columns: def.columns ?? null }),
       })
     },
 

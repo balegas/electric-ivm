@@ -2,7 +2,7 @@ import { ilike, or } from '@tanstack/db'
 
 import type { Filters } from '../App'
 import { navigate } from '../App'
-import { type Issue, issuesShapeDef, updateIssue } from '../electric'
+import { type Issue, issuesShapeDef, LIST_COLUMNS, updateIssue } from '../electric'
 import { PRIORITY_RANK } from '../schema'
 import { useShapeRows } from '../lib/useShape'
 import { Virtual } from '../lib/Virtual'
@@ -57,8 +57,10 @@ export function IssueList({
   // created/modified are real numeric columns → order in-query; priority is a rank over a TEXT enum
   // (no integer column), so that one ordering is applied client-side below.
   const dateSort = filters.orderBy === 'created' || filters.orderBy === 'modified'
+  // Browse syncs only the displayed columns (no `description`); search needs the full row to match on
+  // `description`, so it omits the projection.
   const { rows, loading } = useShapeRows<Issue>(
-    issuesShapeDef(filters.statuses, filters.priorities),
+    issuesShapeDef(filters.statuses, filters.priorities, showSearch ? undefined : LIST_COLUMNS),
     (b) => {
       let query = b
       if (q) query = query.where(({ t }: { t: Issue }) => or(ilike(t.title, `%${q}%`), ilike(t.description, `%${q}%`)))

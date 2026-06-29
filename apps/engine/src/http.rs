@@ -43,6 +43,9 @@ struct CreateShapeReq {
     table: String,
     #[serde(default, rename = "where")]
     where_: Option<PredicateJson>,
+    /// Optional output projection: column names to sync. Omitted = the full row.
+    #[serde(default)]
+    columns: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -65,7 +68,7 @@ async fn create_shape(
     State(engine): State<Engine>,
     Json(req): Json<CreateShapeReq>,
 ) -> Result<Json<ShapeResp>, AppError> {
-    let rec = engine.create_shape(&req.table, req.where_).await?;
+    let rec = engine.create_shape(&req.table, req.where_, req.columns).await?;
     Ok(Json(ShapeResp::of(&engine, rec)))
 }
 

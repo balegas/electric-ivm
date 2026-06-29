@@ -43,9 +43,14 @@ export interface ElectricLiteClient {
   close(): Promise<void>
 }
 
-function zodRowSchema(def: TableDef): z.ZodType {
+function zodRowSchema(def: TableDef, cols?: string[]): z.ZodType {
+  // When the shape projects a column subset, validate only those columns (+ pk) — the projected rows
+  // genuinely omit the rest, so requiring them would reject every row. The pk is always present.
+  const names = cols ? Array.from(new Set([def.primaryKey, ...cols])) : Object.keys(def.columns)
   const shape: Record<string, z.ZodTypeAny> = {}
-  for (const [col, c] of Object.entries(def.columns)) {
+  for (const col of names) {
+    const c = def.columns[col]
+    if (!c) continue
     // pk is validated as its declared type here, then the dispatcher stringifies it on the row.
     const base = c.type === 'bool' ? z.boolean() : c.type === 'text' ? z.string() : z.number()
     // Non-pk columns are nullable (the pk is never null); allow null cells to materialize.
@@ -93,10 +98,11 @@ export function createClient(opts: {
       const handle = (await trpc.shapes.create.mutate({
         table: def.table,
         where: def.where as never,
+        columns: def.columns,
       })) as ShapeHandle
 
       const state = createStateSchema({
-        [def.table]: { schema: zodRowSchema(tableDef), type: def.table, primaryKey: tableDef.primaryKey },
+        [def.table]: { schema: zodRowSchema(tableDef, def.columns), type: def.table, primaryKey: tableDef.primaryKey },
       })
       const streamUrl = opts.dsBaseUrl
         ? `${opts.dsBaseUrl.replace(/\/$/, '')}/${handle.streamPath}`

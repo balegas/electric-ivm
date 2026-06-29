@@ -92,18 +92,28 @@ export function deleteComment(id: number) {
 const anyOf = (col: string, values: string[]): Predicate =>
   values.length === 1 ? { col, op: 'eq', value: values[0]! } : { or: values.map((v) => ({ col, op: 'eq', value: v })) }
 
-/** Build the list view's shape from the active status/priority filters. Empty filters => match-all. */
-export function issuesShapeDef(statuses: Status[], priorities: Priority[]): ShapeDef {
+// The list/board never render `description` (a large lorem blob — ~55% of each issue's bytes); it's
+// only needed by search. Projecting it out of the browse shapes cuts the synced payload roughly in
+// half. Search syncs the full row (columns omitted) so it can match on description.
+export const LIST_COLUMNS = ['id', 'title', 'status', 'priority', 'username', 'created', 'modified', 'kanbanorder']
+const BOARD_COLUMNS = ['id', 'title', 'priority', 'username', 'kanbanorder']
+
+/**
+ * Build the list view's shape from the active status/priority filters. Empty filters => match-all.
+ * `columns` restricts which columns sync (the pk is always included); omit it for the full row.
+ */
+export function issuesShapeDef(statuses: Status[], priorities: Priority[], columns?: string[]): ShapeDef {
   const clauses: Predicate[] = []
   if (statuses.length) clauses.push(anyOf('status', statuses))
   if (priorities.length) clauses.push(anyOf('priority', priorities))
   const where = clauses.length === 0 ? undefined : clauses.length === 1 ? clauses[0] : { and: clauses }
-  return { table: 'issues', where }
+  return { table: 'issues', where, columns }
 }
 
 export const statusShapeDef = (status: Status): ShapeDef => ({
   table: 'issues',
   where: { col: 'status', op: 'eq', value: status },
+  columns: BOARD_COLUMNS,
 })
 
 export const commentsShapeDef = (issueId: number): ShapeDef => ({

@@ -75,6 +75,13 @@ export interface ShapeDef {
   table: string
   /** Omitted/undefined predicate means "all rows of the table". */
   where?: Predicate
+  /**
+   * Output projection: the columns to sync to the client. Omitted = the full row. The primary key is
+   * always included (the client keys rows by it). Use this to keep large unused columns out of a
+   * shape's stream (e.g. a list view that never reads a big `description`). The predicate may still
+   * reference columns outside this set — projection only affects what is emitted, not what is matched.
+   */
+  columns?: string[]
 }
 
 /** Handle returned when a shape is registered; the client materializes from `streamPath`. */

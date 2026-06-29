@@ -76,7 +76,14 @@ pub struct FamilyStat {
 }
 
 enum TailerCmd {
-    AddShape { shape_id: String, num_id: u64, stream_path: String, pred: Arc<CompiledPredicate> },
+    AddShape {
+        shape_id: String,
+        num_id: u64,
+        stream_path: String,
+        pred: Arc<CompiledPredicate>,
+        /// Output projection (column indices to emit), or `None` for the full row.
+        out_cols: Option<Arc<Vec<usize>>>,
+    },
     RemoveShape { shape_id: String },
 }
 
@@ -161,13 +168,35 @@ impl Engine {
         Ok(())
     }
 
-    pub async fn create_shape(&self, table: &str, where_: Option<PredicateJson>) -> Result<ShapeRecord> {
+    pub async fn create_shape(
+        &self,
+        table: &str,
+        where_: Option<PredicateJson>,
+        columns: Option<Vec<String>>,
+    ) -> Result<ShapeRecord> {
         let mut st = self.state.lock().await;
         let ts = match st.tables.get(table) {
             Some(ts) => ts.clone(),
             None => bail!("unknown table '{table}'"),
         };
         let pred = Arc::new(CompiledPredicate::compile_opt(where_.as_ref(), &ts)?);
+        // Resolve the optional output projection to column indices. The pk is always included (the
+        // client keys rows by it); indices are sorted into schema order for a stable JSON shape.
+        let out_cols: Option<Arc<Vec<usize>>> = match columns {
+            None => None,
+            Some(names) => {
+                let mut idxs = Vec::with_capacity(names.len() + 1);
+                for name in &names {
+                    idxs.push(ts.column_index(name)?);
+                }
+                if !idxs.contains(&ts.pk_index) {
+                    idxs.push(ts.pk_index);
+                }
+                idxs.sort_unstable();
+                idxs.dedup();
+                Some(Arc::new(idxs))
+            }
+        };
 
         let num_id = st.next_shape_id;
         let id = format!("s{num_id}");
@@ -182,7 +211,13 @@ impl Engine {
         let tailer = st.tailers.get(table).expect("tailer just inserted");
         tailer
             .cmd_tx
-            .send(TailerCmd::AddShape { shape_id: id.clone(), num_id, stream_path: stream_path.clone(), pred })
+            .send(TailerCmd::AddShape {
+                shape_id: id.clone(),
+                num_id,
+                stream_path: stream_path.clone(),
+                pred,
+                out_cols,
+            })
             .map_err(|_| anyhow::anyhow!("tailer for '{table}' is gone"))?;
 
         let rec = ShapeRecord { id: id.clone(), table: table.to_string(), stream_path };
@@ -228,6 +263,8 @@ struct StandaloneShape {
     /// WAL LSN of this shape's backfill snapshot; replication changes whose commit LSN is strictly
     /// `< seed_lsn` are already reflected and are skipped (see `process_envelope`).
     seed_lsn: u64,
+    /// Output projection (column indices), or `None` to emit the full row.
+    out_cols: Option<Arc<Vec<usize>>>,
 }
 
 /// Evaluate a stateless WHERE filter directly on a Z-set delta. A filter has no incremental state
@@ -249,6 +286,8 @@ struct RoutedShape {
     /// WAL LSN of THIS shape's own backfill snapshot; replication changes whose commit LSN is strictly
     /// `< seed_lsn` are already in the backfill and are skipped (see `process_envelope`).
     seed_lsn: u64,
+    /// Output projection (column indices), or `None` to emit the full row.
+    out_cols: Option<Arc<Vec<usize>>>,
 }
 
 /// All equality shapes sharing one key-column set, indexed by key tuple. Holds **no table rows** —
@@ -315,10 +354,10 @@ async fn tailer_loop(
         tokio::select! {
             biased;
             cmd = cmd_rx.recv() => match cmd {
-                Some(TailerCmd::AddShape { shape_id, num_id, stream_path, pred }) => {
+                Some(TailerCmd::AddShape { shape_id, num_id, stream_path, pred, out_cols }) => {
                     if let Err(e) = add_shape_routed(
                         &ds, &ts, &pg_url, &mut shapes, &mut families, &mut family_of,
-                        shape_id, num_id, stream_path, pred,
+                        shape_id, num_id, stream_path, pred, out_cols,
                     ).await {
                         tracing::error!("add_shape failed: {e:#}");
                     }
@@ -388,7 +427,9 @@ async fn add_shape_routed(
     num_id: u64,
     stream_path: String,
     pred: Arc<CompiledPredicate>,
+    out_cols: Option<Arc<Vec<usize>>>,
 ) -> Result<()> {
+    let proj = out_cols.as_deref().map(Vec::as_slice);
     match pred.equality_template() {
         Some(pairs) => {
             let key_cols: Vec<usize> = pairs.iter().map(|(c, _)| *c).collect();
@@ -400,7 +441,7 @@ async fn add_shape_routed(
             let bf = pg_backfill(pg_url, ts, Some(pred.as_ref())).await?;
             let out: Vec<(Row, ZWeight)> = bf.rows.iter().map(|r| (r.clone(), 1)).collect();
             if !out.is_empty() {
-                let envs = translate_output(ts, out, None);
+                let envs = translate_output(ts, out, None, proj);
                 ds.append(&stream_path, &envs).await?;
             }
 
@@ -411,6 +452,7 @@ async fn add_shape_routed(
                 num_id,
                 stream_path,
                 seed_lsn: crate::pg::lsn_to_u64(&bf.seed_lsn),
+                out_cols,
             });
             family_of.insert(shape_id, (key_cols, num_id, key_tuple));
         }
@@ -422,12 +464,12 @@ async fn add_shape_routed(
             let out: Vec<(Row, ZWeight)> =
                 bf.rows.iter().filter(|r| pred.matches(r)).map(|r| (r.clone(), 1)).collect();
             if !out.is_empty() {
-                let envs = translate_output(ts, out, None);
+                let envs = translate_output(ts, out, None, proj);
                 ds.append(&stream_path, &envs).await?;
             }
             shapes.insert(
                 shape_id,
-                StandaloneShape { pred, stream_path, seed_lsn: crate::pg::lsn_to_u64(&bf.seed_lsn) },
+                StandaloneShape { pred, stream_path, seed_lsn: crate::pg::lsn_to_u64(&bf.seed_lsn), out_cols },
             );
         }
     }
@@ -482,7 +524,7 @@ async fn process_envelope(
         if out.is_empty() {
             continue;
         }
-        let envs = translate_output(ts, out, txid.clone());
+        let envs = translate_output(ts, out, txid.clone(), shape.out_cols.as_deref().map(Vec::as_slice));
         pending.entry(shape.stream_path.clone()).or_default().extend(envs);
     }
     // Equality routers: route each delta row by its key to exactly the shapes registered on that key.
@@ -491,7 +533,8 @@ async fn process_envelope(
     // already in that shape's backfill are skipped.
     let _s = Timer::new(&metrics().family_step);
     for router in families.values() {
-        let mut by_shape: HashMap<u64, (&str, Vec<(Row, ZWeight)>)> = HashMap::new();
+        type ShapeOut<'a> = (&'a str, Option<&'a [usize]>, Vec<(Row, ZWeight)>);
+        let mut by_shape: HashMap<u64, ShapeOut> = HashMap::new();
         for Tup2(row, w) in &delta {
             let key = key_of(row, &router.key_cols);
             let Some(routed) = router.index.get(&key) else { continue };
@@ -501,8 +544,8 @@ async fn process_envelope(
                 }
                 by_shape
                     .entry(rs.num_id)
-                    .or_insert_with(|| (rs.stream_path.as_str(), Vec::new()))
-                    .1
+                    .or_insert_with(|| (rs.stream_path.as_str(), rs.out_cols.as_deref().map(Vec::as_slice), Vec::new()))
+                    .2
                     .push((row.clone(), *w));
             }
         }
@@ -510,8 +553,8 @@ async fn process_envelope(
             continue;
         }
         metrics().family_steps.fetch_add(1, Ordering::Relaxed);
-        for (_sid, (stream_path, rows)) in by_shape {
-            let envs = translate_output(ts, rows, txid.clone());
+        for (_sid, (stream_path, out_cols, rows)) in by_shape {
+            let envs = translate_output(ts, rows, txid.clone(), out_cols);
             if !envs.is_empty() {
                 pending.entry(stream_path.to_string()).or_default().extend(envs);
             }
@@ -592,7 +635,12 @@ pub(crate) fn apply_envelope(
 
 /// Translate a shape circuit's output Z-set delta into State-Protocol envelopes. Grouped by pk:
 /// any positive-weight row -> `upsert` (enter/update); otherwise `delete` (leave).
-pub(crate) fn translate_output(ts: &TableSchema, out: Vec<(Row, ZWeight)>, txid: Option<String>) -> Vec<Envelope> {
+pub(crate) fn translate_output(
+    ts: &TableSchema,
+    out: Vec<(Row, ZWeight)>,
+    txid: Option<String>,
+    out_cols: Option<&[usize]>,
+) -> Vec<Envelope> {
     let mut pos: HashMap<String, Row> = HashMap::new();
     let mut neg: HashSet<String> = HashSet::new();
     for (row, w) in out {
@@ -614,7 +662,7 @@ pub(crate) fn translate_output(ts: &TableSchema, out: Vec<(Row, ZWeight)>, txid:
         envs.push(Envelope {
             type_: ts.name.clone(),
             key: pk.clone(),
-            value: Some(ts.row_to_json(row)),
+            value: Some(ts.row_to_json_cols(row, out_cols)),
             old: None,
             headers: EnvelopeHeaders { operation: "upsert".into(), txid: txid.clone(), offset: None, lsn: None },
         });
@@ -673,28 +721,28 @@ mod tests {
 
         // enter: insert an active row -> upsert envelope
         let (delta, _, _) = apply_envelope(&ts, &env("insert", "1", Some(serde_json::json!({"id":1,"name":"a","active":true})), None)).unwrap();
-        let envs = translate_output(&ts, eval_standalone(&pred, &delta), None);
+        let envs = translate_output(&ts, eval_standalone(&pred, &delta), None, None);
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].headers.operation, "upsert");
         assert_eq!(envs[0].key, "1");
 
         // update within shape (name change, still active) -> upsert with new value
         let (delta, _, _) = apply_envelope(&ts, &env("update", "1", Some(serde_json::json!({"id":1,"name":"a2","active":true})), Some(serde_json::json!({"id":1,"name":"a","active":true})))).unwrap();
-        let envs = translate_output(&ts, eval_standalone(&pred, &delta), None);
+        let envs = translate_output(&ts, eval_standalone(&pred, &delta), None, None);
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].headers.operation, "upsert");
         assert_eq!(envs[0].value.as_ref().unwrap()["name"], "a2");
 
         // leave: becomes inactive -> delete envelope
         let (delta, _, _) = apply_envelope(&ts, &env("update", "1", Some(serde_json::json!({"id":1,"name":"a2","active":false})), Some(serde_json::json!({"id":1,"name":"a2","active":true})))).unwrap();
-        let envs = translate_output(&ts, eval_standalone(&pred, &delta), None);
+        let envs = translate_output(&ts, eval_standalone(&pred, &delta), None, None);
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].headers.operation, "delete");
         assert_eq!(envs[0].key, "1");
 
         // a non-matching insert produces no shape envelope
         let (delta, _, _) = apply_envelope(&ts, &env("insert", "2", Some(serde_json::json!({"id":2,"name":"b","active":false})), None)).unwrap();
-        let envs = translate_output(&ts, eval_standalone(&pred, &delta), None);
+        let envs = translate_output(&ts, eval_standalone(&pred, &delta), None, None);
         assert_eq!(envs.len(), 0);
     }
 }
