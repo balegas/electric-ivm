@@ -28,6 +28,11 @@ body {
 .layout { display: grid; grid-template-columns: 240px 1fr; height: 100vh; }
 .main { overflow-y: auto; }
 
+/* List view: fixed header + an internal scroll viewport the virtualizer drives (so only visible
+   rows mount). The viewport owns the scroll; .main no longer scrolls for this route. */
+.list-pane { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.issue-list-viewport { flex: 1; min-height: 0; overflow-y: auto; }
+
 /* ---- sidebar ---- */
 .sidebar {
   background: var(--panel);

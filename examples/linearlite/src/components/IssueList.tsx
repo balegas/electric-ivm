@@ -5,8 +5,28 @@ import { navigate } from '../App'
 import { type Issue, issuesShapeDef, updateIssue } from '../electric'
 import { PRIORITY_RANK } from '../schema'
 import { useShapeRows } from '../lib/useShape'
+import { Virtual } from '../lib/Virtual'
 import { Avatar, displayId, formatDate, PriorityMenu, StatusMenu } from './ui'
 import { TopFilter } from './TopFilter'
+
+function IssueRow({ issue }: { issue: Issue }): JSX.Element {
+  return (
+    <div className="issue-row">
+      <span onClick={(e) => e.stopPropagation()}>
+        <PriorityMenu value={issue.priority} onChange={(priority) => updateIssue(issue, { priority })} />
+      </span>
+      <span onClick={(e) => e.stopPropagation()}>
+        <StatusMenu value={issue.status} onChange={(status) => updateIssue(issue, { status })} />
+      </span>
+      <span className="issue-id">{displayId(issue.id)}</span>
+      <button type="button" className="issue-title" onClick={() => navigate(`#/issue/${issue.id}`)}>
+        {issue.title}
+      </button>
+      <span className="issue-date">{formatDate(issue.created)}</span>
+      <Avatar name={issue.username} />
+    </div>
+  )
+}
 
 function listTitle(filters: Filters, showSearch?: boolean): string {
   if (showSearch) return 'Search'
@@ -58,28 +78,20 @@ export function IssueList({
       : rows
 
   return (
-    <>
+    <div className="list-pane">
       <TopFilter title={listTitle(filters, showSearch)} count={sorted.length} filters={filters} setFilters={setFilters} showSearch={showSearch} />
-      <div className="issue-list">
-        {loading && <div className="empty">Loading shape…</div>}
-        {!loading && sorted.length === 0 && <div className="empty">No issues match.</div>}
-        {sorted.map((issue) => (
-          <div key={issue.id} className="issue-row">
-            <span onClick={(e) => e.stopPropagation()}>
-              <PriorityMenu value={issue.priority} onChange={(priority) => updateIssue(issue, { priority })} />
-            </span>
-            <span onClick={(e) => e.stopPropagation()}>
-              <StatusMenu value={issue.status} onChange={(status) => updateIssue(issue, { status })} />
-            </span>
-            <span className="issue-id">{displayId(issue.id)}</span>
-            <button type="button" className="issue-title" onClick={() => navigate(`#/issue/${issue.id}`)}>
-              {issue.title}
-            </button>
-            <span className="issue-date">{formatDate(issue.created)}</span>
-            <Avatar name={issue.username} />
-          </div>
-        ))}
-      </div>
-    </>
+      {loading && <div className="empty">Loading shape…</div>}
+      {!loading && sorted.length === 0 && <div className="empty">No issues match.</div>}
+      {!loading && sorted.length > 0 && (
+        // Only the visible rows are mounted (see Virtual): renders ~30 nodes instead of one per issue.
+        <Virtual
+          className="issue-list-viewport"
+          items={sorted}
+          getKey={(issue) => issue.id}
+          estimateSize={41}
+          renderItem={(issue) => <IssueRow issue={issue} />}
+        />
+      )}
+    </div>
   )
 }

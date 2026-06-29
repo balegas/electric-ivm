@@ -4,7 +4,27 @@ import { navigate } from '../App'
 import { type Issue, statusShapeDef, updateIssue } from '../electric'
 import { STATUS_LABEL, STATUSES, type Status } from '../schema'
 import { useShapeRows } from '../lib/useShape'
+import { Virtual } from '../lib/Virtual'
 import { Avatar, displayId, PriorityIcon, StatusIcon } from './ui'
+
+function BoardCard({ issue }: { issue: Issue }): JSX.Element {
+  return (
+    <div
+      className="board-card"
+      draggable
+      onDragStart={(e) => e.dataTransfer.setData('issue-id', String(issue.id))}
+      onClick={() => navigate(`#/issue/${issue.id}`)}
+    >
+      <div className="board-card-title">{issue.title}</div>
+      <div className="board-card-meta">
+        <PriorityIcon priority={issue.priority} />
+        <span className="issue-id">{displayId(issue.id)}</span>
+        <span className="spacer" />
+        <Avatar name={issue.username} size={20} />
+      </div>
+    </div>
+  )
+}
 
 function BoardColumn({
   status,
@@ -50,25 +70,15 @@ function BoardColumn({
         <StatusIcon status={status} /> <span>{STATUS_LABEL[status]}</span>
         <span className="count-pill">{rows.length}</span>
       </div>
-      <div className="board-col-body">
-        {rows.map((issue) => (
-          <div
-            key={issue.id}
-            className="board-card"
-            draggable
-            onDragStart={(e) => e.dataTransfer.setData('issue-id', String(issue.id))}
-            onClick={() => navigate(`#/issue/${issue.id}`)}
-          >
-            <div className="board-card-title">{issue.title}</div>
-            <div className="board-card-meta">
-              <PriorityIcon priority={issue.priority} />
-              <span className="issue-id">{displayId(issue.id)}</span>
-              <span className="spacer" />
-              <Avatar name={issue.username} size={20} />
-            </div>
-          </div>
-        ))}
-      </div>
+      {/* Only the cards in view are mounted (see Virtual): a 4k-card column renders ~20 nodes. */}
+      <Virtual
+        className="board-col-body"
+        items={rows}
+        getKey={(issue) => issue.id}
+        estimateSize={76}
+        gap={8}
+        renderItem={(issue) => <BoardCard issue={issue} />}
+      />
     </div>
   )
 }
