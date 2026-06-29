@@ -82,18 +82,6 @@ export interface ShapeDef {
    * reference columns outside this set — projection only affects what is emitted, not what is matched.
    */
   columns?: string[]
-  /**
-   * Backfill order for cursor pagination (the engine appends the primary key as a tiebreaker for a
-   * total, stable order). Required when `limit` is set, for a deterministic window.
-   */
-  orderBy?: { col: string; desc?: boolean }
-  /**
-   * Backfill window size: sync at most this many rows (the first `limit` by `orderBy`). The cursor for
-   * the next page is carried in `where` (a range like `created < lastSeen`), so each page is a bounded
-   * range query. Live changes matching the predicate still flow in — a page is a backfill bound, not a
-   * live-maintained top-N.
-   */
-  limit?: number
 }
 
 /** Handle returned when a shape is registered; the client materializes from `streamPath`. */

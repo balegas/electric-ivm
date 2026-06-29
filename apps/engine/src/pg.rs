@@ -97,18 +97,6 @@ pub async fn ensure_slot(client: &Client, slot: &str) -> Result<()> {
     Ok(())
 }
 
-/// Backfill window: an optional ORDER BY + LIMIT applied to the snapshot read. Used for cursor/range
-/// pagination — read only the first `limit` rows by `order` (the engine appends the pk as a
-/// tiebreaker for a total, stable order). The cursor itself rides in the predicate (a range like
-/// `col < $cursor`), so this only carries the ordering + bound. Live changes are unaffected (a page is
-/// a backfill bound, not a live-maintained top-N).
-#[derive(Default, Clone, Copy)]
-pub struct Window {
-    /// `(column index, descending?)` for ORDER BY.
-    pub order: Option<(usize, bool)>,
-    pub limit: Option<i64>,
-}
-
 pub struct Backfill {
     pub rows: Vec<Row>,
     /// `pg_current_wal_lsn()` of the snapshot. A transaction visible to this REPEATABLE READ snapshot
@@ -126,27 +114,17 @@ pub struct Backfill {
 /// `filter`, when given, is the shape's predicate: backfill reads only the matching rows
 /// (`… WHERE <predicate>`) instead of the whole table, so a selective shape never scans/transfers the
 /// rest. `None` reads the whole table (used while a family still seeds a full-table trace).
-pub async fn backfill(
-    client: &Client,
-    ts: &TableSchema,
-    filter: Option<&CompiledPredicate>,
-    window: Window,
-) -> Result<Backfill> {
+pub async fn backfill(client: &Client, ts: &TableSchema, filter: Option<&CompiledPredicate>) -> Result<Backfill> {
     client
         .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .await
         .context("begin backfill snapshot")?;
-    let result = backfill_in_txn(client, ts, filter, window).await;
+    let result = backfill_in_txn(client, ts, filter).await;
     client.batch_execute("COMMIT").await.ok();
     result
 }
 
-async fn backfill_in_txn(
-    client: &Client,
-    ts: &TableSchema,
-    filter: Option<&CompiledPredicate>,
-    window: Window,
-) -> Result<Backfill> {
+async fn backfill_in_txn(client: &Client, ts: &TableSchema, filter: Option<&CompiledPredicate>) -> Result<Backfill> {
     let seed_lsn: String = client.query_one("select pg_current_wal_lsn()::text", &[]).await?.get(0);
     // Push the shape's predicate into the SELECT so only matching rows are read. Text literals are
     // bound parameters; numeric/bool/null are inlined (see `crate::sql`). The engine still applies
@@ -157,22 +135,8 @@ async fn backfill_in_txn(
     };
     let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
         params.iter().map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-    // Optional window (cursor pagination). The pk is appended to ORDER BY as a tiebreaker so the bound
-    // is total and stable across pages. A LIMIT without an explicit order falls back to pk order so the
-    // page is deterministic. Column/pk names are quoted idents and the limit is a non-negative integer
-    // literal — no injection surface.
-    let order_sql = match window.order {
-        Some((col, desc)) => {
-            let d = if desc { "desc" } else { "asc" };
-            format!(" order by {} {d}, {} {d}", quote_ident(&ts.columns[col].0), quote_ident(&ts.pk_name))
-        }
-        None if window.limit.is_some() => format!(" order by {} asc", quote_ident(&ts.pk_name)),
-        None => String::new(),
-    };
-    let limit_sql = window.limit.map(|n| format!(" limit {}", n.max(0))).unwrap_or_default();
     // to_jsonb gives one JSON object per row, so we reuse the schema's JSON->Row mapping verbatim.
-    let q =
-        format!("select to_jsonb(t) from {} t{}{}{}", quote_ident(&ts.name), where_clause, order_sql, limit_sql);
+    let q = format!("select to_jsonb(t) from {} t{}", quote_ident(&ts.name), where_clause);
     let rows = client.query(&q, &param_refs).await.with_context(|| format!("backfill select {}", ts.name))?;
     let mut out = Vec::with_capacity(rows.len());
     for r in &rows {

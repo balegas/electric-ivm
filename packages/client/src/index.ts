@@ -99,8 +99,6 @@ export function createClient(opts: {
         table: def.table,
         where: def.where as never,
         columns: def.columns,
-        orderBy: def.orderBy,
-        limit: def.limit,
       })) as ShapeHandle
 
       const state = createStateSchema({

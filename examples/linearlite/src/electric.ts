@@ -98,58 +98,16 @@ const anyOf = (col: string, values: string[]): Predicate =>
 export const LIST_COLUMNS = ['id', 'title', 'status', 'priority', 'username', 'created', 'modified', 'kanbanorder']
 const BOARD_COLUMNS = ['id', 'title', 'priority', 'username', 'kanbanorder']
 
-/** Cursor for keyset pagination: the (window-column value, pk) of the last row of the previous page. */
-export interface Cursor {
-  col: string
-  val: number
-  pk: number
-}
-
-/** One page of a windowed list: order by `col` (desc/asc) + the pk tiebreaker, `limit` rows, starting
- * after `after`. */
-export interface WindowOpts {
-  col: string
-  desc: boolean
-  limit: number
-  after?: Cursor
-}
-
-// A keyset cursor as a predicate: rows ordered after `c`. For desc: col < val, or (col = val and id <
-// pk). The pk tiebreaker makes the order total, so pages never skip or duplicate at the boundary.
-function cursorRange(c: Cursor, desc: boolean): Predicate {
-  const op = desc ? 'lt' : 'gt'
-  return {
-    or: [
-      { col: c.col, op, value: c.val },
-      { and: [{ col: c.col, op: 'eq', value: c.val }, { col: 'id', op, value: c.pk }] },
-    ],
-  }
-}
-
 /**
  * Build the list view's shape from the active status/priority filters. Empty filters => match-all.
  * `columns` restricts which columns sync (the pk is always included); omit it for the full row.
- * `window`, when given, makes this a single page: the engine reads only the first `limit` rows by the
- * window order (after the cursor), so browse syncs a page at a time instead of the whole table.
  */
-export function issuesShapeDef(
-  statuses: Status[],
-  priorities: Priority[],
-  columns?: string[],
-  window?: WindowOpts,
-): ShapeDef {
+export function issuesShapeDef(statuses: Status[], priorities: Priority[], columns?: string[]): ShapeDef {
   const clauses: Predicate[] = []
   if (statuses.length) clauses.push(anyOf('status', statuses))
   if (priorities.length) clauses.push(anyOf('priority', priorities))
-  if (window?.after) clauses.push(cursorRange(window.after, window.desc))
   const where = clauses.length === 0 ? undefined : clauses.length === 1 ? clauses[0] : { and: clauses }
-  return {
-    table: 'issues',
-    where,
-    columns,
-    orderBy: window ? { col: window.col, desc: window.desc } : undefined,
-    limit: window?.limit,
-  }
+  return { table: 'issues', where, columns }
 }
 
 export const statusShapeDef = (status: Status): ShapeDef => ({

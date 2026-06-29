@@ -79,9 +79,5 @@ export function useShapeRows<T extends Row = Row>(
     // `src` identity gates readiness; `deps` carry whatever `build` closes over.
     [src, ...deps],
   )
-  // Stable empty reference: callers feed `rows` into effect deps (e.g. infinite-scroll paging), so a
-  // fresh `[]` each render would loop. `data` is already a stable reference while unchanged.
-  return { rows: (data ?? EMPTY_ROWS) as T[], loading: def !== null && collection === null }
+  return { rows: (data ?? []) as T[], loading: def !== null && collection === null }
 }
-
-const EMPTY_ROWS: never[] = []
