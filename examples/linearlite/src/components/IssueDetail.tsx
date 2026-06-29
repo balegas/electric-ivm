@@ -8,7 +8,10 @@ import { Avatar, displayId, formatDate, PriorityMenu, StatusMenu } from './ui'
 export function IssueDetail({ id }: { id: number }): JSX.Element {
   // Live single-issue shape + a live per-issue comments shape (created/closed with this view).
   const { rows: issues, loading } = useShapeRows<Issue>({ table: 'issues', where: { col: 'id', op: 'eq', value: id } })
-  const { rows: comments } = useShapeRows<Comment>(commentsShapeDef(id))
+  // Comments ordered oldest-first in the live query.
+  const { rows: comments } = useShapeRows<Comment>(commentsShapeDef(id), (b) =>
+    b.orderBy(({ t }: { t: Comment }) => t.created, 'asc').select(({ t }: { t: Comment }) => t),
+  )
   const issue = issues[0]
 
   const [title, setTitle] = useState('')
@@ -36,7 +39,6 @@ export function IssueDetail({ id }: { id: number }): JSX.Element {
     )
   }
 
-  const sortedComments = [...comments].sort((a, b) => a.created - b.created)
 
   return (
     <div className="detail">
@@ -75,9 +77,9 @@ export function IssueDetail({ id }: { id: number }): JSX.Element {
             onBlur={() => description !== issue.description && updateIssue(issue, { description })}
           />
 
-          <h3 className="comments-title">Comments ({sortedComments.length})</h3>
+          <h3 className="comments-title">Comments ({comments.length})</h3>
           <div className="comments">
-            {sortedComments.map((c) => (
+            {comments.map((c) => (
               <div key={c.id} className="comment">
                 <Avatar name={c.username} />
                 <div className="comment-body">
@@ -91,7 +93,7 @@ export function IssueDetail({ id }: { id: number }): JSX.Element {
                 </div>
               </div>
             ))}
-            {sortedComments.length === 0 && <div className="empty">No comments yet.</div>}
+            {comments.length === 0 && <div className="empty">No comments yet.</div>}
           </div>
 
           <div className="comment-add">

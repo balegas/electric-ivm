@@ -1,3 +1,5 @@
+import { ilike, or } from '@tanstack/db'
+
 import type { Filters } from '../App'
 import { navigate } from '../App'
 import { type Issue, issuesShapeDef, updateIssue } from '../electric'
@@ -25,25 +27,37 @@ export function IssueList({
   showSearch?: boolean
   onNewIssue: () => void
 }): JSX.Element {
-  // The engine evaluates the status/priority predicate; search is applied client-side (no LIKE here).
-  const { rows, loading } = useShapeRows<Issue>(issuesShapeDef(filters.statuses, filters.priorities))
+  // The engine evaluates the status/priority predicate (the shape). Search and ordering are pushed
+  // into the live query — incrementally maintained over the synced shape, not re-run in JS each change.
+  // (Search is a client-side query refinement, so it doesn't re-sync the engine-side shape.)
+  const q = filters.q.trim()
+  const dir = filters.dir
+  // created/modified are real numeric columns → order in-query; priority is a rank over a TEXT enum
+  // (no integer column), so that one ordering is applied client-side below.
+  const dateSort = filters.orderBy === 'created' || filters.orderBy === 'modified'
+  const { rows, loading } = useShapeRows<Issue>(
+    issuesShapeDef(filters.statuses, filters.priorities),
+    (b) => {
+      let query = b
+      if (q) query = query.where(({ t }: { t: Issue }) => or(ilike(t.title, `%${q}%`), ilike(t.description, `%${q}%`)))
+      if (dateSort)
+        query = query
+          .orderBy(({ t }: { t: Issue }) => t[filters.orderBy as 'created' | 'modified'], dir)
+          .orderBy(({ t }: { t: Issue }) => t.id, 'asc')
+      return query.select(({ t }: { t: Issue }) => t)
+    },
+    [q, filters.orderBy, dir],
+  )
 
-  const q = filters.q.trim().toLowerCase()
-  const filtered = q
-    ? rows.filter((r) => r.title.toLowerCase().includes(q) || r.description.toLowerCase().includes(q))
-    : rows
-
-  const sign = filters.dir === 'asc' ? 1 : -1
-  const sorted = [...filtered].sort((a, b) => {
-    let d: number
-    if (filters.orderBy === 'priority') d = PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority]
-    else d = a[filters.orderBy] - b[filters.orderBy]
-    return d !== 0 ? sign * d : a.id - b.id
-  })
+  const sign = dir === 'asc' ? 1 : -1
+  const sorted =
+    filters.orderBy === 'priority'
+      ? [...rows].sort((a, b) => sign * (PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority]) || a.id - b.id)
+      : rows
 
   return (
     <>
-      <TopFilter title={listTitle(filters, showSearch)} count={filtered.length} filters={filters} setFilters={setFilters} showSearch={showSearch} />
+      <TopFilter title={listTitle(filters, showSearch)} count={sorted.length} filters={filters} setFilters={setFilters} showSearch={showSearch} />
       <div className="issue-list">
         {loading && <div className="empty">Loading shape…</div>}
         {!loading && sorted.length === 0 && <div className="empty">No issues match.</div>}

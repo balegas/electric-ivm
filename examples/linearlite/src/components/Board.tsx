@@ -15,9 +15,14 @@ function BoardColumn({
   onDropIssue: (id: number, target: Status, maxOrder: number) => void
   register: (rows: Issue[]) => void
 }): JSX.Element {
-  const { rows } = useShapeRows<Issue>(statusShapeDef(status))
+  // Ordering is pushed into the live query (kanbanorder, then id) — no client-side sort.
+  const { rows } = useShapeRows<Issue>(statusShapeDef(status), (b) =>
+    b
+      .orderBy(({ t }: { t: Issue }) => t.kanbanorder, 'asc')
+      .orderBy(({ t }: { t: Issue }) => t.id, 'asc')
+      .select(({ t }: { t: Issue }) => t),
+  )
   const [over, setOver] = useState(false)
-  const sorted = [...rows].sort((a, b) => a.kanbanorder - b.kanbanorder || a.id - b.id)
   const maxOrder = rows.reduce((m, r) => Math.max(m, r.kanbanorder), 0)
   // Feed the board-level registry so a drop reads the FRESHEST row (not a snapshot from dragstart).
   useEffect(() => {
@@ -46,7 +51,7 @@ function BoardColumn({
         <span className="count-pill">{rows.length}</span>
       </div>
       <div className="board-col-body">
-        {sorted.map((issue) => (
+        {rows.map((issue) => (
           <div
             key={issue.id}
             className="board-card"
