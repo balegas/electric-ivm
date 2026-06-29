@@ -16,6 +16,7 @@
     "loop": "bash scripts/conformance-loop.sh",
     "demo": "pnpm --filter @electric-lite/examples demo",
     "demo:web": "pnpm --filter @electric-lite/web start",
+    "demo:linearlite": "pnpm --filter @electric-lite/linearlite start",
     "bench": "pnpm --filter @electric-lite/bench bench"
   },
   "devDependencies": {

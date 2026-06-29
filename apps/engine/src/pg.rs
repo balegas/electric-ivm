@@ -98,12 +98,16 @@ pub async fn ensure_slot(client: &Client, slot: &str) -> Result<()> {
 
 pub struct Backfill {
     pub rows: Vec<Row>,
-    /// WAL LSN of the snapshot: any change with commit lsn <= this is already reflected in `rows`.
+    /// `pg_current_wal_lsn()` of the snapshot. A transaction visible to this REPEATABLE READ snapshot
+    /// committed strictly before it, so its commit LSN is `< seed_lsn` and its changes are already in
+    /// `rows`; a transaction committing at/after the snapshot has commit LSN `>= seed_lsn`.
     pub seed_lsn: String,
 }
 
 /// Read the table's current rows in a single repeatable-read snapshot, plus the snapshot LSN. The
-/// engine seeds a shape/family from `rows` and skips replication changes with `lsn <= seed_lsn`.
+/// engine seeds a shape/family from `rows` and skips replication changes whose COMMIT LSN is strictly
+/// `< seed_lsn` (see `engine::process_envelope`; the comparison is against the transaction commit LSN
+/// stamped by the ingestor, not the per-change record LSN).
 /// Uses an explicit transaction over `&Client` (so it needs a dedicated connection, not a shared one).
 pub async fn backfill(client: &Client, ts: &TableSchema) -> Result<Backfill> {
     client

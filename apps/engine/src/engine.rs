@@ -32,6 +32,8 @@ pub struct Engine {
     /// bumps the sentinel and waits for this to catch up — robust under a shared multi-database
     /// Postgres (per-database, no dependence on server-global WAL LSNs).
     repl_sync: Arc<std::sync::atomic::AtomicI64>,
+    /// Set once the replication ingestor has been spawned, so `setup_postgres` stays idempotent.
+    replicator_started: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct EngineState {
@@ -91,6 +93,7 @@ impl Engine {
             pg_url: None,
             repl_lsn: Arc::new(std::sync::Mutex::new("0/0".to_string())),
             repl_sync: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            replicator_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -103,7 +106,8 @@ impl Engine {
     }
 
     /// Introspect the configured tables from Postgres, set `REPLICA IDENTITY FULL`, create the
-    /// replication slot, register the schema, and start the replication ingestor. Idempotent.
+    /// replication slot, register the schema, and start the replication ingestor. Idempotent: a second
+    /// call re-introspects but will NOT spawn a second ingestor (two ingestors would fight for the slot).
     pub async fn setup_postgres(&self, tables: &[String], slot: &str, poll_ms: u64) -> Result<()> {
         let url = self.pg_url.clone().context("setup_postgres called without a pg_url")?;
         let client = crate::pg::connect(&url).await?;
@@ -117,6 +121,11 @@ impl Engine {
         }
         crate::pg::ensure_slot(&client, slot).await?;
         self.state.lock().await.tables = compiled.clone();
+        // Spawn the ingestor at most once, even if setup_postgres is called again.
+        if self.replicator_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            tracing::warn!("setup_postgres called again; ingestor already running, not spawning another");
+            return Ok(());
+        }
         tokio::spawn(crate::replication::run(
             url,
             slot.to_string(),
@@ -460,10 +469,13 @@ async fn process_envelope(
     metrics().envelopes.fetch_add(1, Ordering::Relaxed);
     let _t = Timer::new(&metrics().process_envelope);
     // Standalone shapes: evaluate each stateless filter directly on the delta (no thread, no clone).
-    // Skip changes already reflected in the shape's backfill snapshot. `seed_lsn` is the snapshot's
-    // `pg_current_wal_lsn()` (the NEXT byte to be written), so every in-snapshot change has
-    // `lsn < seed_lsn` strictly; the first post-snapshot change can have `lsn == seed_lsn` and MUST
-    // NOT be skipped (else the first live insert is silently dropped).
+    // Skip changes already reflected in the shape's backfill snapshot. `lsn` here is the change's
+    // transaction COMMIT lsn (stamped by the ingestor), and `seed_lsn` is the snapshot's
+    // `pg_current_wal_lsn()`. A transaction visible to the REPEATABLE READ backfill committed before
+    // the snapshot, so its commit lsn < seed_lsn -> skip (already in the backfill). A transaction that
+    // commits at/after the snapshot has commit lsn >= seed_lsn -> keep (not in the backfill). (Residual
+    // window: a commit whose WAL record was written but not yet visible at snapshot time; negligible
+    // for the single-ingestor model — see process_envelope docs / ARCHITECTURE.)
     for shape in shapes.values() {
         if lsn != 0 && lsn < shape.seed_lsn {
             continue;
@@ -592,7 +604,13 @@ pub(crate) fn translate_output(ts: &TableSchema, out: Vec<(Row, ZWeight)>, txid:
     let mut pos: HashMap<String, Row> = HashMap::new();
     let mut neg: HashSet<String> = HashSet::new();
     for (row, w) in out {
-        let Ok(pk) = ts.pk_of(&row).map(Value::to_key_string) else { continue };
+        let pk = match ts.pk_of(&row).map(Value::to_key_string) {
+            Ok(pk) => pk,
+            Err(e) => {
+                tracing::warn!("translate_output: dropping row with unextractable pk on table {}: {e:#}", ts.name);
+                continue;
+            }
+        };
         if w > 0 {
             pos.insert(pk, row);
         } else if w < 0 {

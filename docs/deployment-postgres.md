@@ -112,8 +112,13 @@ activeUsers.subscribe((rows) => render(rows))
   `SELECT pg_drop_replication_slot('<slot>');` Monitor `pg_replication_slots.confirmed_flush_lsn` vs
   `pg_current_wal_lsn()` to watch lag.
 - **Consistency:** on shape registration the engine takes a `REPEATABLE READ` snapshot of the table
-  (the backfill) and records its WAL LSN; replicated changes at or before that LSN are already in the
-  snapshot and are skipped, so each row is counted exactly once. This assumes a single ingestor per
-  database (the model above). Running multiple ingestors over the same tables is not supported.
+  (the backfill) and records its `pg_current_wal_lsn()` as `seed_lsn`. Each replicated change is
+  stamped with its transaction's **COMMIT LSN**, and the engine skips changes whose commit LSN is
+  strictly **`< seed_lsn`** — those transactions committed before the snapshot, so they are already in
+  the backfill; transactions committing at/after the snapshot (commit LSN `>= seed_lsn`) are taken
+  from the live stream. Comparing the commit LSN (not the per-change record LSN) is what keeps rows of
+  transactions that were in flight during the snapshot from being dropped, so each row is counted
+  exactly once. This assumes a single ingestor per database (the model above). Running multiple
+  ingestors over the same tables is not supported.
 - **Permissions:** the engine's Postgres role needs `SELECT` on the watched tables, ownership (for
   `ALTER TABLE … REPLICA IDENTITY`), and the `REPLICATION` attribute (to create/read the slot).

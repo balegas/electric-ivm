@@ -1,22 +1,23 @@
-// Dev entrypoint for the web demo, wired to the Postgres backend. Boots an ephemeral Postgres with
-// logical replication, the engine in Postgres mode (it ingests changes via the replication slot and
-// reads rows back for backfill), durable-streams + the API for the read/shape path, and Vite. Browser
-// writes go to Postgres through a tiny /pg/write middleware — Postgres is the system of record.
-// durable-streams + API use ephemeral ports; Vite proxies to them dynamically (no fixed-port clashes).
-//   pnpm demo:web
+// Dev entrypoint for LinearLite on electric-lite, wired to the Postgres backend. Boots an ephemeral
+// Postgres with logical replication, the engine in Postgres mode (it ingests changes via the
+// replication slot and reads rows back for backfill), durable-streams + the API for the read/shape
+// path, and Vite. Browser writes go to Postgres through a /pg/write middleware — Postgres is the
+// system of record. durable-streams + API use ephemeral ports; Vite proxies to them dynamically.
+//   pnpm --filter @electric-lite/linearlite start     (or: pnpm demo:linearlite)
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
 import { appendFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { DurableStreamTestServer } from '@durable-streams/server'
 import { type ApiServer, createApiServer } from '@electric-lite/api'
-import { changeEventToDML, tableDDL } from '@electric-lite/protocol'
+import { DurableStreamTestServer } from '@durable-streams/server'
+import { changeEventToDML } from '@electric-lite/protocol'
+import { faker } from '@faker-js/faker'
 import pgpkg from 'pg'
 import { createServer as createViteServer, type Plugin, type ViteDevServer } from 'vite'
 
-import { schema } from './src/schema.js'
+import { PRIORITIES, schema, STATUSES } from './src/schema.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 function repoRoot(): string {
@@ -28,7 +29,7 @@ function repoRoot(): string {
   throw new Error('repo root not found')
 }
 
-const SLOT = 'electric_lite_web'
+const SLOT = 'electric_lite_linearlite'
 
 // Resources to tear down (in reverse order) on shutdown or partial-boot failure.
 let pgDir: string | undefined
@@ -38,14 +39,11 @@ let ds: DurableStreamTestServer | undefined
 let engineProc: ChildProcess | undefined
 let api: ApiServer | undefined
 let vite: ViteDevServer | undefined
-let churnTimer: NodeJS.Timeout | undefined
 let shuttingDown = false
 
 async function shutdown(code = 0): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
-  if (churnTimer) clearInterval(churnTimer)
-  // Stop the engine + Postgres FIRST (so a slow vite/api close can't leave an orphan cluster).
   engineProc?.kill('SIGKILL')
   if (pg) {
     await pg.query('SELECT pg_drop_replication_slot($1)', [SLOT]).catch(() => {})
@@ -73,35 +71,15 @@ async function shutdown(code = 0): Promise<void> {
 process.on('SIGINT', () => void shutdown(0))
 process.on('SIGTERM', () => void shutdown(0))
 
-const TITLES = [
-  'Ship electric-lite',
-  'Write the docs',
-  'Buy milk',
-  'Refactor the parser',
-  'Review the PR',
-  'Fix the flaky test',
-  'Plan the sprint',
-  'Answer support tickets',
-  'Update dependencies',
-  'Profile the hot path',
-]
-const makeTodo = (id: number) => ({
-  id,
-  title: `${TITLES[id % TITLES.length]} #${id}`,
-  priority: (id % 5) + 1, // 1..5
-  done: id % 3 === 0, // ~1/3 done
-})
-let maxId = 0
-
 try {
-  // --- 1. Ephemeral Postgres with logical replication ----------------------------------------------
-  pgDir = mkdtempSync(join(tmpdir(), 'el-web-pg-'))
+  // --- 1. Ephemeral Postgres with logical replication --------------------------------------------
+  pgDir = mkdtempSync(join(tmpdir(), 'el-linearlite-pg-'))
   pgData = join(pgDir, 'data')
   execFileSync('initdb', ['-D', pgData, '-U', 'postgres', '--auth=trust', '--no-sync'], { stdio: 'ignore' })
   let pgPort = 0
   let pgStarted = false
   for (let attempt = 0; attempt < 8 && !pgStarted; attempt++) {
-    pgPort = 54330 + Math.floor(Math.random() * 4000)
+    pgPort = 54600 + Math.floor(Math.random() * 4000)
     appendFileSync(
       join(pgData, 'postgresql.conf'),
       `\nwal_level = logical\nmax_replication_slots = 10\nmax_wal_senders = 10\n` +
@@ -118,41 +96,89 @@ try {
   const pgUrl = `postgres://postgres@127.0.0.1:${pgPort}/postgres`
   console.log('postgres        →', pgUrl)
 
-  // Create the tables (REPLICA IDENTITY FULL so replication carries old+new) and seed a few rows.
   pg = new pgpkg.Client({ connectionString: pgUrl })
   await pg.connect()
-  for (const [name, def] of Object.entries(schema.tables)) {
-    await pg.query(`${tableDDL(name, def)};`)
-    await pg.query(`ALTER TABLE "${name}" REPLICA IDENTITY FULL;`)
-  }
-  // --- Priming: parametrized initial workload ----------------------------------------------------
-  // DEMO_SEED_COUNT  initial rows to load into Postgres (default 200).
-  // DEMO_CHURN_MS    if set (>0), drive a continuous write workload: one random op every N ms.
-  const SEED_COUNT = Math.max(0, Number(process.env.DEMO_SEED_COUNT ?? 200))
-  const CHURN_MS = Math.max(0, Number(process.env.DEMO_CHURN_MS ?? 0))
+  // Explicit DDL (not tableDDL) so ids/timestamps are BIGINT — the client mints ids from Date.now(),
+  // which overflows int4. REPLICA IDENTITY FULL so replication carries old+new; a cascading FK so
+  // deleting an issue removes its comments in one shot (the engine sees both deletes via replication).
+  await pg.query(`CREATE TABLE issues (
+    id BIGINT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    status TEXT NOT NULL,
+    priority TEXT NOT NULL,
+    username TEXT NOT NULL,
+    created BIGINT NOT NULL,
+    modified BIGINT NOT NULL,
+    kanbanorder DOUBLE PRECISION NOT NULL
+  )`)
+  await pg.query(`CREATE TABLE comments (
+    id BIGINT PRIMARY KEY,
+    issue_id BIGINT NOT NULL REFERENCES issues(id) ON DELETE CASCADE,
+    body TEXT NOT NULL,
+    username TEXT NOT NULL,
+    created BIGINT NOT NULL
+  )`)
+  await pg.query('ALTER TABLE issues REPLICA IDENTITY FULL')
+  await pg.query('ALTER TABLE comments REPLICA IDENTITY FULL')
 
-  // Bulk-insert in chunked multi-row statements inside one transaction (fast even for large counts).
+  // --- Parametrized seed (faker), mirroring the original LinearLite generator ---------------------
+  // DEMO_SEED_COUNT  number of issues to generate (default 512, the upstream default).
+  const SEED_COUNT = Math.max(0, Number(process.env.DEMO_SEED_COUNT ?? 512))
+  const SEED_PRIORITIES = ['none', 'low', 'medium', 'high'] as const // upstream never seeds 'urgent'
+
   if (SEED_COUNT > 0) {
     const t0 = Date.now()
-    const CHUNK = 1000
-    await pg.query('BEGIN')
-    for (let start = 1; start <= SEED_COUNT; start += CHUNK) {
-      const tuples: string[] = []
-      const params: unknown[] = []
-      let p = 1
-      for (let id = start; id < start + CHUNK && id <= SEED_COUNT; id++) {
-        const row = makeTodo(id)
-        tuples.push(`($${p++},$${p++},$${p++},$${p++})`)
-        params.push(row.id, row.title, row.priority, row.done)
-        maxId = id
+    faker.seed(42)
+    const now = Date.now()
+    const issueRows: unknown[][] = []
+    const commentRows: unknown[][] = []
+    let commentId = 1
+    let order = 1
+    for (let id = 1; id <= SEED_COUNT; id++) {
+      const created = faker.date.past({ years: 1 }).getTime()
+      const modified = faker.date.between({ from: created, to: now }).getTime()
+      issueRows.push([
+        id,
+        faker.lorem.sentence({ min: 3, max: 8 }).replace(/\.$/, ''),
+        faker.lorem.paragraphs({ min: 1, max: 3 }),
+        STATUSES[Math.floor(Math.random() * STATUSES.length)],
+        SEED_PRIORITIES[Math.floor(Math.random() * SEED_PRIORITIES.length)],
+        faker.internet.username().toLowerCase(),
+        created,
+        modified,
+        order++ + Math.random(),
+      ])
+      if (Math.random() < 0.5) {
+        commentRows.push([
+          commentId++,
+          id,
+          faker.lorem.sentences({ min: 1, max: 3 }),
+          faker.internet.username().toLowerCase(),
+          faker.date.between({ from: created, to: now }).getTime(),
+        ])
       }
-      await pg.query(`INSERT INTO "todos" (id, title, priority, done) VALUES ${tuples.join(', ')}`, params)
     }
+
+    const bulkInsert = async (table: string, cols: string[], rows: unknown[][]) => {
+      const CHUNK = 1000
+      for (let s = 0; s < rows.length; s += CHUNK) {
+        const slice = rows.slice(s, s + CHUNK)
+        const params: unknown[] = []
+        let p = 1
+        const tuples = slice.map((r) => `(${r.map(() => `$${p++}`).join(',')})`)
+        for (const r of slice) params.push(...r)
+        await pg!.query(`INSERT INTO "${table}" (${cols.map((c) => `"${c}"`).join(',')}) VALUES ${tuples.join(',')}`, params)
+      }
+    }
+    await pg.query('BEGIN')
+    await bulkInsert('issues', ['id', 'title', 'description', 'status', 'priority', 'username', 'created', 'modified', 'kanbanorder'], issueRows)
+    await bulkInsert('comments', ['id', 'issue_id', 'body', 'username', 'created'], commentRows)
     await pg.query('COMMIT')
-    console.log(`primed          → ${SEED_COUNT} todos into Postgres (${Date.now() - t0}ms)`)
+    console.log(`primed          → ${issueRows.length} issues, ${commentRows.length} comments (${Date.now() - t0}ms)`)
   }
 
-  // --- 2. durable-streams + engine (Postgres mode) + API (ephemeral ports) -----------------------
+  // --- 2. durable-streams + engine (Postgres mode) + API (ephemeral ports) ------------------------
   ds = new DurableStreamTestServer({ port: 0 })
   const dsUrl = await ds.start()
   console.log('durable-streams →', dsUrl)
@@ -186,13 +212,10 @@ try {
   })
   console.log('engine          →', engineUrl, '(postgres mode)')
 
-  // No defineSchema: in Postgres mode the engine self-configures from introspection.
   api = await createApiServer({ dsUrl, engineUrl })
   console.log('api             →', api.url)
 
   // --- 3. Vite + the /pg/write middleware (writes go to Postgres) --------------------------------
-  // Postgres is the system of record: browser writes become real DML; the engine sees them via the
-  // replication slot and updates the live shapes. No tRPC write path.
   const pgWritePlugin: Plugin = {
     name: 'electric-lite-pg-write',
     configureServer(server) {
@@ -240,34 +263,10 @@ try {
   await vite.listen()
   console.log('')
   vite.printUrls()
-  console.log('\n👉 Open the Local URL above. Edit todos on the left; they are written to Postgres,')
-  console.log('   ingested via logical replication, and the live shape on the right updates.\n')
-
-  // --- Optional continuous write workload --------------------------------------------------------
-  // One random op per CHURN_MS: ~30% insert, ~50% update (toggle done / re-roll priority), ~20% delete.
-  // All writes go to Postgres, so the live shape moves on its own — useful for load/visual demos.
-  if (CHURN_MS > 0) {
-    console.log(`churn           → 1 op / ${CHURN_MS}ms (writing to Postgres)\n`)
-    churnTimer = setInterval(async () => {
-      try {
-        const r = Math.random()
-        if (r < 0.3) {
-          const row = makeTodo(++maxId)
-          const { text, params } = changeEventToDML('todos', schema.tables.todos!, { op: 'insert', pk: row.id, row })
-          await pg!.query(text, params)
-        } else if (r < 0.8) {
-          const id = 1 + Math.floor(Math.random() * maxId)
-          await pg!.query('UPDATE "todos" SET done = NOT done, priority = 1 + floor(random() * 5)::int WHERE id = $1', [id])
-        } else {
-          const id = 1 + Math.floor(Math.random() * maxId)
-          await pg!.query('DELETE FROM "todos" WHERE id = $1', [id])
-        }
-      } catch (e) {
-        console.error('churn op failed:', e)
-      }
-    }, CHURN_MS)
-  }
+  console.log(`\n👉 Open the Local URL above. LinearLite (${PRIORITIES.length} priorities, ${STATUSES.length} statuses)`)
+  console.log('   on electric-lite: writes go to Postgres, replicate into the engine, and the')
+  console.log('   board/list shapes update live.\n')
 } catch (e) {
-  console.error('web demo: startup failed:', e)
+  console.error('linearlite: startup failed:', e)
   await shutdown(1)
 }

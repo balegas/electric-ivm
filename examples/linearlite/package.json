@@ -1,5 +1,5 @@
 {
-  "name": "@electric-lite/web",
+  "name": "@electric-lite/linearlite",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -13,6 +13,7 @@
     "@electric-lite/client": "workspace:*",
     "@durable-streams/server": "^0.3.7",
     "@durable-streams/state": "^0.3.1",
+    "@faker-js/faker": "^10.5.0",
     "@tanstack/db": "^0.6.12",
     "@tanstack/react-db": "^0.1.90",
     "pg": "^8.13.1",

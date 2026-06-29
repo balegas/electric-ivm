@@ -75,14 +75,29 @@ and a row inserted concurrently arrives via the stream — no loss. (A strict sn
 `CREATE_REPLICATION_SLOT … USE_SNAPSHOT` is a later hardening; for the single-writer test/oracle model
 the monotonic-slot + idempotent-upsert approach converges.)
 
+> **As built (update).** The "idempotent-upsert, no LSN handshake" approach above proved unsound under
+> *concurrent* writers: a transaction in flight while a backfill snapshot is taken could be in neither
+> the snapshot nor the post-registration stream, silently dropping rows. The implementation instead does
+> a **commit-LSN handshake**: backfill records the snapshot's `pg_current_wal_lsn()` as `seed_lsn`, the
+> ingestor stamps every change with its transaction's **COMMIT LSN** (buffering a transaction until its
+> `COMMIT` record), and the engine skips replicated changes whose commit LSN is strictly `< seed_lsn`.
+> This matches snapshot *commit* visibility exactly (transactions committed before the snapshot are in
+> the backfill; those committing at/after it come from the stream), so each row counts once even under
+> concurrent writers. The ingestor also reads the slot non-consuming (`peek`) and advances it only after
+> a successful append, so a transient append failure re-reads rather than loses data. Guarded by
+> `packages/conformance/src/conformance-concurrency.test.ts`.
+
 ## Testing
 
 The oracle becomes a **real Postgres** (`@electric-lite/oracle` gains a `pg` backend reusing the existing
 `tableDDL`/`changeEventToDML`/`shapeSelectSql` from `@electric-lite/protocol`). The harness boots one
 ephemeral PG, points the oracle (writes + SELECT) and the engine (ingestor + backfill) at it. `applyOp`
-writes to PG only; the change flows PG→slot→ingestor→stream→engine→shape. The drain barrier waits until
-the ingestor's LSN ≥ PG's `pg_current_wal_lsn()` and then the engine offset ≥ stream tail. Comparison is
-unchanged (engine/client shape set vs `oracle.queryShape`).
+writes to PG only; the change flows PG→slot→ingestor→stream→engine→shape. The drain barrier (as built)
+bumps a per-database `__el_sync` sentinel counter and waits for the ingestor to report having
+decoded-and-appended at least that value, then waits for the engine offset ≥ stream tail. (The
+sentinel, rather than a server-global `pg_current_wal_lsn()`, makes the barrier robust under a shared
+multi-database Postgres; it throws on timeout so a stalled barrier can't false-green a comparison.)
+Comparison is unchanged (engine/client shape set vs `oracle.queryShape`).
 
 New scenarios to add: update moving a row across a shape boundary (enter/leave via old+new), delete by
 replication, NULL transitions via replication, backfill of pre-existing rows, multi-statement

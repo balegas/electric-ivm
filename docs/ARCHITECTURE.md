@@ -15,9 +15,19 @@ benchmark-findings, postgres-logical-replication).
 > snapshot `SELECT`. This replaces the in-memory `table_state` (§4.1–4.2) and the API write path (§3)
 > described below — those now apply only to the legacy/library mode (no `ELECTRIC_LITE_PG_URL`). Delta
 > computation uses the replicated **old + new** tuples (`REPLICA IDENTITY FULL`) instead of a local
-> table copy; backfill and live replication are reconciled by WAL **LSN** so each row counts exactly
-> once. The shape fan-out, family/standalone strategies (§4.3), output translation (§4.4), and the
-> durable-streams transport are unchanged. See `docs/deployment-postgres.md` to run it and
+> table copy.
+>
+> The ingestor (`replication.rs`) reads the slot non-consuming (`peek`), buffers each transaction, and
+> stamps every change with its transaction's **COMMIT LSN** (taken from the `COMMIT` record), then
+> appends to durable-streams and only **then** advances the slot (so a failed append re-reads rather
+> than loses data). Backfill (`pg.rs`) records the snapshot's `pg_current_wal_lsn()` as `seed_lsn`, and
+> the engine skips replicated changes whose **commit LSN is strictly `< seed_lsn`** — transactions that
+> committed before the snapshot are already in the backfill; those committing at/after it
+> (`>= seed_lsn`) are taken from the live stream. Comparing the *commit* LSN (not the per-change record
+> LSN) is what keeps rows of transactions in flight during the snapshot from being dropped, so each row
+> counts exactly once (guarded by `conformance-concurrency.test.ts`). The shape fan-out,
+> family/standalone strategies (§4.3), output translation (§4.4), and the durable-streams transport are
+> unchanged. See `docs/deployment-postgres.md` to run it and
 > `docs/superpowers/specs/2026-06-29-postgres-logical-replication.md` for the design.
 
 ```
@@ -342,7 +352,9 @@ lever as-is.
 
 | path | role |
 |------|------|
-| `apps/engine/src/engine.rs` | tailer, table state, delta computation, routing, fan-out, flush |
+| `apps/engine/src/engine.rs` | tailer, delta computation, routing, fan-out, flush, backfill↔replication LSN reconciliation |
+| `apps/engine/src/replication.rs` | Postgres logical-replication ingestor: peek slot, buffer per-txn, stamp commit LSN, append, advance |
+| `apps/engine/src/pg.rs` | Postgres connect/introspect, `REPLICA IDENTITY FULL`, slot create, snapshot backfill (`seed_lsn`) |
 | `apps/engine/src/family.rs` | shared equality-template join circuit (`FamilyActor`) |
 | `apps/engine/src/predicate.rs` | predicate compilation, three-valued `matches`, `equality_template` |
 | `apps/engine/src/ds.rs` | durable-streams HTTP client (`ensure_stream`/`append`/`read`) |
