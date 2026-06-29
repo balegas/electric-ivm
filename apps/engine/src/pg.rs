@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, bail};
 use tokio_postgres::{Client, NoTls};
 
+use crate::predicate::CompiledPredicate;
 use crate::schema::{ColumnDef, ColumnType, TableDef, TableSchema};
 use crate::value::Row;
 
@@ -109,21 +110,34 @@ pub struct Backfill {
 /// `< seed_lsn` (see `engine::process_envelope`; the comparison is against the transaction commit LSN
 /// stamped by the ingestor, not the per-change record LSN).
 /// Uses an explicit transaction over `&Client` (so it needs a dedicated connection, not a shared one).
-pub async fn backfill(client: &Client, ts: &TableSchema) -> Result<Backfill> {
+///
+/// `filter`, when given, is the shape's predicate: backfill reads only the matching rows
+/// (`… WHERE <predicate>`) instead of the whole table, so a selective shape never scans/transfers the
+/// rest. `None` reads the whole table (used while a family still seeds a full-table trace).
+pub async fn backfill(client: &Client, ts: &TableSchema, filter: Option<&CompiledPredicate>) -> Result<Backfill> {
     client
         .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .await
         .context("begin backfill snapshot")?;
-    let result = backfill_in_txn(client, ts).await;
+    let result = backfill_in_txn(client, ts, filter).await;
     client.batch_execute("COMMIT").await.ok();
     result
 }
 
-async fn backfill_in_txn(client: &Client, ts: &TableSchema) -> Result<Backfill> {
+async fn backfill_in_txn(client: &Client, ts: &TableSchema, filter: Option<&CompiledPredicate>) -> Result<Backfill> {
     let seed_lsn: String = client.query_one("select pg_current_wal_lsn()::text", &[]).await?.get(0);
+    // Push the shape's predicate into the SELECT so only matching rows are read. Text literals are
+    // bound parameters; numeric/bool/null are inlined (see `crate::sql`). The engine still applies
+    // `matches()` afterward, so the SQL only needs to be a sound superset filter.
+    let (where_clause, params) = match filter.and_then(|p| crate::sql::predicate_to_sql(p, ts)) {
+        Some((w, ps)) => (format!(" where {w}"), ps),
+        None => (String::new(), Vec::new()),
+    };
+    let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+        params.iter().map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
     // to_jsonb gives one JSON object per row, so we reuse the schema's JSON->Row mapping verbatim.
-    let q = format!("select to_jsonb(t) from {} t", quote_ident(&ts.name));
-    let rows = client.query(&q, &[]).await.with_context(|| format!("backfill select {}", ts.name))?;
+    let q = format!("select to_jsonb(t) from {} t{}", quote_ident(&ts.name), where_clause);
+    let rows = client.query(&q, &param_refs).await.with_context(|| format!("backfill select {}", ts.name))?;
     let mut out = Vec::with_capacity(rows.len());
     for r in &rows {
         let j: serde_json::Value = r.get(0);

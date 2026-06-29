@@ -380,8 +380,9 @@ async fn add_shape_routed(
             } else {
                 // New family: seed the data trace from a Postgres snapshot and add the param in one
                 // step; the step output is this shape's backfill. `seed_lsn` lets the tailer skip
-                // replication changes already reflected in the snapshot.
-                let bf = pg_backfill(pg_url, ts).await?;
+                // replication changes already reflected in the snapshot. The trace must hold the whole
+                // table (future members can be on any key constant), so no predicate pushdown here.
+                let bf = pg_backfill(pg_url, ts, None).await?;
                 let actor = FamilyActor::spawn(Arc::new(key_cols.clone()))?;
                 let data: Vec<Tup2<Row, ZWeight>> = bf.rows.iter().map(|r| Tup2(r.clone(), 1)).collect();
                 let out = actor.step(data, vec![param]).await?;
@@ -398,7 +399,9 @@ async fn add_shape_routed(
         }
         None => {
             // Standalone filter: backfill = current matching rows from Postgres (emitted as upserts).
-            let bf = pg_backfill(pg_url, ts).await?;
+            // Push the predicate into the SELECT so only matching rows are read; `matches()` below is
+            // the final authority (and a safety net if the SQL is ever a looser superset).
+            let bf = pg_backfill(pg_url, ts, Some(pred.as_ref())).await?;
             let out: Vec<(Row, ZWeight)> =
                 bf.rows.iter().filter(|r| pred.matches(r)).map(|r| (r.clone(), 1)).collect();
             if !out.is_empty() {
@@ -414,13 +417,18 @@ async fn add_shape_routed(
     Ok(())
 }
 
-/// Read a backfill snapshot from Postgres (current rows + snapshot LSN). Without a `pg_url`
-/// (library/no-source mode) the shape simply starts empty.
-async fn pg_backfill(pg_url: &Option<String>, ts: &TableSchema) -> Result<crate::pg::Backfill> {
+/// Read a backfill snapshot from Postgres (current rows + snapshot LSN). `filter`, when given, is the
+/// shape's predicate — backfill reads only matching rows instead of the whole table. Without a
+/// `pg_url` (library/no-source mode) the shape simply starts empty.
+async fn pg_backfill(
+    pg_url: &Option<String>,
+    ts: &TableSchema,
+    filter: Option<&CompiledPredicate>,
+) -> Result<crate::pg::Backfill> {
     match pg_url {
         Some(url) => {
             let client = crate::pg::connect(url).await?;
-            crate::pg::backfill(&client, ts).await
+            crate::pg::backfill(&client, ts, filter).await
         }
         None => Ok(crate::pg::Backfill { rows: Vec::new(), seed_lsn: "0/0".to_string() }),
     }

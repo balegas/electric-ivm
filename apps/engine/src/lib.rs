@@ -17,6 +17,7 @@ pub mod pg;
 pub mod predicate;
 pub mod replication;
 pub mod schema;
+pub mod sql;
 pub mod value;
 
 pub use value::{Row, Value};
