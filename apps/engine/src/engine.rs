@@ -17,6 +17,7 @@ use crate::ds::{DsClient, Envelope, EnvelopeHeaders};
 use crate::metrics::{Timer, metrics};
 use crate::predicate::{CompiledPredicate, PredicateJson};
 use crate::schema::{Schema, TableSchema, compile_schema};
+use crate::subquery::{SubqueryRegistry, predicate_has_subquery, referenced_tables};
 use crate::value::{Row, Value};
 
 #[derive(Clone)]
@@ -34,6 +35,10 @@ pub struct Engine {
     repl_sync: Arc<std::sync::atomic::AtomicI64>,
     /// Set once the replication ingestor has been spawned, so `setup_postgres` stays idempotent.
     replicator_started: Arc<std::sync::atomic::AtomicBool>,
+    /// Cross-table subquery registry: maintained inner-set nodes (shared by canonical signature) + the
+    /// outer subquery shapes that depend on them. Every tailer routes its deltas here so an inner-table
+    /// change moves outer rows. `None`-free; empty until a subquery shape is created.
+    subqueries: Arc<Mutex<SubqueryRegistry>>,
 }
 
 struct EngineState {
@@ -93,6 +98,7 @@ enum TailerCmd {
 
 impl Engine {
     pub fn new(ds: DsClient) -> Self {
+        let subqueries = Arc::new(Mutex::new(SubqueryRegistry::new(ds.clone(), None)));
         Engine {
             ds,
             state: Arc::new(Mutex::new(EngineState {
@@ -105,14 +111,16 @@ impl Engine {
             repl_lsn: Arc::new(std::sync::Mutex::new("0/0".to_string())),
             repl_sync: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             replicator_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            subqueries,
         }
     }
 
     /// Engine in Postgres mode: data lives in Postgres, ingested via logical replication and read
     /// back for backfill. Call [`setup_postgres`](Self::setup_postgres) before serving.
     pub fn new_pg(ds: DsClient, pg_url: String) -> Self {
-        let mut e = Self::new(ds);
-        e.pg_url = Some(pg_url);
+        let mut e = Self::new(ds.clone());
+        e.pg_url = Some(pg_url.clone());
+        e.subqueries = Arc::new(Mutex::new(SubqueryRegistry::new(ds, Some(pg_url))));
         e
     }
 
@@ -132,6 +140,7 @@ impl Engine {
         }
         crate::pg::ensure_slot(&client, slot).await?;
         self.state.lock().await.tables = compiled.clone();
+        self.subqueries.lock().await.set_schemas(Arc::new(compiled.clone()));
         // Spawn the ingestor at most once, even if setup_postgres is called again.
         if self.replicator_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
             tracing::warn!("setup_postgres called again; ingestor already running, not spawning another");
@@ -168,6 +177,7 @@ impl Engine {
         for name in compiled.keys() {
             self.ds.ensure_stream(&format!("table/{name}")).await?;
         }
+        self.subqueries.lock().await.set_schemas(Arc::new(compiled.clone()));
         self.state.lock().await.tables = compiled;
         Ok(())
     }
@@ -216,7 +226,6 @@ impl Engine {
             Some(ts) => ts.clone(),
             None => bail!("unknown table '{table}'"),
         };
-        let pred = Arc::new(CompiledPredicate::compile_opt(where_.as_ref(), &ts)?);
         let out_cols = resolve_columns(&ts, columns)?;
 
         let num_id = st.next_shape_id;
@@ -225,8 +234,45 @@ impl Engine {
         let stream_path = format!("shape/{id}");
         self.ds.ensure_stream(&stream_path).await?;
 
+        // Subquery shapes (`col IN (SELECT …)`) are maintained by the cross-table registry, not by a
+        // tailer's local routing. Ensure a tailer exists for the outer table AND every referenced inner
+        // table (so their deltas reach the registry), then register + backfill via the registry.
+        if where_.as_ref().is_some_and(predicate_has_subquery) {
+            if changes_only {
+                bail!("changes_only feeds are not supported for subquery shapes");
+            }
+            let where_json = where_.expect("subquery predicate present");
+            let mut tables = referenced_tables(&where_json);
+            tables.push(table.to_string());
+            for t in &tables {
+                if !st.tailers.contains_key(t) {
+                    let tts = st
+                        .tables
+                        .get(t)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("unknown table '{t}' referenced by subquery"))?;
+                    let handle =
+                        spawn_tailer(self.ds.clone(), tts, self.pg_url.clone(), self.subqueries.clone());
+                    st.tailers.insert(t.clone(), handle);
+                }
+            }
+            let rec = ShapeRecord { id: id.clone(), table: table.to_string(), stream_path: stream_path.clone() };
+            st.shapes.insert(id.clone(), rec.clone());
+            // Release the engine-state lock before the registry's PG backfill (so offset polling etc.
+            // aren't blocked); the registry has its own lock.
+            drop(st);
+            self.subqueries
+                .lock()
+                .await
+                .create_subquery_shape(&id, table, &stream_path, &where_json, out_cols)
+                .await?;
+            return Ok(rec);
+        }
+
+        let pred = Arc::new(CompiledPredicate::compile_opt(where_.as_ref(), &ts)?);
+
         if !st.tailers.contains_key(table) {
-            let handle = spawn_tailer(self.ds.clone(), ts.clone(), self.pg_url.clone());
+            let handle = spawn_tailer(self.ds.clone(), ts.clone(), self.pg_url.clone(), self.subqueries.clone());
             st.tailers.insert(table.to_string(), handle);
         }
         let tailer = st.tailers.get(table).expect("tailer just inserted");
@@ -254,7 +300,15 @@ impl Engine {
                 let _ = t.cmd_tx.send(TailerCmd::RemoveShape { shape_id: id.to_string() });
             }
         }
+        drop(st);
+        // Subquery shapes live in the registry (a no-op here if `id` was a plain shape).
+        self.subqueries.lock().await.drop_subquery_shape(id);
         Ok(())
+    }
+
+    /// Number of maintained subquery nodes (for the sharing-topology introspection endpoint).
+    pub async fn subquery_node_count(&self) -> usize {
+        self.subqueries.lock().await.node_count()
     }
 
     pub async fn get_shape(&self, id: &str) -> Option<ShapeRecord> {
@@ -353,11 +407,16 @@ fn resolve_columns(ts: &TableSchema, columns: Option<Vec<String>>) -> Result<Opt
     }
 }
 
-fn spawn_tailer(ds: DsClient, ts: TableSchema, pg_url: Option<String>) -> TailerHandle {
+fn spawn_tailer(
+    ds: DsClient,
+    ts: TableSchema,
+    pg_url: Option<String>,
+    subqueries: Arc<Mutex<SubqueryRegistry>>,
+) -> TailerHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let processed = Arc::new(std::sync::Mutex::new("-1".to_string()));
     let stats = Arc::new(std::sync::Mutex::new(TableStats::default()));
-    tokio::spawn(tailer_loop(ds, ts, pg_url, cmd_rx, processed.clone(), stats.clone()));
+    tokio::spawn(tailer_loop(ds, ts, pg_url, cmd_rx, processed.clone(), stats.clone(), subqueries));
     TailerHandle { cmd_tx, processed, stats }
 }
 
@@ -381,6 +440,7 @@ async fn tailer_loop(
     mut cmd_rx: mpsc::UnboundedReceiver<TailerCmd>,
     processed: Arc<std::sync::Mutex<String>>,
     stats: Arc<std::sync::Mutex<TableStats>>,
+    subqueries: Arc<Mutex<SubqueryRegistry>>,
 ) {
     let table_path = format!("table/{}", ts.name);
     let mut offset = "-1".to_string();
@@ -435,7 +495,9 @@ async fn tailer_loop(
                     // parallelizing is the main throughput/latency lever.
                     let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
                     for env in rr.envelopes {
-                        if let Err(e) = process_envelope(&ts, &shapes, &families, env, &mut pending).await {
+                        if let Err(e) =
+                            process_envelope(&ts, &shapes, &families, env, &mut pending, &subqueries).await
+                        {
                             tracing::error!("process_envelope failed: {e:#}");
                         }
                     }
@@ -553,6 +615,7 @@ async fn process_envelope(
     families: &HashMap<Vec<usize>, KeyRouter>,
     env: Envelope,
     pending: &mut HashMap<String, Vec<Envelope>>,
+    subqueries: &Arc<Mutex<SubqueryRegistry>>,
 ) -> Result<()> {
     let (delta, txid, lsn) = apply_envelope(ts, &env)?;
     if delta.is_empty() {
@@ -611,6 +674,15 @@ async fn process_envelope(
             if !envs.is_empty() {
                 pending.entry(stream_path.to_string()).or_default().extend(envs);
             }
+        }
+    }
+    // Subquery shapes/nodes: route this delta through the cross-table registry. It updates the shared
+    // inner-set nodes, emits outer-shape deltas, and propagates inner-set flips to dependents — appending
+    // move envelopes synchronously, so this batch's processed-offset barrier still implies convergence.
+    {
+        let mut reg = subqueries.lock().await;
+        if reg.touches(&ts.name) {
+            reg.on_table_delta(ts, &delta, lsn, txid.clone()).await?;
         }
     }
     Ok(())
