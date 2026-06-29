@@ -18,7 +18,18 @@ pub enum LeafOp {
     Gte,
 }
 
-/// JSON predicate shape: a leaf `{col,op,value}` or a combinator `{and|or:[...]}` / `{not:{}}`.
+/// Inner subquery reference: `(SELECT project FROM table WHERE where)`. `where` may itself contain
+/// `In` leaves (nested subqueries). Single column only.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubqueryJson {
+    pub table: String,
+    pub project: String,
+    #[serde(rename = "where", default)]
+    pub where_: Option<Box<PredicateJson>>,
+}
+
+/// JSON predicate shape: a leaf `{col,op,value}`, a combinator `{and|or:[...]}` / `{not:{}}`, or a
+/// subquery leaf `{col, in:{table,project,where?}, negated?}`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum PredicateJson {
@@ -26,6 +37,87 @@ pub enum PredicateJson {
     And { and: Vec<PredicateJson> },
     Or { or: Vec<PredicateJson> },
     Not { not: Box<PredicateJson> },
+    In {
+        col: String,
+        #[serde(rename = "in")]
+        subquery: SubqueryJson,
+        #[serde(default)]
+        negated: bool,
+    },
+}
+
+/// Canonical signature for a subquery node: identical subqueries (same inner table, projected column,
+/// and structurally-equal `where`) produce equal signatures, so they share one maintained node.
+pub type SubquerySig = String;
+
+/// Stable, order-insensitive canonicalization of a predicate (AND/OR children sorted by their own
+/// canonical form). Used to build a [`SubquerySig`] so two equivalent subqueries dedupe to one node.
+pub fn canonical_pred(p: &PredicateJson) -> String {
+    match p {
+        PredicateJson::Leaf { col, op, value } => {
+            format!("L({col},{op:?},{})", serde_json::to_string(value).unwrap_or_default())
+        }
+        PredicateJson::And { and } => {
+            let mut cs: Vec<String> = and.iter().map(canonical_pred).collect();
+            cs.sort();
+            format!("A({})", cs.join(","))
+        }
+        PredicateJson::Or { or } => {
+            let mut cs: Vec<String> = or.iter().map(canonical_pred).collect();
+            cs.sort();
+            format!("O({})", cs.join(","))
+        }
+        PredicateJson::Not { not } => format!("N({})", canonical_pred(not)),
+        PredicateJson::In { col, subquery, negated } => {
+            format!(
+                "I({col},{negated},{})",
+                subquery_sig(&subquery.table, &subquery.project, subquery.where_.as_deref())
+            )
+        }
+    }
+}
+
+/// The canonical signature of a subquery node.
+pub fn subquery_sig(table: &str, project: &str, where_: Option<&PredicateJson>) -> SubquerySig {
+    let w = where_.map(canonical_pred).unwrap_or_default();
+    format!("{table}|{project}|{w}")
+}
+
+/// Collects (and dedupes) subquery nodes encountered while compiling a predicate. The engine's
+/// registry implements this to create/seed nodes; `NoSubqueries` errors (used by paths that don't
+/// support subqueries, e.g. subset queries).
+pub trait SubqueryCollector {
+    /// Register or dedupe a subquery node and return its canonical signature.
+    fn collect(&mut self, table: &str, project: &str, where_: Option<&PredicateJson>) -> Result<SubquerySig>;
+}
+
+/// A collector that rejects subqueries — for predicate paths where they are not supported.
+pub struct NoSubqueries;
+impl SubqueryCollector for NoSubqueries {
+    fn collect(&mut self, _t: &str, _p: &str, _w: Option<&PredicateJson>) -> Result<SubquerySig> {
+        anyhow::bail!("subqueries are not supported here")
+    }
+}
+
+/// Resolves subquery-node membership during evaluation (`matches_ctx`). The engine's registry
+/// implements this over its maintained node sets.
+pub trait SubqueryEval {
+    /// Is `value` a member of the node's current set?
+    fn contains(&self, sig: &SubquerySig, value: &Value) -> bool;
+    /// Does the node's set currently contain a NULL value? (Makes `x NOT IN set` UNKNOWN.)
+    fn has_null(&self, sig: &SubquerySig) -> bool;
+}
+
+/// A [`SubqueryEval`] that panics — guards `matches()` (the non-subquery path) against ever reaching
+/// an `InSubquery` arm. Subquery shapes must use `matches_ctx` with the real registry.
+struct PanicEval;
+impl SubqueryEval for PanicEval {
+    fn contains(&self, _: &SubquerySig, _: &Value) -> bool {
+        panic!("matches() reached a subquery predicate; use matches_ctx with the registry")
+    }
+    fn has_null(&self, _: &SubquerySig) -> bool {
+        panic!("matches() reached a subquery predicate; use matches_ctx with the registry")
+    }
 }
 
 /// Compiled predicate over positional columns. `MatchAll` is used when a shape has no `where`.
@@ -36,32 +128,63 @@ pub enum CompiledPredicate {
     And(Vec<CompiledPredicate>),
     Or(Vec<CompiledPredicate>),
     Not(Box<CompiledPredicate>),
+    /// `col IN (subquery)` (or `NOT IN` when `negated`). The inner predicate lives in the registry node
+    /// keyed by `sig`; evaluation consults it via [`SubqueryEval`].
+    InSubquery { col: usize, sig: SubquerySig, negated: bool },
 }
 
 impl CompiledPredicate {
+    /// Compile against `ts`, rejecting subqueries (back-compat for non-subquery paths).
     pub fn compile(p: &PredicateJson, ts: &TableSchema) -> Result<Self> {
+        Self::compile_with(p, ts, &mut NoSubqueries)
+    }
+
+    /// Compile against `ts`, registering any `IN (SELECT …)` subqueries via `collector` (which creates
+    /// the maintained nodes). The compiled `InSubquery` leaves reference nodes by signature.
+    pub fn compile_with(
+        p: &PredicateJson,
+        ts: &TableSchema,
+        collector: &mut dyn SubqueryCollector,
+    ) -> Result<Self> {
         Ok(match p {
             PredicateJson::Leaf { col, op, value } => {
                 let idx = ts.column_index(col)?;
                 let v = Value::from_json(value, ts.column_type(idx))?;
                 CompiledPredicate::Cmp { col: idx, op: *op, value: v }
             }
-            PredicateJson::And { and } => {
-                CompiledPredicate::And(and.iter().map(|p| Self::compile(p, ts)).collect::<Result<_>>()?)
-            }
-            PredicateJson::Or { or } => {
-                CompiledPredicate::Or(or.iter().map(|p| Self::compile(p, ts)).collect::<Result<_>>()?)
-            }
+            PredicateJson::And { and } => CompiledPredicate::And(
+                and.iter().map(|p| Self::compile_with(p, ts, collector)).collect::<Result<_>>()?,
+            ),
+            PredicateJson::Or { or } => CompiledPredicate::Or(
+                or.iter().map(|p| Self::compile_with(p, ts, collector)).collect::<Result<_>>()?,
+            ),
             PredicateJson::Not { not } => {
-                CompiledPredicate::Not(Box::new(Self::compile(not, ts)?))
+                CompiledPredicate::Not(Box::new(Self::compile_with(not, ts, collector)?))
+            }
+            PredicateJson::In { col, subquery, negated } => {
+                let idx = ts.column_index(col)?;
+                let sig = collector.collect(&subquery.table, &subquery.project, subquery.where_.as_deref())?;
+                CompiledPredicate::InSubquery { col: idx, sig, negated: *negated }
             }
         })
     }
 
-    /// Compile an optional predicate; `None` -> match all rows.
+    /// Compile an optional predicate; `None` -> match all rows. Rejects subqueries.
     pub fn compile_opt(p: Option<&PredicateJson>, ts: &TableSchema) -> Result<Self> {
         match p {
             Some(p) => Self::compile(p, ts),
+            None => Ok(CompiledPredicate::MatchAll),
+        }
+    }
+
+    /// Compile an optional predicate with a subquery collector; `None` -> match all rows.
+    pub fn compile_opt_with(
+        p: Option<&PredicateJson>,
+        ts: &TableSchema,
+        collector: &mut dyn SubqueryCollector,
+    ) -> Result<Self> {
+        match p {
+            Some(p) => Self::compile_with(p, ts, collector),
             None => Ok(CompiledPredicate::MatchAll),
         }
     }
@@ -99,14 +222,21 @@ impl CompiledPredicate {
     }
 
     /// Filter membership under SQL `WHERE` semantics: a row is included iff the predicate is TRUE.
-    /// UNKNOWN (from a NULL operand) and FALSE both exclude the row.
+    /// UNKNOWN (from a NULL operand) and FALSE both exclude the row. Panics if the predicate contains a
+    /// subquery — use [`matches_ctx`](Self::matches_ctx) for those.
     pub fn matches(&self, row: &Row) -> bool {
-        self.eval(row) == Tri::True
+        self.eval_ctx(row, &PanicEval) == Tri::True
+    }
+
+    /// Filter membership with subquery resolution: subquery leaves consult `ev` (the registry's node
+    /// sets). Equivalent to [`matches`](Self::matches) for subquery-free predicates.
+    pub fn matches_ctx(&self, row: &Row, ev: &dyn SubqueryEval) -> bool {
+        self.eval_ctx(row, ev) == Tri::True
     }
 
     /// Three-valued evaluation (TRUE / FALSE / UNKNOWN), mirroring Postgres so the engine and the
-    /// pglite oracle agree even in the presence of NULLs.
-    fn eval(&self, row: &Row) -> Tri {
+    /// pglite oracle agree even in the presence of NULLs. `ev` resolves subquery membership.
+    fn eval_ctx(&self, row: &Row, ev: &dyn SubqueryEval) -> Tri {
         match self {
             CompiledPredicate::MatchAll => Tri::True,
             CompiledPredicate::Cmp { col, op, value } => {
@@ -117,7 +247,7 @@ impl CompiledPredicate {
             CompiledPredicate::And(ps) => {
                 let mut acc = Tri::True;
                 for p in ps {
-                    match p.eval(row) {
+                    match p.eval_ctx(row, ev) {
                         Tri::False => return Tri::False,
                         Tri::Unknown => acc = Tri::Unknown,
                         Tri::True => {}
@@ -129,7 +259,7 @@ impl CompiledPredicate {
             CompiledPredicate::Or(ps) => {
                 let mut acc = Tri::False;
                 for p in ps {
-                    match p.eval(row) {
+                    match p.eval_ctx(row, ev) {
                         Tri::True => return Tri::True,
                         Tri::Unknown => acc = Tri::Unknown,
                         Tri::False => {}
@@ -139,7 +269,23 @@ impl CompiledPredicate {
             }
             // NOT TRUE = FALSE, NOT FALSE = TRUE, NOT UNKNOWN = UNKNOWN. The UNKNOWN case is the fix
             // that makes `NOT (col = x)` over a NULL cell keep the row out, exactly as Postgres does.
-            CompiledPredicate::Not(p) => p.eval(row).not(),
+            CompiledPredicate::Not(p) => p.eval_ctx(row, ev).not(),
+            // `x IN set`: NULL x -> UNKNOWN; else membership. `x NOT IN set`: NULL x -> UNKNOWN; a set
+            // containing NULL makes it UNKNOWN (SQL); else the complement. Mirrors Postgres exactly.
+            CompiledPredicate::InSubquery { col, sig, negated } => {
+                let cell = row.0.get(*col).unwrap_or(&Value::Null);
+                if matches!(cell, Value::Null) {
+                    return Tri::Unknown;
+                }
+                let present = ev.contains(sig, cell);
+                if !negated {
+                    Tri::from_bool(present)
+                } else if ev.has_null(sig) {
+                    Tri::Unknown
+                } else {
+                    Tri::from_bool(!present)
+                }
+            }
         }
     }
 }
@@ -300,6 +446,124 @@ mod tests {
         ]})).is_none()); // duplicate column
         // MatchAll
         assert!(CompiledPredicate::MatchAll.equality_template().is_none());
+    }
+
+    /// A collector that records every (table, project, where-sig) it sees, for assertions.
+    struct RecordCollector {
+        sigs: Vec<SubquerySig>,
+    }
+    impl SubqueryCollector for RecordCollector {
+        fn collect(&mut self, t: &str, p: &str, w: Option<&PredicateJson>) -> Result<SubquerySig> {
+            let sig = subquery_sig(t, p, w);
+            self.sigs.push(sig.clone());
+            Ok(sig)
+        }
+    }
+
+    /// A test eval: a fixed membership set per sig, plus a null flag.
+    struct MockEval {
+        set: std::collections::HashSet<Value>,
+        null: bool,
+    }
+    impl SubqueryEval for MockEval {
+        fn contains(&self, _sig: &SubquerySig, v: &Value) -> bool {
+            self.set.contains(v)
+        }
+        fn has_null(&self, _sig: &SubquerySig) -> bool {
+            self.null
+        }
+    }
+
+    #[test]
+    fn subquery_signature_is_stable_and_order_insensitive() {
+        // identical subqueries -> identical sig
+        let a = subquery_sig(
+            "parent",
+            "id",
+            Some(&serde_json::from_value(serde_json::json!({"col":"active","op":"eq","value":true})).unwrap()),
+        );
+        let b = subquery_sig(
+            "parent",
+            "id",
+            Some(&serde_json::from_value(serde_json::json!({"col":"active","op":"eq","value":true})).unwrap()),
+        );
+        assert_eq!(a, b);
+        // AND child order does not change the sig
+        let p1: PredicateJson = serde_json::from_value(serde_json::json!({"and":[
+            {"col":"active","op":"eq","value":true}, {"col":"x","op":"gt","value":1}
+        ]})).unwrap();
+        let p2: PredicateJson = serde_json::from_value(serde_json::json!({"and":[
+            {"col":"x","op":"gt","value":1}, {"col":"active","op":"eq","value":true}
+        ]})).unwrap();
+        assert_eq!(subquery_sig("t", "id", Some(&p1)), subquery_sig("t", "id", Some(&p2)));
+        // a different inner where -> different sig
+        let p3: PredicateJson = serde_json::from_value(serde_json::json!({"col":"active","op":"eq","value":false})).unwrap();
+        assert_ne!(subquery_sig("parent", "id", Some(&p3)), a);
+        // a different project / table -> different sig
+        assert_ne!(subquery_sig("parent", "name", None), subquery_sig("parent", "id", None));
+    }
+
+    #[test]
+    fn compiles_in_subquery_leaf_and_collects_node() {
+        let ts = users();
+        let p: PredicateJson = serde_json::from_value(serde_json::json!({
+            "col": "id",
+            "in": { "table": "groups", "project": "gid", "where": {"col":"name","op":"eq","value":"a"} },
+            "negated": true
+        })).unwrap();
+        let mut c = RecordCollector { sigs: Vec::new() };
+        let cp = CompiledPredicate::compile_with(&p, &ts, &mut c).unwrap();
+        match cp {
+            CompiledPredicate::InSubquery { col, ref sig, negated } => {
+                assert_eq!(col, ts.column_index("id").unwrap());
+                assert!(negated);
+                let want = subquery_sig(
+                    "groups",
+                    "gid",
+                    Some(&serde_json::from_value(serde_json::json!({"col":"name","op":"eq","value":"a"})).unwrap()),
+                );
+                assert_eq!(sig, &want);
+                assert!(sig.starts_with("groups|gid|"));
+            }
+            _ => panic!("expected InSubquery, got {cp:?}"),
+        }
+        assert_eq!(c.sigs.len(), 1);
+        // subqueries are rejected without a collector
+        assert!(CompiledPredicate::compile(&p, &ts).is_err());
+        // equality_template never treats a subquery as a shareable equality key
+        let mut c2 = RecordCollector { sigs: Vec::new() };
+        assert!(CompiledPredicate::compile_with(&p, &ts, &mut c2).unwrap().equality_template().is_none());
+    }
+
+    #[test]
+    fn matches_ctx_in_and_not_in_with_null_semantics() {
+        let ts = users();
+        let mut c = RecordCollector { sigs: Vec::new() };
+        let in_pred = CompiledPredicate::compile_with(
+            &serde_json::from_value(serde_json::json!({"col":"id","in":{"table":"g","project":"gid"}})).unwrap(),
+            &ts,
+            &mut c,
+        ).unwrap();
+        let not_in = CompiledPredicate::compile_with(
+            &serde_json::from_value(serde_json::json!({"col":"id","negated":true,"in":{"table":"g","project":"gid"}})).unwrap(),
+            &ts,
+            &mut c,
+        ).unwrap();
+        let mk = |id: i64| row(&ts, serde_json::json!({"id":id,"name":"a","age":1,"active":true}));
+        let null_row = row(&ts, serde_json::json!({"id":null,"name":"a","age":1,"active":true}));
+
+        let ev = MockEval { set: [Value::Int(1), Value::Int(2)].into_iter().collect(), null: false };
+        assert!(in_pred.matches_ctx(&mk(1), &ev)); // 1 in set
+        assert!(!in_pred.matches_ctx(&mk(3), &ev)); // 3 not in set
+        assert!(!in_pred.matches_ctx(&null_row, &ev)); // NULL IN -> UNKNOWN -> excluded
+        assert!(!not_in.matches_ctx(&mk(1), &ev)); // 1 in set -> NOT IN false
+        assert!(not_in.matches_ctx(&mk(3), &ev)); // 3 not in set -> NOT IN true
+        assert!(!not_in.matches_ctx(&null_row, &ev)); // NULL NOT IN -> UNKNOWN
+
+        // set contains NULL -> NOT IN is UNKNOWN for everyone (SQL gotcha)
+        let ev_null = MockEval { set: [Value::Int(1)].into_iter().collect(), null: true };
+        assert!(!not_in.matches_ctx(&mk(3), &ev_null));
+        assert!(in_pred.matches_ctx(&mk(1), &ev_null)); // positive IN unaffected by null in set
     }
 
     #[test]
