@@ -562,8 +562,14 @@ impl SubqueryRegistry {
         Ok(())
     }
 
-    /// Evaluate a subquery shape's predicate over a delta on its own (outer) table and append the
-    /// resulting enter/update/leave envelopes — the subquery-aware analog of the standalone filter path.
+    /// Evaluate a subquery shape over a delta on its own (outer) table and append the resulting
+    /// enter/leave envelopes. Emission is **absolute, not delta-based**: for each touched pk we emit the
+    /// row's *current* membership (`upsert` if its latest row matches, else `delete` by pk). This is what
+    /// makes the outer path independent of cross-table processing order — a per-table tailer may apply an
+    /// inner-set change before an earlier-committed outer change, so a delta-based "delete only if the
+    /// *old* row matched" misses move-outs once the inner set is already ahead. Emitting on the *new*
+    /// row's membership (delete is idempotent by pk) converges regardless of order; a value the inner set
+    /// hasn't caught up to yet is reconciled later by the flip-driven move query.
     async fn emit_shape_delta(
         &self,
         shape_id: &str,
@@ -573,8 +579,24 @@ impl SubqueryRegistry {
     ) -> Result<()> {
         let Some(shape) = self.shapes.get(shape_id) else { return Ok(()) };
         let pred = shape.pred.clone();
-        let out: Vec<(Row, ZWeight)> =
-            delta.iter().filter(|t| pred.matches_ctx(&t.0, self)).map(|t| (t.0.clone(), t.1)).collect();
+        // Per touched pk, take the row's latest state: the `+1` row if present (insert/update), else the
+        // `-1` row (delete). `is_new` distinguishes "row still exists" from "row was deleted".
+        let mut by_pk: HashMap<String, (Row, bool)> = HashMap::new();
+        for Tup2(row, w) in delta {
+            let pk = ts.pk_of(row).map(Value::to_key_string).unwrap_or_default();
+            if *w > 0 {
+                by_pk.insert(pk, (row.clone(), true));
+            } else {
+                by_pk.entry(pk).or_insert_with(|| (row.clone(), false));
+            }
+        }
+        let out: Vec<(Row, ZWeight)> = by_pk
+            .into_values()
+            .map(|(row, is_new)| {
+                let member = is_new && pred.matches_ctx(&row, self);
+                (row, if member { 1 } else { -1 })
+            })
+            .collect();
         if out.is_empty() {
             return Ok(());
         }
