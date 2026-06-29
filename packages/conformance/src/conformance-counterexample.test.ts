@@ -33,15 +33,15 @@ const def: ShapeDef = { table: 'users', where: { col: 'active', op: 'eq', value:
 // (active=false). A correct engine ends with an empty shape; `drop_deletes` keeps the stale row.
 async function runLeaveScenario(h: Harness) {
   const shape = await h.client.shape(def)
-  // Enter: this emits an envelope even under the fault, so we can await it to know the client saw it.
-  const txidEnter = await applyOp(h, 'users', {
+  // Enter: the "enter" envelope is emitted even under the fault, so the client observes the row.
+  await applyOp(h, 'users', {
     op: 'insert',
     pk: 1,
     row: { id: 1, name: 'alpha', age: 30, active: true, score: 1.0 },
   })
-  await shape.awaitTxId(txidEnter, 10000)
-  // Leave: under `drop_deletes` no envelope is emitted, so do NOT awaitTxId here (it would hang);
-  // drainEngine proves the engine processed the op regardless.
+  await drainEngine(h)
+  await waitForConvergence(h, { shape, def, columns: COLUMNS, pk: 'id' })
+  // Leave: under `drop_deletes` no envelope is emitted; drainEngine proves the engine processed it.
   await applyOp(h, 'users', {
     op: 'update',
     pk: 1,

@@ -12,6 +12,11 @@ Deliberately simpler than Electric:
 - Query expressivity is limited and grows pragmatically: column comparisons (`eq neq lt lte gt
   gte`) combined with `and` / `or` / `not`.
 
+> **Running it with Postgres?** electric-lite can use **Postgres as the system of record** — your app
+> writes to Postgres, the engine ingests changes via logical replication and reads rows back for
+> backfill. See **[docs/deployment-postgres.md](docs/deployment-postgres.md)** for setup and the small
+> set of config env vars.
+
 ## How it works
 
 Durable Streams is both the **write-ahead log** and the **shape feed** — everything is a stream.

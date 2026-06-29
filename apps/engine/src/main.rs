@@ -23,7 +23,29 @@ async fn main() -> Result<()> {
         tracing::warn!("ELECTRIC_LITE_FAULT active: {:?}", electric_lite_engine::fault::active());
     }
 
-    let engine = Engine::new(DsClient::new(ds_url.clone()));
+    // Postgres mode: data lives in Postgres, ingested via logical replication and read back for
+    // backfill (no in-memory table_state). Enabled by ELECTRIC_LITE_PG_URL.
+    let engine = match std::env::var("ELECTRIC_LITE_PG_URL") {
+        Ok(url) if !url.is_empty() => {
+            let engine = Engine::new_pg(DsClient::new(ds_url.clone()), url);
+            let tables: Vec<String> = std::env::var("ELECTRIC_LITE_PG_TABLES")
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let slot = std::env::var("ELECTRIC_LITE_PG_SLOT").unwrap_or_else(|_| "electric_lite".to_string());
+            let poll_ms: u64 =
+                std::env::var("ELECTRIC_LITE_PG_POLL_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(50);
+            engine
+                .setup_postgres(&tables, &slot, poll_ms)
+                .await
+                .context("postgres setup (introspect, REPLICA IDENTITY FULL, create slot)")?;
+            tracing::info!("postgres mode: {} table(s), slot '{slot}', poll {poll_ms}ms", tables.len());
+            engine
+        }
+        _ => Engine::new(DsClient::new(ds_url.clone())),
+    };
     let app = router(engine);
 
     let listener = tokio::net::TcpListener::bind(&bind).await.with_context(|| format!("binding {bind}"))?;

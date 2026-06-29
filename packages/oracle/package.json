@@ -11,6 +11,10 @@
   },
   "dependencies": {
     "@electric-lite/protocol": "workspace:*",
-    "@electric-sql/pglite": "^0.5.3"
+    "@electric-sql/pglite": "^0.5.3",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.11.10"
   }
 }

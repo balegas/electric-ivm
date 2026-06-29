@@ -13,6 +13,10 @@ pub struct Envelope {
     pub key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<serde_json::Value>,
+    /// The full prior row, carried by replication on UPDATE/DELETE (`REPLICA IDENTITY FULL`). Lets
+    /// the engine compute the input delta without an in-memory `table_state`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old: Option<serde_json::Value>,
     pub headers: EnvelopeHeaders,
 }
 
@@ -24,6 +28,10 @@ pub struct EnvelopeHeaders {
     // The server stamps an `offset` onto each item; accept it on read, never send it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<String>,
+    /// Postgres commit LSN of the change (set by the replication ingestor). Used to skip changes a
+    /// shape/family already reflects from its backfill snapshot (`lsn <= seed_lsn`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsn: Option<String>,
 }
 
 pub struct ReadResult {

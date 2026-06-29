@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use dbsp::ZWeight;
 use dbsp::utils::Tup2;
 use tokio::sync::{Mutex, mpsc};
@@ -23,6 +23,15 @@ use crate::value::{Row, Value};
 pub struct Engine {
     ds: DsClient,
     state: Arc<Mutex<EngineState>>,
+    /// Postgres connection string when running in Postgres mode (logical replication + query-back
+    /// backfill, no in-memory `table_state`). `None` keeps the engine usable only as a library shell.
+    pg_url: Option<String>,
+    /// Last commit LSN the replication ingestor has appended (observability).
+    repl_lsn: Arc<std::sync::Mutex<String>>,
+    /// Highest `__el_sync` sentinel counter the ingestor has decoded-and-appended. The drain barrier
+    /// bumps the sentinel and waits for this to catch up — robust under a shared multi-database
+    /// Postgres (per-database, no dependence on server-global WAL LSNs).
+    repl_sync: Arc<std::sync::atomic::AtomicI64>,
 }
 
 struct EngineState {
@@ -79,7 +88,55 @@ impl Engine {
                 shapes: HashMap::new(),
                 next_shape_id: 1,
             })),
+            pg_url: None,
+            repl_lsn: Arc::new(std::sync::Mutex::new("0/0".to_string())),
+            repl_sync: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         }
+    }
+
+    /// Engine in Postgres mode: data lives in Postgres, ingested via logical replication and read
+    /// back for backfill. Call [`setup_postgres`](Self::setup_postgres) before serving.
+    pub fn new_pg(ds: DsClient, pg_url: String) -> Self {
+        let mut e = Self::new(ds);
+        e.pg_url = Some(pg_url);
+        e
+    }
+
+    /// Introspect the configured tables from Postgres, set `REPLICA IDENTITY FULL`, create the
+    /// replication slot, register the schema, and start the replication ingestor. Idempotent.
+    pub async fn setup_postgres(&self, tables: &[String], slot: &str, poll_ms: u64) -> Result<()> {
+        let url = self.pg_url.clone().context("setup_postgres called without a pg_url")?;
+        let client = crate::pg::connect(&url).await?;
+        let mut compiled = HashMap::new();
+        for t in tables {
+            let def = crate::pg::introspect(&client, t).await?;
+            let ts = TableSchema::from_def(t, &def)?;
+            crate::pg::ensure_replica_identity_full(&client, t).await?;
+            self.ds.ensure_stream(&format!("table/{t}")).await?;
+            compiled.insert(t.clone(), ts);
+        }
+        crate::pg::ensure_slot(&client, slot).await?;
+        self.state.lock().await.tables = compiled.clone();
+        tokio::spawn(crate::replication::run(
+            url,
+            slot.to_string(),
+            poll_ms,
+            self.ds.clone(),
+            Arc::new(compiled),
+            self.repl_lsn.clone(),
+            self.repl_sync.clone(),
+        ));
+        Ok(())
+    }
+
+    /// Last commit LSN appended by the replication ingestor (text form, e.g. "0/1A2B3C").
+    pub fn replication_lsn(&self) -> String {
+        self.repl_lsn.lock().unwrap().clone()
+    }
+
+    /// Highest `__el_sync` sentinel counter the ingestor has decoded-and-appended.
+    pub fn replication_sync(&self) -> i64 {
+        self.repl_sync.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn stream_url(&self, path: &str) -> String {
@@ -110,7 +167,7 @@ impl Engine {
         self.ds.ensure_stream(&stream_path).await?;
 
         if !st.tailers.contains_key(table) {
-            let handle = spawn_tailer(self.ds.clone(), ts.clone());
+            let handle = spawn_tailer(self.ds.clone(), ts.clone(), self.pg_url.clone());
             st.tailers.insert(table.to_string(), handle);
         }
         let tailer = st.tailers.get(table).expect("tailer just inserted");
@@ -159,6 +216,9 @@ impl Engine {
 struct StandaloneShape {
     pred: Arc<CompiledPredicate>,
     stream_path: String,
+    /// WAL LSN of this shape's backfill snapshot; replication changes with `lsn <= seed_lsn` are
+    /// already reflected and are skipped.
+    seed_lsn: u64,
 }
 
 /// Evaluate a stateless WHERE filter directly on a Z-set delta. A filter has no incremental state
@@ -178,13 +238,16 @@ fn eval_standalone(pred: &CompiledPredicate, delta: &[Tup2<Row, ZWeight>]) -> Ve
 struct Family {
     actor: FamilyActor,
     shapes: HashMap<u64, String>,
+    /// WAL LSN of the snapshot the data trace was seeded from; replication changes with
+    /// `lsn <= seed_lsn` are already in the trace and are skipped.
+    seed_lsn: u64,
 }
 
-fn spawn_tailer(ds: DsClient, ts: TableSchema) -> TailerHandle {
+fn spawn_tailer(ds: DsClient, ts: TableSchema, pg_url: Option<String>) -> TailerHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let processed = Arc::new(std::sync::Mutex::new("-1".to_string()));
     let stats = Arc::new(std::sync::Mutex::new(TableStats::default()));
-    tokio::spawn(tailer_loop(ds, ts, cmd_rx, processed.clone(), stats.clone()));
+    tokio::spawn(tailer_loop(ds, ts, pg_url, cmd_rx, processed.clone(), stats.clone()));
     TailerHandle { cmd_tx, processed, stats }
 }
 
@@ -204,13 +267,13 @@ fn publish_stats(
 async fn tailer_loop(
     ds: DsClient,
     ts: TableSchema,
+    pg_url: Option<String>,
     mut cmd_rx: mpsc::UnboundedReceiver<TailerCmd>,
     processed: Arc<std::sync::Mutex<String>>,
     stats: Arc<std::sync::Mutex<TableStats>>,
 ) {
     let table_path = format!("table/{}", ts.name);
     let mut offset = "-1".to_string();
-    let mut table_state: HashMap<Value, Row> = HashMap::new();
     // Standalone per-shape filter circuits (non-equality predicates), keyed by shape id.
     let mut shapes: HashMap<String, StandaloneShape> = HashMap::new();
     // Shared family circuits, keyed by the equality template's (sorted) column indices.
@@ -225,7 +288,7 @@ async fn tailer_loop(
             cmd = cmd_rx.recv() => match cmd {
                 Some(TailerCmd::AddShape { shape_id, num_id, stream_path, pred }) => {
                     if let Err(e) = add_shape_routed(
-                        &ds, &ts, &table_state, &mut shapes, &mut families, &mut family_of,
+                        &ds, &ts, &pg_url, &mut shapes, &mut families, &mut family_of,
                         shape_id, num_id, stream_path, pred,
                     ).await {
                         tracing::error!("add_shape failed: {e:#}");
@@ -258,7 +321,7 @@ async fn tailer_loop(
                     // parallelizing is the main throughput/latency lever.
                     let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
                     for env in rr.envelopes {
-                        if let Err(e) = process_envelope(&ts, &mut table_state, &shapes, &families, env, &mut pending).await {
+                        if let Err(e) = process_envelope(&ts, &shapes, &families, env, &mut pending).await {
                             tracing::error!("process_envelope failed: {e:#}");
                         }
                     }
@@ -284,7 +347,7 @@ async fn tailer_loop(
 async fn add_shape_routed(
     ds: &DsClient,
     ts: &TableSchema,
-    table_state: &HashMap<Value, Row>,
+    pg_url: &Option<String>,
     shapes: &mut HashMap<String, StandaloneShape>,
     families: &mut HashMap<Vec<usize>, Family>,
     family_of: &mut HashMap<String, (Vec<usize>, u64, Row)>,
@@ -300,18 +363,24 @@ async fn add_shape_routed(
             let param = Tup2(Tup2(key_tuple.clone(), num_id), 1);
 
             if let Some(fam) = families.get_mut(&key_cols) {
-                // Existing family: insert the param; the incremental join backfills from the trace.
+                // Existing family: insert the param; the incremental join backfills from the trace
+                // (which already holds the seed + every change applied since).
                 let out = fam.actor.step(vec![], vec![param]).await?;
                 fam.shapes.insert(num_id, stream_path);
                 emit_family_output(ds, ts, fam, out, None).await?;
             } else {
-                // New family: prime the data trace with the current table state and add the param in
-                // one step; the step output is this shape's backfill.
+                // New family: seed the data trace from a Postgres snapshot and add the param in one
+                // step; the step output is this shape's backfill. `seed_lsn` lets the tailer skip
+                // replication changes already reflected in the snapshot.
+                let bf = pg_backfill(pg_url, ts).await?;
                 let actor = FamilyActor::spawn(Arc::new(key_cols.clone()))?;
-                let data: Vec<Tup2<Row, ZWeight>> =
-                    table_state.values().map(|r| Tup2(r.clone(), 1)).collect();
+                let data: Vec<Tup2<Row, ZWeight>> = bf.rows.iter().map(|r| Tup2(r.clone(), 1)).collect();
                 let out = actor.step(data, vec![param]).await?;
-                let mut fam = Family { actor, shapes: HashMap::new() };
+                let mut fam = Family {
+                    actor,
+                    shapes: HashMap::new(),
+                    seed_lsn: crate::pg::lsn_to_u64(&bf.seed_lsn),
+                };
                 fam.shapes.insert(num_id, stream_path);
                 emit_family_output(ds, ts, &fam, out, None).await?;
                 families.insert(key_cols.clone(), fam);
@@ -319,11 +388,33 @@ async fn add_shape_routed(
             family_of.insert(shape_id, (key_cols, num_id, key_tuple));
         }
         None => {
-            let actor = add_shape(ds, ts, table_state, stream_path, pred).await?;
-            shapes.insert(shape_id, actor);
+            // Standalone filter: backfill = current matching rows from Postgres (emitted as upserts).
+            let bf = pg_backfill(pg_url, ts).await?;
+            let out: Vec<(Row, ZWeight)> =
+                bf.rows.iter().filter(|r| pred.matches(r)).map(|r| (r.clone(), 1)).collect();
+            if !out.is_empty() {
+                let envs = translate_output(ts, out, None);
+                ds.append(&stream_path, &envs).await?;
+            }
+            shapes.insert(
+                shape_id,
+                StandaloneShape { pred, stream_path, seed_lsn: crate::pg::lsn_to_u64(&bf.seed_lsn) },
+            );
         }
     }
     Ok(())
+}
+
+/// Read a backfill snapshot from Postgres (current rows + snapshot LSN). Without a `pg_url`
+/// (library/no-source mode) the shape simply starts empty.
+async fn pg_backfill(pg_url: &Option<String>, ts: &TableSchema) -> Result<crate::pg::Backfill> {
+    match pg_url {
+        Some(url) => {
+            let client = crate::pg::connect(url).await?;
+            crate::pg::backfill(&client, ts).await
+        }
+        None => Ok(crate::pg::Backfill { rows: Vec::new(), seed_lsn: "0/0".to_string() }),
+    }
 }
 
 /// Demultiplex a family circuit's `(shape_id, row, weight)` output by shape and append each shape's
@@ -354,41 +445,29 @@ async fn emit_family_output(
     Ok(())
 }
 
-async fn add_shape(
-    ds: &DsClient,
-    ts: &TableSchema,
-    table_state: &HashMap<Value, Row>,
-    stream_path: String,
-    pred: Arc<CompiledPredicate>,
-) -> Result<StandaloneShape> {
-    // Backfill: emit the table's current matching rows as inserts so the new shape reflects data.
-    if !table_state.is_empty() {
-        let out: Vec<(Row, ZWeight)> =
-            table_state.values().filter(|r| pred.matches(r)).map(|r| (r.clone(), 1)).collect();
-        if !out.is_empty() {
-            let envs = translate_output(ts, out, None);
-            ds.append(&stream_path, &envs).await?;
-        }
-    }
-    Ok(StandaloneShape { pred, stream_path })
-}
-
 async fn process_envelope(
     ts: &TableSchema,
-    table_state: &mut HashMap<Value, Row>,
     shapes: &HashMap<String, StandaloneShape>,
     families: &HashMap<Vec<usize>, Family>,
     env: Envelope,
     pending: &mut HashMap<String, Vec<Envelope>>,
 ) -> Result<()> {
-    let (delta, txid) = apply_envelope(ts, table_state, &env)?;
+    let (delta, txid, lsn) = apply_envelope(ts, &env)?;
     if delta.is_empty() {
         return Ok(());
     }
+    let lsn = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0);
     metrics().envelopes.fetch_add(1, Ordering::Relaxed);
     let _t = Timer::new(&metrics().process_envelope);
     // Standalone shapes: evaluate each stateless filter directly on the delta (no thread, no clone).
+    // Skip changes already reflected in the shape's backfill snapshot. `seed_lsn` is the snapshot's
+    // `pg_current_wal_lsn()` (the NEXT byte to be written), so every in-snapshot change has
+    // `lsn < seed_lsn` strictly; the first post-snapshot change can have `lsn == seed_lsn` and MUST
+    // NOT be skipped (else the first live insert is silently dropped).
     for shape in shapes.values() {
+        if lsn != 0 && lsn < shape.seed_lsn {
+            continue;
+        }
         let out = eval_standalone(&shape.pred, &delta);
         if out.is_empty() {
             continue;
@@ -396,8 +475,12 @@ async fn process_envelope(
         let envs = translate_output(ts, out, txid.clone());
         pending.entry(shape.stream_path.clone()).or_default().extend(envs);
     }
-    // Shared family circuits: one join per template fans the delta to all its shapes.
+    // Shared family circuits: one join per template fans the delta to all its shapes. Skip changes
+    // already in the family's seed snapshot so the trace's weights stay exact (no double-count).
     for fam in families.values() {
+        if lsn != 0 && lsn < fam.seed_lsn {
+            continue;
+        }
         let out = {
             let _s = Timer::new(&metrics().family_step);
             fam.actor.step(delta.clone(), vec![]).await?
@@ -459,45 +542,48 @@ async fn flush_pending(ds: &DsClient, pending: HashMap<String, Vec<Envelope>>) {
     }
 }
 
-/// Apply a table change event to `table_state` and return the resulting input Z-set delta
-/// (with weights) plus the originating txid (propagated to shape envelopes).
+/// Turn a table change event into the resulting input Z-set delta, plus the originating txid and
+/// commit LSN. The delta is computed entirely from the envelope's `value` (new row) and `old` (prior
+/// row, carried by replication under `REPLICA IDENTITY FULL`) — no in-memory `table_state`.
 pub(crate) fn apply_envelope(
     ts: &TableSchema,
-    table_state: &mut HashMap<Value, Row>,
     env: &Envelope,
-) -> Result<(Vec<Tup2<Row, ZWeight>>, Option<String>)> {
+) -> Result<(Vec<Tup2<Row, ZWeight>>, Option<String>, Option<String>)> {
     let txid = env.headers.txid.clone();
+    let lsn = env.headers.lsn.clone();
+    let to_row = |v: &serde_json::Value| -> Result<Row> {
+        let obj = v.as_object().ok_or_else(|| anyhow::anyhow!("envelope row is not an object"))?;
+        ts.row_from_json(obj)
+    };
     let mut delta: Vec<Tup2<Row, ZWeight>> = Vec::new();
     match env.headers.operation.as_str() {
-        "insert" | "update" | "upsert" => {
-            let value = env
-                .value
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("{} envelope missing value", env.headers.operation))?;
-            let obj = value
-                .as_object()
-                .ok_or_else(|| anyhow::anyhow!("envelope value is not an object"))?;
-            let row = ts.row_from_json(obj)?;
-            let pk = ts.pk_of(&row)?.clone();
-            match table_state.get(&pk) {
-                Some(old) if old == &row => {}
+        "insert" => {
+            let new = to_row(env.value.as_ref().context("insert envelope missing value")?)?;
+            delta.push(Tup2(new, 1));
+        }
+        "update" | "upsert" => {
+            let new = to_row(env.value.as_ref().context("update envelope missing value")?)?;
+            match env.old.as_ref() {
                 Some(old) => {
-                    delta.push(Tup2(old.clone(), -1));
-                    delta.push(Tup2(row.clone(), 1));
+                    let old = to_row(old)?;
+                    if old != new {
+                        delta.push(Tup2(old, -1));
+                        delta.push(Tup2(new, 1));
+                    }
                 }
-                None => delta.push(Tup2(row.clone(), 1)),
+                // No prior row available -> treat as an insert of the new row.
+                None => delta.push(Tup2(new, 1)),
             }
-            table_state.insert(pk, row);
         }
         "delete" => {
-            let pk = Value::from_key_string(&env.key, ts.pk_type)?;
-            if let Some(old) = table_state.remove(&pk) {
-                delta.push(Tup2(old, -1));
+            // Replication carries the full old row (REPLICA IDENTITY FULL); retract it.
+            if let Some(old) = env.old.as_ref() {
+                delta.push(Tup2(to_row(old)?, -1));
             }
         }
         other => bail!("unknown operation '{other}'"),
     }
-    Ok((delta, txid))
+    Ok((delta, txid, lsn))
 }
 
 /// Translate a shape circuit's output Z-set delta into State-Protocol envelopes. Grouped by pk:
@@ -519,7 +605,8 @@ pub(crate) fn translate_output(ts: &TableSchema, out: Vec<(Row, ZWeight)>, txid:
             type_: ts.name.clone(),
             key: pk.clone(),
             value: Some(ts.row_to_json(row)),
-            headers: EnvelopeHeaders { operation: "upsert".into(), txid: txid.clone(), offset: None },
+            old: None,
+            headers: EnvelopeHeaders { operation: "upsert".into(), txid: txid.clone(), offset: None, lsn: None },
         });
     }
     // TEST-ONLY: the `drop_deletes` fault suppresses "leave" envelopes so rows that exit a shape
@@ -533,7 +620,8 @@ pub(crate) fn translate_output(ts: &TableSchema, out: Vec<(Row, ZWeight)>, txid:
             type_: ts.name.clone(),
             key: pk.clone(),
             value: None,
-            headers: EnvelopeHeaders { operation: "delete".into(), txid: txid.clone(), offset: None },
+            old: None,
+            headers: EnvelopeHeaders { operation: "delete".into(), txid: txid.clone(), offset: None, lsn: None },
         });
     }
     envs
@@ -553,17 +641,18 @@ mod tests {
         TableSchema::from_def("users", &def).unwrap()
     }
 
-    fn env(op: &str, key: &str, value: Option<serde_json::Value>) -> Envelope {
+    fn env(op: &str, key: &str, value: Option<serde_json::Value>, old: Option<serde_json::Value>) -> Envelope {
         Envelope {
             type_: "users".into(),
             key: key.into(),
             value,
-            headers: EnvelopeHeaders { operation: op.into(), txid: None, offset: None },
+            old,
+            headers: EnvelopeHeaders { operation: op.into(), txid: None, offset: None, lsn: None },
         }
     }
 
-    /// End-to-end (sans HTTP): change event -> input delta -> direct filter eval -> output envelopes,
-    /// exercising enter / update / leave for a `WHERE active = true` shape.
+    /// End-to-end (sans HTTP): replication envelope (old+new) -> input delta -> direct filter eval ->
+    /// output envelopes, exercising enter / update / leave for a `WHERE active = true` shape.
     #[test]
     fn change_to_shape_envelope_enter_update_leave() {
         let ts = users();
@@ -571,31 +660,30 @@ mod tests {
             Some(&serde_json::from_value(serde_json::json!({"col":"active","op":"eq","value":true})).unwrap()),
             &ts,
         ).unwrap();
-        let mut table_state = HashMap::new();
 
         // enter: insert an active row -> upsert envelope
-        let (delta, _) = apply_envelope(&ts, &mut table_state, &env("insert", "1", Some(serde_json::json!({"id":1,"name":"a","active":true})))).unwrap();
+        let (delta, _, _) = apply_envelope(&ts, &env("insert", "1", Some(serde_json::json!({"id":1,"name":"a","active":true})), None)).unwrap();
         let envs = translate_output(&ts, eval_standalone(&pred, &delta), None);
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].headers.operation, "upsert");
         assert_eq!(envs[0].key, "1");
 
         // update within shape (name change, still active) -> upsert with new value
-        let (delta, _) = apply_envelope(&ts, &mut table_state, &env("update", "1", Some(serde_json::json!({"id":1,"name":"a2","active":true})))).unwrap();
+        let (delta, _, _) = apply_envelope(&ts, &env("update", "1", Some(serde_json::json!({"id":1,"name":"a2","active":true})), Some(serde_json::json!({"id":1,"name":"a","active":true})))).unwrap();
         let envs = translate_output(&ts, eval_standalone(&pred, &delta), None);
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].headers.operation, "upsert");
         assert_eq!(envs[0].value.as_ref().unwrap()["name"], "a2");
 
         // leave: becomes inactive -> delete envelope
-        let (delta, _) = apply_envelope(&ts, &mut table_state, &env("update", "1", Some(serde_json::json!({"id":1,"name":"a2","active":false})))).unwrap();
+        let (delta, _, _) = apply_envelope(&ts, &env("update", "1", Some(serde_json::json!({"id":1,"name":"a2","active":false})), Some(serde_json::json!({"id":1,"name":"a2","active":true})))).unwrap();
         let envs = translate_output(&ts, eval_standalone(&pred, &delta), None);
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].headers.operation, "delete");
         assert_eq!(envs[0].key, "1");
 
         // a non-matching insert produces no shape envelope
-        let (delta, _) = apply_envelope(&ts, &mut table_state, &env("insert", "2", Some(serde_json::json!({"id":2,"name":"b","active":false})))).unwrap();
+        let (delta, _, _) = apply_envelope(&ts, &env("insert", "2", Some(serde_json::json!({"id":2,"name":"b","active":false})), None)).unwrap();
         let envs = translate_output(&ts, eval_standalone(&pred, &delta), None);
         assert_eq!(envs.len(), 0);
     }

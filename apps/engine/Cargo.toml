@@ -40,5 +40,8 @@ axum = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
+# Postgres source: logical-replication slot polling (test_decoding) + backfill queries.
+# with-serde_json-1 lets us read `to_jsonb(row)` straight into serde_json::Value.
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

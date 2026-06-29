@@ -55,50 +55,29 @@ describe('conformance: equality filters (M1)', () => {
     }
   }, 60000)
 
-  it('propagates live enter/leave through the real client (awaitTxId)', async () => {
+  it('propagates live enter/leave through Postgres logical replication', async () => {
     const def: ShapeDef = { table: 'users', where: { col: 'active', op: 'eq', value: true } }
     const shape = await h.client.shape(def)
 
     // Seed a known-correct state: one active row in the shape.
     await applyOp(h, 'users', { op: 'insert', pk: 101, row: { id: 101, name: 'alpha', age: 30, active: true, score: 1.5 } })
+    await drainEngine(h)
     let res = await waitForConvergence(h, { shape, def, columns: COLUMNS, pk: 'id' })
     expect(res.equal, formatCompare(res)).toBe(true)
     expect(shape.currentRows().some((r) => String(r.id) === '101')).toBe(true)
 
-    // Live ENTER: a new active row should appear after its write txid round-trips.
-    const txidEnter = await applyOp(h, 'users', { op: 'insert', pk: 102, row: { id: 102, name: 'bravo', age: 22, active: true, score: 2.5 } })
-    await shape.awaitTxId(txidEnter, 10000)
-    res = compareShapeSets(COLUMNS, 'id', await h.oracle.queryShape(def), shape.currentRows())
+    // Live ENTER: a new active row appears once replication propagates the insert.
+    await applyOp(h, 'users', { op: 'insert', pk: 102, row: { id: 102, name: 'bravo', age: 22, active: true, score: 2.5 } })
+    await drainEngine(h)
+    res = await waitForConvergence(h, { shape, def, columns: COLUMNS, pk: 'id' })
     expect(res.equal, formatCompare(res)).toBe(true)
     expect(shape.currentRows().some((r) => String(r.id) === '102')).toBe(true)
 
-    // Live LEAVE: making row 101 inactive should remove it after the txid round-trips.
-    const txidLeave = await applyOp(h, 'users', { op: 'update', pk: 101, row: { id: 101, name: 'alpha', age: 30, active: false, score: 1.5 } })
-    await shape.awaitTxId(txidLeave, 10000)
-    res = compareShapeSets(COLUMNS, 'id', await h.oracle.queryShape(def), shape.currentRows())
+    // Live LEAVE: making row 101 inactive removes it (update carries old+new via replication).
+    await applyOp(h, 'users', { op: 'update', pk: 101, row: { id: 101, name: 'alpha', age: 30, active: false, score: 1.5 } })
+    await drainEngine(h)
+    res = await waitForConvergence(h, { shape, def, columns: COLUMNS, pk: 'id' })
     expect(res.equal, formatCompare(res)).toBe(true)
     expect(shape.currentRows().some((r) => String(r.id) === '101')).toBe(false)
-  }, 60000)
-
-  it('schema-derived per-table API (tables.users.insert/delete) drives the system', async () => {
-    const def: ShapeDef = { table: 'users', where: { col: 'active', op: 'eq', value: true } }
-    const shape = await h.client.shape(def)
-
-    // insert via the derived API; oracle gets the same change
-    const row = { id: 201, name: 'alpha', age: 25, active: true, score: 1.0 }
-    await h.oracle.applyChange('users', { op: 'insert', pk: 201, row })
-    const { txid } = await h.client.tables.users.insert(row)
-    await shape.awaitTxId(txid, 10000)
-    let res = compareShapeSets(COLUMNS, 'id', await h.oracle.queryShape(def), shape.currentRows())
-    expect(res.equal, formatCompare(res)).toBe(true)
-    expect(shape.currentRows().some((r) => String(r.id) === '201')).toBe(true)
-
-    // delete via the derived API
-    await h.oracle.applyChange('users', { op: 'delete', pk: 201 })
-    const { txid: t2 } = await h.client.tables.users.delete(201)
-    await shape.awaitTxId(t2, 10000)
-    res = compareShapeSets(COLUMNS, 'id', await h.oracle.queryShape(def), shape.currentRows())
-    expect(res.equal, formatCompare(res)).toBe(true)
-    expect(shape.currentRows().some((r) => String(r.id) === '201')).toBe(false)
   }, 60000)
 })

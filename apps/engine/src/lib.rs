@@ -13,7 +13,9 @@ pub mod family;
 pub mod fault;
 pub mod http;
 pub mod metrics;
+pub mod pg;
 pub mod predicate;
+pub mod replication;
 pub mod schema;
 pub mod value;
 

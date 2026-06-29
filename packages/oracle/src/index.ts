@@ -12,6 +12,7 @@ import {
   shapeSelectSql,
   tableDDL,
 } from '@electric-lite/protocol'
+import pgpkg from 'pg'
 
 export interface Oracle {
   /** Apply a single change to `table` (upsert on insert/update, delete by pk). */
@@ -53,6 +54,59 @@ export async function createOracle(schema: Schema): Promise<Oracle> {
 
     async close() {
       await db.close()
+    },
+  }
+}
+
+// --- Real Postgres backend -------------------------------------------------------------------
+// Used by the Postgres-mode conformance harness: the *same* Postgres is the write source (changes
+// flow source -> logical replication -> engine) and the comparison oracle (SELECT ... WHERE pred).
+
+/** Create the schema's tables in Postgres with `REPLICA IDENTITY FULL` (so logical decoding carries
+ * the full old row). Run before starting the engine. */
+export async function createPgTables(connectionString: string, schema: Schema): Promise<void> {
+  const client = new pgpkg.Client({ connectionString })
+  await client.connect()
+  try {
+    for (const [name, def] of Object.entries(schema.tables)) {
+      await client.query(`${tableDDL(name, def)};`)
+      await client.query(`ALTER TABLE "${name.replace(/"/g, '""')}" REPLICA IDENTITY FULL;`)
+    }
+  } finally {
+    await client.end()
+  }
+}
+
+/** A Postgres-backed oracle: applies changes as real DML (the replication source) and answers shape
+ * queries with `SELECT … WHERE pred` (the comparison truth). */
+export async function createPgOracle(schema: Schema, connectionString: string): Promise<Oracle> {
+  const client = new pgpkg.Client({ connectionString })
+  await client.connect()
+
+  return {
+    async applyChange(table, ev) {
+      const def = schema.tables[table]
+      if (!def) throw new Error(`oracle: unknown table "${table}"`)
+      const { text, params } = changeEventToDML(table, def, ev)
+      await client.query(text, params)
+    },
+
+    async queryShape(shape) {
+      const def = schema.tables[shape.table]
+      if (!def) throw new Error(`oracle: unknown table "${shape.table}"`)
+      const { text, params } = shapeSelectSql(shape.table, shape.where)
+      const res = await client.query(text, params)
+      return res.rows as Row[]
+    },
+
+    async reset() {
+      for (const name of Object.keys(schema.tables)) {
+        await client.query(`TRUNCATE "${name.replace(/"/g, '""')}" RESTART IDENTITY CASCADE;`)
+      }
+    },
+
+    async close() {
+      await client.end()
     },
   }
 }

@@ -7,7 +7,27 @@ client for materialization.
 
 This document describes the system as built. For the narrower design records see
 `docs/superpowers/specs/` (electric-lite-decisions, shape-pipeline-sharing-design, conformance-expansion,
-benchmark-findings).
+benchmark-findings, postgres-logical-replication).
+
+> **Postgres mode (current default for deployment).** electric-lite now runs with **Postgres as the
+> system of record**: applications write to Postgres, the engine ingests changes via **logical
+> replication** (built-in `test_decoding`), and shape **backfill reads rows back from Postgres** with a
+> snapshot `SELECT`. This replaces the in-memory `table_state` (§4.1–4.2) and the API write path (§3)
+> described below — those now apply only to the legacy/library mode (no `ELECTRIC_LITE_PG_URL`). Delta
+> computation uses the replicated **old + new** tuples (`REPLICA IDENTITY FULL`) instead of a local
+> table copy; backfill and live replication are reconciled by WAL **LSN** so each row counts exactly
+> once. The shape fan-out, family/standalone strategies (§4.3), output translation (§4.4), and the
+> durable-streams transport are unchanged. See `docs/deployment-postgres.md` to run it and
+> `docs/superpowers/specs/2026-06-29-postgres-logical-replication.md` for the design.
+
+```
+  Postgres mode:
+   app ──writes──▶  Postgres  ──logical replication──▶  engine  ──append──▶  durable-streams
+                      ▲                                   │                    (shape/<id>)
+                      └──────────── backfill SELECT ──────┘                         │
+                                                                                    ▼
+                                                                           client (live rows)
+```
 
 ---
 

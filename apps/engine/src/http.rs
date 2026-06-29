@@ -19,6 +19,7 @@ pub fn router(engine: Engine) -> Router {
         .route("/shapes/{id}", get(get_shape).delete(drop_shape))
         .route("/tables/{name}/offset", get(table_offset))
         .route("/tables/{name}/families", get(table_families))
+        .route("/replication/lsn", get(replication_lsn))
         .route("/metrics", get(get_metrics))
         .route("/metrics/reset", post(reset_metrics))
         .with_state(engine)
@@ -104,6 +105,10 @@ async fn table_families(
         Some(stats) => Ok(Json(stats)),
         None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("no tailer for table {name}") }),
     }
+}
+
+async fn replication_lsn(State(engine): State<Engine>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "lsn": engine.replication_lsn(), "sync": engine.replication_sync() }))
 }
 
 async fn get_metrics() -> Json<serde_json::Value> {
