@@ -39,11 +39,13 @@ let ds: DurableStreamTestServer | undefined
 let engineProc: ChildProcess | undefined
 let api: ApiServer | undefined
 let vite: ViteDevServer | undefined
+let caddyProc: ChildProcess | undefined
 let shuttingDown = false
 
 async function shutdown(code = 0): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
+  caddyProc?.kill('SIGKILL')
   engineProc?.kill('SIGKILL')
   if (pg) {
     await pg.query('SELECT pg_drop_replication_slot($1)', [SLOT]).catch(() => {})
@@ -263,7 +265,43 @@ try {
   await vite.listen()
   console.log('')
   vite.printUrls()
-  console.log(`\n👉 Open the Local URL above. LinearLite (${PRIORITIES.length} priorities, ${STATUSES.length} statuses)`)
+
+  // Optional HTTPS / HTTP-2 front (Caddy). Browsers cap HTTP/1.1 at ~6 connections per origin, which
+  // the many concurrent live shape streams (5 board columns + list pages + HMR) can exhaust — the
+  // durable-streams client even warns about it. Fronting Vite with an HTTP/2 TLS proxy multiplexes
+  // every stream over a single connection, lifting the cap. Auto-enabled when `caddy` is on PATH; set
+  // DEMO_HTTPS=0 to skip, DEMO_HTTPS_PORT to change the port (default 8443).
+  if (process.env.DEMO_HTTPS !== '0') {
+    let hasCaddy = true
+    try {
+      execFileSync('caddy', ['version'], { stdio: 'ignore' })
+    } catch {
+      hasCaddy = false
+    }
+    if (hasCaddy) {
+      // Dial the exact address Vite bound (it listens on IPv6 ::1 by default; a 127.0.0.1 upstream
+      // would 502). Bracket IPv6 hosts for the host:port form.
+      const a = vite.httpServer?.address()
+      const vitePort = a && typeof a === 'object' ? a.port : 5174
+      const host = a && typeof a === 'object' && a.family === 'IPv6' && a.address !== '::' ? `[${a.address}]` : '127.0.0.1'
+      const httpsPort = process.env.DEMO_HTTPS_PORT ?? '8443'
+      caddyProc = spawn(
+        'caddy',
+        ['reverse-proxy', '--from', `https://localhost:${httpsPort}`, '--to', `${host}:${vitePort}`],
+        { stdio: 'inherit' },
+      )
+      caddyProc.on('exit', (c) => {
+        if (!shuttingDown) console.warn(`caddy proxy exited (${c}); continuing over HTTP only`)
+      })
+      console.log(`\n🔒 HTTPS (HTTP/2) →  https://localhost:${httpsPort}/`)
+      console.log('   Multiplexes the live shape streams over one connection (past the ~6-per-origin HTTP/1.1 cap).')
+      console.log("   The cert is from Caddy's local CA: run `caddy trust` once to remove the browser warning, or click through it.")
+    } else {
+      console.log('\n(Install `caddy` to also serve over HTTPS/HTTP-2 and avoid the browser ~6-connection HTTP/1.1 cap on live streams.)')
+    }
+  }
+
+  console.log(`\n👉 Open a URL above. LinearLite (${PRIORITIES.length} priorities, ${STATUSES.length} statuses)`)
   console.log('   on electric-lite: writes go to Postgres, replicate into the engine, and the')
   console.log('   board/list shapes update live.\n')
 } catch (e) {
