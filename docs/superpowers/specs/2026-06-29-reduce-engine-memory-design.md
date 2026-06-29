@@ -1,6 +1,13 @@
 # Reduce engine memory: Postgres-backed shapes (no in-engine table copies)
 
-Design record — 2026-06-29. Status: **proposed (awaiting review)**.
+Design record — 2026-06-29. Status: **implemented** (both phases). Phase 1 = commit `7ae7840`,
+Phase 2 = commit `c1aa075`. Conformance + oracle (73) and the fuzz parity loop stay green; the engine
+holds no table copies. Note on measurement: the `bench/memtest` RSS is dominated by transient
+per-envelope churn held as macOS allocator high-water (RSS scales with payload, not with retained
+rows — shapes matching nothing still show hundreds of MB), so it does not cleanly show the trace
+removal; the elimination of retained table data is structural (code + conformance). The remaining RSS
+lever is bounding the read-batch backlog (needs durable-streams server limit support) — tracked
+separately.
 
 ## Context & problem
 

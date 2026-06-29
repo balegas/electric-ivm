@@ -71,14 +71,17 @@ A shape is *one table + a predicate*. The predicate is a **JSON AST** (not SQL);
 it to a Rust closure. Each row change arrives as a **Z-set delta** (rows with `+1`/`-1` weights), and
 the engine maintains the shape's result incrementally:
 
-- **Standalone shapes** are a stateless filter applied directly to the delta — no per-shape thread,
-  no state. The matching rows (and their enter/leave/update transitions) fall straight out of
-  filtering the delta Z-set.
-- **Shape families** (many shapes over the same table/columns) share a `dbsp` circuit so the
-  incremental work is done once and fanned out.
+- **Standalone shapes** (ranges, OR, NOT, …) are a stateless filter applied directly to the delta —
+  no per-shape thread, no state. The matching rows (and their enter/leave/update transitions) fall
+  straight out of filtering the delta Z-set.
+- **Equality shapes** (e.g. `tenant = 7`) are **routed by key**: one `key → shapes` index per template
+  routes each change only to the shapes watching its key (independent of shape count). Each shape
+  backfills its rows directly from Postgres (`WHERE key = const`), so the engine keeps **no copy of the
+  table** — only `O(#shapes)` routing metadata.
 
-dbsp guarantees the incremental result equals a full recompute, so the live set is always exactly the
-query result — never an approximation that drifts.
+Working from the change delta (rather than recomputing) keeps the live set exactly equal to the query
+result, never an approximation that drifts. (The engine holds no table data; backfill reads only the
+rows a shape needs — see `docs/superpowers/specs/2026-06-29-reduce-engine-memory-design.md`.)
 
 ### 3. Durable Streams — the log and the shape feed
 

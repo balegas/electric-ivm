@@ -26,10 +26,23 @@ benchmark-findings, postgres-logical-replication).
 > committed before the snapshot are already in the backfill; those committing at/after it
 > (`>= seed_lsn`) are taken from the live stream. Comparing the *commit* LSN (not the per-change record
 > LSN) is what keeps rows of transactions in flight during the snapshot from being dropped, so each row
-> counts exactly once (guarded by `conformance-concurrency.test.ts`). The shape fan-out,
-> family/standalone strategies (§4.3), output translation (§4.4), and the durable-streams transport are
-> unchanged. See `docs/deployment-postgres.md` to run it and
+> counts exactly once (guarded by `conformance-concurrency.test.ts`). The output translation (§4.4) and
+> the durable-streams transport are unchanged. See `docs/deployment-postgres.md` to run it and
 > `docs/superpowers/specs/2026-06-29-postgres-logical-replication.md` for the design.
+
+> **Routing model (supersedes the dbsp family circuit, §4.3a / §5 / §8 / §10).** The engine no longer
+> keeps any table data in memory. Equality-template shapes are no longer a shared dbsp **join** whose
+> data trace is a full copy of the table; they are a **key routing index** (`key_tuple -> {shapes}`,
+> one per template) holding only per-shape metadata. A new equality shape **backfills directly from
+> Postgres** (`SELECT … WHERE key = const`, the Phase-1 predicate pushdown) and registers in the index;
+> a live change is routed by its old/new key to exactly the shapes on that key (membership = key match)
+> and emits delete(old)/upsert(new), each shape applying its own `seed_lsn`. Standalone shapes are
+> unchanged (stateless filters; their backfill now also pushes the predicate into the `SELECT`). So the
+> engine holds **O(#shapes)** routing metadata and **zero table copies** (was `O(#templates × table)`);
+> `FamilyActor` and the per-template OS thread are gone (dbsp remains only for the `Row`/`Tup2`/`ZWeight`
+> Z-set value types). §4.3(a), the family rows of §5 and §8, and §10 (dbsp trace storage) describe the
+> superseded design. Backfill never reads the whole table any more. See
+> `docs/superpowers/specs/2026-06-29-reduce-engine-memory-design.md`.
 
 ```
   Postgres mode:
@@ -354,10 +367,10 @@ lever as-is.
 
 | path | role |
 |------|------|
-| `apps/engine/src/engine.rs` | tailer, delta computation, routing, fan-out, flush, backfill↔replication LSN reconciliation |
+| `apps/engine/src/engine.rs` | tailer, delta computation, key routing + standalone fan-out, flush, backfill↔replication LSN reconciliation |
 | `apps/engine/src/replication.rs` | Postgres logical-replication ingestor: peek slot, buffer per-txn, stamp commit LSN, append, advance |
-| `apps/engine/src/pg.rs` | Postgres connect/introspect, `REPLICA IDENTITY FULL`, slot create, snapshot backfill (`seed_lsn`) |
-| `apps/engine/src/family.rs` | shared equality-template join circuit (`FamilyActor`) |
+| `apps/engine/src/pg.rs` | Postgres connect/introspect, `REPLICA IDENTITY FULL`, slot create, predicate-pushdown backfill (`seed_lsn`) |
+| `apps/engine/src/sql.rs` | predicate → parameterized SQL `WHERE` (backfill pushdown; mirrors the TS compiler / oracle) |
 | `apps/engine/src/predicate.rs` | predicate compilation, three-valued `matches`, `equality_template` |
 | `apps/engine/src/ds.rs` | durable-streams HTTP client (`ensure_stream`/`append`/`read`) |
 | `apps/engine/src/value.rs` | `Value`, `Row` |

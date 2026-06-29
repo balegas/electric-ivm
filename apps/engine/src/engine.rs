@@ -1,6 +1,7 @@
-//! Engine orchestration: schema/shape registries and one tailer task per table. A tailer owns
-//! the table's authoritative `pk -> Row` state, fans each change out to every shape's circuit
-//! actor, and appends the filtered deltas (as State-Protocol envelopes) to the shape streams.
+//! Engine orchestration: schema/shape registries and one tailer task per table. A tailer holds only
+//! per-shape routing metadata (no table data): it fans each change out to standalone filters and to
+//! equality shapes routed by key, and appends the filtered deltas (as State-Protocol envelopes) to
+//! the shape streams. Shapes backfill from Postgres on registration; see `add_shape_routed`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
