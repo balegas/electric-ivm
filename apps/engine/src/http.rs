@@ -39,6 +39,13 @@ async fn define_schema(
 }
 
 #[derive(Deserialize)]
+struct OrderByReq {
+    col: String,
+    #[serde(default)]
+    desc: bool,
+}
+
+#[derive(Deserialize)]
 struct CreateShapeReq {
     table: String,
     #[serde(default, rename = "where")]
@@ -46,6 +53,13 @@ struct CreateShapeReq {
     /// Optional output projection: column names to sync. Omitted = the full row.
     #[serde(default)]
     columns: Option<Vec<String>>,
+    /// Optional backfill order (ORDER BY) for cursor pagination. Required when `limit` is set for a
+    /// deterministic window; otherwise the read falls back to pk order.
+    #[serde(default, rename = "orderBy")]
+    order_by: Option<OrderByReq>,
+    /// Optional backfill window size (LIMIT). Live changes matching the predicate still flow in.
+    #[serde(default)]
+    limit: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -68,7 +82,8 @@ async fn create_shape(
     State(engine): State<Engine>,
     Json(req): Json<CreateShapeReq>,
 ) -> Result<Json<ShapeResp>, AppError> {
-    let rec = engine.create_shape(&req.table, req.where_, req.columns).await?;
+    let order_by = req.order_by.map(|o| (o.col, o.desc));
+    let rec = engine.create_shape(&req.table, req.where_, req.columns, order_by, req.limit).await?;
     Ok(Json(ShapeResp::of(&engine, rec)))
 }
 

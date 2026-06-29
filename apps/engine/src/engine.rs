@@ -83,6 +83,8 @@ enum TailerCmd {
         pred: Arc<CompiledPredicate>,
         /// Output projection (column indices to emit), or `None` for the full row.
         out_cols: Option<Arc<Vec<usize>>>,
+        /// Optional backfill window (ORDER BY + LIMIT) for cursor pagination. Affects backfill only.
+        window: crate::pg::Window,
     },
     RemoveShape { shape_id: String },
 }
@@ -173,6 +175,8 @@ impl Engine {
         table: &str,
         where_: Option<PredicateJson>,
         columns: Option<Vec<String>>,
+        order_by: Option<(String, bool)>,
+        limit: Option<i64>,
     ) -> Result<ShapeRecord> {
         let mut st = self.state.lock().await;
         let ts = match st.tables.get(table) {
@@ -180,6 +184,12 @@ impl Engine {
             None => bail!("unknown table '{table}'"),
         };
         let pred = Arc::new(CompiledPredicate::compile_opt(where_.as_ref(), &ts)?);
+        // Resolve the optional backfill window (cursor pagination). `order_by` is (column name, desc).
+        let order = match order_by {
+            Some((col, desc)) => Some((ts.column_index(&col)?, desc)),
+            None => None,
+        };
+        let window = crate::pg::Window { order, limit };
         // Resolve the optional output projection to column indices. The pk is always included (the
         // client keys rows by it); indices are sorted into schema order for a stable JSON shape.
         let out_cols: Option<Arc<Vec<usize>>> = match columns {
@@ -217,6 +227,7 @@ impl Engine {
                 stream_path: stream_path.clone(),
                 pred,
                 out_cols,
+                window,
             })
             .map_err(|_| anyhow::anyhow!("tailer for '{table}' is gone"))?;
 
@@ -354,10 +365,10 @@ async fn tailer_loop(
         tokio::select! {
             biased;
             cmd = cmd_rx.recv() => match cmd {
-                Some(TailerCmd::AddShape { shape_id, num_id, stream_path, pred, out_cols }) => {
+                Some(TailerCmd::AddShape { shape_id, num_id, stream_path, pred, out_cols, window }) => {
                     if let Err(e) = add_shape_routed(
                         &ds, &ts, &pg_url, &mut shapes, &mut families, &mut family_of,
-                        shape_id, num_id, stream_path, pred, out_cols,
+                        shape_id, num_id, stream_path, pred, out_cols, window,
                     ).await {
                         tracing::error!("add_shape failed: {e:#}");
                     }
@@ -428,6 +439,7 @@ async fn add_shape_routed(
     stream_path: String,
     pred: Arc<CompiledPredicate>,
     out_cols: Option<Arc<Vec<usize>>>,
+    window: crate::pg::Window,
 ) -> Result<()> {
     let proj = out_cols.as_deref().map(Vec::as_slice);
     match pred.equality_template() {
@@ -438,7 +450,7 @@ async fn add_shape_routed(
             // Per-shape backfill straight from Postgres: the predicate IS this shape's key equality, so
             // the pushdown reads only the key-matching rows — the engine never holds a table copy. Each
             // shape records its own `seed_lsn` for the live-change reconciliation.
-            let bf = pg_backfill(pg_url, ts, Some(pred.as_ref())).await?;
+            let bf = pg_backfill(pg_url, ts, Some(pred.as_ref()), window).await?;
             let out: Vec<(Row, ZWeight)> = bf.rows.iter().map(|r| (r.clone(), 1)).collect();
             if !out.is_empty() {
                 let envs = translate_output(ts, out, None, proj);
@@ -460,7 +472,7 @@ async fn add_shape_routed(
             // Standalone filter: backfill = current matching rows from Postgres (emitted as upserts).
             // Push the predicate into the SELECT so only matching rows are read; `matches()` below is
             // the final authority (and a safety net if the SQL is ever a looser superset).
-            let bf = pg_backfill(pg_url, ts, Some(pred.as_ref())).await?;
+            let bf = pg_backfill(pg_url, ts, Some(pred.as_ref()), window).await?;
             let out: Vec<(Row, ZWeight)> =
                 bf.rows.iter().filter(|r| pred.matches(r)).map(|r| (r.clone(), 1)).collect();
             if !out.is_empty() {
@@ -483,11 +495,12 @@ async fn pg_backfill(
     pg_url: &Option<String>,
     ts: &TableSchema,
     filter: Option<&CompiledPredicate>,
+    window: crate::pg::Window,
 ) -> Result<crate::pg::Backfill> {
     match pg_url {
         Some(url) => {
             let client = crate::pg::connect(url).await?;
-            crate::pg::backfill(&client, ts, filter).await
+            crate::pg::backfill(&client, ts, filter, window).await
         }
         None => Ok(crate::pg::Backfill { rows: Vec::new(), seed_lsn: "0/0".to_string() }),
     }

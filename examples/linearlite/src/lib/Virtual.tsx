@@ -1,5 +1,5 @@
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { useRef } from 'react'
+import { useEffect, useRef } from 'react'
 
 /**
  * Windowed renderer: mounts only the rows currently in view (plus a small overscan) instead of one
@@ -19,6 +19,7 @@ export function Virtual<T>({
   className,
   gap = 0,
   overscan = 12,
+  onEndReached,
 }: {
   items: T[]
   getKey: (item: T, index: number) => string | number
@@ -27,6 +28,8 @@ export function Virtual<T>({
   className?: string
   gap?: number
   overscan?: number
+  /** Fired when the rendered window reaches the end of `items` (for infinite-scroll paging). */
+  onEndReached?: () => void
 }): JSX.Element {
   const parentRef = useRef<HTMLDivElement>(null)
   const virtualizer = useVirtualizer({
@@ -36,12 +39,20 @@ export function Virtual<T>({
     overscan,
   })
 
+  // Trigger paging when the last rendered row is within a screenful of the end. Keyed on the last
+  // rendered index + item count so it re-checks as the user scrolls and as pages arrive.
+  const virtualItems = virtualizer.getVirtualItems()
+  const lastIndex = virtualItems.length ? virtualItems[virtualItems.length - 1]!.index : 0
+  useEffect(() => {
+    if (onEndReached && items.length > 0 && lastIndex >= items.length - 1 - overscan) onEndReached()
+  }, [onEndReached, lastIndex, items.length, overscan])
+
   return (
     <div ref={parentRef} className={className}>
       {/* flexShrink:0 — when the viewport is itself a flex container (e.g. .board-col-body), the sizer
           must keep its full virtual height instead of being shrunk to fit, or scrolling collapses. */}
       <div style={{ height: virtualizer.getTotalSize(), position: 'relative', width: '100%', flexShrink: 0 }}>
-        {virtualizer.getVirtualItems().map((vi) => (
+        {virtualItems.map((vi) => (
           <div
             key={getKey(items[vi.index]!, vi.index)}
             data-index={vi.index}

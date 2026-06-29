@@ -61,9 +61,23 @@ export const appRouter = t.router({
 
   shapes: t.router({
     create: t.procedure
-      .input(z.object({ table: z.string(), where: predicateSchema.optional(), columns: z.array(z.string()).optional() }))
+      .input(
+        z.object({
+          table: z.string(),
+          where: predicateSchema.optional(),
+          columns: z.array(z.string()).optional(),
+          orderBy: z.object({ col: z.string(), desc: z.boolean().optional() }).optional(),
+          limit: z.number().int().nonnegative().optional(),
+        }),
+      )
       .mutation(async ({ input, ctx }) =>
-        ctx.core.createShape({ table: input.table, where: input.where as never, columns: input.columns }),
+        ctx.core.createShape({
+          table: input.table,
+          where: input.where as never,
+          columns: input.columns,
+          orderBy: input.orderBy,
+          limit: input.limit,
+        }),
       ),
 
     get: t.procedure.input(z.object({ id: z.string() })).query(async ({ input, ctx }) => {
