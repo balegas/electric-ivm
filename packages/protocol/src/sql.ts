@@ -2,6 +2,7 @@ import {
   type ChangeEvent,
   type ColumnType,
   isAnd,
+  isInSubquery,
   isLeaf,
   isNot,
   isOr,
@@ -66,6 +67,11 @@ export function predicateToSql(pred: Predicate, startIndex = 1): SqlFragment {
     }
     if (isNot(p)) {
       return `(NOT ${build(p.not)})`
+    }
+    if (isInSubquery(p)) {
+      const op = p.negated ? 'NOT IN' : 'IN'
+      const inner = p.in.where ? ` WHERE ${build(p.in.where)}` : ''
+      return `${q(p.col)} ${op} (SELECT ${q(p.in.project)} FROM ${q(p.in.table)}${inner})`
     }
     throw new Error(`unknown predicate node: ${JSON.stringify(p)}`)
   }

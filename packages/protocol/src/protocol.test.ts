@@ -2,10 +2,13 @@ import { describe, expect, it } from 'vitest'
 import {
   changeEventToDML,
   evaluate,
+  type InSubqueryPredicate,
+  isInSubquery,
   type Predicate,
   PredicateError,
   predicateToSql,
   type Row,
+  type Schema,
   shapeSelectSql,
   tableDDL,
   type TableDef,
@@ -99,6 +102,63 @@ describe('predicateToSql', () => {
     const f = predicateToSql(p)
     expect(f.text).toBe('("active" = $1 AND ("age" > $2 OR (NOT "name" = $3)))')
     expect(f.params).toEqual([true, 25, 'Bob'])
+  })
+})
+
+describe('subqueries', () => {
+  const schema: Schema = {
+    tables: {
+      parent: { columns: { id: { type: 'int' }, active: { type: 'bool' } }, primaryKey: 'id' },
+      child: { columns: { id: { type: 'int' }, parent_id: { type: 'int' } }, primaryKey: 'id' },
+    },
+  }
+  const sub: InSubqueryPredicate = {
+    col: 'parent_id',
+    in: { table: 'parent', project: 'id', where: { col: 'active', op: 'eq', value: true } },
+  }
+
+  it('recognizes an in-subquery leaf (and not as a plain leaf)', () => {
+    expect(isInSubquery(sub)).toBe(true)
+    expect(isInSubquery({ col: 'parent_id', op: 'eq', value: 1 } as Predicate)).toBe(false)
+  })
+
+  it('validates the inner where against the inner table', () => {
+    expect(() => validatePredicate(sub, schema.tables.child!, schema)).not.toThrow()
+    const badInnerCol: InSubqueryPredicate = {
+      col: 'parent_id',
+      in: { table: 'parent', project: 'id', where: { col: 'nope', op: 'eq', value: true } },
+    }
+    expect(() => validatePredicate(badInnerCol, schema.tables.child!, schema)).toThrow(PredicateError)
+    const badProject: InSubqueryPredicate = { col: 'parent_id', in: { table: 'parent', project: 'nope' } }
+    expect(() => validatePredicate(badProject, schema.tables.child!, schema)).toThrow(PredicateError)
+    const badOuterCol: InSubqueryPredicate = { col: 'nope', in: { table: 'parent', project: 'id' } }
+    expect(() => validatePredicate(badOuterCol, schema.tables.child!, schema)).toThrow(PredicateError)
+    expect(() => validatePredicate(sub, schema.tables.child!)).toThrow(/requires a schema/)
+  })
+
+  it('evaluate() throws on a subquery (resolved via SQL, not the row evaluator)', () => {
+    expect(() => evaluate(sub, { parent_id: 1 })).toThrow(/subquery/)
+  })
+
+  it('emits IN (SELECT …) SQL with parameterized inner literals', () => {
+    const f = predicateToSql(sub, 1)
+    expect(f.text).toBe('"parent_id" IN (SELECT "id" FROM "parent" WHERE "active" = $1)')
+    expect(f.params).toEqual([true])
+  })
+
+  it('emits NOT IN and supports an omitted inner where', () => {
+    const f = predicateToSql({ col: 'parent_id', negated: true, in: { table: 'parent', project: 'id' } }, 1)
+    expect(f.text).toBe('"parent_id" NOT IN (SELECT "id" FROM "parent")')
+    expect(f.params).toEqual([])
+  })
+
+  it('composes inside shapeSelectSql with surrounding params', () => {
+    const where: Predicate = { and: [{ col: 'id', op: 'gt', value: 5 }, sub] }
+    const f = shapeSelectSql('child', where)
+    expect(f.text).toBe(
+      'SELECT * FROM "child" WHERE ("id" > $1 AND "parent_id" IN (SELECT "id" FROM "parent" WHERE "active" = $2))',
+    )
+    expect(f.params).toEqual([5, true])
   })
 })
 

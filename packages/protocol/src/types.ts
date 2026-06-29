@@ -50,10 +50,37 @@ export interface NotPredicate {
 }
 
 /**
- * A restricted boolean predicate over a single table's columns.
- * M1 uses only `eq` leaves; M2 adds the other ops plus and/or/not.
+ * Reference to an inner subquery: the set of `project` values over `table`'s rows matching `where`.
+ * `where` may itself contain `InSubqueryPredicate` leaves (nested subqueries). Single column only —
+ * composite `(a,b) IN (…)` is out of scope.
  */
-export type Predicate = LeafPredicate | AndPredicate | OrPredicate | NotPredicate
+export interface SubqueryRef {
+  table: string
+  project: string
+  where?: Predicate
+}
+
+/**
+ * `outer.col IN (SELECT project FROM table WHERE where)` (or `NOT IN` when `negated`). Outer membership
+ * is `row[col] ∈ innerSet` / `∉`; the engine maintains the inner set incrementally (shared across shapes
+ * referencing the same subquery). `col` references the *outer* table; `in.project`/`in.where` the inner.
+ */
+export interface InSubqueryPredicate {
+  col: string
+  in: SubqueryRef
+  negated?: boolean
+}
+
+/**
+ * A restricted boolean predicate over a single table's columns, plus single-column `IN`/`NOT IN`
+ * subqueries. M1 used only `eq` leaves; M2 added the other ops plus and/or/not; subqueries add `in`.
+ */
+export type Predicate =
+  | LeafPredicate
+  | AndPredicate
+  | OrPredicate
+  | NotPredicate
+  | InSubqueryPredicate
 
 export function isLeaf(p: Predicate): p is LeafPredicate {
   return 'col' in p && 'op' in p
@@ -66,6 +93,9 @@ export function isOr(p: Predicate): p is OrPredicate {
 }
 export function isNot(p: Predicate): p is NotPredicate {
   return 'not' in p
+}
+export function isInSubquery(p: Predicate): p is InSubqueryPredicate {
+  return 'in' in p && 'col' in p
 }
 
 // --- Shapes ------------------------------------------------------------------
