@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "bench": "tsx src/run.ts"
+    "bench": "tsx src/run.ts",
+    "memtest": "tsx src/memtest.ts"
   },
   "dependencies": {
     "@electric-lite/protocol": "workspace:*",

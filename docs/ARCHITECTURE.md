@@ -289,15 +289,34 @@ batch files + dirlocks are written. Output is identical — storage is transpare
 | on-disk, PageCache, `MIN_BYTES=0` | 7.4ms | **556MB** | pathological — forcing every tiny batch to disk makes mmap'd pages + write buffers count toward RSS |
 | on-disk, FelderaCache 64 MiB, default threshold | 7.5ms | **34MB** | nothing spills (working set < 10 MiB); behaves like in-memory |
 
-**Takeaways / caveats:**
-- It is **not** a free memory win on small data. With the default threshold, small traces stay in RAM
-  (no spill) — same as in-memory. With `MIN_BYTES=0` + PageCache, RSS *grows* (page cache + buffers).
-- The memory-bounding benefit materializes only when the **working set exceeds RAM**, using a sensible
-  `MIN_BYTES` plus a bounded `FelderaCache` budget: RAM is then capped near the cache size at the cost of
-  disk-read **p99** spikes on cache misses (p50 stays flat if the hot set fits the cache).
+**Large-scale test (`packages/bench/src/memtest.ts`, `pnpm --filter @electric-lite/bench memtest`).**
+8 distinct equality templates (8 families, so the table is held 8× in trace memory — the §8
+amplification) + a growing table of ~130k wide rows (512B payload). Measured engine RSS peak:
+
+| config | RSS peak | spilled to disk |
+|--------|----------|-----------------|
+| in-memory (default) | 401MB | — |
+| on-disk, FelderaCache 128 MiB, `MIN_BYTES=1MiB` | **1538MB** | 41MB |
+| on-disk, PageCache, `MAX_RSS_MB=300`, `MIN_BYTES=0` | 469MB | **2MB** |
+
+**Conclusion (honest negative result):** in dbsp 0.299, enabling storage on our **ephemeral,
+hand-built** circuit does **not** offload the join's steady-state data trace to disk for this workload.
+`MIN_BYTES=0` wrote only ~2MB while the ~570MB of 8× trace data stayed resident; `FelderaCache` made
+RSS *worse* (cache + write buffers + un-spilled batches, and it is documented as under-development).
+Effective spill appears tied to dbsp's persistent-id / checkpoint machinery, which our circuit does not
+use (`Mode::Ephemeral`; `Mode::Persistent` requires compiler-assigned operator ids we don't have). So
+the wiring is correct and transparent (conformance green), but it is **not** a usable memory-bounding
+lever as-is.
+
+**Caveats / next steps:**
+- Don't ship `MIN_BYTES=0` or `FelderaCache` — both inflate RSS here.
+- Getting real spill likely needs deeper dbsp work (persistent mode + checkpoint cadence), validation on
+  Linux (where the storage path is primarily developed and file-I/O RSS accounting differs), and/or a
+  newer dbsp release. Treat the env flags as experimental until that's done.
+- The higher-confidence path to "run from disk" for *this* engine is the part we fully control:
+  back `table_state` (and optionally the shape index) with an embedded KV (redb/lmdb/sled), independent
+  of dbsp's trace storage.
 - Spilled family subdirs are not yet garbage-collected on family drop (families are long-lived; minor).
-- A benchmark driving a working set larger than the cache (wide rows / many rows) is the right next
-  step to plot the cache-size-vs-p99 curve — not yet done.
 
 ## 11. File map
 
