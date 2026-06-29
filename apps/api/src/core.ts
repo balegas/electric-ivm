@@ -35,8 +35,16 @@ export interface ElectricCore {
   /** Register a **materialized, live** shape (backfilled + maintained as a durable stream). */
   createShape(def: ShapeDef): Promise<ShapeHandle>
   getShape(id: string): Promise<ShapeHandle | null>
+  /** Drop a shape (or subset feed) and tear down its stream. Idempotent. */
+  dropShape(id: string): Promise<void>
   /** Run a one-shot **subset query** (ephemeral, non-materialized query-back from Postgres). */
   querySubset(def: SubsetDef): Promise<SubsetResult>
+  /**
+   * Open the **live tail** for a subset: a non-materialized, changes-only feed on the base predicate
+   * (no backfill, no stored set). The client seeds rows from {@link querySubset} and applies this
+   * feed's deltas, re-checking view membership — so paging never becomes server-side range state.
+   */
+  createSubsetFeed(def: Pick<SubsetDef, 'table' | 'where' | 'columns'>): Promise<ShapeHandle>
 }
 
 export interface CoreOptions {
@@ -92,6 +100,23 @@ export function createCore(opts: CoreOptions): ElectricCore {
       if (res.status === 404) return null
       if (!res.ok) throw new Error(`engine /shapes/${id} -> ${res.status}`)
       return (await res.json()) as ShapeHandle
+    },
+
+    async dropShape(id) {
+      const res = await doFetch(`${engineUrl}/shapes/${encodeURIComponent(id)}`, { method: 'DELETE' })
+      if (!res.ok && res.status !== 404) throw new Error(`engine DELETE /shapes/${id} -> ${res.status}`)
+    },
+
+    async createSubsetFeed(def) {
+      return engineJson<ShapeHandle>('/shapes', {
+        method: 'POST',
+        body: JSON.stringify({
+          table: def.table,
+          where: def.where ?? null,
+          columns: def.columns ?? null,
+          changesOnly: true,
+        }),
+      })
     },
 
     async querySubset(def) {

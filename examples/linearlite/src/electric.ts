@@ -1,5 +1,5 @@
 import { createClient } from '@electric-lite/client'
-import type { Predicate, ShapeDef } from '@electric-lite/protocol'
+import type { Predicate, ShapeDef, SubsetDef } from '@electric-lite/protocol'
 import { type Priority, schema, type Status } from './schema'
 
 // The browser talks to the API and reads shape streams through the Vite dev proxy
@@ -98,16 +98,37 @@ const anyOf = (col: string, values: string[]): Predicate =>
 export const LIST_COLUMNS = ['id', 'title', 'status', 'priority', 'username', 'created', 'modified', 'kanbanorder']
 const BOARD_COLUMNS = ['id', 'title', 'priority', 'username', 'kanbanorder']
 
+/** The status/priority filter predicate shared by the list shape and the browse subset. */
+function issuesWhere(statuses: Status[], priorities: Priority[]): Predicate | undefined {
+  const clauses: Predicate[] = []
+  if (statuses.length) clauses.push(anyOf('status', statuses))
+  if (priorities.length) clauses.push(anyOf('priority', priorities))
+  return clauses.length === 0 ? undefined : clauses.length === 1 ? clauses[0] : { and: clauses }
+}
+
 /**
  * Build the list view's shape from the active status/priority filters. Empty filters => match-all.
  * `columns` restricts which columns sync (the pk is always included); omit it for the full row.
  */
 export function issuesShapeDef(statuses: Status[], priorities: Priority[], columns?: string[]): ShapeDef {
-  const clauses: Predicate[] = []
-  if (statuses.length) clauses.push(anyOf('status', statuses))
-  if (priorities.length) clauses.push(anyOf('priority', priorities))
-  const where = clauses.length === 0 ? undefined : clauses.length === 1 ? clauses[0] : { and: clauses }
-  return { table: 'issues', where, columns }
+  return { table: 'issues', where: issuesWhere(statuses, priorities), columns }
+}
+
+/** Page size for the browse subset (query-back chunk + live-tail window growth on scroll). */
+export const SUBSET_PAGE = 200
+
+/**
+ * The browse view as a **subset query**: same status/priority predicate, ordered + paged, fetched by
+ * query-back from Postgres (never materialized). Ordering must be a real column for keyset paging, so
+ * the demo pages by `created`/`modified`; the engine appends the pk as a tiebreaker.
+ */
+export function issuesSubsetDef(
+  statuses: Status[],
+  priorities: Priority[],
+  orderBy: { col: 'created' | 'modified'; desc?: boolean },
+  columns?: string[],
+): SubsetDef {
+  return { table: 'issues', where: issuesWhere(statuses, priorities), columns, orderBy, limit: SUBSET_PAGE }
 }
 
 export const statusShapeDef = (status: Status): ShapeDef => ({

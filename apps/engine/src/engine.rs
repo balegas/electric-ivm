@@ -83,6 +83,10 @@ enum TailerCmd {
         pred: Arc<CompiledPredicate>,
         /// Output projection (column indices to emit), or `None` for the full row.
         out_cols: Option<Arc<Vec<usize>>>,
+        /// Skip the Postgres backfill and emit only future matching changes (a non-materialized live
+        /// "tail" feed). Used by subset queries: the page rows come from a `query_subset`, and this
+        /// feed carries just the live deltas the client re-checks against the loaded view.
+        changes_only: bool,
     },
     RemoveShape { shape_id: String },
 }
@@ -205,6 +209,7 @@ impl Engine {
         table: &str,
         where_: Option<PredicateJson>,
         columns: Option<Vec<String>>,
+        changes_only: bool,
     ) -> Result<ShapeRecord> {
         let mut st = self.state.lock().await;
         let ts = match st.tables.get(table) {
@@ -233,6 +238,7 @@ impl Engine {
                 stream_path: stream_path.clone(),
                 pred,
                 out_cols,
+                changes_only,
             })
             .map_err(|_| anyhow::anyhow!("tailer for '{table}' is gone"))?;
 
@@ -390,10 +396,10 @@ async fn tailer_loop(
         tokio::select! {
             biased;
             cmd = cmd_rx.recv() => match cmd {
-                Some(TailerCmd::AddShape { shape_id, num_id, stream_path, pred, out_cols }) => {
+                Some(TailerCmd::AddShape { shape_id, num_id, stream_path, pred, out_cols, changes_only }) => {
                     if let Err(e) = add_shape_routed(
                         &ds, &ts, &pg_url, &mut shapes, &mut families, &mut family_of,
-                        shape_id, num_id, stream_path, pred, out_cols,
+                        shape_id, num_id, stream_path, pred, out_cols, changes_only,
                     ).await {
                         tracing::error!("add_shape failed: {e:#}");
                     }
@@ -464,6 +470,7 @@ async fn add_shape_routed(
     stream_path: String,
     pred: Arc<CompiledPredicate>,
     out_cols: Option<Arc<Vec<usize>>>,
+    changes_only: bool,
 ) -> Result<()> {
     let proj = out_cols.as_deref().map(Vec::as_slice);
     match pred.equality_template() {
@@ -473,13 +480,19 @@ async fn add_shape_routed(
 
             // Per-shape backfill straight from Postgres: the predicate IS this shape's key equality, so
             // the pushdown reads only the key-matching rows — the engine never holds a table copy. Each
-            // shape records its own `seed_lsn` for the live-change reconciliation.
-            let bf = pg_backfill(pg_url, ts, Some(pred.as_ref())).await?;
-            let out: Vec<(Row, ZWeight)> = bf.rows.iter().map(|r| (r.clone(), 1)).collect();
-            if !out.is_empty() {
-                let envs = translate_output(ts, out, None, proj);
-                ds.append(&stream_path, &envs).await?;
-            }
+            // shape records its own `seed_lsn` for the live-change reconciliation. A `changes_only` feed
+            // skips the backfill entirely and forwards every future match (seed_lsn 0).
+            let seed_lsn = if changes_only {
+                0
+            } else {
+                let bf = pg_backfill(pg_url, ts, Some(pred.as_ref())).await?;
+                let out: Vec<(Row, ZWeight)> = bf.rows.iter().map(|r| (r.clone(), 1)).collect();
+                if !out.is_empty() {
+                    let envs = translate_output(ts, out, None, proj);
+                    ds.append(&stream_path, &envs).await?;
+                }
+                crate::pg::lsn_to_u64(&bf.seed_lsn)
+            };
 
             let router = families
                 .entry(key_cols.clone())
@@ -487,7 +500,7 @@ async fn add_shape_routed(
             router.index.entry(key_tuple.clone()).or_default().push(RoutedShape {
                 num_id,
                 stream_path,
-                seed_lsn: crate::pg::lsn_to_u64(&bf.seed_lsn),
+                seed_lsn,
                 out_cols,
             });
             family_of.insert(shape_id, (key_cols, num_id, key_tuple));
@@ -495,18 +508,22 @@ async fn add_shape_routed(
         None => {
             // Standalone filter: backfill = current matching rows from Postgres (emitted as upserts).
             // Push the predicate into the SELECT so only matching rows are read; `matches()` below is
-            // the final authority (and a safety net if the SQL is ever a looser superset).
-            let bf = pg_backfill(pg_url, ts, Some(pred.as_ref())).await?;
-            let out: Vec<(Row, ZWeight)> =
-                bf.rows.iter().filter(|r| pred.matches(r)).map(|r| (r.clone(), 1)).collect();
-            if !out.is_empty() {
-                let envs = translate_output(ts, out, None, proj);
-                ds.append(&stream_path, &envs).await?;
-            }
-            shapes.insert(
-                shape_id,
-                StandaloneShape { pred, stream_path, seed_lsn: crate::pg::lsn_to_u64(&bf.seed_lsn), out_cols },
-            );
+            // the final authority (and a safety net if the SQL is ever a looser superset). A
+            // `changes_only` feed skips the backfill and forwards only future matches (seed_lsn 0) —
+            // this is the non-materialized live tail a subset query follows.
+            let seed_lsn = if changes_only {
+                0
+            } else {
+                let bf = pg_backfill(pg_url, ts, Some(pred.as_ref())).await?;
+                let out: Vec<(Row, ZWeight)> =
+                    bf.rows.iter().filter(|r| pred.matches(r)).map(|r| (r.clone(), 1)).collect();
+                if !out.is_empty() {
+                    let envs = translate_output(ts, out, None, proj);
+                    ds.append(&stream_path, &envs).await?;
+                }
+                crate::pg::lsn_to_u64(&bf.seed_lsn)
+            };
+            shapes.insert(shape_id, StandaloneShape { pred, stream_path, seed_lsn, out_cols });
         }
     }
     Ok(())

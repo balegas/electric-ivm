@@ -1,7 +1,8 @@
-import type { Row, ShapeDef } from '@electric-lite/protocol'
+import type { SubsetSubscription } from '@electric-lite/client'
+import type { Row, ShapeDef, SubsetDef } from '@electric-lite/protocol'
 import { createCollection, type Collection } from '@tanstack/db'
 import { useLiveQuery } from '@tanstack/react-db'
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { client } from '../electric'
 
 // Always-ready, empty placeholder collection. While a shape's real collection is still being created
@@ -80,4 +81,64 @@ export function useShapeRows<T extends Row = Row>(
     [src, ...deps],
   )
   return { rows: (data ?? []) as T[], loading: def !== null && collection === null }
+}
+
+/**
+ * Live rows of a **subset query**: the first page is query-backed from Postgres, then the loaded
+ * window is kept current by following the table's tail (no materialized page-shape). `loadMore` pages
+ * by query-backing the next chunk; `hasMore` is false once the set is exhausted. The subscription is
+ * (re)created whenever `def` changes (keyed by JSON) and closed on unmount — which also drops the
+ * server-side feed. `build` refines the client-side live query (sort/select) like {@link useShapeRows}.
+ */
+export function useSubset<T extends Row = Row>(
+  def: SubsetDef | null,
+  build?: (from: ShapeQueryBuilder) => ShapeQueryBuilder,
+  deps: unknown[] = [],
+): { rows: T[]; loading: boolean; loadMore: () => void; hasMore: boolean } {
+  const [sub, setSub] = useState<SubsetSubscription<T> | null>(null)
+  const key = def ? JSON.stringify(def) : null
+
+  useEffect(() => {
+    if (!def) {
+      setSub(null)
+      return
+    }
+    let closed = false
+    let s: SubsetSubscription<T> | undefined
+    setSub(null)
+    void client.subset(def).then((sb) => {
+      if (closed) {
+        void sb.close()
+        return
+      }
+      s = sb as unknown as SubsetSubscription<T>
+      setSub(s)
+    })
+    return () => {
+      closed = true
+      if (s) void s.close()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key])
+
+  const collection = (sub?.collection ?? null) as Collection<T, string> | null
+  const src = (collection ?? EMPTY) as unknown as Collection<T, string>
+  const { data } = useLiveQuery(
+    (q: ShapeQueryBuilder) => {
+      const base = q.from({ t: src })
+      return build ? build(base) : base.select(({ t }: { t: T }) => t)
+    },
+    [src, ...deps],
+  )
+
+  const loadMore = useCallback(() => {
+    void sub?.loadMore()
+  }, [sub])
+
+  return {
+    rows: (data ?? []) as T[],
+    loading: def !== null && sub === null,
+    loadMore,
+    hasMore: sub?.hasMore() ?? false,
+  }
 }

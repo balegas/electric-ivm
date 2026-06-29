@@ -1,7 +1,14 @@
 # Subset queries: non-materialized, query-back + live-tail (separate from shapes)
 
-Design record — 2026-06-29. Status: **draft (research in progress)**. Supersedes the reverted
+Design record — 2026-06-29. Status: **implemented + verified end-to-end**. Supersedes the reverted
 windowed page-shape approach (commit `8858977`, reverted in `2a04399`).
+
+**Verification (headless, against the live stack):** query-back returns a non-materialized page (feed
+stream empty → no backfill); a live insert into the window appears via the tail; a **move-out**
+(predicate-leaving update) is removed via a raw `delete` envelope (the engine evaluates the *old* row,
+so the delete is forwarded even though the row was never in the feed — this is why the client reads raw
+envelopes, not stream-db's reconciled view); `loadMore` pages via another query-back. Engine tests
+(19) and the full conformance/fuzz suite (88) stay green.
 
 ## Problem with page-shapes (what we reverted)
 

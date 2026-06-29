@@ -190,6 +190,9 @@ importers:
 
   packages/client:
     dependencies:
+      '@durable-streams/client':
+        specifier: 0.2.6
+        version: 0.2.6
       '@durable-streams/state':
         specifier: ^0.3.1
         version: 0.3.1(@tanstack/db@0.6.12(typescript@5.9.3))

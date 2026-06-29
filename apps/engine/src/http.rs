@@ -86,6 +86,10 @@ struct CreateShapeReq {
     /// Optional output projection: column names to sync. Omitted = the full row.
     #[serde(default)]
     columns: Option<Vec<String>>,
+    /// When true, skip the backfill and stream only future matching changes (a non-materialized live
+    /// tail feed). Used by subset queries; a normal materialized shape leaves this false.
+    #[serde(default, rename = "changesOnly")]
+    changes_only: bool,
 }
 
 #[derive(Serialize)]
@@ -108,7 +112,7 @@ async fn create_shape(
     State(engine): State<Engine>,
     Json(req): Json<CreateShapeReq>,
 ) -> Result<Json<ShapeResp>, AppError> {
-    let rec = engine.create_shape(&req.table, req.where_, req.columns).await?;
+    let rec = engine.create_shape(&req.table, req.where_, req.columns, req.changes_only).await?;
     Ok(Json(ShapeResp::of(&engine, rec)))
 }
 

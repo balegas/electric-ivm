@@ -7,6 +7,10 @@ import { createStateSchema, createStreamDB } from '@durable-streams/state/db'
 import { createTRPCClient, httpBatchLink } from '@trpc/client'
 import { z } from 'zod'
 
+import { createSubset, type SubsetSubscription } from './subset.js'
+
+export type { SubsetSubscription } from './subset.js'
+
 export interface ShapeHandle {
   shapeId: string
   table: string
@@ -48,6 +52,12 @@ export interface ElectricLiteClient {
    * table's tail and re-checking view membership rather than materializing a per-page shape.
    */
   query(def: SubsetDef): Promise<SubsetResult>
+  /**
+   * Open a **live subset**: query-back the first page, then follow the table's tail to keep the loaded
+   * window current (paging via {@link SubsetSubscription.loadMore}). Non-materialized — the engine
+   * never stores the page; a change is matched against one base predicate, never fanned across ranges.
+   */
+  subset(def: SubsetDef): Promise<SubsetSubscription>
   close(): Promise<void>
 }
 
@@ -150,6 +160,19 @@ export function createClient(opts: {
         offset: def.offset,
       })
       return result as SubsetResult
+    },
+
+    async subset(def) {
+      return createSubset(
+        {
+          trpc,
+          schema: opts.schema,
+          liveMode: opts.liveMode === true ? 'long-poll' : (opts.liveMode ?? 'long-poll'),
+          resolveStreamUrl: (handle) =>
+            opts.dsBaseUrl ? `${opts.dsBaseUrl.replace(/\/$/, '')}/${handle.streamPath}` : handle.streamUrl,
+        },
+        def,
+      )
     },
 
     async close() {

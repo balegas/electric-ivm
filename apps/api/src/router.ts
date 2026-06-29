@@ -71,10 +71,19 @@ export const appRouter = t.router({
       if (!handle) throw new TRPCError({ code: 'NOT_FOUND', message: `shape ${input.id} not found` })
       return handle
     }),
+
+    delete: t.procedure
+      .input(z.object({ id: z.string() }))
+      .mutation(async ({ input, ctx }) => {
+        await ctx.core.dropShape(input.id)
+        return { ok: true as const }
+      }),
   }),
 
-  // Subset queries — the non-materialized counterpart to shapes. A `query` is a one-shot, cacheable
+  // Subset queries — the non-materialized counterpart to shapes. `query` is a one-shot, cacheable
   // read (no stream, no live state); page by moving a keyset cursor in `where` or bumping `offset`.
+  // `live` opens a changes-only tail feed on the base predicate that the client follows to keep a
+  // loaded page live (re-checking view membership client-side) — a single predicate, no range fanout.
   subset: t.router({
     query: t.procedure
       .input(
@@ -96,6 +105,12 @@ export const appRouter = t.router({
           limit: input.limit,
           offset: input.offset,
         }),
+      ),
+
+    live: t.procedure
+      .input(z.object({ table: z.string(), where: predicateSchema.optional(), columns: z.array(z.string()).optional() }))
+      .mutation(async ({ input, ctx }) =>
+        ctx.core.createSubsetFeed({ table: input.table, where: input.where as never, columns: input.columns }),
       ),
   }),
 })
