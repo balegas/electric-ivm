@@ -90,6 +90,66 @@ describe('conformance: subquery AND a non-subquery condition', () => {
   }, 60000)
 })
 
+describe('conformance: subquery — explicit move-in/out at nesting depth 2 and 3', () => {
+  // c4 IN (l3 whose l2 IN (l2 whose l1 IN (active l1)))  — toggle the DEEPEST level both ways and assert
+  // the depth-3 chain propagates an explicit enter then leave (the per-level rigor Electric has at depth 1).
+  const schema: Schema = {
+    tables: {
+      l1: { columns: { id: { type: 'int' }, active: { type: 'bool' } }, primaryKey: 'id' },
+      l2: { columns: { id: { type: 'int' }, l1_id: { type: 'int' } }, primaryKey: 'id' },
+      l3: { columns: { id: { type: 'int' }, l2_id: { type: 'int' } }, primaryKey: 'id' },
+      l4: { columns: { id: { type: 'int' }, l3_id: { type: 'int' } }, primaryKey: 'id' },
+    },
+  }
+  const COLS = ['id', 'l3_id']
+  const where: Predicate = {
+    col: 'l3_id',
+    in: {
+      table: 'l3',
+      project: 'id',
+      where: {
+        col: 'l2_id',
+        in: { table: 'l2', project: 'id', where: { col: 'l1_id', in: { table: 'l1', project: 'id', where: { col: 'active', op: 'eq', value: true } } } },
+      },
+    },
+  }
+  let h: Harness
+  beforeAll(async () => { h = await bootHarness(schema) }, 60000)
+  afterAll(async () => await h?.shutdown())
+
+  it('toggling the depth-3 root active flag moves the depth-4 row in then out', async () => {
+    const def: ShapeDef = { table: 'l4', where }
+    // chain: l4-1 -> l3-1 -> l2-1 -> l1-1 (start inactive). Also a depth-2 sibling l4-2 -> l3-2 -> l2-2 -> l1-2 (active).
+    await applyOp(h, 'l1', { op: 'insert', pk: 1, row: { id: 1, active: false } })
+    await applyOp(h, 'l1', { op: 'insert', pk: 2, row: { id: 2, active: true } })
+    await applyOp(h, 'l2', { op: 'insert', pk: 1, row: { id: 1, l1_id: 1 } })
+    await applyOp(h, 'l2', { op: 'insert', pk: 2, row: { id: 2, l1_id: 2 } })
+    await applyOp(h, 'l3', { op: 'insert', pk: 1, row: { id: 1, l2_id: 1 } })
+    await applyOp(h, 'l3', { op: 'insert', pk: 2, row: { id: 2, l2_id: 2 } })
+    await applyOp(h, 'l4', { op: 'insert', pk: 1, row: { id: 1, l3_id: 1 } })
+    await applyOp(h, 'l4', { op: 'insert', pk: 2, row: { id: 2, l3_id: 2 } })
+    const shape = await h.client.shape(def)
+    await drainEngine(h)
+    // Only l4-2 (its l1-2 active) is in; l4-1 (l1-1 inactive) is out.
+    expect(await ids(h, shape, def, COLS)).toEqual([2])
+
+    // DEPTH-3 MOVE-IN: activate l1-1 -> propagates l1-1∈active ⇒ l2-1∈node ⇒ l3-1∈node ⇒ l4-1 enters.
+    await applyOp(h, 'l1', { op: 'update', pk: 1, row: { id: 1, active: true } })
+    await drainEngine(h)
+    expect(await ids(h, shape, def, COLS)).toEqual([1, 2])
+
+    // DEPTH-3 MOVE-OUT: deactivate l1-2 -> l4-2 leaves (depth-3 retraction through the whole chain).
+    await applyOp(h, 'l1', { op: 'update', pk: 2, row: { id: 2, active: false } })
+    await drainEngine(h)
+    expect(await ids(h, shape, def, COLS)).toEqual([1])
+
+    // DEPTH-2 MOVE: re-parent l3-1 to l2-2 (whose l1-2 is now inactive) -> l4-1 leaves via a depth-2 change.
+    await applyOp(h, 'l3', { op: 'update', pk: 1, row: { id: 1, l2_id: 2 } })
+    await drainEngine(h)
+    expect(await ids(h, shape, def, COLS)).toEqual([])
+  }, 60000)
+})
+
 describe('conformance: multi-level subquery — no spurious delete on dependency move', () => {
   // tasks -> projects -> teams -> organizations(+org tags). A task stays in the shape as long as SOME
   // path keeps its org premium; moving a team between premium orgs (or the old org losing the tag after

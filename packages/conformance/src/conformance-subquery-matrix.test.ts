@@ -37,6 +37,22 @@ const l3ViaL2AlphaTag: Predicate = {
   col: 'level_3_id',
   in: { table: 'level_3', project: 'id', where: { col: 'level_2_id', in: { table: 'level_2_tags', project: 'level_2_id', where: { col: 'tag', op: 'eq', value: 'alpha' } } } },
 }
+// 3-level tag subquery: level_3 -> level_2 -> level_1, tag side-table at level_1 (Electric generator:230).
+const l3ViaL2ViaL1AlphaTag: Predicate = {
+  col: 'level_3_id',
+  in: {
+    table: 'level_3',
+    project: 'id',
+    where: {
+      col: 'level_2_id',
+      in: {
+        table: 'level_2',
+        project: 'id',
+        where: { col: 'level_1_id', in: { table: 'level_1_tags', project: 'level_1_id', where: { col: 'tag', op: 'eq', value: 'alpha' } } },
+      },
+    },
+  },
+}
 const notActiveL3: Predicate = { col: 'level_3_id', negated: true, in: { table: 'level_3', project: 'id', where: { col: 'active', op: 'eq', value: true } } }
 
 const CASES: { label: string; where: Predicate }[] = [
@@ -50,6 +66,14 @@ const CASES: { label: string; where: Predicate }[] = [
   { label: 'subquery OR atomic', where: { or: [activeL3, { col: 'value', op: 'eq', value: 'v0' }] } },
   { label: 'NOT (subquery)', where: { not: activeL3 } },
   { label: 'two subqueries ANDed', where: { and: [activeL3, l3WithAlphaTag] } },
+  { label: 'tag (3-level)', where: l3ViaL2ViaL1AlphaTag },
+  // OR of two subqueries — where OR-combined dependency-index bugs hide (Electric generator:331).
+  { label: 'two subqueries ORed', where: { or: [activeL3, l3WithAlphaTag] } },
+  // (OR of subqueries) AND (OR of subquery + atomic) — the nested AND-of-ORs Electric generates (:340).
+  {
+    label: '(OR subqueries) AND (OR subquery|atomic)',
+    where: { and: [{ or: [activeL3, l3WithAlphaTag] }, { or: [l3ViaActiveL2, { col: 'value', op: 'gte', value: 'v1' }] }] },
+  },
 ]
 
 describe('conformance: subquery matrix', () => {
