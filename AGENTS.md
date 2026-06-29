@@ -8,7 +8,7 @@ shapes**; **durable streams** is the log between them; a TanStack-DB client mate
 
 | Path | What |
 |---|---|
-| `apps/engine` | Rust query engine (dbsp). Postgres-backed: logical replication in, rows read back for backfill. Key files: `engine.rs` (tailer + shape routing), `pg.rs` (backfill + subset query-back), `http.rs` (HTTP API), `predicate.rs`/`sql.rs` (WHERE AST → match + SQL pushdown), `replication.rs`. |
+| `apps/engine` | Rust query engine (dbsp). Postgres-backed: logical replication in, rows read back for backfill. Key files: `engine.rs` (tailer + shape routing), `pg.rs` (backfill + subset query-back), `http.rs` (HTTP API), `predicate.rs`/`sql.rs` (WHERE AST → match + SQL pushdown), `subquery.rs` (cross-table subquery registry: shared inner-set nodes + move-queries), `replication.rs`. |
 | `apps/api` | tRPC API (`router.ts`) over the engine + durable-streams (`core.ts`). The public read/write/shape/subset surface. |
 | `packages/protocol` | Shared types + the change-event envelope (`types.ts`, `envelope.ts`, `predicate.ts`, `sql.ts`). |
 | `packages/client` | Browser client: `shape()` (materialized), `query()`/`subset()` (subset queries — see `subset.ts`). |
@@ -35,8 +35,8 @@ New designs go in `docs/superpowers/specs/YYYY-MM-DD-<topic>-design.md` and get 
 
 ```bash
 pnpm engine:build          # cargo build -p electric-lite-engine
-pnpm engine:test           # cargo test  -p electric-lite-engine   (19 tests, fast)
-pnpm test                  # vitest run — full suite incl. conformance (~30s, spins up its own PG)
+pnpm engine:test           # cargo test  -p electric-lite-engine   (30 tests, fast)
+pnpm test                  # vitest run — full suite incl. conformance (103 tests, ~40s; spins up its own PG)
 pnpm test:conformance      # just the conformance package
 pnpm test:fuzz             # random-predicate fuzz vs oracle
 pnpm demo:linearlite       # boot the LinearLite demo (ephemeral PG + engine + ds + api + vite + caddy)
@@ -59,7 +59,15 @@ run `pnpm engine:test` + `pnpm test` before claiming done.
     matching deltas). Ranges/limits live *only* here. This is how range fanout is avoided: ranges are
     never live-tailed, so one change is matched against one base predicate, never split across ranges.
 - Predicates are a JSON AST: `Leaf{col,op,value}` / `And` / `Or` / `Not`; ops `eq neq lt lte gt gte`.
-  One table + WHERE over its own columns only — no joins.
+  One table + WHERE over its own columns, **plus single-column subqueries**
+  `{col, in:{table,project,where?}, negated?}` = `col [NOT] IN (SELECT project FROM table WHERE …)`
+  (recursive; no other join form). Subquery shapes are maintained by a cross-table registry
+  (`apps/engine/src/subquery.rs`): each distinct inner subquery is one **shared node** (a value→
+  contributor-pk multiset, keyed by a canonical signature, refcounted, `GET /subqueries`); an inner-set
+  flip query-backs the affected outer rows. **Outer membership is emitted absolutely** (upsert if the
+  new row matches else delete-by-pk), never delta-based — per-table tailers process tables out of global
+  commit order, so a delta-based emit misses move-outs. See
+  `docs/superpowers/specs/2026-06-29-subqueries-design.md`.
 - Commit messages end with the two trailers from the harness (`Co-Authored-By:` Claude + a
   `Claude-Session:` link). Branch before committing if on the default branch.
 
@@ -73,6 +81,15 @@ run `pnpm engine:test` + `pnpm test` before claiming done.
 - **The engine computes move-in/move-out from the WAL alone** (old+new rows via `REPLICA IDENTITY FULL`),
   no Postgres round-trip — same as Electric. A standalone predicate filter over `[(old,-1),(new,+1)]`
   deltas yields the right insert/delete.
+- **Subqueries: emit outer membership *absolutely*, not as a delta.** A subquery shape's outer table and
+  its inner tables flow through *independent per-table tailers*, so an inner-set node can be updated
+  *before* an earlier-committed outer change. A delta-based "delete only if the *old* row matched" then
+  misses move-outs (the inner set is already ahead) and a stale backfill row sticks. Emit each touched
+  pk's *current* membership — `upsert` if the new row matches else `delete` by pk (idempotent) — and let
+  the flip-driven move-query reconcile values the inner set hasn't caught up to yet. This converges
+  regardless of cross-table order, so Electric's LSN-buffering/tag protocol isn't needed.
+  (`apps/engine/src/subquery.rs::emit_shape_delta`.) Symptom when wrong: convergence holds op-by-op but
+  fails on *batched* mutations (the interleaving that exposes the race only happens under load).
 - **A `changes_only` feed must use `seed_lsn = 0`** (no backfill ⇒ forward all future matches) and the
   client reads its fresh stream from offset `-1` (= from feed creation). Create the feed *before* the
   query-back so the live tail can't miss a delta in the gap; overlap is reconciled idempotently by pk.

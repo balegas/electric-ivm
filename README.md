@@ -8,10 +8,13 @@ database that matches that query, live.
 
 Deliberately simpler than Electric:
 
-- A shape is exactly **one table + a `WHERE` clause over that table's own columns**. No joins,
-  no cross-table queries.
+- A shape is **one table + a `WHERE` clause over that table's own columns**, plus single-column
+  **subqueries** (`col [NOT] IN (SELECT project FROM other WHERE …)`, recursive) — the one cross-table
+  form. No general joins.
 - Query expressivity is limited and grows pragmatically: column comparisons (`eq neq lt lte gt
-  gte`) combined with `and` / `or` / `not`.
+  gte`) combined with `and` / `or` / `not`, and `in` subqueries. Subqueries are maintained by a
+  cross-table registry that shares one node per distinct inner query (see
+  `docs/superpowers/specs/2026-06-29-subqueries-design.md`).
 - Two optional knobs keep large shapes cheap to sync: **`columns`** (output projection — sync only
   the columns a view needs; the pk is always included) and **`orderBy` + `limit`** (a backfill
   window — read only the first *N* rows in order, the basis for cursor/keyset pagination). Both

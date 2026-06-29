@@ -1,6 +1,18 @@
 # Subqueries: `col IN (SELECT … )` shapes (shared inner-set nodes)
 
-Design record — 2026-06-29. Status: **proposed**. Goal: add subquery support to the dbsp engine so a
+Design record — 2026-06-29. Status: **implemented + verified**. The engine maintains shared inner-set
+nodes and converges to the Postgres oracle across the ported subquery suite (multi-level convergence
+matrix over many seeds, deterministic move-in/out, `NOT IN`, combined-condition, multi-level
+no-spurious-delete, and node-sharing topology); full suite 103 tests green. One non-obvious correctness
+fix during implementation: outer-table membership is emitted **absolutely** (upsert if the new row
+matches, else idempotent delete by pk), not as a delta — because per-table tailers can apply an
+inner-set change ahead of an earlier-committed outer change, and a delta-based "delete only if the *old*
+row matched" then misses move-outs. Absolute emission + flip-driven move-queries converge regardless of
+cross-table order (so Electric's LSN buffering/tag machinery stays unnecessary). Code:
+`apps/engine/src/subquery.rs` (registry), `predicate.rs`/`sql.rs` (AST + SQL), `engine.rs`/`http.rs`
+(wiring + `GET /subqueries`); tests `packages/conformance/src/conformance-subquery*.test.ts`.
+
+Goal: add subquery support to the dbsp engine so a
 shape's `WHERE` can be `outer.col IN (SELECT inner.proj FROM inner WHERE …)` (and `NOT IN`), with the
 inner subquery maintained **once** and **shared** across shapes that reference the same inner shape.
 Port Electric sync-service's subquery oracle tests; stop when they pass.
