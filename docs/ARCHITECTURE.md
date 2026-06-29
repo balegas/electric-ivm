@@ -12,10 +12,11 @@ benchmark-findings, postgres-logical-replication).
 > **Postgres mode (current default for deployment).** electric-lite now runs with **Postgres as the
 > system of record**: applications write to Postgres, the engine ingests changes via **logical
 > replication** (built-in `test_decoding`), and shape **backfill reads rows back from Postgres** with a
-> snapshot `SELECT`. This replaces the in-memory `table_state` (§4.1–4.2) and the API write path (§3)
-> described below — those now apply only to the legacy/library mode (no `ELECTRIC_LITE_PG_URL`). Delta
-> computation uses the replicated **old + new** tuples (`REPLICA IDENTITY FULL`) instead of a local
-> table copy.
+> snapshot `SELECT`. The in-memory `table_state` described in §4.1–4.2 has been **removed entirely** (in
+> *all* modes): delta computation now uses the replicated/envelope **old + new** tuples
+> (`REPLICA IDENTITY FULL` in Postgres mode) instead of a local table copy, so §4.1–4.2 (and the
+> `table_state` row of the §8 trade-off table) describe the original design and no longer reflect the
+> code. The API write path (§3) now applies only to the legacy/library mode (no `ELECTRIC_LITE_PG_URL`).
 >
 > The ingestor (`replication.rs`) reads the slot non-consuming (`peek`), buffers each transaction, and
 > stamps every change with its transaction's **COMMIT LSN** (taken from the `COMMIT` record), then
@@ -69,7 +70,8 @@ benchmark-findings, postgres-logical-replication).
   resulting upsert/delete envelopes to shape streams. Holds all dataflow state.
 - **client** (`packages/client`) — `createClient` exposes typed writes (tRPC) and `shape()` which
   creates a shape and returns a **TanStack DB collection** kept live by a stream-db reader on the shape
-  stream. `awaitTxId` resolves when a given write's txid is observed in the shape stream.
+  stream. `awaitTxId` resolves when a given write's txid is observed in the shape stream. The collection
+  is consumed reactively via `@tanstack/react-db`'s `useLiveQuery` (see §12, the client query layer).
 
 The write path and read path are **decoupled through durable-streams**: the API never blocks on the
 engine, and the engine is a stateless-restartable consumer of the durable log.
@@ -365,4 +367,40 @@ lever as-is.
 | `apps/api/src/core.ts` | write path + schema/shape forwarding |
 | `packages/client/src/index.ts` | typed writes + `shape()` live collections |
 | `packages/bench/src/run.ts` | stress benchmark harness |
+| `examples/linearlite/src/lib/useShape.ts` | client query layer: shape→collection + `useLiveQuery` (§12) |
 ```
+
+---
+
+## 12. Client query layer (two-level querying)
+
+There are **two query layers** with different jobs, and keeping them distinct is what lets the system
+sync a bounded set yet still present it flexibly:
+
+1. **Server-side shape predicate** (the engine, §4) — *what crosses the network*. One table + a
+   `WHERE` over its columns (eq/neq/lt/lte/gt/gte + and/or/not). The engine maintains exactly this set
+   on the client's `shape/<id>` stream, incrementally, as Postgres changes. This is the sync boundary:
+   rows outside the predicate are never materialized.
+2. **Client-side live query** (`@tanstack/react-db`'s `useLiveQuery` over the materialized TanStack DB
+   collection) — *how the synced set is presented*. Ordering (`orderBy`), text search (`ilike`/`like`),
+   projection (`select`), and any finer filtering run here. TanStack DB maintains the query result
+   **incrementally** over the collection (it is not re-computed in JS on every delta), so a client-only
+   refinement — e.g. typing in a search box — updates the rendered rows **without changing the
+   engine-side shape or re-syncing**.
+
+The split is deliberate: ordering and `LIKE`-style search are intentionally **not** part of the shape
+model (§ the shape predicate is an unordered-set filter), because they are presentation concerns over
+an already-synced set, and pushing them server-side would couple sync to view state. It is also the
+natural seam for windowed / infinite-scroll sync: a value-range shape bounds *what* syncs while the
+live query handles ordering within the loaded window.
+
+**Binding pattern (the example apps).** `useShapeCollection(def)` creates the engine-side shape and
+returns its live collection (async; `null` while loading or when `def` is `null`), recreating it when
+`def` changes and closing it on unmount. `useShapeRows(def, build?, deps?)` runs `useLiveQuery` over
+that collection, where `build` pushes `.where()/.orderBy()/.select()` into the query and `deps` carry
+any values `build` closes over (so a search term re-runs the *client* query without re-syncing). A
+shared always-ready empty placeholder collection is queried while the real one is still loading, so
+`useLiveQuery` can be called unconditionally (React rules of hooks). LinearLite filters by
+status/priority/id server-side (the shape) and orders by date/kanban-order and searches by text in the
+live query; the one exception is priority ordering, which is a rank over a *text* enum (no integer
+column) and so is applied as a small client-side sort over the live-query result.

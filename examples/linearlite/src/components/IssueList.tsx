@@ -30,7 +30,9 @@ export function IssueList({
   // The engine evaluates the status/priority predicate (the shape). Search and ordering are pushed
   // into the live query — incrementally maintained over the synced shape, not re-run in JS each change.
   // (Search is a client-side query refinement, so it doesn't re-sync the engine-side shape.)
-  const q = filters.q.trim()
+  // Strip `%`/`_` from the search term: TanStack DB's ilike treats them as wildcards and has no
+  // ESCAPE, so a literal `%`/`_` would otherwise match everything. (We want plain substring search.)
+  const q = filters.q.trim().replace(/[%_]/g, '')
   const dir = filters.dir
   // created/modified are real numeric columns → order in-query; priority is a rank over a TEXT enum
   // (no integer column), so that one ordering is applied client-side below.

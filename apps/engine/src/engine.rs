@@ -225,8 +225,8 @@ impl Engine {
 struct StandaloneShape {
     pred: Arc<CompiledPredicate>,
     stream_path: String,
-    /// WAL LSN of this shape's backfill snapshot; replication changes with `lsn <= seed_lsn` are
-    /// already reflected and are skipped.
+    /// WAL LSN of this shape's backfill snapshot; replication changes whose commit LSN is strictly
+    /// `< seed_lsn` are already reflected and are skipped (see `process_envelope`).
     seed_lsn: u64,
 }
 
@@ -247,8 +247,8 @@ fn eval_standalone(pred: &CompiledPredicate, delta: &[Tup2<Row, ZWeight>]) -> Ve
 struct Family {
     actor: FamilyActor,
     shapes: HashMap<u64, String>,
-    /// WAL LSN of the snapshot the data trace was seeded from; replication changes with
-    /// `lsn <= seed_lsn` are already in the trace and are skipped.
+    /// WAL LSN of the snapshot the data trace was seeded from; replication changes whose commit LSN
+    /// is strictly `< seed_lsn` are already in the trace and are skipped (see `process_envelope`).
     seed_lsn: u64,
 }
 

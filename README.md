@@ -88,12 +88,30 @@ Everything is a stream, which is what decouples the layers:
   engine tails it. The engine and the source of writes never talk directly.
 - **`shape/<id>`** is the per-shape feed. The engine appends matched deltas (enter/leave/update);
   the client reads/long-polls it.
-- A **client** materializes `shape/<id>` with `@durable-streams/state` (stream-db) + TanStack DB
-  (`@tanstack/react-db`'s `useLiveQuery`) and re-renders on every delta.
+- A **client** materializes `shape/<id>` with `@durable-streams/state` (stream-db) into a **TanStack
+  DB collection** and re-renders on every delta.
 
 Because the predicate has a single definition, it has two derivations with no drift: the engine
 compiles it to a Rust `dbsp.filter` closure; the oracle translates it to a SQL `WHERE`. The
 conformance suite asserts the two always agree.
+
+### Two-level querying: server shape vs client live query
+
+There are two query layers, and they do different jobs:
+
+- The **server-side shape predicate** (engine) decides *what crosses the network* — one table + a
+  `WHERE` over its columns. It's the sync boundary: only matching rows are materialized on the client,
+  and the engine maintains that set incrementally as Postgres changes.
+- A **client-side live query** (TanStack DB `useLiveQuery`) runs *over the already-materialized
+  collection* for the things the shape predicate can't express — ordering (`ORDER BY`), text search
+  (`ilike`/`LIKE`), and any finer filtering — without re-syncing. Because it's a live query, it's
+  maintained **incrementally** (not re-run in JS on every delta), and a client-only refinement (e.g.
+  typing in a search box) changes the rendered result without touching the engine-side shape.
+
+So: shape = *what you sync*, live query = *how you present it*. The example apps follow this split —
+the engine filters by status/priority/id; the client orders by date/kanban-order and searches by text
+in the live query. (Ordering/`LIKE` are deliberately not part of the shape model; this is also the
+seam where windowed/infinite-scroll sync would slot in — see the partial-sync notes.)
 
 > Postgres is the default source of record. The engine can also run **without** Postgres — writes
 > append directly to `table/<name>` through the tRPC `ingest.write` API — which is how the

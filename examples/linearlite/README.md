@@ -59,8 +59,13 @@ accordingly:
   type is `BIGINT`. `status` and `priority` are stored as their lowercase string constants, exactly as
   upstream.
 - **No cross-table queries**: the issue↔comments relationship is expressed as a per-issue comments
-  shape, not a join. Search (`LIKE`/full-text) isn't a shape predicate, so it's done client-side over
-  the loaded shape.
+  shape, not a join.
+- **Two-level querying**: the *shape* (engine-side predicate) decides what syncs — status/priority/id.
+  Everything else runs as a **TanStack DB live query** over the materialized collection: ordering
+  (`orderBy` by date/kanban-order), text search (`ilike` on title/description), and projection. These
+  refine the *already-synced* set incrementally (no re-sync when you type in the search box); only the
+  priority sort is a small client-side step (a rank over a text enum, no integer column). See
+  `src/lib/useShape.ts` and the [ARCHITECTURE client-query-layer section](../../docs/ARCHITECTURE.md#12-client-query-layer-two-level-querying).
 - The Electric sync-engine columns (`deleted`, `new`, `synced`, …) and the offline write path are
   dropped — electric-lite's ingestion *is* Postgres logical replication.
 
@@ -70,6 +75,8 @@ accordingly:
   `/pg/write` middleware; faker seed.
 - `src/schema.ts` — tables + the status/priority value sets and labels.
 - `src/electric.ts` — the client, write helpers (all writes go to Postgres), and shape definitions.
-- `src/lib/useShape.ts` — a hook that subscribes to a shape and returns its live rows.
+- `src/lib/useShape.ts` — the client query layer: `useShapeCollection` creates a shape and returns its
+  live TanStack DB collection; `useShapeRows(def, build?, deps?)` runs a `useLiveQuery` over it,
+  pushing sort/filter/search into the query.
 - `src/components/` — `Sidebar`, `TopFilter`, `IssueList`, `Board`, `IssueDetail`, `IssueModal`, and
   shared `ui` (status/priority icons, avatars, menus).
