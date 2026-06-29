@@ -72,6 +72,32 @@ export const appRouter = t.router({
       return handle
     }),
   }),
+
+  // Subset queries — the non-materialized counterpart to shapes. A `query` is a one-shot, cacheable
+  // read (no stream, no live state); page by moving a keyset cursor in `where` or bumping `offset`.
+  subset: t.router({
+    query: t.procedure
+      .input(
+        z.object({
+          table: z.string(),
+          where: predicateSchema.optional(),
+          columns: z.array(z.string()).optional(),
+          orderBy: z.object({ col: z.string(), desc: z.boolean().optional() }).optional(),
+          limit: z.number().int().nonnegative().optional(),
+          offset: z.number().int().nonnegative().optional(),
+        }),
+      )
+      .query(async ({ input, ctx }) =>
+        ctx.core.querySubset({
+          table: input.table,
+          where: input.where as never,
+          columns: input.columns,
+          orderBy: input.orderBy,
+          limit: input.limit,
+          offset: input.offset,
+        }),
+      ),
+  }),
 })
 
 export type AppRouter = typeof appRouter

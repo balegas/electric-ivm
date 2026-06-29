@@ -9,3 +9,6 @@ pnpm-debug.log*
 
 # playwright-mcp output
 .playwright-mcp/
+
+# TS incremental build info
+*.tsbuildinfo

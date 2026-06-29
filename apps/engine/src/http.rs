@@ -17,6 +17,7 @@ pub fn router(engine: Engine) -> Router {
         .route("/schema", post(define_schema))
         .route("/shapes", post(create_shape))
         .route("/shapes/{id}", get(get_shape).delete(drop_shape))
+        .route("/query", post(query_subset))
         .route("/tables/{name}/offset", get(table_offset))
         .route("/tables/{name}/families", get(table_families))
         .route("/replication/lsn", get(replication_lsn))
@@ -28,6 +29,45 @@ pub fn router(engine: Engine) -> Router {
 #[derive(Deserialize)]
 struct DefineSchemaReq {
     schema: Schema,
+}
+
+#[derive(Deserialize)]
+struct SubsetOrderByReq {
+    col: String,
+    #[serde(default)]
+    desc: bool,
+}
+
+/// A one-shot subset query (the non-materialized counterpart to `/shapes`).
+#[derive(Deserialize)]
+struct QueryReq {
+    table: String,
+    #[serde(default, rename = "where")]
+    where_: Option<PredicateJson>,
+    #[serde(default)]
+    columns: Option<Vec<String>>,
+    #[serde(default, rename = "orderBy")]
+    order_by: Option<SubsetOrderByReq>,
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    offset: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct QueryResp {
+    rows: Vec<serde_json::Value>,
+    lsn: String,
+}
+
+async fn query_subset(
+    State(engine): State<Engine>,
+    Json(req): Json<QueryReq>,
+) -> Result<Json<QueryResp>, AppError> {
+    let order_by = req.order_by.map(|o| (o.col, o.desc));
+    let (rows, lsn) =
+        engine.query_subset(&req.table, req.where_, req.columns, order_by, req.limit, req.offset).await?;
+    Ok(Json(QueryResp { rows, lsn }))
 }
 
 async fn define_schema(

@@ -147,6 +147,80 @@ async fn backfill_in_txn(client: &Client, ts: &TableSchema, filter: Option<&Comp
     Ok(Backfill { rows: out, seed_lsn })
 }
 
+/// Result of a one-shot subset query: the page rows + the snapshot LSN they were read at.
+pub struct SubsetQuery {
+    pub rows: Vec<Row>,
+    pub lsn: String,
+}
+
+/// Run a **non-materialized** subset query: a single `SELECT … WHERE … ORDER BY … LIMIT … OFFSET …`
+/// against Postgres in a `REPEATABLE READ` snapshot, returning the page rows and the snapshot LSN.
+/// Unlike [`backfill`], this creates no shape and no durable stream — it is the ephemeral query-back a
+/// subset/pagination view uses (the live tail is followed separately). `order` is `(column index,
+/// descending?)`; the pk is appended as a tiebreaker so the window is total/stable.
+pub async fn query_subset(
+    client: &Client,
+    ts: &TableSchema,
+    filter: Option<&CompiledPredicate>,
+    order: Option<(usize, bool)>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<SubsetQuery> {
+    client
+        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .await
+        .context("begin subset snapshot")?;
+    let result = query_subset_in_txn(client, ts, filter, order, limit, offset).await;
+    client.batch_execute("COMMIT").await.ok();
+    result
+}
+
+async fn query_subset_in_txn(
+    client: &Client,
+    ts: &TableSchema,
+    filter: Option<&CompiledPredicate>,
+    order: Option<(usize, bool)>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<SubsetQuery> {
+    let lsn: String = client.query_one("select pg_current_wal_lsn()::text", &[]).await?.get(0);
+    let (where_clause, params) = match filter.and_then(|p| crate::sql::predicate_to_sql(p, ts)) {
+        Some((w, ps)) => (format!(" where {w}"), ps),
+        None => (String::new(), Vec::new()),
+    };
+    let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+        params.iter().map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+    // ORDER BY <col> <dir>, <pk> <dir> for a total order; a limit/offset without an explicit order
+    // falls back to pk order so the page is deterministic. Idents are quoted; limit/offset are
+    // non-negative integer literals — no injection surface.
+    let order_sql = match order {
+        Some((col, desc)) => {
+            let d = if desc { "desc" } else { "asc" };
+            format!(" order by {} {d}, {} {d}", quote_ident(&ts.columns[col].0), quote_ident(&ts.pk_name))
+        }
+        None if limit.is_some() || offset.is_some() => format!(" order by {} asc", quote_ident(&ts.pk_name)),
+        None => String::new(),
+    };
+    let limit_sql = limit.map(|n| format!(" limit {}", n.max(0))).unwrap_or_default();
+    let offset_sql = offset.map(|n| format!(" offset {}", n.max(0))).unwrap_or_default();
+    let q = format!(
+        "select to_jsonb(t) from {} t{}{}{}{}",
+        quote_ident(&ts.name),
+        where_clause,
+        order_sql,
+        limit_sql,
+        offset_sql
+    );
+    let rows = client.query(&q, &param_refs).await.with_context(|| format!("subset select {}", ts.name))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let j: serde_json::Value = r.get(0);
+        let obj = j.as_object().context("to_jsonb did not return an object")?;
+        out.push(ts.row_from_json(obj)?);
+    }
+    Ok(SubsetQuery { rows: out, lsn })
+}
+
 /// Parse a Postgres LSN ("X/Y", hex) into a comparable u64. Returns 0 on parse failure.
 pub fn lsn_to_u64(lsn: &str) -> u64 {
     match lsn.split_once('/') {

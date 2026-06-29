@@ -92,6 +92,49 @@ export interface ShapeHandle {
   streamPath: string
 }
 
+// --- Subset queries ----------------------------------------------------------
+// A **subset query** is the deliberate opposite of a shape. A shape is *materialized and live-tailed*
+// (the engine backfills it, stores it as a durable stream, and maintains the whole matching set). A
+// subset query is *ephemeral and one-shot*: the engine runs a single `SELECT … WHERE … ORDER BY …
+// LIMIT … OFFSET …` straight against Postgres and returns the rows + the snapshot LSN. Nothing is
+// stored server-side, so paging/ranges never become live state — which is exactly why a change can
+// never fan out across ranges (ranges are simply never live-tailed). This mirrors Electric's
+// Shape-vs-Subset split. To keep a subset *live*, follow the table's tail and re-check view membership
+// (see `SubsetDef.where`), rather than materializing a per-page shape.
+
+/** Order key for a subset query. The engine appends the primary key as a tiebreaker (total order). */
+export interface SubsetOrderBy {
+  col: string
+  desc?: boolean
+}
+
+/**
+ * A subset query: one table + an optional `where`, projected `columns`, and an ordered window
+ * (`orderBy` + `limit` + `offset`). Ephemeral and non-live — run it again (e.g. with a moved cursor in
+ * `where`, or a higher `offset`) to page. Compare with [`ShapeDef`], which is materialized + live.
+ */
+export interface SubsetDef {
+  table: string
+  /** Filter over the table's columns. Omitted = all rows. */
+  where?: Predicate
+  /** Output projection (pk always included). Omitted = the full row. */
+  columns?: string[]
+  /** Order for the window; required when `limit`/`offset` are set (for a deterministic page). */
+  orderBy?: SubsetOrderBy
+  /** Max rows to return (the page size). */
+  limit?: number
+  /** Rows to skip before the page (keyset cursors via `where` are preferred over large offsets). */
+  offset?: number
+}
+
+/** Result of a subset query: the page rows, plus the Postgres snapshot LSN they were read at (so a
+ * live tail can be followed from exactly that point with no gap or duplicate). */
+export interface SubsetResult {
+  rows: Row[]
+  /** `pg_current_wal_lsn()` at the read snapshot. */
+  lsn: string
+}
+
 // --- Change events (the unit on every stream) --------------------------------
 
 /**

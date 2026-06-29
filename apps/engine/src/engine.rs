@@ -168,6 +168,38 @@ impl Engine {
         Ok(())
     }
 
+    /// Run a one-shot **subset query** (the non-materialized counterpart to a shape): a single
+    /// `SELECT … WHERE … ORDER BY … LIMIT … OFFSET …` against Postgres, returning the projected page
+    /// rows (as JSON) + the snapshot LSN. Creates no shape, no stream, no live state — paging never
+    /// becomes server-side range state, so a change can never fan out across ranges. The caller follows
+    /// the live tail separately (a base-predicate feed) to keep the page live.
+    pub async fn query_subset(
+        &self,
+        table: &str,
+        where_: Option<PredicateJson>,
+        columns: Option<Vec<String>>,
+        order_by: Option<(String, bool)>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<(Vec<serde_json::Value>, String)> {
+        let ts = {
+            let st = self.state.lock().await;
+            st.tables.get(table).cloned().ok_or_else(|| anyhow::anyhow!("unknown table '{table}'"))?
+        };
+        let pred = CompiledPredicate::compile_opt(where_.as_ref(), &ts)?;
+        let out_cols = resolve_columns(&ts, columns)?;
+        let order = match order_by {
+            Some((col, desc)) => Some((ts.column_index(&col)?, desc)),
+            None => None,
+        };
+        let url = self.pg_url.clone().context("query_subset requires postgres mode")?;
+        let client = crate::pg::connect(&url).await?;
+        let sq = crate::pg::query_subset(&client, &ts, Some(&pred), order, limit, offset).await?;
+        let proj = out_cols.as_deref().map(Vec::as_slice);
+        let rows = sq.rows.iter().map(|r| ts.row_to_json_cols(r, proj)).collect();
+        Ok((rows, sq.lsn))
+    }
+
     pub async fn create_shape(
         &self,
         table: &str,
@@ -180,23 +212,7 @@ impl Engine {
             None => bail!("unknown table '{table}'"),
         };
         let pred = Arc::new(CompiledPredicate::compile_opt(where_.as_ref(), &ts)?);
-        // Resolve the optional output projection to column indices. The pk is always included (the
-        // client keys rows by it); indices are sorted into schema order for a stable JSON shape.
-        let out_cols: Option<Arc<Vec<usize>>> = match columns {
-            None => None,
-            Some(names) => {
-                let mut idxs = Vec::with_capacity(names.len() + 1);
-                for name in &names {
-                    idxs.push(ts.column_index(name)?);
-                }
-                if !idxs.contains(&ts.pk_index) {
-                    idxs.push(ts.pk_index);
-                }
-                idxs.sort_unstable();
-                idxs.dedup();
-                Some(Arc::new(idxs))
-            }
-        };
+        let out_cols = resolve_columns(&ts, columns)?;
 
         let num_id = st.next_shape_id;
         let id = format!("s{num_id}");
@@ -309,6 +325,26 @@ impl KeyRouter {
 /// project to NULL (defensive; equality-template columns always exist).
 fn key_of(row: &Row, cols: &[usize]) -> Row {
     Row(cols.iter().map(|&i| row.0.get(i).cloned().unwrap_or(Value::Null)).collect())
+}
+
+/// Resolve an optional column-name projection to sorted, pk-included column indices (the pk is always
+/// kept so the client can key rows). `None` => emit the full row. Shared by shapes and subset queries.
+fn resolve_columns(ts: &TableSchema, columns: Option<Vec<String>>) -> Result<Option<Arc<Vec<usize>>>> {
+    match columns {
+        None => Ok(None),
+        Some(names) => {
+            let mut idxs = Vec::with_capacity(names.len() + 1);
+            for name in &names {
+                idxs.push(ts.column_index(name)?);
+            }
+            if !idxs.contains(&ts.pk_index) {
+                idxs.push(ts.pk_index);
+            }
+            idxs.sort_unstable();
+            idxs.dedup();
+            Ok(Some(Arc::new(idxs)))
+        }
+    }
 }
 
 fn spawn_tailer(ds: DsClient, ts: TableSchema, pg_url: Option<String>) -> TailerHandle {

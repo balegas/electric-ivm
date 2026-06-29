@@ -2,7 +2,7 @@
 // (`@durable-streams/state/db`) for materializing a shape into a live TanStack DB collection.
 
 import type { AppRouter } from '@electric-lite/api'
-import type { Op, Row, Schema, ShapeDef, TableDef, Value } from '@electric-lite/protocol'
+import type { Op, Row, Schema, ShapeDef, SubsetDef, SubsetResult, TableDef, Value } from '@electric-lite/protocol'
 import { createStateSchema, createStreamDB } from '@durable-streams/state/db'
 import { createTRPCClient, httpBatchLink } from '@trpc/client'
 import { z } from 'zod'
@@ -39,7 +39,15 @@ export interface ElectricLiteClient {
   write(input: { table: string; op: Op; pk: Value; row?: Row; txid?: string }): Promise<{ txid: string }>
   /** Schema-derived typed ingestion API, one entry per table. */
   tables: Record<string, TableApi>
+  /** Register a **materialized, live** shape (backfilled + maintained as a durable stream). */
   shape(def: ShapeDef): Promise<ShapeMaterialization>
+  /**
+   * Run a one-shot **subset query** — the non-materialized counterpart to {@link shape}. Returns the
+   * page rows + the Postgres snapshot LSN directly, with no stream and no server-side state. Page by
+   * moving a keyset cursor in `where` (preferred) or bumping `offset`; keep it live by following the
+   * table's tail and re-checking view membership rather than materializing a per-page shape.
+   */
+  query(def: SubsetDef): Promise<SubsetResult>
   close(): Promise<void>
 }
 
@@ -130,6 +138,18 @@ export function createClient(opts: {
       }
       open.push(mat)
       return mat
+    },
+
+    async query(def) {
+      const result = await trpc.subset.query.query({
+        table: def.table,
+        where: def.where as never,
+        columns: def.columns,
+        orderBy: def.orderBy,
+        limit: def.limit,
+        offset: def.offset,
+      })
+      return result as SubsetResult
     },
 
     async close() {

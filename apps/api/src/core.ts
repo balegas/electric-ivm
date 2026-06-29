@@ -2,7 +2,16 @@
 // envelopes directly to the durable-streams table stream (decoupled from the engine, which
 // tails it). Schema definition and shape lifecycle are forwarded to the Rust engine.
 
-import { type Op, type Row, type Schema, type ShapeDef, toTableEnvelope, type Value } from '@electric-lite/protocol'
+import {
+  type Op,
+  type Row,
+  type Schema,
+  type ShapeDef,
+  type SubsetDef,
+  type SubsetResult,
+  toTableEnvelope,
+  type Value,
+} from '@electric-lite/protocol'
 
 export interface WriteInput {
   table: string
@@ -23,8 +32,11 @@ export interface ElectricCore {
   readonly dsUrl: string
   defineSchema(schema: Schema): Promise<void>
   write(input: WriteInput): Promise<{ txid: string }>
+  /** Register a **materialized, live** shape (backfilled + maintained as a durable stream). */
   createShape(def: ShapeDef): Promise<ShapeHandle>
   getShape(id: string): Promise<ShapeHandle | null>
+  /** Run a one-shot **subset query** (ephemeral, non-materialized query-back from Postgres). */
+  querySubset(def: SubsetDef): Promise<SubsetResult>
 }
 
 export interface CoreOptions {
@@ -80,6 +92,20 @@ export function createCore(opts: CoreOptions): ElectricCore {
       if (res.status === 404) return null
       if (!res.ok) throw new Error(`engine /shapes/${id} -> ${res.status}`)
       return (await res.json()) as ShapeHandle
+    },
+
+    async querySubset(def) {
+      return engineJson<SubsetResult>('/query', {
+        method: 'POST',
+        body: JSON.stringify({
+          table: def.table,
+          where: def.where ?? null,
+          columns: def.columns ?? null,
+          orderBy: def.orderBy ?? null,
+          limit: def.limit ?? null,
+          offset: def.offset ?? null,
+        }),
+      })
     },
   }
 }
