@@ -179,6 +179,15 @@ pub struct SubqueryShape {
 /// A `TableSchema` lookup shared with the engine's compiled schema.
 pub type SchemaMap = Arc<HashMap<String, TableSchema>>;
 
+/// Per-node introspection (served at `GET /subqueries`).
+#[derive(Clone, serde::Serialize)]
+pub struct NodeStat {
+    pub sig: SubquerySig,
+    pub inner_table: String,
+    pub distinct_values: usize,
+    pub refcount: usize,
+}
+
 /// The cross-table registry of subquery nodes + shapes + edges. Implements [`SubqueryEval`] so a
 /// predicate's subquery leaves resolve against the maintained node sets. One per engine, behind a
 /// `tokio::Mutex`; every table tailer calls [`on_table_delta`](Self::on_table_delta).
@@ -220,10 +229,27 @@ impl SubqueryRegistry {
             || self.shapes.values().any(|s| s.outer_table == table)
     }
 
-    /// All tables a node's signature transitively reads (its inner table + its children's). Used by the
-    /// engine to spawn tailers so every involved table's deltas reach the registry.
+    /// Number of maintained nodes (shared inner sets).
     pub fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Per-node topology for the introspection endpoint: signature, inner table, current distinct value
+    /// count, and the dependent refcount. Two shapes referencing the same subquery show one node with
+    /// `refcount == 2` (proves sharing).
+    pub fn stats(&self) -> Vec<NodeStat> {
+        let mut out: Vec<NodeStat> = self
+            .nodes
+            .values()
+            .map(|n| NodeStat {
+                sig: n.sig.clone(),
+                inner_table: n.inner_table.clone(),
+                distinct_values: n.distinct_values(),
+                refcount: n.refcount,
+            })
+            .collect();
+        out.sort_by(|a, b| a.sig.cmp(&b.sig));
+        out
     }
 
     /// Outgoing edges for a node signature.

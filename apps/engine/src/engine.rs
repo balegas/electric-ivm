@@ -311,6 +311,11 @@ impl Engine {
         self.subqueries.lock().await.node_count()
     }
 
+    /// Per-node subquery topology (signature, inner table, distinct values, refcount).
+    pub async fn subquery_stats(&self) -> Vec<crate::subquery::NodeStat> {
+        self.subqueries.lock().await.stats()
+    }
+
     pub async fn get_shape(&self, id: &str) -> Option<ShapeRecord> {
         self.state.lock().await.shapes.get(id).cloned()
     }

@@ -20,6 +20,7 @@ pub fn router(engine: Engine) -> Router {
         .route("/query", post(query_subset))
         .route("/tables/{name}/offset", get(table_offset))
         .route("/tables/{name}/families", get(table_families))
+        .route("/subqueries", get(subquery_stats))
         .route("/replication/lsn", get(replication_lsn))
         .route("/metrics", get(get_metrics))
         .route("/metrics/reset", post(reset_metrics))
@@ -152,6 +153,11 @@ async fn table_families(
         Some(stats) => Ok(Json(stats)),
         None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("no tailer for table {name}") }),
     }
+}
+
+async fn subquery_stats(State(engine): State<Engine>) -> Json<serde_json::Value> {
+    let nodes = engine.subquery_stats().await;
+    Json(serde_json::json!({ "nodes": nodes }))
 }
 
 async fn replication_lsn(State(engine): State<Engine>) -> Json<serde_json::Value> {
