@@ -13,7 +13,6 @@ use tokio::sync::{Mutex, mpsc};
 use std::sync::atomic::Ordering;
 
 use crate::ds::{DsClient, Envelope, EnvelopeHeaders};
-use crate::family::FamilyActor;
 use crate::metrics::{Timer, metrics};
 use crate::predicate::{CompiledPredicate, PredicateJson};
 use crate::schema::{Schema, TableSchema, compile_schema};
@@ -242,14 +241,34 @@ fn eval_standalone(pred: &CompiledPredicate, delta: &[Tup2<Row, ZWeight>]) -> Ve
         .collect()
 }
 
-/// A shared circuit for all shapes whose predicate is the same equality template (see
-/// `family::FamilyActor`). `shapes` maps each member's numeric id to its output stream path.
-struct Family {
-    actor: FamilyActor,
-    shapes: HashMap<u64, String>,
-    /// WAL LSN of the snapshot the data trace was seeded from; replication changes whose commit LSN
-    /// is strictly `< seed_lsn` are already in the trace and are skipped (see `process_envelope`).
+/// One shape registered on an equality template, backfilled from Postgres and routed by key.
+struct RoutedShape {
+    num_id: u64,
+    stream_path: String,
+    /// WAL LSN of THIS shape's own backfill snapshot; replication changes whose commit LSN is strictly
+    /// `< seed_lsn` are already in the backfill and are skipped (see `process_envelope`).
     seed_lsn: u64,
+}
+
+/// All equality shapes sharing one key-column set, indexed by key tuple. Holds **no table rows** —
+/// only the `key -> shapes` routing. A change is routed by its key to exactly the shapes registered on
+/// that key (O(log N), independent of shape count); each shape is backfilled directly from Postgres
+/// (`WHERE key = const`), so the engine never keeps a copy of the table.
+struct KeyRouter {
+    key_cols: Vec<usize>,
+    index: HashMap<Row, Vec<RoutedShape>>,
+}
+
+impl KeyRouter {
+    fn member_count(&self) -> usize {
+        self.index.values().map(|v| v.len()).sum()
+    }
+}
+
+/// The key tuple for a row given the template's key columns (positional projection). Missing columns
+/// project to NULL (defensive; equality-template columns always exist).
+fn key_of(row: &Row, cols: &[usize]) -> Row {
+    Row(cols.iter().map(|&i| row.0.get(i).cloned().unwrap_or(Value::Null)).collect())
 }
 
 fn spawn_tailer(ds: DsClient, ts: TableSchema, pg_url: Option<String>) -> TailerHandle {
@@ -263,11 +282,11 @@ fn spawn_tailer(ds: DsClient, ts: TableSchema, pg_url: Option<String>) -> Tailer
 fn publish_stats(
     stats: &std::sync::Mutex<TableStats>,
     shapes: &HashMap<String, StandaloneShape>,
-    families: &HashMap<Vec<usize>, Family>,
+    families: &HashMap<Vec<usize>, KeyRouter>,
 ) {
     let mut fams: Vec<FamilyStat> = families
         .iter()
-        .map(|(k, f)| FamilyStat { key_cols: k.clone(), shapes: f.shapes.len() })
+        .map(|(k, f)| FamilyStat { key_cols: k.clone(), shapes: f.member_count() })
         .collect();
     fams.sort_by(|a, b| a.key_cols.cmp(&b.key_cols));
     *stats.lock().unwrap() = TableStats { families: fams, standalone: shapes.len() };
@@ -286,7 +305,7 @@ async fn tailer_loop(
     // Standalone per-shape filter circuits (non-equality predicates), keyed by shape id.
     let mut shapes: HashMap<String, StandaloneShape> = HashMap::new();
     // Shared family circuits, keyed by the equality template's (sorted) column indices.
-    let mut families: HashMap<Vec<usize>, Family> = HashMap::new();
+    let mut families: HashMap<Vec<usize>, KeyRouter> = HashMap::new();
     // Reverse lookup for removal: shape id -> (template key cols, numeric id, key tuple).
     let mut family_of: HashMap<String, (Vec<usize>, u64, Row)> = HashMap::new();
 
@@ -307,14 +326,18 @@ async fn tailer_loop(
                 Some(TailerCmd::RemoveShape { shape_id }) => {
                     if shapes.remove(&shape_id).is_none()
                         && let Some((key_cols, num_id, key_tuple)) = family_of.remove(&shape_id)
-                        && let Some(fam) = families.get_mut(&key_cols)
+                        && let Some(router) = families.get_mut(&key_cols)
                     {
-                        // Drop the shape's param so future changes skip it; ignore the removal delta
-                        // (the shape stream is being torn down).
-                        let _ = fam.actor.step(vec![], vec![Tup2(Tup2(key_tuple, num_id), -1)]).await;
-                        fam.shapes.remove(&num_id);
-                        if fam.shapes.is_empty() {
-                            families.remove(&key_cols); // discard the now-unused family + its trace
+                        // Drop the shape from its key's routing list (the shape stream is torn down
+                        // elsewhere); discard the router once it routes to no shapes.
+                        if let Some(routed) = router.index.get_mut(&key_tuple) {
+                            routed.retain(|rs| rs.num_id != num_id);
+                            if routed.is_empty() {
+                                router.index.remove(&key_tuple);
+                            }
+                        }
+                        if router.index.is_empty() {
+                            families.remove(&key_cols);
                         }
                     }
                     publish_stats(&stats, &shapes, &families);
@@ -358,7 +381,7 @@ async fn add_shape_routed(
     ts: &TableSchema,
     pg_url: &Option<String>,
     shapes: &mut HashMap<String, StandaloneShape>,
-    families: &mut HashMap<Vec<usize>, Family>,
+    families: &mut HashMap<Vec<usize>, KeyRouter>,
     family_of: &mut HashMap<String, (Vec<usize>, u64, Row)>,
     shape_id: String,
     num_id: u64,
@@ -369,32 +392,25 @@ async fn add_shape_routed(
         Some(pairs) => {
             let key_cols: Vec<usize> = pairs.iter().map(|(c, _)| *c).collect();
             let key_tuple = Row(pairs.into_iter().map(|(_, v)| v).collect());
-            let param = Tup2(Tup2(key_tuple.clone(), num_id), 1);
 
-            if let Some(fam) = families.get_mut(&key_cols) {
-                // Existing family: insert the param; the incremental join backfills from the trace
-                // (which already holds the seed + every change applied since).
-                let out = fam.actor.step(vec![], vec![param]).await?;
-                fam.shapes.insert(num_id, stream_path);
-                emit_family_output(ds, ts, fam, out, None).await?;
-            } else {
-                // New family: seed the data trace from a Postgres snapshot and add the param in one
-                // step; the step output is this shape's backfill. `seed_lsn` lets the tailer skip
-                // replication changes already reflected in the snapshot. The trace must hold the whole
-                // table (future members can be on any key constant), so no predicate pushdown here.
-                let bf = pg_backfill(pg_url, ts, None).await?;
-                let actor = FamilyActor::spawn(Arc::new(key_cols.clone()))?;
-                let data: Vec<Tup2<Row, ZWeight>> = bf.rows.iter().map(|r| Tup2(r.clone(), 1)).collect();
-                let out = actor.step(data, vec![param]).await?;
-                let mut fam = Family {
-                    actor,
-                    shapes: HashMap::new(),
-                    seed_lsn: crate::pg::lsn_to_u64(&bf.seed_lsn),
-                };
-                fam.shapes.insert(num_id, stream_path);
-                emit_family_output(ds, ts, &fam, out, None).await?;
-                families.insert(key_cols.clone(), fam);
+            // Per-shape backfill straight from Postgres: the predicate IS this shape's key equality, so
+            // the pushdown reads only the key-matching rows — the engine never holds a table copy. Each
+            // shape records its own `seed_lsn` for the live-change reconciliation.
+            let bf = pg_backfill(pg_url, ts, Some(pred.as_ref())).await?;
+            let out: Vec<(Row, ZWeight)> = bf.rows.iter().map(|r| (r.clone(), 1)).collect();
+            if !out.is_empty() {
+                let envs = translate_output(ts, out, None);
+                ds.append(&stream_path, &envs).await?;
             }
+
+            let router = families
+                .entry(key_cols.clone())
+                .or_insert_with(|| KeyRouter { key_cols: key_cols.clone(), index: HashMap::new() });
+            router.index.entry(key_tuple.clone()).or_default().push(RoutedShape {
+                num_id,
+                stream_path,
+                seed_lsn: crate::pg::lsn_to_u64(&bf.seed_lsn),
+            });
             family_of.insert(shape_id, (key_cols, num_id, key_tuple));
         }
         None => {
@@ -434,38 +450,11 @@ async fn pg_backfill(
     }
 }
 
-/// Demultiplex a family circuit's `(shape_id, row, weight)` output by shape and append each shape's
-/// rows (translated to envelopes) to its stream.
-async fn emit_family_output(
-    ds: &DsClient,
-    ts: &TableSchema,
-    fam: &Family,
-    out: Vec<(u64, Row, ZWeight)>,
-    txid: Option<String>,
-) -> Result<()> {
-    let mut by_shape: HashMap<u64, Vec<(Row, ZWeight)>> = HashMap::new();
-    for (sid, row, w) in out {
-        by_shape.entry(sid).or_default().push((row, w));
-    }
-    for (sid, rows) in by_shape {
-        if let Some(stream_path) = fam.shapes.get(&sid) {
-            let envs = translate_output(ts, rows, txid.clone());
-            if !envs.is_empty() {
-                {
-                    let _a = Timer::new(&metrics().append);
-                    ds.append(stream_path, &envs).await?;
-                }
-                metrics().shape_appends.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-    Ok(())
-}
 
 async fn process_envelope(
     ts: &TableSchema,
     shapes: &HashMap<String, StandaloneShape>,
-    families: &HashMap<Vec<usize>, Family>,
+    families: &HashMap<Vec<usize>, KeyRouter>,
     env: Envelope,
     pending: &mut HashMap<String, Vec<Envelope>>,
 ) -> Result<()> {
@@ -495,45 +484,39 @@ async fn process_envelope(
         let envs = translate_output(ts, out, txid.clone());
         pending.entry(shape.stream_path.clone()).or_default().extend(envs);
     }
-    // Shared family circuits: one join per template fans the delta to all its shapes. Skip changes
-    // already in the family's seed snapshot so the trace's weights stay exact (no double-count).
-    for fam in families.values() {
-        if lsn != 0 && lsn < fam.seed_lsn {
+    // Equality routers: route each delta row by its key to exactly the shapes registered on that key.
+    // No table copy, no dbsp — membership is the key match (an equality-template predicate matches a
+    // row iff its key equals the shape's constants). Each shape's own `seed_lsn` is applied, so changes
+    // already in that shape's backfill are skipped.
+    let _s = Timer::new(&metrics().family_step);
+    for router in families.values() {
+        let mut by_shape: HashMap<u64, (&str, Vec<(Row, ZWeight)>)> = HashMap::new();
+        for Tup2(row, w) in &delta {
+            let key = key_of(row, &router.key_cols);
+            let Some(routed) = router.index.get(&key) else { continue };
+            for rs in routed {
+                if lsn != 0 && lsn < rs.seed_lsn {
+                    continue;
+                }
+                by_shape
+                    .entry(rs.num_id)
+                    .or_insert_with(|| (rs.stream_path.as_str(), Vec::new()))
+                    .1
+                    .push((row.clone(), *w));
+            }
+        }
+        if by_shape.is_empty() {
             continue;
         }
-        let out = {
-            let _s = Timer::new(&metrics().family_step);
-            fam.actor.step(delta.clone(), vec![]).await?
-        };
         metrics().family_steps.fetch_add(1, Ordering::Relaxed);
-        if out.is_empty() {
-            continue;
-        }
-        collect_family_output(ts, fam, out, txid.clone(), pending);
-    }
-    Ok(())
-}
-
-/// Demultiplex a family circuit's output by shape and stage each shape's envelopes for flushing.
-fn collect_family_output(
-    ts: &TableSchema,
-    fam: &Family,
-    out: Vec<(u64, Row, ZWeight)>,
-    txid: Option<String>,
-    pending: &mut HashMap<String, Vec<Envelope>>,
-) {
-    let mut by_shape: HashMap<u64, Vec<(Row, ZWeight)>> = HashMap::new();
-    for (sid, row, w) in out {
-        by_shape.entry(sid).or_default().push((row, w));
-    }
-    for (sid, rows) in by_shape {
-        if let Some(stream_path) = fam.shapes.get(&sid) {
+        for (_sid, (stream_path, rows)) in by_shape {
             let envs = translate_output(ts, rows, txid.clone());
             if !envs.is_empty() {
-                pending.entry(stream_path.clone()).or_default().extend(envs);
+                pending.entry(stream_path.to_string()).or_default().extend(envs);
             }
         }
     }
+    Ok(())
 }
 
 /// Flush the batch's staged appends, bounded-concurrently. Each envelope keeps its own txid, so

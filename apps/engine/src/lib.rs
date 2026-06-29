@@ -9,7 +9,6 @@
 
 pub mod ds;
 pub mod engine;
-pub mod family;
 pub mod fault;
 pub mod http;
 pub mod metrics;

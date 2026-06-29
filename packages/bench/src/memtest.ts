@@ -197,8 +197,26 @@ async function main() {
   const end = rssTrace.at(-1) ?? 0
   const disk = await diskMb()
 
-  log(`\nrows inserted:     ${inserts} (table now ~${(nextId / 1000).toFixed(0)}k distinct rows, held in ${fams.families.length} family traces)`)
+  // Drained measurement: wait until the engine has processed the whole table stream, then let memory
+  // settle, and re-measure RSS. With the routing model the engine retains NO table rows (only per-shape
+  // key metadata), so this should fall back toward baseline — the firehose-time peak is dominated by
+  // the transient read-batch backlog, not retained data.
+  const tail = (await fetch(`${dsUrl}/table/items`, { method: 'HEAD' })).headers.get('stream-next-offset')
+  const drainDeadline = now() + 30000
+  while (now() < drainDeadline) {
+    const r = await fetch(`${engine.url}/tables/items/offset`).catch(() => null)
+    if (r?.ok) {
+      const { offset } = (await r.json()) as { offset: string }
+      if (tail && offset >= tail) break
+    }
+    await sleep(200)
+  }
+  await sleep(3000)
+  const drained = await rssMb(enginePid)
+
+  log(`\nrows inserted:     ${inserts} (~${(nextId / 1000).toFixed(0)}k distinct rows written to the table stream)`)
   log(`engine RSS:        start=${start.toFixed(0)}MB  peak=${peak.toFixed(0)}MB  end=${end.toFixed(0)}MB`)
+  log(`drained RSS:       ${drained.toFixed(0)}MB  (after the engine processed the whole stream + settled)`)
   log(`RSS trajectory:    ${rssTrace.map((r) => r.toFixed(0)).join(' ')}`)
   if (STORAGE_DIR) log(`disk spilled:      ${disk.toFixed(0)}MB`)
   log(`hot-shape latency: p50=${pct(latencies, 0.5).toFixed(1)}ms  p99=${pct(latencies, 0.99).toFixed(1)}ms  max=${pct(latencies, 1).toFixed(1)}ms  (${latencies.length} probes)`)
