@@ -200,7 +200,12 @@ pub async fn shape(State(engine): State<Engine>, Query(p): Query<ShapeParams>) -
     }
 }
 
-async fn shape_inner(engine: Engine, p: ShapeParams) -> anyhow::Result<Response> {
+async fn shape_inner(engine: Engine, mut p: ShapeParams) -> anyhow::Result<Response> {
+    // Electric clients send schema-qualified table names (`public.users`); our engine keys by the bare
+    // table name. Strip any schema prefix.
+    if let Some((_schema, bare)) = p.table.rsplit_once('.') {
+        p.table = bare.to_string();
+    }
     let offset = p.offset.clone().unwrap_or_else(|| "-1".into());
     let live = p.live.as_deref() == Some("true");
     let columns = col_csv(&p.columns);
