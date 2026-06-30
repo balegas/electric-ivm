@@ -94,7 +94,23 @@ run `pnpm engine:test` + `pnpm test` before claiming done.
   client reads its fresh stream from offset `-1` (= from feed creation). Create the feed *before* the
   query-back so the live tail can't miss a delta in the gap; overlap is reconciled idempotently by pk.
 - **The demo boots an _ephemeral_ Postgres each run** (`mkdtemp`), seeded by `DEMO_SEED_COUNT` (default
-  512). Data does not persist between runs; don't expect a previous run's rows.
+  512). Data does not persist between runs; don't expect a previous run's rows. **Kill stale demos before
+  restarting** — a leftover `tsx start.ts` + `caddy` from a prior run keeps `:8443`/`:5174` and serves
+  OLD code (an engine without new tables, an API zod without new predicate branches), which reads as a
+  mysterious "unknown table" / "invalid_union" mismatch vs source. `pkill -f electric-lite-engine`,
+  `pkill -f "tsx start.ts"`, `pkill -f caddy` first.
+- **Shape rows stringify the primary key.** A materialized shape's row arrives with its pk column coerced
+  to a *string* (TanStack DB collection keys are strings), while non-pk int columns and the subset
+  query-back path stay numbers. Cross-id joins (e.g. `issue.project_id` number vs `projects.id` string)
+  silently miss — normalize reference-data ids to numbers when reading from shapes
+  (`examples/linearlite/src/lib/CurrentUser.tsx`).
+- **A subset whose predicate folds in the live UI filters re-creates the engine feed on every filter
+  click** (`useSubset` keys on the predicate JSON → teardown + query-back = a visible delay). For
+  permissioned/faceted lists prefer **per-facet feeds reused across filter changes** + a client merge:
+  LinearLite's browse list mounts one `project_id = P` subset per member project (identical predicate
+  across users ⇒ shared engine family; bounded memory at 100k issues) and merges/filters on the client,
+  so switching project/status is instant. The visibility *subquery* stays the declarative form for the
+  bounded Board/Search views.
 - **Vite binds IPv6 `[::1]:5174` only.** `http://localhost:5174` can fail to resolve to it; prefer the
   **`https://localhost:8443`** Caddy proxy (HTTP/2 — also dodges the browser's ~6-connection HTTP/1.1
   cap that freezes multi-stream apps). `DEMO_HTTPS=0` disables the proxy. Caddy's local CA is trusted.
