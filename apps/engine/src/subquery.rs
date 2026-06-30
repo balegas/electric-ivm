@@ -376,7 +376,7 @@ impl SubqueryRegistry {
             let node = self.nodes.get_mut(&sig).context("seed: node vanished")?;
             node.seed_lsn = seed_lsn;
             for r in &bf.rows {
-                let pk = ts.pk_of(r).map(Value::to_key_string).unwrap_or_default();
+                let pk = ts.key_string(r).unwrap_or_default();
                 let pv = r.0.get(proj_col).cloned().unwrap_or(Value::Null);
                 node.reconcile_row(&pk, Some(pv));
             }
@@ -505,7 +505,7 @@ impl SubqueryRegistry {
         let mut newrow: HashMap<String, Row> = HashMap::new();
         let mut seen: Vec<String> = Vec::new();
         for Tup2(row, w) in delta {
-            let pk = ts.pk_of(row).map(Value::to_key_string).unwrap_or_default();
+            let pk = ts.key_string(row).unwrap_or_default();
             if !seen.contains(&pk) {
                 seen.push(pk.clone());
             }
@@ -559,7 +559,7 @@ impl SubqueryRegistry {
         let evals: Vec<(String, Option<Value>)> = rows
             .iter()
             .map(|r| {
-                let pk = ts.pk_of(r).map(Value::to_key_string).unwrap_or_default();
+                let pk = ts.key_string(r).unwrap_or_default();
                 let pv = if pred.matches_ctx(r, self) {
                     Some(r.0.get(proj).cloned().unwrap_or(Value::Null))
                 } else {
@@ -622,7 +622,7 @@ impl SubqueryRegistry {
         // `-1` row (delete). `is_new` distinguishes "row still exists" from "row was deleted".
         let mut by_pk: HashMap<String, (Row, bool)> = HashMap::new();
         for Tup2(row, w) in delta {
-            let pk = ts.pk_of(row).map(Value::to_key_string).unwrap_or_default();
+            let pk = ts.key_string(row).unwrap_or_default();
             if *w > 0 {
                 by_pk.insert(pk, (row.clone(), true));
             } else {
@@ -685,7 +685,7 @@ impl SubqueryRegistry {
                 let evals: Vec<(String, Option<Value>)> = rows
                     .iter()
                     .map(|r| {
-                        let pk = ts.pk_of(r).map(Value::to_key_string).unwrap_or_default();
+                        let pk = ts.key_string(r).unwrap_or_default();
                         let pv = if pred.matches_ctx(r, self) { Some(r.0.get(proj).cloned().unwrap_or(Value::Null)) } else { None };
                         (pk, pv)
                     })

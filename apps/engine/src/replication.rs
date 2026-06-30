@@ -262,15 +262,22 @@ fn parse_sync_body(body: &str) -> Option<i64> {
     rest[..end].parse::<i64>().ok()
 }
 
-/// Extract the primary-key string from a parsed row object.
+/// Extract the primary-key string from a parsed row object. For composite primary keys the column values
+/// are joined by the same separator [`TableSchema::key_string`] uses, so envelope keys match the engine's.
 fn key_from_obj(obj: &Json, ts: &TableSchema) -> String {
-    match obj.get(&ts.pk_name) {
-        Some(Json::Null) | None => "null".to_string(),
-        Some(Json::String(s)) => s.clone(),
-        Some(Json::Number(n)) => n.to_string(),
-        Some(Json::Bool(b)) => b.to_string(),
-        Some(v) => v.to_string(),
+    let one = |name: &str| -> String {
+        match obj.get(name) {
+            Some(Json::Null) | None => "null".to_string(),
+            Some(Json::String(s)) => s.clone(),
+            Some(Json::Number(n)) => n.to_string(),
+            Some(Json::Bool(b)) => b.to_string(),
+            Some(v) => v.to_string(),
+        }
+    };
+    if ts.pk_cols.len() == 1 {
+        return one(&ts.pk_name);
     }
+    ts.pk_cols.iter().map(|&i| one(&ts.columns[i].0)).collect::<Vec<_>>().join("\u{1f}")
 }
 
 /// Parse a `test_decoding` column segment (`c1[type]:v1 c2[type]:'a b' c3[type]:null`) into a JSON
@@ -399,7 +406,7 @@ mod tests {
         columns.insert("id".to_string(), ColumnDef { ty: ColumnType::Int });
         columns.insert("tenant".to_string(), ColumnDef { ty: ColumnType::Int });
         columns.insert("name".to_string(), ColumnDef { ty: ColumnType::Text });
-        let def = TableDef { columns, primary_key: "id".to_string() };
+        let def = TableDef { columns, primary_key: vec!["id".to_string()] };
         let mut m = HashMap::new();
         m.insert("users".to_string(), TableSchema::from_def("users", &def).unwrap());
         m
@@ -471,7 +478,7 @@ mod tests {
         let mut columns = BTreeMap::new();
         columns.insert("id".to_string(), ColumnDef { ty: ColumnType::Int });
         columns.insert("name".to_string(), ColumnDef { ty: ColumnType::Text });
-        let def = TableDef { columns, primary_key: "id".to_string() };
+        let def = TableDef { columns, primary_key: vec!["id".to_string()] };
         let mut m = HashMap::new();
         m.insert("users".to_string(), TableSchema::from_def("users", &def).unwrap());
         let e = parse_change(r#"table public."users": INSERT: "id"[integer]:1 "name"[text]:'a'"#, &m).unwrap();

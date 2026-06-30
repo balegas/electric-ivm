@@ -27,18 +27,23 @@ function repoRoot(): string {
 }
 const SLOT = process.env.ADAPTER_PG_SLOT || 'electric_lite_conformance'
 
-// Single-PK subset of Electric's standard schema (level_1..4). The composite-PK *_tags tables are added
-// later once the engine supports composite keys.
+// Electric's full standard schema (level_1..4 + composite-PK *_tags side tables).
 const STANDARD_DDL = [
   `CREATE TABLE IF NOT EXISTS level_1 (id TEXT PRIMARY KEY, active BOOLEAN NOT NULL DEFAULT true)`,
+  `CREATE TABLE IF NOT EXISTS level_1_tags (level_1_id TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY (level_1_id, tag))`,
   `CREATE TABLE IF NOT EXISTS level_2 (id TEXT PRIMARY KEY, level_1_id TEXT NOT NULL, active BOOLEAN NOT NULL DEFAULT true)`,
+  `CREATE TABLE IF NOT EXISTS level_2_tags (level_2_id TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY (level_2_id, tag))`,
   `CREATE TABLE IF NOT EXISTS level_3 (id TEXT PRIMARY KEY, level_2_id TEXT NOT NULL, active BOOLEAN NOT NULL DEFAULT true)`,
+  `CREATE TABLE IF NOT EXISTS level_3_tags (level_3_id TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY (level_3_id, tag))`,
   `CREATE TABLE IF NOT EXISTS level_4 (id TEXT PRIMARY KEY, level_3_id TEXT NOT NULL, value TEXT NOT NULL DEFAULT '')`,
 ]
 const SEED = [
   `INSERT INTO level_1 VALUES ('l1-1', true), ('l1-2', false)`,
+  `INSERT INTO level_1_tags VALUES ('l1-1','alpha'), ('l1-1','beta'), ('l1-2','gamma')`,
   `INSERT INTO level_2 VALUES ('l2-1','l1-1',true), ('l2-2','l1-2',true)`,
+  `INSERT INTO level_2_tags VALUES ('l2-1','alpha'), ('l2-2','delta')`,
   `INSERT INTO level_3 VALUES ('l3-1','l2-1',true), ('l3-2','l2-2',false)`,
+  `INSERT INTO level_3_tags VALUES ('l3-1','alpha'), ('l3-2','beta'), ('l3-1','gamma')`,
   `INSERT INTO level_4 VALUES ('l4-1','l3-1','alpha'), ('l4-2','l3-2','beta'), ('l4-3','l3-1','gamma')`,
 ]
 
@@ -72,7 +77,9 @@ async function main() {
   }
 
   let pgUrl = process.env.ADAPTER_PG_URL || ''
-  let tables = process.env.ADAPTER_PG_TABLES || 'level_1,level_2,level_3,level_4'
+  let tables =
+    process.env.ADAPTER_PG_TABLES ||
+    'level_1,level_1_tags,level_2,level_2_tags,level_3,level_3_tags,level_4'
   if (!pgUrl) {
     pgUrl = bootEphemeralPg()
     const client = new pgpkg.Client({ connectionString: pgUrl })

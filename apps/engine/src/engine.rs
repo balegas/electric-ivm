@@ -839,7 +839,7 @@ pub(crate) fn translate_output(
     let mut pos: HashMap<String, Row> = HashMap::new();
     let mut neg: HashSet<String> = HashSet::new();
     for (row, w) in out {
-        let pk = match ts.pk_of(&row).map(Value::to_key_string) {
+        let pk = match ts.key_string(&row) {
             Ok(pk) => pk,
             Err(e) => {
                 tracing::warn!("translate_output: dropping row with unextractable pk on table {}: {e:#}", ts.name);

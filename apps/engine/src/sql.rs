@@ -161,7 +161,7 @@ mod tests {
         columns.insert("name".to_string(), ColumnDef { ty: ColumnType::Text });
         columns.insert("score".to_string(), ColumnDef { ty: ColumnType::Float });
         columns.insert("active".to_string(), ColumnDef { ty: ColumnType::Bool });
-        let def = TableDef { columns, primary_key: "id".to_string() };
+        let def = TableDef { columns, primary_key: vec!["id".to_string()] };
         TableSchema::from_def("users", &def).unwrap()
     }
 

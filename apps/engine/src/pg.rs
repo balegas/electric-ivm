@@ -58,19 +58,22 @@ pub async fn introspect(client: &Client, table: &str) -> Result<TableDef> {
         columns.insert(name, ColumnDef { ty: map_pg_type(&dt) });
     }
 
+    // Composite primary keys are supported (e.g. Electric's `*_tags` tables); columns are ordered by
+    // their position in the index key so the synthesized row key is deterministic.
     let pk_rows = client
         .query(
             "select a.attname from pg_index i \
              join pg_attribute a on a.attrelid = i.indrelid and a.attnum = any(i.indkey) \
-             where i.indrelid = to_regclass($1) and i.indisprimary",
+             where i.indrelid = to_regclass($1) and i.indisprimary \
+             order by array_position(i.indkey, a.attnum)",
             &[&table],
         )
         .await
         .context("introspect primary key")?;
-    if pk_rows.len() != 1 {
-        bail!("table '{table}' must have a single-column primary key (found {})", pk_rows.len());
+    if pk_rows.is_empty() {
+        bail!("table '{table}' must have a primary key");
     }
-    let primary_key: String = pk_rows[0].get(0);
+    let primary_key: Vec<String> = pk_rows.iter().map(|r| r.get(0)).collect();
     Ok(TableDef { columns, primary_key })
 }
 
