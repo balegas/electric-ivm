@@ -322,6 +322,42 @@ impl Engine {
         self.subqueries.lock().await.stats()
     }
 
+    /// Engine-internal cardinalities for the memory probe — the structures whose growth drives RSS:
+    /// registered shapes, per-table tailers, shared **family circuits** (the M× join-trace amplifier:
+    /// each holds the base table once), standalone per-shape circuits, and the subquery registry's
+    /// nodes/contributor-pks. Read directly from in-memory state (cheap; no tailer round-trip).
+    pub async fn mem_cardinalities(&self) -> crate::mem::Cardinalities {
+        let (shapes, tailers, tables, families, family_shapes, standalone) = {
+            let st = self.state.lock().await;
+            let mut families = 0usize;
+            let mut family_shapes = 0usize;
+            let mut standalone = 0usize;
+            for h in st.tailers.values() {
+                if let Ok(s) = h.stats.lock() {
+                    families += s.families.len();
+                    family_shapes += s.families.iter().map(|f| f.shapes).sum::<usize>();
+                    standalone += s.standalone;
+                }
+            }
+            (st.shapes.len(), st.tailers.len(), st.tables.len(), families, family_shapes, standalone)
+        };
+        let (sq_nodes, sq_contributors, sq_distinct, sq_shapes, sq_edges) =
+            self.subqueries.lock().await.mem_totals();
+        crate::mem::Cardinalities {
+            shapes,
+            tailers,
+            tables,
+            families,
+            family_shapes,
+            standalone,
+            subquery_nodes: sq_nodes,
+            subquery_contributors: sq_contributors,
+            subquery_distinct_values: sq_distinct,
+            subquery_shapes: sq_shapes,
+            subquery_edges: sq_edges,
+        }
+    }
+
     pub async fn get_shape(&self, id: &str) -> Option<ShapeRecord> {
         self.state.lock().await.shapes.get(id).cloned()
     }

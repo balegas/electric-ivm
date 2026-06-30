@@ -45,3 +45,8 @@ uuid = { version = "1", features = ["v4"] }
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+memory-stats = "1"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["metrics"] }
+opentelemetry-prometheus = "0.27"
+prometheus = "0.13"

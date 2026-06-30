@@ -5,13 +5,15 @@
   "type": "module",
   "scripts": {
     "bench": "tsx src/run.ts",
-    "memtest": "tsx src/memtest.ts"
+    "memtest": "tsx src/memtest.ts",
+    "shape-mem": "tsx src/shape-mem-matrix.ts"
   },
   "dependencies": {
     "@electric-lite/protocol": "workspace:*",
     "@electric-lite/api": "workspace:*",
     "@electric-lite/client": "workspace:*",
     "@durable-streams/server": "^0.3.7",
+    "pg": "^8.13.1",
     "tsx": "^4.19.2"
   }
 }

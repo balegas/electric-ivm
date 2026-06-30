@@ -13,6 +13,7 @@ pub mod ds;
 pub mod engine;
 pub mod fault;
 pub mod http;
+pub mod mem;
 pub mod metrics;
 pub mod pg;
 pub mod predicate;

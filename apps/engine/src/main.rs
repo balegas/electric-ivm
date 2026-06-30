@@ -46,6 +46,14 @@ async fn main() -> Result<()> {
         }
         _ => Engine::new(DsClient::new(ds_url.clone())),
     };
+
+    // Memory probes via OpenTelemetry: register the meter provider + Prometheus exporter, publish an
+    // initial sample, and start the background sampler. `_otel` is held for the process lifetime so the
+    // provider (and its exporter) stays alive. Exposed at GET /metrics/prometheus and GET /memory.
+    let _otel = electric_lite_engine::mem::init_otel();
+    electric_lite_engine::mem::publish(&engine.mem_cardinalities().await);
+    electric_lite_engine::mem::spawn_sampler(engine.clone(), std::time::Duration::from_millis(500));
+
     let app = router(engine);
 
     let listener = tokio::net::TcpListener::bind(&bind).await.with_context(|| format!("binding {bind}"))?;

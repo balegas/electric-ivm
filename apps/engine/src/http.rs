@@ -24,6 +24,8 @@ pub fn router(engine: Engine) -> Router {
         .route("/replication/lsn", get(replication_lsn))
         .route("/metrics", get(get_metrics))
         .route("/metrics/reset", post(reset_metrics))
+        .route("/memory", get(get_memory))
+        .route("/metrics/prometheus", get(get_prometheus))
         .with_state(engine)
 }
 
@@ -171,6 +173,25 @@ async fn get_metrics() -> Json<serde_json::Value> {
 async fn reset_metrics() -> Json<serde_json::Value> {
     crate::metrics::metrics().reset();
     Json(serde_json::json!({ "ok": true }))
+}
+
+/// JSON memory snapshot — process RSS/virtual + engine cardinalities. Recomputes cardinalities fresh so
+/// the harness reads the exact state right after creating a batch of shapes (and republishes the OTel
+/// gauges in the same pass).
+async fn get_memory(State(engine): State<Engine>) -> Json<serde_json::Value> {
+    let card = engine.mem_cardinalities().await;
+    crate::mem::publish(&card);
+    Json(crate::mem::snapshot_json())
+}
+
+/// OpenTelemetry metrics in Prometheus exposition format (what an OTel collector's prometheus receiver
+/// scrapes). Reflects the last published sample (refreshed by the background sampler + every `/memory`).
+async fn get_prometheus() -> Response {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        crate::mem::prometheus_text(),
+    )
+        .into_response()
 }
 
 struct AppError {

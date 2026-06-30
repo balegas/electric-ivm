@@ -234,6 +234,19 @@ impl SubqueryRegistry {
         self.nodes.len()
     }
 
+    /// Memory-relevant registry totals: maintained nodes, total contributor pks across all nodes (the
+    /// dominant per-node state — one entry per inner row producing a value), distinct values, shapes,
+    /// and edges. Used by the memory probe to attribute subquery state growth.
+    pub fn mem_totals(&self) -> (usize, usize, usize, usize, usize) {
+        let mut contributors = 0;
+        let mut distinct = 0;
+        for n in self.nodes.values() {
+            contributors += n.contributors.values().map(|s| s.len()).sum::<usize>();
+            distinct += n.contributors.len();
+        }
+        (self.nodes.len(), contributors, distinct, self.shapes.len(), self.edges.len())
+    }
+
     /// Per-node topology for the introspection endpoint: signature, inner table, current distinct value
     /// count, and the dependent refcount. Two shapes referencing the same subquery show one node with
     /// `refcount == 2` (proves sharing).
