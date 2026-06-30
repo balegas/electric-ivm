@@ -2,10 +2,12 @@ import { useEffect, useState } from 'react'
 
 import { navigate } from '../App'
 import { addComment, type Comment, commentsShapeDef, deleteComment, deleteIssue, type Issue, updateIssue } from '../electric'
+import { useCurrentUser } from '../lib/CurrentUser'
 import { useShapeRows } from '../lib/useShape'
-import { Avatar, displayId, formatDate, PriorityMenu, StatusMenu } from './ui'
+import { Avatar, displayId, formatDate, PriorityMenu, ProjectBadge, StatusMenu } from './ui'
 
 export function IssueDetail({ id }: { id: number }): JSX.Element {
+  const { currentUserName, projectById } = useCurrentUser()
   // Live single-issue shape + a live per-issue comments shape (created/closed with this view).
   const { rows: issues, loading } = useShapeRows<Issue>({ table: 'issues', where: { col: 'id', op: 'eq', value: id } })
   // Comments ordered oldest-first in the live query.
@@ -108,7 +110,7 @@ export function IssueDetail({ id }: { id: number }): JSX.Element {
               className="btn primary"
               disabled={!body.trim()}
               onClick={() => {
-                addComment(issue.id, body.trim())
+                addComment(issue.id, body.trim(), currentUserName)
                 setBody('')
               }}
             >
@@ -125,6 +127,12 @@ export function IssueDetail({ id }: { id: number }): JSX.Element {
           <div className="side-field">
             <span className="side-label">Priority</span>
             <PriorityMenu value={issue.priority} onChange={(priority) => updateIssue(issue, { priority })} />
+          </div>
+          <div className="side-field">
+            <span className="side-label">Project</span>
+            <span className="side-value">
+              <ProjectBadge project={projectById.get(issue.project_id)} />
+            </span>
           </div>
           <div className="side-field">
             <span className="side-label">Assignee</span>

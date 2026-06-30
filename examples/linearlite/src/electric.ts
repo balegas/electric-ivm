@@ -19,9 +19,27 @@ export interface Issue {
   status: Status
   priority: Priority
   username: string
+  project_id: number
   created: number
   modified: number
   kanbanorder: number
+}
+
+export interface Project {
+  id: number
+  name: string
+  color: string
+}
+
+export interface User {
+  id: number
+  name: string
+}
+
+export interface ProjectMember {
+  id: number
+  project_id: number
+  user_id: number
 }
 
 export interface Comment {
@@ -56,11 +74,14 @@ async function pgWrite(body: { table: string; op: 'insert' | 'update' | 'delete'
   }
 }
 
-export function createIssue(fields: Pick<Issue, 'title' | 'description' | 'status' | 'priority'>): Issue {
+export function createIssue(
+  fields: Pick<Issue, 'title' | 'description' | 'status' | 'priority' | 'project_id'>,
+  username: string,
+): Issue {
   const now = Date.now()
   const issue: Issue = {
     id: genId(),
-    username: 'testuser',
+    username,
     created: now,
     modified: now,
     kanbanorder: now, // append to the end of its column; reorders adjust this
@@ -68,6 +89,15 @@ export function createIssue(fields: Pick<Issue, 'title' | 'description' | 'statu
   }
   void pgWrite({ table: 'issues', op: 'insert', pk: issue.id, row: issue })
   return issue
+}
+
+/** Join/leave a project: insert/delete a `project_members` row. Drives live visibility changes. */
+export function joinProject(memberId: number, projectId: number, userId: number) {
+  void pgWrite({ table: 'project_members', op: 'insert', pk: memberId, row: { id: memberId, project_id: projectId, user_id: userId } })
+}
+
+export function leaveProject(memberId: number) {
+  void pgWrite({ table: 'project_members', op: 'delete', pk: memberId })
 }
 
 export function updateIssue(issue: Issue, patch: Partial<Issue>) {
@@ -79,8 +109,8 @@ export function deleteIssue(id: number) {
   void pgWrite({ table: 'issues', op: 'delete', pk: id })
 }
 
-export function addComment(issueId: number, body: string) {
-  const comment: Comment = { id: genId(), issue_id: issueId, body, username: 'testuser', created: Date.now() }
+export function addComment(issueId: number, body: string, username: string) {
+  const comment: Comment = { id: genId(), issue_id: issueId, body, username, created: Date.now() }
   void pgWrite({ table: 'comments', op: 'insert', pk: comment.id, row: comment })
 }
 
@@ -94,50 +124,112 @@ const anyOf = (col: string, values: string[]): Predicate =>
 
 // The list/board never render `description` (a large lorem blob — ~55% of each issue's bytes); it's
 // only needed by search. Projecting it out of the browse shapes cuts the synced payload roughly in
-// half. Search syncs the full row (columns omitted) so it can match on description.
-export const LIST_COLUMNS = ['id', 'title', 'status', 'priority', 'username', 'created', 'modified', 'kanbanorder']
-const BOARD_COLUMNS = ['id', 'title', 'priority', 'username', 'kanbanorder']
+// half. Search syncs the full row (columns omitted) so it can match on description. `project_id` is
+// included so rows can render their project badge.
+export const LIST_COLUMNS = ['id', 'title', 'status', 'priority', 'username', 'project_id', 'created', 'modified', 'kanbanorder']
+const BOARD_COLUMNS = ['id', 'title', 'priority', 'username', 'project_id', 'kanbanorder']
 
-/** The status/priority filter predicate shared by the list shape and the browse subset. */
-function issuesWhere(statuses: Status[], priorities: Priority[]): Predicate | undefined {
-  const clauses: Predicate[] = []
-  if (statuses.length) clauses.push(anyOf('status', statuses))
-  if (priorities.length) clauses.push(anyOf('priority', priorities))
-  return clauses.length === 0 ? undefined : clauses.length === 1 ? clauses[0] : { and: clauses }
+const andAll = (preds: (Predicate | undefined)[]): Predicate | undefined => {
+  const cs = preds.filter((p): p is Predicate => p !== undefined)
+  return cs.length === 0 ? undefined : cs.length === 1 ? cs[0] : { and: cs }
 }
 
 /**
- * Build the list view's shape from the active status/priority filters. Empty filters => match-all.
- * `columns` restricts which columns sync (the pk is always included); omit it for the full row.
+ * **Visibility = a subquery.** A user sees an issue only if they belong to its project: the issue's
+ * `project_id` must be IN the set of projects the user is a member of. This single subquery is reused
+ * across every issue read path (list, board, search, my-tasks); identical instances share one inner
+ * registry node in the engine.
  */
-export function issuesShapeDef(statuses: Status[], priorities: Priority[], columns?: string[]): ShapeDef {
-  return { table: 'issues', where: issuesWhere(statuses, priorities), columns }
+export function visibleIssues(userId: number): Predicate {
+  return {
+    col: 'project_id',
+    in: { table: 'project_members', project: 'project_id', where: { col: 'user_id', op: 'eq', value: userId } },
+  }
+}
+
+/** Everything an issue query needs: who's asking (visibility) + the active filters/view. */
+export interface IssueQuery {
+  userId: number
+  userName: string
+  statuses: Status[]
+  priorities: Priority[]
+  projectId?: number | null // restrict to one project (sidebar project link)
+  myTasksOnly?: boolean // only issues assigned to the current user
+}
+
+/** The full issue predicate: visibility ∧ status ∧ priority ∧ [project] ∧ [assigned-to-me]. */
+function issuesWhere(q: IssueQuery): Predicate | undefined {
+  return andAll([
+    visibleIssues(q.userId),
+    q.statuses.length ? anyOf('status', q.statuses) : undefined,
+    q.priorities.length ? anyOf('priority', q.priorities) : undefined,
+    q.projectId ? { col: 'project_id', op: 'eq', value: q.projectId } : undefined,
+    q.myTasksOnly ? { col: 'username', op: 'eq', value: q.userName } : undefined,
+  ])
+}
+
+/**
+ * Build the search list's shape from the active query. `columns` restricts which columns sync (the pk
+ * is always included); omit it for the full row (search needs `description`).
+ */
+export function issuesShapeDef(q: IssueQuery, columns?: string[]): ShapeDef {
+  return { table: 'issues', where: issuesWhere(q), columns }
 }
 
 /** Page size for the browse subset (query-back chunk + live-tail window growth on scroll). */
 export const SUBSET_PAGE = 200
 
 /**
- * The browse view as a **subset query**: same status/priority predicate, ordered + paged, fetched by
- * query-back from Postgres (never materialized). Ordering must be a real column for keyset paging, so
- * the demo pages by `created`/`modified`; the engine appends the pk as a tiebreaker.
+ * The browse view as a **subset query**: the visibility-subquery predicate, ordered + paged, fetched by
+ * query-back from Postgres (never materialized — the subquery is evaluated natively by Postgres) with a
+ * changes-only live tail. Ordering must be a real column for keyset paging, so the demo pages by
+ * `created`/`modified`; the engine appends the pk as a tiebreaker.
  */
 export function issuesSubsetDef(
-  statuses: Status[],
-  priorities: Priority[],
+  q: IssueQuery,
   orderBy: { col: 'created' | 'modified'; desc?: boolean },
   columns?: string[],
 ): SubsetDef {
-  return { table: 'issues', where: issuesWhere(statuses, priorities), columns, orderBy, limit: SUBSET_PAGE }
+  return { table: 'issues', where: issuesWhere(q), columns, orderBy, limit: SUBSET_PAGE }
 }
 
-export const statusShapeDef = (status: Status): ShapeDef => ({
+/**
+ * One **subset** (paginated query-back, never materialized) per project the current user belongs to. The
+ * browse list mounts one of these per member project and merges/filters them on the client, so switching
+ * project/status/sort is instant (no new engine feed per filter combination) AND it scales — a member of
+ * a 100k-issue workspace never holds more than the loaded pages. The `project_id = P` predicate is
+ * identical across users, so the engine reuses one feed family per project rather than a per-user subquery
+ * subset per filter combination.
+ */
+export const projectIssuesSubsetDef = (projectId: number, orderBy: { col: 'created' | 'modified'; desc?: boolean }): SubsetDef => ({
   table: 'issues',
-  where: { col: 'status', op: 'eq', value: status },
+  where: { col: 'project_id', op: 'eq', value: projectId },
+  columns: LIST_COLUMNS,
+  orderBy,
+  limit: SUBSET_PAGE,
+})
+
+/** A board column: visible issues with a given status (and optional project filter), as a shape. */
+export const statusShapeDef = (q: Pick<IssueQuery, 'userId' | 'projectId'>, status: Status): ShapeDef => ({
+  table: 'issues',
+  where: andAll([
+    visibleIssues(q.userId),
+    { col: 'status', op: 'eq', value: status },
+    q.projectId ? { col: 'project_id', op: 'eq', value: q.projectId } : undefined,
+  ]),
   columns: BOARD_COLUMNS,
 })
 
 export const commentsShapeDef = (issueId: number): ShapeDef => ({
   table: 'comments',
   where: { col: 'issue_id', op: 'eq', value: issueId },
+})
+
+// --- Reference-data shapes (small, fully materialized): the user roster, projects, and the current
+// user's memberships. The UI reads these live so the switcher/badges/sidebar reflect real engine state.
+export const usersShapeDef: ShapeDef = { table: 'users' }
+export const projectsShapeDef: ShapeDef = { table: 'projects' }
+export const myMembershipsShapeDef = (userId: number): ShapeDef => ({
+  table: 'project_members',
+  where: { col: 'user_id', op: 'eq', value: userId },
 })

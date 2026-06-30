@@ -192,11 +192,25 @@ pub async fn query_subset(
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> Result<SubsetQuery> {
+    query_subset_where(client, ts, filter.and_then(|p| crate::sql::predicate_to_sql(p, ts)), order, limit, offset).await
+}
+
+/// Like [`query_subset`], but with a **prebuilt** `WHERE` fragment + params — used when the predicate
+/// contains an `IN (SELECT …)` subquery (the JSON SQL emitter builds it; Postgres evaluates it natively,
+/// so paginated subquery lists work without engine-side subquery state).
+pub async fn query_subset_where(
+    client: &Client,
+    ts: &TableSchema,
+    where_sql: Option<(String, Vec<String>)>,
+    order: Option<(usize, bool)>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<SubsetQuery> {
     client
         .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .await
         .context("begin subset snapshot")?;
-    let result = query_subset_in_txn(client, ts, filter, order, limit, offset).await;
+    let result = query_subset_in_txn(client, ts, where_sql, order, limit, offset).await;
     client.batch_execute("COMMIT").await.ok();
     result
 }
@@ -204,13 +218,13 @@ pub async fn query_subset(
 async fn query_subset_in_txn(
     client: &Client,
     ts: &TableSchema,
-    filter: Option<&CompiledPredicate>,
+    where_sql: Option<(String, Vec<String>)>,
     order: Option<(usize, bool)>,
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> Result<SubsetQuery> {
     let lsn: String = client.query_one("select pg_current_wal_lsn()::text", &[]).await?.get(0);
-    let (where_clause, params) = match filter.and_then(|p| crate::sql::predicate_to_sql(p, ts)) {
+    let (where_clause, params) = match where_sql {
         Some((w, ps)) => (format!(" where {w}"), ps),
         None => (String::new(), Vec::new()),
     };

@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
 
+import type { Filters } from '../App'
 import { navigate } from '../App'
 import { type Issue, statusShapeDef, updateIssue } from '../electric'
 import { STATUS_LABEL, STATUSES, type Status } from '../schema'
+import { useCurrentUser } from '../lib/CurrentUser'
 import { useShapeRows } from '../lib/useShape'
 import { Virtual } from '../lib/Virtual'
 import { Avatar, displayId, PriorityIcon, StatusIcon } from './ui'
@@ -28,15 +30,20 @@ function BoardCard({ issue }: { issue: Issue }): JSX.Element {
 
 function BoardColumn({
   status,
+  userId,
+  projectId,
   onDropIssue,
   register,
 }: {
   status: Status
+  userId: number
+  projectId: number | null
   onDropIssue: (id: number, target: Status, maxOrder: number) => void
   register: (rows: Issue[]) => void
 }): JSX.Element {
-  // Ordering is pushed into the live query (kanbanorder, then id) — no client-side sort.
-  const { rows } = useShapeRows<Issue>(statusShapeDef(status), (b) =>
+  // Each column is a visibility subquery ∧ status shape; all five share one inner registry node. Ordering
+  // is pushed into the live query (kanbanorder, then id) — no client-side sort.
+  const { rows } = useShapeRows<Issue>(statusShapeDef({ userId, projectId }, status), (b) =>
     b
       .orderBy(({ t }: { t: Issue }) => t.kanbanorder, 'asc')
       .orderBy(({ t }: { t: Issue }) => t.id, 'asc')
@@ -83,7 +90,8 @@ function BoardColumn({
   )
 }
 
-export function Board({ onNewIssue }: { onNewIssue: () => void }): JSX.Element {
+export function Board({ filters, onNewIssue }: { filters: Filters; onNewIssue: () => void }): JSX.Element {
+  const { currentUserId } = useCurrentUser()
   // id -> freshest known row, fed by every column's live shape (see BoardColumn).
   const registry = useRef<Map<number, Issue>>(new Map())
   const register = useRef((rows: Issue[]) => {
@@ -109,7 +117,14 @@ export function Board({ onNewIssue }: { onNewIssue: () => void }): JSX.Element {
       </div>
       <div className="board">
         {STATUSES.map((s) => (
-          <BoardColumn key={s} status={s} onDropIssue={onDropIssue} register={register} />
+          <BoardColumn
+            key={s}
+            status={s}
+            userId={currentUserId}
+            projectId={filters.projectId}
+            onDropIssue={onDropIssue}
+            register={register}
+          />
         ))}
       </div>
     </>

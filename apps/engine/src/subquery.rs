@@ -268,6 +268,7 @@ impl SubqueryRegistry {
         stream_path: &str,
         where_json: &PredicateJson,
         out_cols: Option<Arc<Vec<usize>>>,
+        changes_only: bool,
     ) -> Result<()> {
         let outer_ts =
             self.schemas.get(outer_table).cloned().context("subquery shape: unknown outer table")?;
@@ -283,25 +284,32 @@ impl SubqueryRegistry {
             });
         }
         // 3. Seed newly-created nodes from Postgres (Postgres evaluates nested subqueries natively).
+        //    Nodes are seeded even for a `changes_only` feed — `matches_ctx` needs the inner sets to
+        //    evaluate live membership.
         self.seed_pending_nodes().await?;
-        // 4. Backfill the outer shape and append its initial members.
-        let (wsql, params) = crate::sql::predicate_json_to_sql(where_json, 1);
-        let bf = {
-            let url = self.pg_url.clone().context("subquery shape backfill requires postgres")?;
-            let client = crate::pg::connect(&url).await?;
-            crate::pg::backfill_where(&client, &outer_ts, Some((wsql, params))).await?
+        // 4. Backfill the outer shape and append its initial members — UNLESS this is a `changes_only`
+        //    feed (a subset's live tail), which forwards only future membership deltas (seed_lsn 0).
+        let seed_lsn = if changes_only {
+            0
+        } else {
+            let (wsql, params) = crate::sql::predicate_json_to_sql(where_json, 1);
+            let bf = {
+                let url = self.pg_url.clone().context("subquery shape backfill requires postgres")?;
+                let client = crate::pg::connect(&url).await?;
+                crate::pg::backfill_where(&client, &outer_ts, Some((wsql, params))).await?
+            };
+            let out: Vec<(Row, ZWeight)> = bf.rows.iter().map(|r| (r.clone(), 1)).collect();
+            if !out.is_empty() {
+                let envs = crate::engine::translate_output(
+                    &outer_ts,
+                    out,
+                    None,
+                    out_cols.as_deref().map(Vec::as_slice),
+                );
+                self.ds.append(stream_path, &envs).await?;
+            }
+            crate::pg::lsn_to_u64(&bf.seed_lsn)
         };
-        let seed_lsn = crate::pg::lsn_to_u64(&bf.seed_lsn);
-        let out: Vec<(Row, ZWeight)> = bf.rows.iter().map(|r| (r.clone(), 1)).collect();
-        if !out.is_empty() {
-            let envs = crate::engine::translate_output(
-                &outer_ts,
-                out,
-                None,
-                out_cols.as_deref().map(Vec::as_slice),
-            );
-            self.ds.append(stream_path, &envs).await?;
-        }
         // 5. Record the shape.
         self.shapes.insert(
             shape_id.to_string(),

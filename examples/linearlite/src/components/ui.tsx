@@ -37,6 +37,16 @@ export function Avatar({ name, size = 22 }: { name: string; size?: number }): JS
   )
 }
 
+// --- Project badge: a colored pill with the project's name (visibility is by project) -----------
+export function ProjectBadge({ project }: { project?: { name: string; color: string } }): JSX.Element | null {
+  if (!project) return null
+  return (
+    <span className="project-badge" title={`Project: ${project.name}`} style={{ borderColor: project.color, color: project.color }}>
+      {project.name}
+    </span>
+  )
+}
+
 // --- Status icon: a colored ring/disc per status -------------------------------------------------
 const STATUS_COLOR: Record<Status, string> = {
   backlog: '#9ca3af',

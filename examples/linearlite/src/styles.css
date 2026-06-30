@@ -54,6 +54,30 @@ body {
 }
 .nav-item:hover { background: var(--panel-2); }
 .nav-item.active { background: var(--panel-2); color: #fff; font-weight: 600; }
+/* nav items can carry a trailing affordance (join/leave) */
+.nav-item { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.nav-item-label { display: inline-flex; align-items: center; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-row { display: inline-flex; align-items: center; gap: 7px; min-width: 0; }
+.project-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+.project-join {
+  font-size: 11px; color: var(--muted); padding: 1px 7px; border-radius: 5px; flex: none;
+  opacity: 0; transition: opacity 0.12s;
+}
+.nav-item:hover .project-join { opacity: 1; }
+.project-join:hover { background: var(--accent); color: #fff; }
+
+/* user switcher + project picker selects */
+.user-switcher { display: flex; flex-direction: column; gap: 4px; padding: 0 8px 4px; }
+.user-switcher select, .project-select {
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--border, #2a2a33);
+  border-radius: 7px; padding: 6px 8px; font-size: 13px; cursor: pointer; text-transform: capitalize;
+}
+
+/* project badge on issue rows / detail */
+.project-badge {
+  font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 999px;
+  border: 1px solid currentColor; background: transparent; white-space: nowrap; flex: none;
+}
 .sidebar-footer { margin-top: auto; display: flex; flex-direction: column; gap: 4px; font-size: 11px; padding: 8px; }
 .sidebar-footer a { color: var(--muted); text-decoration: none; }
 .sidebar-footer a:hover { color: var(--accent); }

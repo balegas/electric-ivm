@@ -200,15 +200,24 @@ impl Engine {
             let st = self.state.lock().await;
             st.tables.get(table).cloned().ok_or_else(|| anyhow::anyhow!("unknown table '{table}'"))?
         };
-        let pred = CompiledPredicate::compile_opt(where_.as_ref(), &ts)?;
         let out_cols = resolve_columns(&ts, columns)?;
         let order = match order_by {
             Some((col, desc)) => Some((ts.column_index(&col)?, desc)),
             None => None,
         };
+        // Subquery predicates are evaluated natively by Postgres in the one-shot query-back (no engine
+        // subquery state needed for a non-live page); other predicates use the compiled-form emitter.
+        let where_sql = match where_.as_ref() {
+            Some(p) if crate::subquery::predicate_has_subquery(p) => Some(crate::sql::predicate_json_to_sql(p, 1)),
+            Some(p) => {
+                let cp = CompiledPredicate::compile_opt(Some(p), &ts)?;
+                crate::sql::predicate_to_sql(&cp, &ts)
+            }
+            None => None,
+        };
         let url = self.pg_url.clone().context("query_subset requires postgres mode")?;
         let client = crate::pg::connect(&url).await?;
-        let sq = crate::pg::query_subset(&client, &ts, Some(&pred), order, limit, offset).await?;
+        let sq = crate::pg::query_subset_where(&client, &ts, where_sql, order, limit, offset).await?;
         let proj = out_cols.as_deref().map(Vec::as_slice);
         let rows = sq.rows.iter().map(|r| ts.row_to_json_cols(r, proj)).collect();
         Ok((rows, sq.lsn))
@@ -238,9 +247,6 @@ impl Engine {
         // tailer's local routing. Ensure a tailer exists for the outer table AND every referenced inner
         // table (so their deltas reach the registry), then register + backfill via the registry.
         if where_.as_ref().is_some_and(predicate_has_subquery) {
-            if changes_only {
-                bail!("changes_only feeds are not supported for subquery shapes");
-            }
             let where_json = where_.expect("subquery predicate present");
             let mut tables = referenced_tables(&where_json);
             tables.push(table.to_string());
@@ -264,7 +270,7 @@ impl Engine {
             self.subqueries
                 .lock()
                 .await
-                .create_subquery_shape(&id, table, &stream_path, &where_json, out_cols)
+                .create_subquery_shape(&id, table, &stream_path, &where_json, out_cols, changes_only)
                 .await?;
             return Ok(rec);
         }

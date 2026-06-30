@@ -14,9 +14,35 @@ export const schema: Schema = {
         status: { type: 'text' }, // STATUSES below
         priority: { type: 'text' }, // PRIORITIES below
         username: { type: 'text' }, // assignee / creator
+        project_id: { type: 'int' }, // the project this issue belongs to (visibility)
         created: { type: 'int' }, // epoch ms
         modified: { type: 'int' }, // epoch ms
         kanbanorder: { type: 'float' }, // fractional ordering within a status column
+      },
+      primaryKey: 'id',
+    },
+    // Visibility model: a user sees an issue only if they belong to its project. Membership is the
+    // `project_members` join table, consulted via a subquery on the issue queries (see electric.ts).
+    projects: {
+      columns: {
+        id: { type: 'int' },
+        name: { type: 'text' },
+        color: { type: 'text' }, // badge color
+      },
+      primaryKey: 'id',
+    },
+    users: {
+      columns: {
+        id: { type: 'int' },
+        name: { type: 'text' }, // also the issue `username` (assignee)
+      },
+      primaryKey: 'id',
+    },
+    project_members: {
+      columns: {
+        id: { type: 'int' },
+        project_id: { type: 'int' },
+        user_id: { type: 'int' },
       },
       primaryKey: 'id',
     },

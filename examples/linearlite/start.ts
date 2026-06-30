@@ -103,6 +103,20 @@ try {
   // Explicit DDL (not tableDDL) so ids/timestamps are BIGINT — the client mints ids from Date.now(),
   // which overflows int4. REPLICA IDENTITY FULL so replication carries old+new; a cascading FK so
   // deleting an issue removes its comments in one shot (the engine sees both deletes via replication).
+  await pg.query(`CREATE TABLE projects (
+    id BIGINT PRIMARY KEY,
+    name TEXT NOT NULL,
+    color TEXT NOT NULL
+  )`)
+  await pg.query(`CREATE TABLE users (
+    id BIGINT PRIMARY KEY,
+    name TEXT NOT NULL
+  )`)
+  await pg.query(`CREATE TABLE project_members (
+    id BIGINT PRIMARY KEY,
+    project_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL
+  )`)
   await pg.query(`CREATE TABLE issues (
     id BIGINT PRIMARY KEY,
     title TEXT NOT NULL,
@@ -110,6 +124,7 @@ try {
     status TEXT NOT NULL,
     priority TEXT NOT NULL,
     username TEXT NOT NULL,
+    project_id BIGINT NOT NULL,
     created BIGINT NOT NULL,
     modified BIGINT NOT NULL,
     kanbanorder DOUBLE PRECISION NOT NULL
@@ -121,18 +136,47 @@ try {
     username TEXT NOT NULL,
     created BIGINT NOT NULL
   )`)
-  await pg.query('ALTER TABLE issues REPLICA IDENTITY FULL')
-  await pg.query('ALTER TABLE comments REPLICA IDENTITY FULL')
+  for (const t of ['projects', 'users', 'project_members', 'issues', 'comments']) {
+    await pg.query(`ALTER TABLE ${t} REPLICA IDENTITY FULL`)
+  }
 
   // --- Parametrized seed (faker), mirroring the original LinearLite generator ---------------------
   // DEMO_SEED_COUNT  number of issues to generate (default 512, the upstream default).
   const SEED_COUNT = Math.max(0, Number(process.env.DEMO_SEED_COUNT ?? 512))
   const SEED_PRIORITIES = ['none', 'low', 'medium', 'high'] as const // upstream never seeds 'urgent'
 
+  // Fixed roster + projects so visibility is demonstrable: each user belongs to an overlapping subset of
+  // projects, so switching the current user visibly changes which issues are in scope. Kept in sync with
+  // examples/linearlite/src/demo-data.ts (the client reads the same ids/names for the user switcher).
+  const USERS = ['alice', 'bob', 'carol', 'dave', 'erin', 'frank'] // user id = index + 1
+  const PROJECTS = [
+    { name: 'Web App', color: '#5e6ad2' },
+    { name: 'Mobile', color: '#26a269' },
+    { name: 'Infra', color: '#c64600' },
+    { name: 'Design System', color: '#a347ba' },
+    { name: 'Marketing', color: '#0a7ea4' },
+  ] // project id = index + 1
+  // Membership: project ids each user belongs to (overlapping; 'frank' is in everything).
+  const MEMBERSHIP: number[][] = [
+    [1, 2, 3], // alice
+    [2, 3, 4], // bob
+    [3, 4, 5], // carol
+    [1, 4, 5], // dave
+    [1, 2, 5], // erin
+    [1, 2, 3, 4, 5], // frank
+  ]
+
   if (SEED_COUNT > 0) {
     const t0 = Date.now()
     faker.seed(42)
     const now = Date.now()
+    const projectRows: unknown[][] = PROJECTS.map((p, i) => [i + 1, p.name, p.color])
+    const userRows: unknown[][] = USERS.map((n, i) => [i + 1, n])
+    const memberRows: unknown[][] = []
+    let memberId = 1
+    MEMBERSHIP.forEach((projectIds, ui) => {
+      for (const pid of projectIds) memberRows.push([memberId++, pid, ui + 1])
+    })
     const issueRows: unknown[][] = []
     const commentRows: unknown[][] = []
     let commentId = 1
@@ -140,13 +184,15 @@ try {
     for (let id = 1; id <= SEED_COUNT; id++) {
       const created = faker.date.past({ years: 1 }).getTime()
       const modified = faker.date.between({ from: created, to: now }).getTime()
+      const projectId = (id % PROJECTS.length) + 1
       issueRows.push([
         id,
         faker.lorem.sentence({ min: 3, max: 8 }).replace(/\.$/, ''),
         faker.lorem.paragraphs({ min: 1, max: 3 }),
         STATUSES[Math.floor(Math.random() * STATUSES.length)],
         SEED_PRIORITIES[Math.floor(Math.random() * SEED_PRIORITIES.length)],
-        faker.internet.username().toLowerCase(),
+        USERS[Math.floor(Math.random() * USERS.length)], // assignee from the roster (so My Tasks is real)
+        projectId,
         created,
         modified,
         order++ + Math.random(),
@@ -156,7 +202,7 @@ try {
           commentId++,
           id,
           faker.lorem.sentences({ min: 1, max: 3 }),
-          faker.internet.username().toLowerCase(),
+          USERS[Math.floor(Math.random() * USERS.length)],
           faker.date.between({ from: created, to: now }).getTime(),
         ])
       }
@@ -174,10 +220,13 @@ try {
       }
     }
     await pg.query('BEGIN')
-    await bulkInsert('issues', ['id', 'title', 'description', 'status', 'priority', 'username', 'created', 'modified', 'kanbanorder'], issueRows)
+    await bulkInsert('projects', ['id', 'name', 'color'], projectRows)
+    await bulkInsert('users', ['id', 'name'], userRows)
+    await bulkInsert('project_members', ['id', 'project_id', 'user_id'], memberRows)
+    await bulkInsert('issues', ['id', 'title', 'description', 'status', 'priority', 'username', 'project_id', 'created', 'modified', 'kanbanorder'], issueRows)
     await bulkInsert('comments', ['id', 'issue_id', 'body', 'username', 'created'], commentRows)
     await pg.query('COMMIT')
-    console.log(`primed          → ${issueRows.length} issues, ${commentRows.length} comments (${Date.now() - t0}ms)`)
+    console.log(`primed          → ${issueRows.length} issues, ${commentRows.length} comments, ${projectRows.length} projects, ${userRows.length} users, ${memberRows.length} memberships (${Date.now() - t0}ms)`)
   }
 
   // --- 2. durable-streams + engine (Postgres mode) + API (ephemeral ports) ------------------------

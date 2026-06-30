@@ -1,16 +1,30 @@
 import { ilike, or } from '@tanstack/db'
-import { useMemo } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 
 import type { Filters } from '../App'
 import { navigate } from '../App'
-import { type Issue, issuesShapeDef, issuesSubsetDef, LIST_COLUMNS, updateIssue } from '../electric'
+import { type Issue, type IssueQuery, issuesShapeDef, projectIssuesSubsetDef, updateIssue } from '../electric'
 import { PRIORITY_RANK } from '../schema'
+import { useCurrentUser } from '../lib/CurrentUser'
 import { useShapeRows, useSubset } from '../lib/useShape'
 import { Virtual } from '../lib/Virtual'
-import { Avatar, displayId, formatDate, PriorityMenu, StatusMenu } from './ui'
+import { Avatar, displayId, formatDate, PriorityMenu, ProjectBadge, StatusMenu } from './ui'
 import { TopFilter } from './TopFilter'
 
+/** Derive the engine-side issue query (visibility + filters) from the UI filters and the current user. */
+function toIssueQuery(filters: Filters, userId: number, userName: string): IssueQuery {
+  return {
+    userId,
+    userName,
+    statuses: filters.statuses,
+    priorities: filters.priorities,
+    projectId: filters.projectId,
+    myTasksOnly: filters.myTasksOnly,
+  }
+}
+
 function IssueRow({ issue }: { issue: Issue }): JSX.Element {
+  const { projectById } = useCurrentUser()
   return (
     <div className="issue-row">
       <span onClick={(e) => e.stopPropagation()}>
@@ -23,6 +37,7 @@ function IssueRow({ issue }: { issue: Issue }): JSX.Element {
       <button type="button" className="issue-title" onClick={() => navigate(`#/issue/${issue.id}`)}>
         {issue.title}
       </button>
+      <ProjectBadge project={projectById.get(issue.project_id)} />
       <span className="issue-date">{formatDate(issue.created)}</span>
       <Avatar name={issue.username} />
     </div>
@@ -31,6 +46,8 @@ function IssueRow({ issue }: { issue: Issue }): JSX.Element {
 
 function listTitle(filters: Filters, showSearch?: boolean): string {
   if (showSearch) return 'Search'
+  if (filters.myTasksOnly) return 'My Tasks'
+  if (filters.projectId !== null) return 'Project'
   const s = filters.statuses
   if (s.length === 1 && s[0] === 'backlog') return 'Backlog'
   if (s.length === 2 && s.includes('todo') && s.includes('in_progress')) return 'Active'
@@ -74,41 +91,111 @@ function ListChrome({
   )
 }
 
+interface FeedState {
+  rows: Issue[]
+  loadMore: () => void
+  hasMore: boolean
+}
+
 /**
- * Browse the issues as a **subset query**: the first page is query-backed from Postgres and the loaded
- * window stays live by following the table's tail — no materialized shape, so the engine never holds
- * the 20k rows. Scrolling to the bottom pages in the next chunk (another query-back). Ordering pages by
- * a real column (`created`/`modified`); a `priority` selection re-sorts the loaded window client-side.
+ * One project's subset feed (`project_id = P`), paginated + live. Renders nothing — it reports its
+ * loaded rows + paging controls up to {@link BrowseList} via `register`. Kept mounted for every project
+ * the user belongs to (regardless of the active filter) so switching project/status is instant client
+ * work and the underlying engine feed is reused across users and filter changes.
+ */
+function ProjectSubsetFeed({
+  projectId,
+  orderCol,
+  desc,
+  register,
+}: {
+  projectId: number
+  orderCol: 'created' | 'modified'
+  desc: boolean
+  register: (projectId: number, state: FeedState | null) => void
+}): JSX.Element | null {
+  const { rows, loadMore, hasMore } = useSubset<Issue>(
+    projectIssuesSubsetDef(projectId, { col: orderCol, desc }),
+    (b) =>
+      b
+        .orderBy(({ t }: { t: Issue }) => t[orderCol], desc ? 'desc' : 'asc')
+        .orderBy(({ t }: { t: Issue }) => t.id, 'asc')
+        .select(({ t }: { t: Issue }) => t),
+    [orderCol, desc],
+  )
+  // Report state up; on unmount (lost membership) clear this feed from the merge.
+  useEffect(() => {
+    register(projectId, { rows, loadMore, hasMore })
+    return () => register(projectId, null)
+  }, [projectId, rows, loadMore, hasMore, register])
+  return null
+}
+
+/**
+ * Browse the visible issues by **merging one per-project subset feed per project the user belongs to**.
+ * Each feed is a paginated query-back (never materialized — scales to 100k+ issues), reused across users
+ * and filter changes. Project/status/priority/my-tasks selection and ordering happen on the client over
+ * the merged loaded window, so switching filters is instant with no new engine request. Scrolling pages
+ * every active feed forward together.
  */
 function BrowseList({ filters, setFilters }: { filters: Filters; setFilters: (f: Filters) => void }): JSX.Element {
-  const dir = filters.dir
+  const { myProjectIds, currentUserName } = useCurrentUser()
+  const memberIds = useMemo(() => [...myProjectIds].sort((a, b) => a - b), [myProjectIds])
   const orderCol: 'created' | 'modified' = filters.orderBy === 'modified' ? 'modified' : 'created'
-  const { rows, loading, loadMore, hasMore } = useSubset<Issue>(
-    issuesSubsetDef(filters.statuses, filters.priorities, { col: orderCol, desc: dir === 'desc' }, LIST_COLUMNS),
-  )
+  const desc = filters.dir === 'desc'
 
-  // The subset collection is an unordered set; impose the display order over the loaded window.
-  const sign = dir === 'asc' ? 1 : -1
-  const sorted = useMemo(() => {
-    const arr = [...rows]
-    if (filters.orderBy === 'priority') {
-      arr.sort((a, b) => sign * (PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority]) || a.id - b.id)
-    } else {
-      arr.sort((a, b) => sign * ((a[orderCol] as number) - (b[orderCol] as number)) || a.id - b.id)
+  const [feeds, setFeeds] = useState<Map<number, FeedState>>(new Map())
+  const register = useCallback((projectId: number, state: FeedState | null) => {
+    setFeeds((prev) => {
+      const next = new Map(prev)
+      if (state) next.set(projectId, state)
+      else next.delete(projectId)
+      return next
+    })
+  }, [])
+
+  // Which projects feed the current view: one when a project is selected, else all member projects.
+  const activeIds = filters.projectId ? [filters.projectId] : memberIds
+
+  const rendered = useMemo(() => {
+    let all: Issue[] = []
+    for (const pid of activeIds) all = all.concat(feeds.get(pid)?.rows ?? [])
+    if (filters.statuses.length) all = all.filter((i) => filters.statuses.includes(i.status))
+    if (filters.priorities.length) all = all.filter((i) => filters.priorities.includes(i.priority))
+    if (filters.myTasksOnly) all = all.filter((i) => i.username === currentUserName)
+    all.sort((a, b) => {
+      const d =
+        filters.orderBy === 'priority'
+          ? PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority]
+          : (a[orderCol] as number) - (b[orderCol] as number)
+      return (desc ? -d : d) || a.id - b.id
+    })
+    return all
+  }, [feeds, activeIds, filters.statuses, filters.priorities, filters.myTasksOnly, filters.orderBy, orderCol, desc, currentUserName])
+
+  const hasMore = activeIds.some((pid) => feeds.get(pid)?.hasMore)
+  const loadMore = () => {
+    for (const pid of activeIds) {
+      const f = feeds.get(pid)
+      if (f?.hasMore) f.loadMore()
     }
-    return arr
-  }, [rows, filters.orderBy, sign, orderCol])
+  }
 
   return (
-    <ListChrome
-      filters={filters}
-      setFilters={setFilters}
-      rows={sorted}
-      loading={loading}
-      onEndReached={() => {
-        if (hasMore) loadMore()
-      }}
-    />
+    <>
+      {memberIds.map((pid) => (
+        <ProjectSubsetFeed key={pid} projectId={pid} orderCol={orderCol} desc={desc} register={register} />
+      ))}
+      <ListChrome
+        filters={filters}
+        setFilters={setFilters}
+        rows={rendered}
+        loading={feeds.size === 0 && memberIds.length > 0}
+        onEndReached={() => {
+          if (hasMore) loadMore()
+        }}
+      />
+    </>
   )
 }
 
@@ -120,11 +207,12 @@ function BrowseList({ filters, setFilters }: { filters: Filters; setFilters: (f:
 function SearchList({ filters, setFilters }: { filters: Filters; setFilters: (f: Filters) => void }): JSX.Element {
   // Strip `%`/`_` from the search term: TanStack DB's ilike treats them as wildcards and has no
   // ESCAPE, so a literal `%`/`_` would otherwise match everything. (We want plain substring search.)
+  const { currentUserId, currentUserName } = useCurrentUser()
   const q = filters.q.trim().replace(/[%_]/g, '')
   const dir = filters.dir
   const dateSort = filters.orderBy === 'created' || filters.orderBy === 'modified'
   const { rows, loading } = useShapeRows<Issue>(
-    issuesShapeDef(filters.statuses, filters.priorities),
+    issuesShapeDef(toIssueQuery(filters, currentUserId, currentUserName)),
     (b) => {
       let query = b
       if (q) query = query.where(({ t }: { t: Issue }) => or(ilike(t.title, `%${q}%`), ilike(t.description, `%${q}%`)))
