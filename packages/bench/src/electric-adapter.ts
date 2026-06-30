@@ -83,7 +83,10 @@ async function main() {
     console.error(`seeded standard schema (single-PK subset) → ${pgUrl}`)
   }
 
-  ds = new DurableStreamTestServer({ port: 0 })
+  // Short long-poll timeout: Electric's oracle harness polls each shape live and only detects "no more
+  // changes" when an up-to-date response returns. With the 30s default, unchanged shapes stall a batch;
+  // a short timeout returns up-to-date quickly (changed shapes still wake immediately on append).
+  ds = new DurableStreamTestServer({ port: 0, longPollTimeout: Number(process.env.ADAPTER_LONGPOLL_MS || 1000) })
   const dsUrl = await ds.start()
 
   engineProc = spawn(join(repoRoot(), 'target', 'release', 'electric-lite-engine'), [], {
@@ -112,7 +115,8 @@ async function main() {
     })
     engineProc!.on('exit', (c) => reject(new Error(`engine exited ${c}`)))
   })
-  // Discovery line on stdout (the Elixir setup reads this); diagnostics go to stderr.
+  // Discovery lines on stdout (the Elixir setup reads these); diagnostics go to stderr.
+  console.log(`ADAPTER_PG ${pgUrl}`)
   console.log(`ADAPTER_LISTENING ${url}`)
 }
 

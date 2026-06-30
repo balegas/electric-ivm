@@ -51,6 +51,7 @@ pub struct ShapeParams {
 struct HandleState {
     stream_path: String,
     table: String,
+    pk_name: String,
     columns: Option<Vec<String>>,
     keys: HashSet<String>,
     offset: String,
@@ -225,7 +226,14 @@ async fn shape_inner(engine: Engine, p: ShapeParams) -> anyhow::Result<Response>
         let schema_str = serde_json::to_string(&schema_json(&ts, &columns)).unwrap_or_default();
         handles().lock().await.insert(
             rec.id.clone(),
-            HandleState { stream_path: rec.stream_path.clone(), table: p.table.clone(), columns, keys, offset: tail.clone() },
+            HandleState {
+                stream_path: rec.stream_path.clone(),
+                table: p.table.clone(),
+                pk_name: ts.pk_name.clone(),
+                columns,
+                keys,
+                offset: tail.clone(),
+            },
         );
 
         let mut headers = HeaderMap::new();
@@ -263,7 +271,14 @@ async fn shape_inner(engine: Engine, p: ShapeParams) -> anyhow::Result<Response>
         match env.headers.operation.as_str() {
             "delete" => {
                 if st.keys.remove(&env.key) {
-                    messages.push(change_msg("delete", &env.key, None));
+                    // Electric's client requires a `value` on every change message (its parser matches
+                    // on `"value"`). For a delete we carry the row's old value if present, else the key.
+                    let value = env
+                        .value
+                        .as_ref()
+                        .map(encode_value)
+                        .unwrap_or_else(|| serde_json::json!({ st.pk_name.clone(): env.key }));
+                    messages.push(change_msg("delete", &env.key, Some(value)));
                 }
             }
             _ => {
