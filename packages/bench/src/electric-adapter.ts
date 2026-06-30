@@ -59,7 +59,7 @@ function bootEphemeralPg(): string {
   let port = 0
   for (let attempt = 0; attempt < 8; attempt++) {
     port = 55000 + Math.floor(Math.random() * 4000)
-    execFileSync('bash', ['-c', `printf '\\nwal_level=logical\\nmax_replication_slots=10\\nmax_wal_senders=10\\nlisten_addresses=\\047127.0.0.1\\047\\nunix_socket_directories=\\047/tmp\\047\\nport=${port}\\nfsync=off\\n' >> ${pgData}/postgresql.conf`])
+    execFileSync('bash', ['-c', `printf '\\nwal_level=logical\\nmax_replication_slots=10\\nmax_wal_senders=10\\nmax_connections=500\\nlisten_addresses=\\047127.0.0.1\\047\\nunix_socket_directories=\\047/tmp\\047\\nport=${port}\\nfsync=off\\n' >> ${pgData}/postgresql.conf`])
     try {
       execFileSync('pg_ctl', ['-D', pgData, '-l', join(pgDir, 'log'), '-w', 'start'], { stdio: 'ignore' })
       return `postgres://postgres@127.0.0.1:${port}/postgres`
@@ -80,14 +80,31 @@ async function main() {
   let tables =
     process.env.ADAPTER_PG_TABLES ||
     'level_1,level_1_tags,level_2,level_2_tags,level_3,level_3_tags,level_4'
-  if (!pgUrl) {
+  // Two-phase mode: boot an ephemeral PG, announce its URL, then wait for an external driver (the Elixir
+  // oracle harness) to create the schema before introspecting — lets the test apply StandardSchema's
+  // exact DDL+seed so the property generators line up.
+  const waitTable = process.env.ADAPTER_WAIT_TABLE
+  if (!pgUrl && waitTable) {
+    pgUrl = bootEphemeralPg()
+    console.log(`ADAPTER_PG ${pgUrl}`)
+    const client = new pgpkg.Client({ connectionString: pgUrl })
+    await client.connect()
+    const deadline = Date.now() + 60000
+    while (Date.now() < deadline) {
+      const r = await client.query(`SELECT to_regclass($1) AS t`, [`public.${waitTable}`])
+      if (r.rows[0]?.t) break
+      await new Promise((res) => setTimeout(res, 200))
+    }
+    await client.end()
+    console.error(`schema present (${waitTable}) → ${pgUrl}`)
+  } else if (!pgUrl) {
     pgUrl = bootEphemeralPg()
     const client = new pgpkg.Client({ connectionString: pgUrl })
     await client.connect()
     for (const ddl of STANDARD_DDL) await client.query(ddl)
     for (const s of SEED) await client.query(s)
     await client.end()
-    console.error(`seeded standard schema (single-PK subset) → ${pgUrl}`)
+    console.error(`seeded standard schema → ${pgUrl}`)
   }
 
   // Short long-poll timeout: Electric's oracle harness polls each shape live and only detects "no more

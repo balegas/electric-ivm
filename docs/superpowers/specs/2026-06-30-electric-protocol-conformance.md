@@ -1,8 +1,18 @@
 # Electric protocol conformance: run Electric's oracle tests against our engine
 
-Design record — 2026-06-30. Status: **in progress**. Branch `electric-protocol-conformance`. Goal: make
-electric-lite speak Electric's `GET /v1/shape` HTTP protocol faithfully enough that Electric's **own**
-oracle tests (driven by the real Elixir `Electric.Client`) pass against our engine.
+Design record — 2026-06-30. Status: **✅ done — Electric's oracle property test passes against our engine.**
+Branch `electric-protocol-conformance`. Goal: make electric-lite speak Electric's `GET /v1/shape` HTTP
+protocol faithfully enough that Electric's **own** oracle tests (driven by the real Elixir
+`Electric.Client`) pass against our engine.
+
+**Result:** Electric's oracle property test — its real `OracleHarness`/`ShapeChecker` + official
+`Electric.Client` + `WhereClauseGenerator`/`StandardSchema` generators — runs against our `/v1/shape`
+adapter and converges vs the Postgres oracle across the full standard schema (`level_1..4` +
+composite-PK `*_tags`) and full grammar (comparisons, `LIKE`/`NOT LIKE`, `BETWEEN`/`NOT BETWEEN`,
+`IN (list)`, 1/2/3-level `IN (SELECT …)` + tag subqueries, `NOT IN`, `AND`/`OR`/`NOT`).
+`1 property, 0 failures` at 25 runs × 5 shapes × 4 batches. Tests + reproduction in `electric-conformance/`.
+Engine work delivered: the `/v1/shape` adapter (`electric.rs`), a SQL `where` parser (`where_sql.rs`),
+the `LIKE` operator, `create_shape` backfill-await, and composite-primary-key support.
 
 ## How the oracle tests work (reverse-engineered from ../electric/packages/sync-service)
 
