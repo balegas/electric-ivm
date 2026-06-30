@@ -38,6 +38,24 @@ fn map_pg_type(data_type: &str) -> ColumnType {
     }
 }
 
+/// List all base tables in the `public` schema that have a primary key (skipping the engine's own
+/// `__el_sync` bookkeeping table). Used by "introspect all" mode (`ELECTRIC_LITE_PG_TABLES=*`), where the
+/// set of tables isn't known up front (e.g. driving Electric's integration tests over varied schemas).
+pub async fn list_tables(client: &Client) -> Result<Vec<String>> {
+    let rows = client
+        .query(
+            "select t.table_name from information_schema.tables t \
+             where t.table_schema = 'public' and t.table_type = 'BASE TABLE' \
+               and t.table_name <> '__el_sync' \
+               and exists (select 1 from pg_index i where i.indrelid = to_regclass('public.'||t.table_name) and i.indisprimary) \
+             order by t.table_name",
+            &[],
+        )
+        .await
+        .context("list public tables")?;
+    Ok(rows.iter().map(|r| r.get(0)).collect())
+}
+
 /// Introspect a table's columns (+ types) and single-column primary key from the catalog.
 pub async fn introspect(client: &Client, table: &str) -> Result<TableDef> {
     let col_rows = client

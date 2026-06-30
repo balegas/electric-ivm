@@ -134,6 +134,15 @@ impl Engine {
     pub async fn setup_postgres(&self, tables: &[String], slot: &str, poll_ms: u64) -> Result<()> {
         let url = self.pg_url.clone().context("setup_postgres called without a pg_url")?;
         let client = crate::pg::connect(&url).await?;
+        // `*` (or empty) => introspect every public table with a PK (set isn't known up front).
+        let discovered;
+        let tables: &[String] = if tables.is_empty() || tables == ["*".to_string()] {
+            discovered = crate::pg::list_tables(&client).await?;
+            tracing::info!("introspect-all: {} tables", discovered.len());
+            &discovered
+        } else {
+            tables
+        };
         let mut compiled = HashMap::new();
         for t in tables {
             let def = crate::pg::introspect(&client, t).await?;

@@ -19,7 +19,24 @@ mutation generators); the launcher's two-phase mode (`ADAPTER_WAIT_TABLE`) lets 
 StandardSchema's exact schema+seed before the engine introspects. `ELECTRIC_LITE_DIR` overrides the path.
 Tunables: `ORACLE_RUNS`, `ORACLE_SHAPE_COUNT`, `ORACLE_BATCH_COUNT`, `ORACLE_MUTATIONS_PER_TXN`.
 
-## Status — ✅ passing
+## Electric's subquery integration tests (`subquery_move_out_test.exs`, `subquery_dependency_update_test.exs`)
+
+These are Electric's **hand-written** subquery integration tests, run against electric-lite via a setup
+swap: `el_lite_setup.ex` (`el_lite_pg` + `el_lite_client`) replaces `with_unique_db` + `with_complete_stack`
++ `with_electric_client` with our launcher-booted stack (engine introspects all tables via
+`ELECTRIC_LITE_PG_TABLES=*`); **the test bodies and assertions are unchanged**. Copy all three files into
+`test/integration/` (the two test files) and `test/support/` (`el_lite_setup.ex`), then
+`mix test test/integration/subquery_move_out_test.exs test/integration/subquery_dependency_update_test.exs`.
+
+**Result: 13 / 15 pass.** The 13 cover the real subquery behaviors — synthetic move-out deletes (parent
+deactivation/deletion), move-in via a different parent, negated move-in/out, dependency tracking (team
+moves between premium orgs with no spurious deletes), combined-condition move-in, resume-preserves-move-out,
+and the stale-tag no-spurious-delete case. The **2 failures both assert Electric's row-`tags` mechanism**
+(`assert %{headers: %{tags: [_]}}` / `assert new_tags != initial_tags`) — an Electric-internal protocol
+detail electric-lite deliberately doesn't emit (we use absolute membership emission, not row tags). They
+are not membership/correctness failures.
+
+## Status — ✅ passing (oracle)
 The Electric oracle property test passes against electric-lite across the **full** standard schema
 (`level_1..4` + composite-PK `*_tags`) and the full generated grammar: comparisons (`= <> < > <= >=`),
 `LIKE`/`NOT LIKE`, `BETWEEN`/`NOT BETWEEN`, `IN (list)`, 1/2/3-level `IN (SELECT …)` subqueries, tag
