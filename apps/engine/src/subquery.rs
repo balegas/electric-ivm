@@ -203,6 +203,10 @@ pub struct SubqueryRegistry {
     ds: DsClient,
     pg_url: Option<String>,
     schemas: SchemaMap,
+    /// A single reused Postgres connection for node seeding / backfill / query-back. Subquery work is
+    /// serialized under the registry mutex, so one connection suffices — and reusing it is essential:
+    /// connecting per shape exhausts ephemeral TCP ports when thousands of subquery shapes are created.
+    pg_client: tokio::sync::Mutex<Option<Arc<tokio_postgres::Client>>>,
 }
 
 impl SubqueryRegistry {
@@ -215,7 +219,23 @@ impl SubqueryRegistry {
             ds,
             pg_url,
             schemas: Arc::new(HashMap::new()),
+            pg_client: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// Lazily connect to Postgres and cache the client, reconnecting if the cached connection has closed.
+    /// All subquery PG access funnels through here so we hold one connection, not one per shape.
+    async fn pg(&self) -> Result<Arc<tokio_postgres::Client>> {
+        let url = self.pg_url.clone().context("subquery work requires postgres")?;
+        let mut guard = self.pg_client.lock().await;
+        if let Some(c) = guard.as_ref() {
+            if !c.is_closed() {
+                return Ok(c.clone());
+            }
+        }
+        let client = Arc::new(crate::pg::connect(&url).await?);
+        *guard = Some(client.clone());
+        Ok(client)
     }
 
     pub fn set_schemas(&mut self, schemas: SchemaMap) {
@@ -307,8 +327,7 @@ impl SubqueryRegistry {
         } else {
             let (wsql, params) = crate::sql::predicate_json_to_sql(where_json, 1);
             let bf = {
-                let url = self.pg_url.clone().context("subquery shape backfill requires postgres")?;
-                let client = crate::pg::connect(&url).await?;
+                let client = self.pg().await?;
                 crate::pg::backfill_where(&client, &outer_ts, Some((wsql, params))).await?
             };
             let out: Vec<(Row, ZWeight)> = bf.rows.iter().map(|r| (r.clone(), 1)).collect();
@@ -344,8 +363,7 @@ impl SubqueryRegistry {
         if pending.is_empty() {
             return Ok(());
         }
-        let url = self.pg_url.clone().context("subquery node seeding requires postgres")?;
-        let client = crate::pg::connect(&url).await?;
+        let client = self.pg().await?;
         for sig in pending {
             let (inner_table, where_json, proj_col) = {
                 let n = self.nodes.get(&sig).context("seed: node vanished")?;
@@ -682,8 +700,7 @@ impl SubqueryRegistry {
 
     /// Query candidate rows of `ts` where `col = value` (current Postgres state).
     async fn query_candidates(&self, ts: &TableSchema, col: usize, value: &Value) -> Result<Vec<Row>> {
-        let url = self.pg_url.clone().context("subquery query-back requires postgres")?;
-        let client = crate::pg::connect(&url).await?;
+        let client = self.pg().await?;
         let where_sql = value_eq_sql(&ts.columns[col].0, value);
         let bf = crate::pg::backfill_where(&client, ts, Some(where_sql)).await?;
         Ok(bf.rows)
@@ -691,8 +708,7 @@ impl SubqueryRegistry {
 
     /// Query all rows of `ts` (for full re-derive).
     async fn query_all(&self, ts: &TableSchema) -> Result<Vec<Row>> {
-        let url = self.pg_url.clone().context("subquery query-back requires postgres")?;
-        let client = crate::pg::connect(&url).await?;
+        let client = self.pg().await?;
         let bf = crate::pg::backfill_where(&client, ts, None).await?;
         Ok(bf.rows)
     }

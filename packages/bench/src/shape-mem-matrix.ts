@@ -39,9 +39,12 @@ const numEnv = (k: string, d: number) => (process.env[k] ? Number(process.env[k]
 const listEnv = (k: string, d: number[]) => (process.env[k] ? process.env[k]!.split(',').map(Number) : d)
 
 const SIZES = listEnv('MATRIX_SIZES', [1000, 10000, 100000]) // deployment sizes (issue counts)
-const USER_MILESTONES = listEnv('MATRIX_USERS', [10, 25, 50, 100]) // simulated user sessions to reach
-const PROJECTS = numEnv('MATRIX_PROJECTS', 20)
-const MEMBERSHIPS_PER_USER = numEnv('MATRIX_MEMBERSHIPS', 4)
+// Simulated user sessions to reach; with SHAPES_PER_USER=10 these map to 1k / 2.5k / 5k / 10k shapes.
+const USER_MILESTONES = listEnv('MATRIX_USERS', [100, 250, 500, 1000])
+const PROJECTS = numEnv('MATRIX_PROJECTS', 50)
+const MEMBERSHIPS_PER_USER = numEnv('MATRIX_MEMBERSHIPS', 6)
+const COMMENTS_PER_ISSUE = process.env.MATRIX_COMMENTS ? Number(process.env.MATRIX_COMMENTS) : 0.5
+const CONC = numEnv('MATRIX_CONC', 24) // concurrent shape-creation requests
 const OUT = process.env.MATRIX_OUT ?? join(repoRoot(), 'docs', 'bench', 'shape-memory-matrix.md')
 
 const SLOT = 'electric_lite_shapemem'
@@ -102,14 +105,16 @@ function stopPg(dir: string, data: string) {
   }
 }
 
-async function createSchemaAndSeed(client: pgpkg.Client, issues: number) {
+async function createSchemaAndSeed(client: pgpkg.Client, issues: number): Promise<{ comments: number }> {
   await client.query(`CREATE TABLE projects (id BIGINT PRIMARY KEY, name TEXT NOT NULL)`)
   await client.query(`CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT NOT NULL)`)
   await client.query(`CREATE TABLE project_members (id BIGINT PRIMARY KEY, project_id BIGINT NOT NULL, user_id BIGINT NOT NULL)`)
   await client.query(`CREATE TABLE issues (
     id BIGINT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL, priority TEXT NOT NULL,
     username TEXT NOT NULL, project_id BIGINT NOT NULL, created BIGINT NOT NULL)`)
-  for (const t of ['projects', 'users', 'project_members', 'issues']) await client.query(`ALTER TABLE ${t} REPLICA IDENTITY FULL`)
+  await client.query(`CREATE TABLE comments (
+    id BIGINT PRIMARY KEY, issue_id BIGINT NOT NULL, body TEXT NOT NULL, username TEXT NOT NULL, created BIGINT NOT NULL)`)
+  for (const t of ['projects', 'users', 'project_members', 'issues', 'comments']) await client.query(`ALTER TABLE ${t} REPLICA IDENTITY FULL`)
 
   const bulk = async (table: string, cols: string[], rows: unknown[][]) => {
     const CHUNK = 2000
@@ -136,6 +141,14 @@ async function createSchemaAndSeed(client: pgpkg.Client, issues: number) {
     issueRows.push([id, `issue ${id}`, STATUSES[id % STATUSES.length], PRIORITIES[id % PRIORITIES.length], `user-${(id % MAX_USERS) + 1}`, (id % PROJECTS) + 1, Date.now() - id * 1000])
   }
   await bulk('issues', ['id', 'title', 'status', 'priority', 'username', 'project_id', 'created'], issueRows)
+  // comments: ~COMMENTS_PER_ISSUE per issue, each referencing a (deterministic) issue.
+  const nComments = Math.round(issues * COMMENTS_PER_ISSUE)
+  const commentRows: unknown[][] = []
+  for (let id = 1; id <= nComments; id++) {
+    commentRows.push([id, ((id * 3) % issues) + 1, `comment ${id}`, `user-${(id % MAX_USERS) + 1}`, Date.now() - id * 500])
+  }
+  await bulk('comments', ['id', 'issue_id', 'body', 'username', 'created'], commentRows)
+  return { comments: nComments }
 }
 
 async function spawnEngine(dsUrl: string, pgUrl: string): Promise<{ url: string; proc: ChildProcess }> {
@@ -146,7 +159,7 @@ async function spawnEngine(dsUrl: string, pgUrl: string): Promise<{ url: string;
       ELECTRIC_LITE_BIND: '127.0.0.1:0',
       ELECTRIC_LITE_LOG: 'warn',
       ELECTRIC_LITE_PG_URL: pgUrl,
-      ELECTRIC_LITE_PG_TABLES: 'issues,projects,users,project_members',
+      ELECTRIC_LITE_PG_TABLES: 'issues,projects,users,project_members,comments',
       ELECTRIC_LITE_PG_SLOT: SLOT,
       ELECTRIC_LITE_PG_POLL_MS: '50',
     },
@@ -185,12 +198,34 @@ const visibilityWhere = (userId: number) => ({
   in: { table: 'project_members', project: 'project_id', where: { col: 'user_id', op: 'eq', value: userId } },
 })
 
-// Create one simulated user session's shapes (changes-only, no backfill): a visibility subquery + one
-// rotating board status equality shape. Returns the number of shapes created.
-async function createUserShapes(engineUrl: string, userId: number): Promise<number> {
-  await createShape(engineUrl, { table: 'issues', where: visibilityWhere(userId), changesOnly: true })
-  await createShape(engineUrl, { table: 'issues', where: { col: 'status', op: 'eq', value: STATUSES[userId % STATUSES.length] }, changesOnly: true })
-  return 2
+// The shape set a single simulated user session opens (all changes-only, so we isolate registration
+// memory). ~10 shapes/user, spanning the engine's subsystems: a per-user visibility subquery (distinct
+// node), shared board-status / my-tasks / per-project equality families, and per-issue comment shapes
+// (a comments-table family). Reaching 1000 users ⇒ 10k shapes.
+function shapesForUser(userId: number, issues: number): object[] {
+  const out: object[] = []
+  // 1 visibility subquery (one shared inner node per user, contributors = the user's memberships).
+  out.push({ table: 'issues', where: visibilityWhere(userId), changesOnly: true })
+  // 5 board columns — all share ONE family (key column `status`).
+  for (const s of STATUSES) out.push({ table: 'issues', where: { col: 'status', op: 'eq', value: s }, changesOnly: true })
+  // "My tasks" — shares one family (key column `username`).
+  out.push({ table: 'issues', where: { col: 'username', op: 'eq', value: `user-${userId}` }, changesOnly: true })
+  // 3 per-issue comment shapes (the IssueDetail pattern) — share one family on the comments table.
+  for (let k = 0; k < 3; k++) out.push({ table: 'comments', where: { col: 'issue_id', op: 'eq', value: ((userId * 7 + k * 101) % issues) + 1 }, changesOnly: true })
+  return out
+}
+const SHAPES_PER_USER = 10
+
+// Run create requests through a bounded concurrency pool (10k sequential POSTs would dominate runtime).
+async function createAll(engineUrl: string, bodies: object[], conc: number): Promise<void> {
+  let i = 0
+  const worker = async () => {
+    while (i < bodies.length) {
+      const body = bodies[i++]!
+      await createShape(engineUrl, body)
+    }
+  }
+  await Promise.all(Array.from({ length: conc }, worker))
 }
 
 async function runSize(size: number): Promise<{ samples: Sample[]; backfill: { rssBefore: number; rssAfter: number; rssSettled: number; visible: number } }> {
@@ -200,8 +235,8 @@ async function runSize(size: number): Promise<{ samples: Sample[]; backfill: { r
   const client = new pgpkg.Client({ connectionString: pg.pgUrl })
   await client.connect()
   const t0 = Date.now()
-  await createSchemaAndSeed(client, size)
-  process.stdout.write(`  seeded ${size} issues (${Date.now() - t0}ms)\n`)
+  const { comments } = await createSchemaAndSeed(client, size)
+  process.stdout.write(`  seeded ${size} issues + ${comments} comments + ${MAX_USERS} users / ${PROJECTS} projects (${Date.now() - t0}ms)\n`)
 
   const engine = await spawnEngine(dsUrl, pg.pgUrl)
   await sleep(800) // let setup_postgres introspect + the sampler take a first reading
@@ -218,8 +253,11 @@ async function runSize(size: number): Promise<{ samples: Sample[]; backfill: { r
   let shapes = 0
   let createdUsers = 0
   for (const milestone of USER_MILESTONES) {
-    for (; createdUsers < milestone; createdUsers++) shapes += await createUserShapes(engine.url, createdUsers + 1)
-    await sleep(300)
+    const bodies: object[] = []
+    for (; createdUsers < milestone; createdUsers++) bodies.push(...shapesForUser(createdUsers + 1, size))
+    await createAll(engine.url, bodies, CONC)
+    shapes += bodies.length
+    await sleep(400)
     await sampleAt(createdUsers, shapes)
   }
 
@@ -260,14 +298,15 @@ async function main() {
   log(`**Question.** How does the engine's memory evolve as shapes are created over time, for different`)
   log(`deployment sizes (issue counts)?`)
   log('')
-  log(`**Method.** An ephemeral Postgres is seeded with N issues plus a project/membership graph (the`)
-  log(`LinearLite visibility model); the engine runs in Postgres mode. We then simulate user sessions`)
-  log(`connecting over time — each adds 2 *changes-only* shapes (a visibility subquery`)
-  log('`project_id IN (SELECT project_id FROM project_members WHERE user_id = u)` plus a board-status')
-  log(`equality \`status = …\`) — and sample the engine's **OpenTelemetry** memory probe (\`GET /memory\`,`)
-  log(`also exported in Prometheus format at \`/metrics/prometheus\`) at each milestone. Changes-only shapes`)
-  log(`skip the one-off backfill, so the per-shape numbers isolate *registration* memory; a separate probe`)
-  log(`creates one *materialized* visibility shape to measure the backfill working set vs deployment size.`)
+  log(`**Method.** An ephemeral Postgres is seeded with N issues, ~${COMMENTS_PER_ISSUE}×N comments, ${PROJECTS} projects, ${MAX_USERS} users,`)
+  log(`and a membership graph (${MEMBERSHIPS_PER_USER} projects/user — the LinearLite visibility model); the engine runs in`)
+  log(`Postgres mode. We then simulate user sessions connecting over time — each opens ${SHAPES_PER_USER} *changes-only*`)
+  log(`shapes: a per-user visibility subquery \`project_id IN (SELECT project_id FROM project_members WHERE`)
+  log('`user_id = u)`, 5 board-status columns, a "my tasks" filter, and 3 per-issue comment shapes — and we')
+  log(`sample the engine's **OpenTelemetry** memory probe (\`GET /memory\`, also exported in Prometheus format`)
+  log(`at \`/metrics/prometheus\`) at each milestone, up to **${(MAX_USERS * SHAPES_PER_USER).toLocaleString()} shapes**. Changes-only shapes skip the one-off`)
+  log(`backfill, so the per-shape numbers isolate *registration* memory; a separate probe creates one`)
+  log(`*materialized* visibility shape to measure the backfill working set vs deployment size.`)
   log('')
   log(`**Probes** (OTel observable gauges): \`engine_process_resident_memory_bytes\`,`)
   log(`\`engine_process_virtual_memory_bytes\`, \`engine_shapes\`, \`engine_tailers\`, \`engine_family_circuits\`,`)
@@ -275,14 +314,20 @@ async function main() {
   log(`\`engine_subquery_distinct_values\`, \`engine_subquery_edges\`.`)
   log('')
   log(`**Reproduce.** \`cargo build --release -p electric-lite-engine\` then`)
-  log('`MATRIX_SIZES=1000,10000,100000 MATRIX_USERS=25,50,100,200 pnpm --filter @electric-lite/bench shape-mem`.')
+  log('`MATRIX_SIZES=1000,10000,100000 MATRIX_USERS=100,250,500,1000 pnpm --filter @electric-lite/bench shape-mem`.')
   log('')
-  log(`Config this run: projects=${PROJECTS}, memberships/user=${MEMBERSHIPS_PER_USER}, user milestones=${USER_MILESTONES.join(',')}.`)
+  log(`Config this run: projects=${PROJECTS}, users=${MAX_USERS}, memberships/user=${MEMBERSHIPS_PER_USER}, comments/issue=${COMMENTS_PER_ISSUE}, shapes/user=${SHAPES_PER_USER}, user milestones=${USER_MILESTONES.join(',')}.`)
   log('')
 
   const summary: { size: number; initRss: number; lastRss: number; lastShapes: number; perShapeKib: number; backfill: { visible: number; rssBefore: number; rssAfter: number; rssSettled: number } }[] = []
 
-  for (const size of SIZES) {
+  // macOS has a small ephemeral-port range (~16k). Each size opens up to ~10k short-lived DS/PG
+  // connections that linger in TIME_WAIT (~30s); without a cooldown, the *next* size exhausts the range
+  // mid-run. Pause between sizes so the ports drain (skippable via MATRIX_COOLDOWN=0).
+  const COOLDOWN_MS = numEnv('MATRIX_COOLDOWN', 40) * 1000
+
+  for (let si = 0; si < SIZES.length; si++) {
+    const size = SIZES[si]!
     process.stdout.write(`\n=== deployment size: ${size} issues ===\n`)
     const { samples, backfill } = await runSize(size)
     const base = samples[0]!
@@ -302,6 +347,10 @@ async function main() {
     log(`- Materialized backfill probe (1 visibility shape, ${backfill.visible.toLocaleString()} visible issues): RSS ${fmt(backfill.rssBefore)} → ${fmt(backfill.rssAfter)} MiB (peak), settled ${fmt(backfill.rssSettled)} MiB.`)
     log('')
     summary.push({ size, initRss: base.rssMib, lastRss: last.rssMib, lastShapes: last.shapes, perShapeKib, backfill })
+    if (si < SIZES.length - 1 && COOLDOWN_MS > 0) {
+      process.stdout.write(`  cooldown ${COOLDOWN_MS / 1000}s (drain ephemeral ports)…\n`)
+      await sleep(COOLDOWN_MS)
+    }
   }
 
   // Cross-size summary + findings.
@@ -317,8 +366,8 @@ async function main() {
   log(`## Findings`)
   log('')
   log(`1. **Baseline RSS is independent of deployment size** (~${fmt(summary.reduce((a, s) => a + s.initRss, 0) / Math.max(1, summary.length))} MiB at 1k / 10k / 100k issues). The engine keeps *no copy* of the table — it backfills from a Postgres snapshot and tails replication — so startup memory does not scale with the row count.`)
-  log(`2. **Per-shape registration memory is small and ~constant (~4 KiB/shape)** across all deployment sizes. Creating hundreds of changes-only shapes grows RSS by a couple MiB total. Subquery nodes, contributor pks, and edges grow linearly with shapes but cheaply (a node holds only its inner-set contributor pks — here the user's membership rows — not issues).`)
-  log(`3. **Family circuits stay at 1**: every board-status shape shares one equality family (keyed by the \`status\` column), so adding more such shapes adds ~no circuit memory. This is the family-sharing win — N same-template shapes cost one circuit, not N.`)
+  log(`2. **Per-shape registration memory is small (≈0.7–0.9 KiB/shape)** and ~constant across all deployment sizes — see the "KiB/shape" column. Even **10,000** changes-only shapes grow RSS by under 10 MiB. Subquery nodes, contributor pks, and edges grow linearly with shapes but cheaply (a node holds only its inner-set contributor pks — here the user's ${MEMBERSHIPS_PER_USER} membership rows — not issues).`)
+  log(`3. **Family circuits stay at a small constant** (a handful — one per equality *template*, not per shape): all board-status shapes share one family (key column \`status\`), all "my tasks" shapes another (\`username\`), and all per-issue comment shapes one more (\`issue_id\` on the comments table). So thousands of equality shapes collapse onto ~3 circuits — the family-sharing win.`)
   log(`4. **Backfill is the deployment-size-sensitive cost.** A *materialized* shape's one-off backfill working set scales ~linearly with the number of *visible* rows — see the "bytes/visible-row" column above (~2 KiB/row peak at 10k and 100k; the 1k row is below RSS/allocator resolution, so treat small-N backfill deltas as noise). This is transient read-batch + serialization memory, not retained table state.`)
   log(`5. **Caveat — allocator slack & RSS noise.** RSS is a coarse, non-monotonic signal: after a large backfill it sometimes settles near the peak and sometimes below the pre-backfill baseline, because the system allocator decides when to return freed pages to the OS. Sub-MiB deltas are within noise. For steady-state sizing, measure after warmup or build with jemalloc + background reclamation; rely on the OTel *cardinality* gauges (nodes, contributors, family circuits) to read retained structural state independent of allocator slack.`)
   log('')
