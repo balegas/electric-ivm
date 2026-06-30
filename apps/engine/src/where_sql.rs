@@ -206,8 +206,23 @@ impl Parser {
         }
     }
 
-    // predicate := col [NOT] (op lit | LIKE str | BETWEEN a AND b | IN (...))
+    // predicate := col [NOT] (op lit | LIKE str | BETWEEN a AND b | IN (...))  |  lit op lit (constant)
     fn parse_predicate(&mut self) -> Result<PredicateJson> {
+        // Constant comparison `<lit> <op> <lit>` (e.g. `373 = 373`, used as a trivial always-true
+        // predicate). Evaluate it at parse time → an empty `And` (TRUE) or empty `Or` (FALSE).
+        if matches!(self.peek(), Some(Tok::Str(_) | Tok::Num(_) | Tok::True | Tok::False)) {
+            let left = self.parse_literal()?;
+            let Some(Tok::Op(op)) = self.next() else {
+                bail!("expected comparison operator after literal in constant predicate");
+            };
+            let right = self.parse_literal()?;
+            let truth = eval_const(&left, &op, &right);
+            return Ok(if truth {
+                PredicateJson::And { and: vec![] }
+            } else {
+                PredicateJson::Or { or: vec![] }
+            });
+        }
         let col = self.parse_ident()?;
         let negated = if matches!(self.peek(), Some(Tok::Not)) {
             self.next();
@@ -288,6 +303,27 @@ impl Parser {
             other => bail!("expected operator/LIKE/BETWEEN/IN after column '{col}', got {other:?}"),
         };
         Ok(if negated { PredicateJson::Not { not: Box::new(pred) } } else { pred })
+    }
+}
+
+/// Evaluate a constant `<lit> <op> <lit>` comparison (numbers compared numerically, strings/bools by
+/// value/order). Used for trivial predicates like `373 = 373`.
+fn eval_const(left: &serde_json::Value, op: &str, right: &serde_json::Value) -> bool {
+    use serde_json::Value as V;
+    let ord = match (left, right) {
+        (V::Number(a), V::Number(b)) => a.as_f64().partial_cmp(&b.as_f64()),
+        (V::String(a), V::String(b)) => Some(a.cmp(b)),
+        (V::Bool(a), V::Bool(b)) => Some(a.cmp(b)),
+        _ => None,
+    };
+    match op {
+        "=" => left == right,
+        "<>" | "!=" => left != right,
+        "<" => ord.map(|o| o.is_lt()).unwrap_or(false),
+        "<=" => ord.map(|o| o.is_le()).unwrap_or(false),
+        ">" => ord.map(|o| o.is_gt()).unwrap_or(false),
+        ">=" => ord.map(|o| o.is_ge()).unwrap_or(false),
+        _ => false,
     }
 }
 
