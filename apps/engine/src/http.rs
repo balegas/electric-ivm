@@ -26,6 +26,8 @@ pub fn router(engine: Engine) -> Router {
         .route("/metrics/reset", post(reset_metrics))
         .route("/memory", get(get_memory))
         .route("/metrics/prometheus", get(get_prometheus))
+        // Electric-protocol adapter: lets Electric's official client + oracle harness read our shapes.
+        .route("/v1/shape", get(crate::electric::shape))
         .with_state(engine)
 }
 

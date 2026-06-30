@@ -92,6 +92,10 @@ enum TailerCmd {
         /// "tail" feed). Used by subset queries: the page rows come from a `query_subset`, and this
         /// feed carries just the live deltas the client re-checks against the loaded view.
         changes_only: bool,
+        /// Signalled once the shape is registered AND its backfill has been appended to the stream, so
+        /// `create_shape` can return only after the snapshot is readable (the Electric adapter folds the
+        /// stream immediately on create).
+        ready: tokio::sync::oneshot::Sender<()>,
     },
     RemoveShape { shape_id: String },
 }
@@ -282,6 +286,7 @@ impl Engine {
             st.tailers.insert(table.to_string(), handle);
         }
         let tailer = st.tailers.get(table).expect("tailer just inserted");
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         tailer
             .cmd_tx
             .send(TailerCmd::AddShape {
@@ -291,11 +296,16 @@ impl Engine {
                 pred,
                 out_cols,
                 changes_only,
+                ready: ready_tx,
             })
             .map_err(|_| anyhow::anyhow!("tailer for '{table}' is gone"))?;
 
         let rec = ShapeRecord { id: id.clone(), table: table.to_string(), stream_path };
-        st.shapes.insert(id, rec.clone());
+        st.shapes.insert(id.clone(), rec.clone());
+        // Release the engine-state lock, then wait for the tailer to finish the backfill so the shape's
+        // snapshot is readable when we return (the Electric adapter folds the stream immediately).
+        drop(st);
+        let _ = ready_rx.await;
         Ok(rec)
     }
 
@@ -320,6 +330,18 @@ impl Engine {
     /// Per-node subquery topology (signature, inner table, distinct values, refcount).
     pub async fn subquery_stats(&self) -> Vec<crate::subquery::NodeStat> {
         self.subqueries.lock().await.stats()
+    }
+
+    /// The schema for `table`, if known (used by the Electric-protocol adapter for the schema header and
+    /// value encoding).
+    pub async fn table_schema(&self, table: &str) -> Option<TableSchema> {
+        self.state.lock().await.tables.get(table).cloned()
+    }
+
+    /// Read a shape's durable stream (catch-up or long-poll live) — used by the Electric adapter to turn
+    /// the engine's shape output into Electric `/v1/shape` change messages.
+    pub async fn read_shape_stream(&self, path: &str, offset: &str, live: bool) -> Result<crate::ds::ReadResult> {
+        self.ds.read(path, offset, live).await
     }
 
     /// Engine-internal cardinalities for the memory probe — the structures whose growth drives RSS:
@@ -503,13 +525,14 @@ async fn tailer_loop(
         tokio::select! {
             biased;
             cmd = cmd_rx.recv() => match cmd {
-                Some(TailerCmd::AddShape { shape_id, num_id, stream_path, pred, out_cols, changes_only }) => {
+                Some(TailerCmd::AddShape { shape_id, num_id, stream_path, pred, out_cols, changes_only, ready }) => {
                     if let Err(e) = add_shape_routed(
                         &ds, &ts, &pg_url, &mut shapes, &mut families, &mut family_of,
                         shape_id, num_id, stream_path, pred, out_cols, changes_only,
                     ).await {
                         tracing::error!("add_shape failed: {e:#}");
                     }
+                    let _ = ready.send(()); // backfill done (or failed) — unblock create_shape
                     publish_stats(&stats, &shapes, &families);
                 }
                 Some(TailerCmd::RemoveShape { shape_id }) => {

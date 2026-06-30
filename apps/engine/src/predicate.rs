@@ -16,6 +16,9 @@ pub enum LeafOp {
     Lte,
     Gt,
     Gte,
+    /// SQL `LIKE` (case-sensitive; `%` = any sequence, `_` = any single char). `NOT LIKE` is modeled as
+    /// `Not(Like)` by the where-clause parser. Added for Electric-protocol conformance.
+    Like,
 }
 
 /// Inner subquery reference: `(SELECT project FROM table WHERE where)`. `where` may itself contain
@@ -320,6 +323,10 @@ fn cmp(cell: &Value, op: LeafOp, value: &Value) -> Tri {
     let truth = match op {
         LeafOp::Eq => cell == value,
         LeafOp::Neq => cell != value,
+        LeafOp::Like => match (cell, value) {
+            (Value::Text(c), Value::Text(p)) => like_match(c, p),
+            _ => return Tri::Unknown,
+        },
         LeafOp::Lt | LeafOp::Lte | LeafOp::Gt | LeafOp::Gte => {
             // A type mismatch has no ordering; treat as UNKNOWN (literals are column-typed, so this
             // does not arise in practice).
@@ -337,6 +344,35 @@ fn cmp(cell: &Value, op: LeafOp, value: &Value) -> Tri {
         }
     };
     Tri::from_bool(truth)
+}
+
+/// SQL `LIKE` matching: `%` = any sequence (including empty), `_` = exactly one char, everything else
+/// literal (case-sensitive). Iterative backtracking over chars — patterns here are short.
+pub(crate) fn like_match(text: &str, pattern: &str) -> bool {
+    let t: Vec<char> = text.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    let (mut ti, mut pi) = (0usize, 0usize);
+    let (mut star_p, mut star_t): (Option<usize>, usize) = (None, 0);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '_' || p[pi] == t[ti]) {
+            ti += 1;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == '%' {
+            star_p = Some(pi);
+            star_t = ti;
+            pi += 1;
+        } else if let Some(sp) = star_p {
+            pi = sp + 1;
+            star_t += 1;
+            ti = star_t;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '%' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 fn ordering(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {

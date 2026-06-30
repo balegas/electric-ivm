@@ -32,6 +32,7 @@ fn op_sql(op: LeafOp) -> &'static str {
         LeafOp::Lte => "<=",
         LeafOp::Gt => ">",
         LeafOp::Gte => ">=",
+        LeafOp::Like => "LIKE",
     }
 }
 

@@ -10,6 +10,7 @@
 //! and `docs/superpowers/specs/2026-06-29-reduce-engine-memory-design.md`.
 
 pub mod ds;
+pub mod electric;
 pub mod engine;
 pub mod fault;
 pub mod http;
@@ -22,5 +23,6 @@ pub mod schema;
 pub mod sql;
 pub mod subquery;
 pub mod value;
+pub mod where_sql;
 
 pub use value::{Row, Value};
