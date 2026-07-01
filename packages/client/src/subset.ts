@@ -73,6 +73,75 @@ function andPredicate(base: Predicate | undefined, cursor: Predicate): Predicate
   return base ? { and: [base, cursor] } : cursor
 }
 
+/**
+ * Parse a Postgres LSN (`"HI/LO"` hex) into a comparable bigint — mirrors the engine's
+ * `pg::lsn_to_u64` (`(hi << 32) | lo`). `null`/empty → null (library/no-Postgres mode).
+ */
+export function lsnToU64(lsn: string | undefined | null): bigint | null {
+  if (!lsn) return null
+  const slash = lsn.indexOf('/')
+  if (slash < 0) return null
+  const hi = BigInt(parseInt(lsn.slice(0, slash), 16))
+  const lo = BigInt(parseInt(lsn.slice(slash + 1), 16))
+  return (hi << 32n) | lo
+}
+
+/** The loaded subset window's membership + per-row LSN watermark (the merge state). */
+export interface SubsetView {
+  snapshotLsn: bigint
+  present: Set<string>
+  applied: Map<string, bigint>
+  /** Is the row within the currently-loaded keyset window? */
+  inView: (row: Row) => boolean
+}
+
+/** A collection write to emit, or `null` to drop the delta. */
+export type MergeAction =
+  | { type: 'insert' | 'update'; value: Row }
+  | { type: 'delete'; key: string }
+  | null
+
+/**
+ * Decide how one live-feed delta updates the loaded subset view, applying **LSN positioning** +
+ * **last-writer-wins**. Mutates `view.present`/`view.applied`. Returns the write to emit, or `null`
+ * to drop the delta because it is: already reflected in the page (commit LSN < the row's watermark /
+ * the snapshot floor), stale w.r.t. a newer page/delta, or out of the loaded window. Exported so the
+ * no-double-count invariant can be unit-tested without the full stack.
+ */
+export function mergeFeedDelta(view: SubsetView, env: StreamEnvelope): MergeAction {
+  const key = env.key
+  const deltaLsn = lsnToU64(env.headers.lsn)
+  // A null LSN (library/no-Postgres mode) always applies — the old idempotent-by-pk behaviour.
+  const fresh = (): boolean => {
+    if (deltaLsn === null) return true
+    const w = view.applied.get(key)
+    return w === undefined ? deltaLsn >= view.snapshotLsn : deltaLsn >= w
+  }
+  if (env.headers.operation === 'delete') {
+    if (view.present.has(key) && fresh()) {
+      view.present.delete(key)
+      view.applied.delete(key)
+      return { type: 'delete', key }
+    }
+    return null
+  }
+  const value = env.value
+  if (!value || !fresh()) return null
+  if (view.inView(value)) {
+    const type = view.present.has(key) ? 'update' : 'insert'
+    view.present.add(key)
+    if (deltaLsn !== null) view.applied.set(key, deltaLsn)
+    return { type, value }
+  }
+  if (view.present.has(key)) {
+    // Moved out of the loaded window (e.g. its sort key dropped below the boundary).
+    view.present.delete(key)
+    view.applied.delete(key)
+    return { type: 'delete', key }
+  }
+  return null
+}
+
 /** Manual-write handles captured from the collection's sync callback (used by load-more + the feed). */
 interface SyncCtl {
   begin: () => void
@@ -95,9 +164,23 @@ export async function createSubset<T extends Row = Row>(
     ? Array.from(new Set([pk, ...(def.orderBy ? [def.orderBy.col] : []), ...def.columns]))
     : undefined
 
-  // 1. Open the live tail FIRST so it captures every change from ~now; any overlap with the query-back
-  //    snapshot is reconciled idempotently below (upsert/delete by pk).
+  // 1. Open the live tail FIRST so it captures every change from ~now. The feed may be SHARED with other
+  //    subscriptions on the same predicate (the engine ref-counts identical changes-only feeds).
   const feed = await deps.trpc.subset.live.mutate({ table: def.table, where: def.where as never, columns: cols })
+  const feedUrl = deps.resolveStreamUrl(feed)
+
+  // 1b. Capture the feed's current tail offset BEFORE the page snapshot. Reading the live tail from here
+  //     (rather than the stream origin) means a joiner to a SHARED, long-lived feed does not replay the
+  //     whole backlog — it starts at "≈now". Everything at/before this offset committed before the
+  //     snapshot LSN below and is already in the page; the `< snapshotLsn` drop covers the small
+  //     [thisOffset, snapshot] overlap. Falls back to the stream origin if HEAD is unavailable.
+  let feedOffset = '-1'
+  try {
+    const head = await fetch(feedUrl, { method: 'HEAD' })
+    feedOffset = head.headers.get('stream-next-offset') ?? '-1'
+  } catch {
+    /* proxy/env without HEAD support → read from origin; correctness unaffected (only backlog). */
+  }
 
   // 2. Query-back page 1 straight from Postgres (no stream, no materialization).
   const first = (await deps.trpc.subset.query.query({
@@ -112,39 +195,26 @@ export async function createSubset<T extends Row = Row>(
   let boundary: Row | null = first.rows.length ? first.rows[first.rows.length - 1]! : null
   let ended = first.rows.length < limit
   const present = new Set<string>()
+  // LSN positioning: `snapshotLsn` is the page's read point in the engine's replication timeline.
+  // `applied` is a per-present-row watermark — the snapshot LSN the row's current value was read at
+  // (page or loadMore), bumped to a feed delta's LSN when applied. A feed delta is accepted only if
+  // its commit LSN is at/after the relevant watermark, so deltas already reflected in the page (commit
+  // LSN < snapshotLsn) are dropped — exactly-once after the snapshot, no double-count.
+  const snapshotLsn = lsnToU64(first.lsn) ?? 0n
+  const applied = new Map<string, bigint>()
   const inView = (row: Row): boolean => ended || boundary == null || cmp(row, boundary) <= 0
 
   let ctl: SyncCtl | null = null
   const ac = new AbortController()
 
+  const view: SubsetView = { snapshotLsn, present, applied, inView }
   const applyEnvelope = (env: StreamEnvelope): void => {
     if (!ctl || env.type !== def.table) return
-    const key = env.key
-    const op = env.headers.operation
-    if (op === 'delete') {
-      if (present.has(key)) {
-        ctl.begin()
-        ctl.write({ type: 'delete', key })
-        ctl.commit()
-        present.delete(key)
-      }
-      return
-    }
-    const value = env.value
-    if (!value) return
-    if (inView(value)) {
-      const type = present.has(key) ? 'update' : 'insert'
-      ctl.begin()
-      ctl.write({ type, value })
-      ctl.commit()
-      present.add(key)
-    } else if (present.has(key)) {
-      // The row moved out of the loaded window (e.g. its sort key dropped below the boundary).
-      ctl.begin()
-      ctl.write({ type: 'delete', key })
-      ctl.commit()
-      present.delete(key)
-    }
+    const action = mergeFeedDelta(view, env)
+    if (!action) return
+    ctl.begin()
+    ctl.write(action)
+    ctl.commit()
   }
 
   const collection = createCollection<T>({
@@ -156,19 +226,20 @@ export async function createSubset<T extends Row = Row>(
         // Seed the query-back page.
         params.begin()
         for (const r of first.rows) {
+          const k = String(r[pk])
           params.write({ type: 'insert', value: r })
-          present.add(String(r[pk]))
+          present.add(k)
+          applied.set(k, snapshotLsn)
         }
         params.commit()
         params.markReady()
-        // 3. Follow the raw live tail and apply each change, filtered by membership. Reading from the
-        //    start of the freshly-created feed stream ('-1') == reading from feed creation onward.
-        const url = deps.resolveStreamUrl(feed)
+        // 3. Follow the raw live tail from the offset captured before the snapshot, applying each change
+        //    filtered by membership + LSN positioning (deltas already in the page are dropped).
         void (async () => {
           try {
             const resp = await stream<StreamEnvelope>({
-              url,
-              offset: '-1',
+              url: feedUrl,
+              offset: feedOffset,
               live: deps.liveMode ?? 'long-poll',
               contentType: 'application/json',
               signal: ac.signal,
@@ -199,11 +270,18 @@ export async function createSubset<T extends Row = Row>(
         limit: pageSize,
       })) as SubsetResult
       if (page.rows.length) {
+        // This page is a fresh Postgres snapshot at `pageLsn`; its rows are the authoritative state as
+        // of that LSN. Don't let a stale page regress a row already advanced past `pageLsn` by the live
+        // feed (the loadMore-vs-feed race), and set each row's watermark so older feed deltas drop.
+        const pageLsn = lsnToU64(page.lsn) ?? snapshotLsn
         ctl.begin()
         for (const r of page.rows) {
           const k = String(r[pk])
+          const w = applied.get(k)
+          if (w !== undefined && pageLsn < w) continue
           ctl.write({ type: present.has(k) ? 'update' : 'insert', value: r })
           present.add(k)
+          applied.set(k, pageLsn)
         }
         ctl.commit()
         boundary = page.rows[page.rows.length - 1]!

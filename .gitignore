@@ -12,3 +12,10 @@ pnpm-debug.log*
 
 # TS incremental build info
 *.tsbuildinfo
+
+# Ad-hoc run artifacts / scratch (not source)
+/*.png
+erl_crash.dump
+*.dump
+memtest.txt
+/results/

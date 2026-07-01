@@ -46,6 +46,58 @@ struct EngineState {
     tailers: HashMap<String, TailerHandle>,
     shapes: HashMap<String, ShapeRecord>,
     next_shape_id: u64,
+    /// Shape sharing. Any two **equal** shapes — same kind and definition (see `shape_signature` /
+    /// `agg_signature`: table + canonical predicate + columns + changes-only, or table + predicate +
+    /// func + column for aggregates) — share ONE durable stream + ONE routed/standalone/registry entry,
+    /// ref-counted, so the engine maintains + appends once for all subscribers instead of once each. A
+    /// joiner positions itself with its own snapshot LSN (client-side `< S` drop), so sharing is safe.
+    /// Covers plain, subquery, and aggregate shapes. `feed_by_sig`: signature -> shape_id;
+    /// `feed_shares`: shape_id -> (sig, refcount).
+    feed_by_sig: HashMap<String, String>,
+    feed_shares: HashMap<String, FeedShare>,
+}
+
+struct FeedShare {
+    sig: String,
+    refcount: usize,
+}
+
+/// Canonical signature for feed sharing: table + serialized predicate + sorted projection indices.
+/// Two subset feeds with an equal signature are interchangeable and share one stream.
+/// Order-insensitive predicate canonicalization (same form used for subquery-node sharing), so
+/// `a AND b` and `b AND a` collapse to one shape.
+fn canon_where(where_: &Option<PredicateJson>) -> String {
+    where_.as_ref().map(crate::predicate::canonical_pred).unwrap_or_default()
+}
+
+fn canon_cols(out_cols: &Option<Arc<Vec<usize>>>) -> String {
+    out_cols
+        .as_ref()
+        .map(|v| {
+            let mut idx = v.as_ref().clone();
+            idx.sort_unstable();
+            idx.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",")
+        })
+        .unwrap_or_default()
+}
+
+/// The sharing key for a **row shape** (materialized or changes-only feed, plain or subquery). Two
+/// shapes are interchangeable — and so share one maintained stream — iff these all match. `changes_only`
+/// is part of the key: a backfilled shape and a no-backfill feed over the same rows are NOT the same
+/// stream.
+fn shape_signature(
+    table: &str,
+    where_: &Option<PredicateJson>,
+    out_cols: &Option<Arc<Vec<usize>>>,
+    changes_only: bool,
+) -> String {
+    format!("shape\u{1f}{}\u{1f}{table}\u{1f}{}\u{1f}{}", changes_only, canon_where(where_), canon_cols(out_cols))
+}
+
+/// The sharing key for an **aggregation shape**: table + predicate + function + column. Namespaced so it
+/// never collides with a row shape's key.
+fn agg_signature(table: &str, where_: &Option<PredicateJson>, func: &AggFn, col_idx: Option<usize>) -> String {
+    format!("agg\u{1f}{table}\u{1f}{}\u{1f}{:?}\u{1f}{:?}", canon_where(where_), func, col_idx)
 }
 
 #[derive(Clone, Debug)]
@@ -53,6 +105,100 @@ pub struct ShapeRecord {
     pub id: String,
     pub table: String,
     pub stream_path: String,
+    /// Graph-introspection metadata (for `GET /graph` / the pipeline visualizer). Filled at creation.
+    pub changes_only: bool,
+    /// The shape's `where` predicate as raw JSON, for rendering the pipeline. `None` = match-all.
+    pub where_json: Option<PredicateJson>,
+    /// The columns this shape projects (syncs), as requested at creation. `None` = the full row (all
+    /// columns). Surfaced for the visualizer so a shape's SELECT-list is visible.
+    pub columns: Option<Vec<String>>,
+    /// `Some(key_cols)` iff this shape is an equality template routed by a shared **family** on those
+    /// columns; `None` = standalone filter or subquery.
+    pub family_key: Option<Vec<String>>,
+    /// True iff the predicate contains a `col IN (SELECT …)` leaf (routed via the subquery registry).
+    pub is_subquery: bool,
+    /// Present iff this shape is a scalar **aggregation** (maintains a running COUNT/SUM/… over `where`,
+    /// not the rows). Streams a single value that updates as rows enter/leave the predicate.
+    pub aggregate: Option<AggInfo>,
+}
+
+/// Aggregation descriptor carried on a shape record + `GET /graph` (for the visualizer).
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AggInfo {
+    pub func: AggFn,
+    pub col: Option<String>,
+}
+
+// --- Pipeline-graph introspection (served at `GET /graph` for the visualizer) ---
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphShape {
+    pub id: String,
+    pub table: String,
+    pub stream_path: String,
+    pub changes_only: bool,
+    #[serde(rename = "where")]
+    pub where_: Option<PredicateJson>,
+    /// The projected columns (SELECT-list); `null` = the full row (all columns).
+    pub columns: Option<Vec<String>>,
+    /// Key columns iff this shape routes via a shared equality **family**; else `null` (standalone/subquery).
+    pub family_key: Option<Vec<String>>,
+    pub is_subquery: bool,
+    /// Present iff this shape is a scalar aggregation (COUNT/SUM/…).
+    pub aggregate: Option<AggInfo>,
+}
+
+/// A shared maintained inner-set node (`SELECT proj FROM inner WHERE …`), one per distinct subquery.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphNode {
+    pub sig: String,
+    pub inner_table: String,
+    pub proj_col: String,
+    pub distinct_values: usize,
+    pub refcount: usize,
+}
+
+/// A dependency edge from a subquery node to a dependent (an outer shape, or a parent node for nesting).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphEdge {
+    pub node_sig: String,
+    pub dependent_kind: String, // "shape" | "node"
+    pub dependent_id: String,
+    pub connecting_col: String,
+    pub negated: bool,
+}
+
+/// The whole maintained dbsp pipeline at an instant: tables, shapes (with their routing placement), and
+/// the shared subquery node/edge DAG. The visualizer derives family + subquery sharing from this.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineGraph {
+    pub tables: Vec<String>,
+    pub shapes: Vec<GraphShape>,
+    pub subquery_nodes: Vec<GraphNode>,
+    pub subquery_edges: Vec<GraphEdge>,
+}
+
+/// One entry of a subquery node's live inner-set index.
+#[derive(serde::Serialize)]
+pub struct NodeValue {
+    pub value: serde_json::Value,
+    pub contributors: usize,
+}
+
+/// The live inner-set index of a subquery node (served at `GET /graph/node?sig=…`).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeIndex {
+    pub sig: String,
+    pub distinct_values: usize,
+    pub refcount: usize,
+    pub values: Vec<NodeValue>,
+    pub truncated: bool,
 }
 
 struct TailerHandle {
@@ -97,6 +243,15 @@ enum TailerCmd {
         /// stream immediately on create).
         ready: tokio::sync::oneshot::Sender<()>,
     },
+    /// Register a scalar aggregation (COUNT/SUM/AVG/MIN/MAX) over `pred`, maintained incrementally.
+    AddAggregate {
+        shape_id: String,
+        stream_path: String,
+        pred: Arc<CompiledPredicate>,
+        func: AggFn,
+        col: Option<usize>,
+        ready: tokio::sync::oneshot::Sender<()>,
+    },
     RemoveShape { shape_id: String },
 }
 
@@ -110,6 +265,8 @@ impl Engine {
                 tailers: HashMap::new(),
                 shapes: HashMap::new(),
                 next_shape_id: 1,
+                feed_by_sig: HashMap::new(),
+                feed_shares: HashMap::new(),
             })),
             pg_url: None,
             repl_lsn: Arc::new(std::sync::Mutex::new("0/0".to_string())),
@@ -236,19 +393,40 @@ impl Engine {
         Ok((rows, sq.lsn))
     }
 
+    /// `share`: when true, an identical existing shape (same table, canonical predicate, and columns) is
+    /// joined by ref-count instead of creating a second stream — so N app clients subscribing to the same
+    /// reference shape (e.g. `project_members WHERE user_id = me`) share one maintained output. The
+    /// Electric `/v1/shape` path passes `false`: it keys per-request live state by shape id, so each
+    /// request needs its own handle.
     pub async fn create_shape(
         &self,
         table: &str,
         where_: Option<PredicateJson>,
         columns: Option<Vec<String>>,
         changes_only: bool,
+        share: bool,
     ) -> Result<ShapeRecord> {
         let mut st = self.state.lock().await;
         let ts = match st.tables.get(table) {
             Some(ts) => ts.clone(),
             None => bail!("unknown table '{table}'"),
         };
+        let col_names = columns.clone();
         let out_cols = resolve_columns(&ts, columns)?;
+
+        // Shape sharing: an identical shape (subset feed, materialized, OR subquery) that already exists
+        // is joined (ref-count++), returning the same stream — no second stream, no per-subscriber append
+        // fan-out. Subquery shapes share their inner-set nodes in the registry regardless; sharing the
+        // *outer* shape here collapses identical subquery shapes fully.
+        let feed_sig = if share { Some(shape_signature(table, &where_, &out_cols, changes_only)) } else { None };
+        if let Some(sig) = &feed_sig {
+            if let Some(existing_id) = st.feed_by_sig.get(sig).cloned() {
+                if let Some(rec) = st.shapes.get(&existing_id).cloned() {
+                    st.feed_shares.get_mut(&existing_id).expect("share entry for live feed").refcount += 1;
+                    return Ok(rec);
+                }
+            }
+        }
 
         let num_id = st.next_shape_id;
         let id = format!("s{num_id}");
@@ -275,8 +453,23 @@ impl Engine {
                     st.tailers.insert(t.clone(), handle);
                 }
             }
-            let rec = ShapeRecord { id: id.clone(), table: table.to_string(), stream_path: stream_path.clone() };
+            let rec = ShapeRecord {
+                id: id.clone(),
+                table: table.to_string(),
+                stream_path: stream_path.clone(),
+                changes_only,
+                where_json: Some(where_json.clone()),
+                columns: col_names.clone(),
+                family_key: None,
+                is_subquery: true,
+                aggregate: None,
+            };
             st.shapes.insert(id.clone(), rec.clone());
+            // Register this (first) subquery shape so later identical ones join it by ref-count.
+            if let Some(sig) = feed_sig {
+                st.feed_by_sig.insert(sig.clone(), id.clone());
+                st.feed_shares.insert(id.clone(), FeedShare { sig, refcount: 1 });
+            }
             // Release the engine-state lock before the registry's PG backfill (so offset polling etc.
             // aren't blocked); the registry has its own lock.
             drop(st);
@@ -289,6 +482,11 @@ impl Engine {
         }
 
         let pred = Arc::new(CompiledPredicate::compile_opt(where_.as_ref(), &ts)?);
+        // Family placement (for graph introspection): an equality template routes by these key columns
+        // via a shared family; otherwise it's a standalone filter.
+        let family_key = pred
+            .equality_template()
+            .map(|pairs| pairs.iter().map(|(i, _)| ts.columns[*i].0.clone()).collect::<Vec<_>>());
 
         if !st.tailers.contains_key(table) {
             let handle = spawn_tailer(self.ds.clone(), ts.clone(), self.pg_url.clone(), self.subqueries.clone());
@@ -309,8 +507,23 @@ impl Engine {
             })
             .map_err(|_| anyhow::anyhow!("tailer for '{table}' is gone"))?;
 
-        let rec = ShapeRecord { id: id.clone(), table: table.to_string(), stream_path };
+        let rec = ShapeRecord {
+            id: id.clone(),
+            table: table.to_string(),
+            stream_path,
+            changes_only,
+            where_json: where_.clone(),
+            columns: col_names,
+            family_key,
+            is_subquery: false,
+            aggregate: None,
+        };
         st.shapes.insert(id.clone(), rec.clone());
+        // Register the (first) shared feed so later identical subset feeds join it.
+        if let Some(sig) = feed_sig {
+            st.feed_by_sig.insert(sig.clone(), id.clone());
+            st.feed_shares.insert(id.clone(), FeedShare { sig, refcount: 1 });
+        }
         // Release the engine-state lock, then wait for the tailer to finish the backfill so the shape's
         // snapshot is readable when we return (the Electric adapter folds the stream immediately).
         drop(st);
@@ -318,8 +531,184 @@ impl Engine {
         Ok(rec)
     }
 
+    /// Create a scalar **aggregation** shape (COUNT/SUM/AVG/MIN/MAX over `where`), maintained
+    /// incrementally. An electric-lite extension — not part of the Electric-compatible API. Rejects
+    /// subquery predicates (use a plain filter); SUM/AVG/MIN/MAX require a column.
+    pub async fn create_aggregate(
+        &self,
+        table: &str,
+        where_: Option<PredicateJson>,
+        func: AggFn,
+        col: Option<String>,
+    ) -> Result<ShapeRecord> {
+        let mut st = self.state.lock().await;
+        let ts = st.tables.get(table).cloned().ok_or_else(|| anyhow::anyhow!("unknown table '{table}'"))?;
+        if where_.as_ref().is_some_and(predicate_has_subquery) {
+            bail!("aggregations over subquery predicates are not supported");
+        }
+        let col_idx = match &col {
+            Some(c) => Some(ts.column_index(c)?),
+            None => None,
+        };
+        if matches!(func, AggFn::Sum | AggFn::Avg | AggFn::Min | AggFn::Max) && col_idx.is_none() {
+            bail!("aggregation {func:?} requires a column");
+        }
+
+        // Aggregate sharing: an identical aggregation (same table, predicate, function, column) is joined
+        // by ref-count — one maintained fold feeds every subscriber (e.g. the same live COUNT opened by
+        // many clients).
+        let agg_sig = agg_signature(table, &where_, &func, col_idx);
+        if let Some(existing_id) = st.feed_by_sig.get(&agg_sig).cloned() {
+            if let Some(rec) = st.shapes.get(&existing_id).cloned() {
+                st.feed_shares.get_mut(&existing_id).expect("share entry for aggregate").refcount += 1;
+                return Ok(rec);
+            }
+        }
+
+        let pred = Arc::new(CompiledPredicate::compile_opt(where_.as_ref(), &ts)?);
+
+        let num_id = st.next_shape_id;
+        let id = format!("s{num_id}");
+        st.next_shape_id += 1;
+        let stream_path = format!("shape/{id}");
+        self.ds.ensure_stream(&stream_path).await?;
+
+        if !st.tailers.contains_key(table) {
+            let handle = spawn_tailer(self.ds.clone(), ts.clone(), self.pg_url.clone(), self.subqueries.clone());
+            st.tailers.insert(table.to_string(), handle);
+        }
+        let tailer = st.tailers.get(table).expect("tailer just inserted");
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        tailer
+            .cmd_tx
+            .send(TailerCmd::AddAggregate {
+                shape_id: id.clone(),
+                stream_path: stream_path.clone(),
+                pred,
+                func,
+                col: col_idx,
+                ready: ready_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("tailer for '{table}' is gone"))?;
+
+        let rec = ShapeRecord {
+            id: id.clone(),
+            table: table.to_string(),
+            stream_path,
+            changes_only: false,
+            where_json: where_,
+            columns: None,
+            family_key: None,
+            is_subquery: false,
+            aggregate: Some(AggInfo { func, col }),
+        };
+        st.shapes.insert(id.clone(), rec.clone());
+        // Register this (first) aggregate so later identical ones join it by ref-count.
+        st.feed_by_sig.insert(agg_sig.clone(), id.clone());
+        st.feed_shares.insert(id.clone(), FeedShare { sig: agg_sig, refcount: 1 });
+        drop(st);
+        let _ = ready_rx.await;
+        Ok(rec)
+    }
+
+    /// Snapshot the whole maintained pipeline for the visualizer: tables, every registered shape with
+    /// its routing placement (family key / standalone / subquery), and the shared subquery node+edge DAG.
+    pub async fn graph(&self) -> EngineGraph {
+        let (tables, shapes, schemas) = {
+            let st = self.state.lock().await;
+            let tables: Vec<String> = st.tables.keys().cloned().collect();
+            let shapes: Vec<GraphShape> = st
+                .shapes
+                .values()
+                .map(|r| GraphShape {
+                    id: r.id.clone(),
+                    table: r.table.clone(),
+                    stream_path: r.stream_path.clone(),
+                    changes_only: r.changes_only,
+                    where_: r.where_json.clone(),
+                    columns: r.columns.clone(),
+                    family_key: r.family_key.clone(),
+                    is_subquery: r.is_subquery,
+                    aggregate: r.aggregate.clone(),
+                })
+                .collect();
+            let schemas: HashMap<String, TableSchema> = st.tables.clone();
+            (tables, shapes, schemas)
+        };
+        let col_name = |table: &str, idx: usize| -> String {
+            schemas
+                .get(table)
+                .and_then(|ts| ts.columns.get(idx))
+                .map(|(n, _)| n.clone())
+                .unwrap_or_else(|| format!("col{idx}"))
+        };
+        let reg = self.subqueries.lock().await;
+        let subquery_nodes: Vec<GraphNode> = reg
+            .nodes
+            .values()
+            .map(|n| GraphNode {
+                sig: n.sig.clone(),
+                inner_table: n.inner_table.clone(),
+                proj_col: col_name(&n.inner_table, n.proj_col),
+                distinct_values: n.distinct_values(),
+                refcount: n.refcount,
+            })
+            .collect();
+        let subquery_edges: Vec<GraphEdge> = reg
+            .edges
+            .iter()
+            .map(|e| {
+                let (kind, dep_id, dep_table) = match &e.dependent {
+                    crate::subquery::Dependent::Shape(id) => (
+                        "shape",
+                        id.clone(),
+                        reg.shapes.get(id).map(|s| s.outer_table.clone()).unwrap_or_default(),
+                    ),
+                    crate::subquery::Dependent::Node(sig) => (
+                        "node",
+                        sig.clone(),
+                        reg.nodes.get(sig).map(|n| n.inner_table.clone()).unwrap_or_default(),
+                    ),
+                };
+                GraphEdge {
+                    node_sig: e.node_sig.clone(),
+                    dependent_kind: kind.to_string(),
+                    dependent_id: dep_id,
+                    connecting_col: col_name(&dep_table, e.connecting_col),
+                    negated: e.negated,
+                }
+            })
+            .collect();
+        EngineGraph { tables, shapes, subquery_nodes, subquery_edges }
+    }
+
+    /// The live inner-set index of one subquery node (values + contributor counts), for the visualizer's
+    /// node-detail view. `None` if the signature is unknown.
+    pub async fn node_index(&self, sig: &str, cap: usize) -> Option<NodeIndex> {
+        let reg = self.subqueries.lock().await;
+        let (distinct_values, refcount, values, truncated) = reg.node_value_index(sig, cap)?;
+        Some(NodeIndex {
+            sig: sig.to_string(),
+            distinct_values,
+            refcount,
+            values: values.into_iter().map(|(value, contributors)| NodeValue { value, contributors }).collect(),
+            truncated,
+        })
+    }
+
     pub async fn drop_shape(&self, id: &str) -> Result<()> {
         let mut st = self.state.lock().await;
+        // Shared subset feed: decrement the ref-count; only actually tear it down when the last
+        // subscriber leaves. (A materialized shape / unshared feed is not in `feed_shares` → drops now.)
+        if let Some(share) = st.feed_shares.get_mut(id) {
+            share.refcount -= 1;
+            if share.refcount > 0 {
+                return Ok(());
+            }
+            let sig = share.sig.clone();
+            st.feed_shares.remove(id);
+            st.feed_by_sig.remove(&sig);
+        }
         if let Some(rec) = st.shapes.remove(id) {
             if let Some(t) = st.tailers.get(&rec.table) {
                 let _ = t.cmd_tx.send(TailerCmd::RemoveShape { shape_id: id.to_string() });
@@ -459,6 +848,104 @@ impl KeyRouter {
     }
 }
 
+/// Supported scalar aggregation functions. COUNT/SUM/AVG are O(1) running scalars; MIN/MAX keep an
+/// ordered multiset of the matching values (so a retraction can restore the previous extreme).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AggFn {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+fn value_f64(v: &Value) -> f64 {
+    match v {
+        Value::Int(i) => *i as f64,
+        Value::Float(f) => f.0,
+        Value::Bool(b) => {
+            if *b {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        _ => 0.0,
+    }
+}
+
+/// A scalar aggregation maintained **incrementally** over the rows matching `pred` — the dbsp fold over
+/// the Z-set of matching changes. Holds only the running aggregate, never the rows: COUNT is a sum of
+/// weights, SUM/AVG add `value·weight`, MIN/MAX keep a `value → net-weight` multiset. O(1) per change
+/// (plus a log-factor for MIN/MAX). Evaluated on the delta like a standalone filter, for any
+/// non-subquery predicate.
+struct AggShape {
+    pred: Arc<CompiledPredicate>,
+    func: AggFn,
+    col: Option<usize>,
+    stream_path: String,
+    seed_lsn: u64,
+    count: i64,
+    sum: f64,
+    multiset: std::collections::BTreeMap<Value, i64>,
+    last: Option<serde_json::Value>,
+}
+
+impl AggShape {
+    /// Fold a Z-set delta into the running aggregate. Returns true if any matching row was seen.
+    fn apply(&mut self, delta: &[Tup2<Row, ZWeight>]) -> bool {
+        let mut touched = false;
+        for Tup2(row, w) in delta {
+            if !self.pred.matches(row) {
+                continue;
+            }
+            touched = true;
+            self.count += *w;
+            if let Some(ci) = self.col {
+                let v = row.0.get(ci).cloned().unwrap_or(Value::Null);
+                self.sum += value_f64(&v) * (*w as f64);
+                if matches!(self.func, AggFn::Min | AggFn::Max) {
+                    let e = self.multiset.entry(v.clone()).or_insert(0);
+                    *e += *w;
+                    if *e <= 0 {
+                        self.multiset.remove(&v);
+                    }
+                }
+            }
+        }
+        touched
+    }
+
+    /// The current aggregate value as JSON.
+    fn value(&self) -> serde_json::Value {
+        match self.func {
+            AggFn::Count => serde_json::json!(self.count),
+            AggFn::Sum => serde_json::json!(self.sum),
+            AggFn::Avg => {
+                if self.count > 0 {
+                    serde_json::json!(self.sum / self.count as f64)
+                } else {
+                    serde_json::Value::Null
+                }
+            }
+            AggFn::Min => self.multiset.keys().next().map(Value::to_json).unwrap_or(serde_json::Value::Null),
+            AggFn::Max => self.multiset.keys().next_back().map(Value::to_json).unwrap_or(serde_json::Value::Null),
+        }
+    }
+
+    /// The output envelope carrying the current aggregate (key `"agg"`, so the client materializes one row).
+    fn envelope(&self, ts: &TableSchema, txid: Option<String>, lsn: Option<String>) -> Envelope {
+        Envelope {
+            type_: ts.name.clone(),
+            key: "agg".into(),
+            value: Some(serde_json::json!({ "value": self.value(), "n": self.count })),
+            old: None,
+            headers: EnvelopeHeaders { operation: "upsert".into(), txid, offset: None, lsn },
+        }
+    }
+}
+
 /// The key tuple for a row given the template's key columns (positional projection). Missing columns
 /// project to NULL (defensive; equality-template columns always exist).
 fn key_of(row: &Row, cols: &[usize]) -> Row {
@@ -528,6 +1015,8 @@ async fn tailer_loop(
     let mut families: HashMap<Vec<usize>, KeyRouter> = HashMap::new();
     // Reverse lookup for removal: shape id -> (template key cols, numeric id, key tuple).
     let mut family_of: HashMap<String, (Vec<usize>, u64, Row)> = HashMap::new();
+    // Scalar aggregations maintained incrementally over a filter predicate, keyed by shape id.
+    let mut aggregates: HashMap<String, AggShape> = HashMap::new();
 
     loop {
         let off = offset.clone();
@@ -544,8 +1033,18 @@ async fn tailer_loop(
                     let _ = ready.send(()); // backfill done (or failed) — unblock create_shape
                     publish_stats(&stats, &shapes, &families);
                 }
+                Some(TailerCmd::AddAggregate { shape_id, stream_path, pred, func, col, ready }) => {
+                    if let Err(e) = add_aggregate(
+                        &ds, &ts, &pg_url, &mut aggregates, shape_id, stream_path, pred, func, col,
+                    ).await {
+                        tracing::error!("add_aggregate failed: {e:#}");
+                    }
+                    let _ = ready.send(());
+                }
                 Some(TailerCmd::RemoveShape { shape_id }) => {
-                    if shapes.remove(&shape_id).is_none()
+                    if aggregates.remove(&shape_id).is_some() {
+                        // an aggregation shape — nothing else to unwind
+                    } else if shapes.remove(&shape_id).is_none()
                         && let Some((key_cols, num_id, key_tuple)) = family_of.remove(&shape_id)
                         && let Some(router) = families.get_mut(&key_cols)
                     {
@@ -574,8 +1073,10 @@ async fn tailer_loop(
                     // parallelizing is the main throughput/latency lever.
                     let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
                     for env in rr.envelopes {
-                        if let Err(e) =
-                            process_envelope(&ts, &shapes, &families, env, &mut pending, &subqueries).await
+                        if let Err(e) = process_envelope(
+                            &ts, &shapes, &families, &mut aggregates, env, &mut pending, &subqueries,
+                        )
+                        .await
                         {
                             tracing::error!("process_envelope failed: {e:#}");
                         }
@@ -593,6 +1094,41 @@ async fn tailer_loop(
             },
         }
     }
+}
+
+/// Seed a scalar aggregation from Postgres (fold the matching rows once), emit the initial value, and
+/// register it for incremental maintenance. Steady state holds only the running aggregate — no rows.
+#[allow(clippy::too_many_arguments)]
+async fn add_aggregate(
+    ds: &DsClient,
+    ts: &TableSchema,
+    pg_url: &Option<String>,
+    aggregates: &mut HashMap<String, AggShape>,
+    shape_id: String,
+    stream_path: String,
+    pred: Arc<CompiledPredicate>,
+    func: AggFn,
+    col: Option<usize>,
+) -> Result<()> {
+    let bf = pg_backfill(pg_url, ts, Some(pred.as_ref())).await?;
+    let mut agg = AggShape {
+        pred,
+        func,
+        col,
+        stream_path: stream_path.clone(),
+        seed_lsn: crate::pg::lsn_to_u64(&bf.seed_lsn),
+        count: 0,
+        sum: 0.0,
+        multiset: std::collections::BTreeMap::new(),
+        last: None,
+    };
+    let seed: Vec<Tup2<Row, ZWeight>> = bf.rows.iter().map(|r| Tup2(r.clone(), 1)).collect();
+    agg.apply(&seed);
+    let env = agg.envelope(ts, None, None);
+    agg.last = Some(agg.value());
+    ds.append(&stream_path, &[env]).await?;
+    aggregates.insert(shape_id, agg);
+    Ok(())
 }
 
 /// Route a new shape to a shared family circuit (pure-equality predicate) or a standalone filter
@@ -629,7 +1165,7 @@ async fn add_shape_routed(
                 let bf = pg_backfill(pg_url, ts, Some(pred.as_ref())).await?;
                 let out: Vec<(Row, ZWeight)> = bf.rows.iter().map(|r| (r.clone(), 1)).collect();
                 if !out.is_empty() {
-                    let envs = translate_output(ts, out, None, proj);
+                    let envs = translate_output(ts, out, None, None, proj);
                     ds.append(&stream_path, &envs).await?;
                 }
                 crate::pg::lsn_to_u64(&bf.seed_lsn)
@@ -659,7 +1195,7 @@ async fn add_shape_routed(
                 let out: Vec<(Row, ZWeight)> =
                     bf.rows.iter().filter(|r| pred.matches(r)).map(|r| (r.clone(), 1)).collect();
                 if !out.is_empty() {
-                    let envs = translate_output(ts, out, None, proj);
+                    let envs = translate_output(ts, out, None, None, proj);
                     ds.append(&stream_path, &envs).await?;
                 }
                 crate::pg::lsn_to_u64(&bf.seed_lsn)
@@ -692,6 +1228,7 @@ async fn process_envelope(
     ts: &TableSchema,
     shapes: &HashMap<String, StandaloneShape>,
     families: &HashMap<Vec<usize>, KeyRouter>,
+    aggregates: &mut HashMap<String, AggShape>,
     env: Envelope,
     pending: &mut HashMap<String, Vec<Envelope>>,
     subqueries: &Arc<Mutex<SubqueryRegistry>>,
@@ -700,7 +1237,10 @@ async fn process_envelope(
     if delta.is_empty() {
         return Ok(());
     }
-    let lsn = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0);
+    // `lsn` (the commit-LSN string) is stamped onto output envelopes so a subset client can position
+    // its live tail at the page snapshot (drop deltas with `lsn < snapshot_lsn`); `lsn_u64` is the
+    // numeric form used for the per-shape backfill-skip compare.
+    let lsn_u64 = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0);
     metrics().envelopes.fetch_add(1, Ordering::Relaxed);
     let _t = Timer::new(&metrics().process_envelope);
     // Standalone shapes: evaluate each stateless filter directly on the delta (no thread, no clone).
@@ -712,14 +1252,15 @@ async fn process_envelope(
     // window: a commit whose WAL record was written but not yet visible at snapshot time; negligible
     // for the single-ingestor model — see process_envelope docs / ARCHITECTURE.)
     for shape in shapes.values() {
-        if lsn != 0 && lsn < shape.seed_lsn {
+        if lsn_u64 != 0 && lsn_u64 < shape.seed_lsn {
             continue;
         }
         let out = eval_standalone(&shape.pred, &delta);
         if out.is_empty() {
             continue;
         }
-        let envs = translate_output(ts, out, txid.clone(), shape.out_cols.as_deref().map(Vec::as_slice));
+        let envs =
+            translate_output(ts, out, txid.clone(), lsn.clone(), shape.out_cols.as_deref().map(Vec::as_slice));
         pending.entry(shape.stream_path.clone()).or_default().extend(envs);
     }
     // Equality routers: route each delta row by its key to exactly the shapes registered on that key.
@@ -734,7 +1275,7 @@ async fn process_envelope(
             let key = key_of(row, &router.key_cols);
             let Some(routed) = router.index.get(&key) else { continue };
             for rs in routed {
-                if lsn != 0 && lsn < rs.seed_lsn {
+                if lsn_u64 != 0 && lsn_u64 < rs.seed_lsn {
                     continue;
                 }
                 by_shape
@@ -749,7 +1290,7 @@ async fn process_envelope(
         }
         metrics().family_steps.fetch_add(1, Ordering::Relaxed);
         for (_sid, (stream_path, out_cols, rows)) in by_shape {
-            let envs = translate_output(ts, rows, txid.clone(), out_cols);
+            let envs = translate_output(ts, rows, txid.clone(), lsn.clone(), out_cols);
             if !envs.is_empty() {
                 pending.entry(stream_path.to_string()).or_default().extend(envs);
             }
@@ -761,7 +1302,22 @@ async fn process_envelope(
     {
         let mut reg = subqueries.lock().await;
         if reg.touches(&ts.name) {
-            reg.on_table_delta(ts, &delta, lsn, txid.clone()).await?;
+            reg.on_table_delta(ts, &delta, lsn_u64, txid.clone()).await?;
+        }
+    }
+    // Scalar aggregations: fold this delta into each running aggregate; emit the new value when it
+    // changes. Skips changes already counted in the seed (commit LSN < the aggregate's seed_lsn).
+    for agg in aggregates.values_mut() {
+        if lsn_u64 != 0 && lsn_u64 < agg.seed_lsn {
+            continue;
+        }
+        if agg.apply(&delta) {
+            let val = agg.value();
+            if agg.last.as_ref() != Some(&val) {
+                agg.last = Some(val.clone());
+                let env = agg.envelope(ts, txid.clone(), lsn.clone());
+                pending.entry(agg.stream_path.clone()).or_default().push(env);
+            }
         }
     }
     Ok(())
@@ -843,6 +1399,7 @@ pub(crate) fn translate_output(
     ts: &TableSchema,
     out: Vec<(Row, ZWeight)>,
     txid: Option<String>,
+    lsn: Option<String>,
     out_cols: Option<&[usize]>,
 ) -> Vec<Envelope> {
     let mut pos: HashMap<String, Row> = HashMap::new();
@@ -868,7 +1425,7 @@ pub(crate) fn translate_output(
             key: pk.clone(),
             value: Some(ts.row_to_json_cols(row, out_cols)),
             old: None,
-            headers: EnvelopeHeaders { operation: "upsert".into(), txid: txid.clone(), offset: None, lsn: None },
+            headers: EnvelopeHeaders { operation: "upsert".into(), txid: txid.clone(), offset: None, lsn: lsn.clone() },
         });
     }
     // TEST-ONLY: the `drop_deletes` fault suppresses "leave" envelopes so rows that exit a shape
@@ -883,7 +1440,7 @@ pub(crate) fn translate_output(
             key: pk.clone(),
             value: None,
             old: None,
-            headers: EnvelopeHeaders { operation: "delete".into(), txid: txid.clone(), offset: None, lsn: None },
+            headers: EnvelopeHeaders { operation: "delete".into(), txid: txid.clone(), offset: None, lsn: lsn.clone() },
         });
     }
     envs
@@ -925,28 +1482,116 @@ mod tests {
 
         // enter: insert an active row -> upsert envelope
         let (delta, _, _) = apply_envelope(&ts, &env("insert", "1", Some(serde_json::json!({"id":1,"name":"a","active":true})), None)).unwrap();
-        let envs = translate_output(&ts, eval_standalone(&pred, &delta), None, None);
+        let envs = translate_output(&ts, eval_standalone(&pred, &delta), None, None, None);
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].headers.operation, "upsert");
         assert_eq!(envs[0].key, "1");
 
         // update within shape (name change, still active) -> upsert with new value
         let (delta, _, _) = apply_envelope(&ts, &env("update", "1", Some(serde_json::json!({"id":1,"name":"a2","active":true})), Some(serde_json::json!({"id":1,"name":"a","active":true})))).unwrap();
-        let envs = translate_output(&ts, eval_standalone(&pred, &delta), None, None);
+        let envs = translate_output(&ts, eval_standalone(&pred, &delta), None, None, None);
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].headers.operation, "upsert");
         assert_eq!(envs[0].value.as_ref().unwrap()["name"], "a2");
 
         // leave: becomes inactive -> delete envelope
         let (delta, _, _) = apply_envelope(&ts, &env("update", "1", Some(serde_json::json!({"id":1,"name":"a2","active":false})), Some(serde_json::json!({"id":1,"name":"a2","active":true})))).unwrap();
-        let envs = translate_output(&ts, eval_standalone(&pred, &delta), None, None);
+        let envs = translate_output(&ts, eval_standalone(&pred, &delta), None, None, None);
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].headers.operation, "delete");
         assert_eq!(envs[0].key, "1");
 
         // a non-matching insert produces no shape envelope
         let (delta, _, _) = apply_envelope(&ts, &env("insert", "2", Some(serde_json::json!({"id":2,"name":"b","active":false})), None)).unwrap();
-        let envs = translate_output(&ts, eval_standalone(&pred, &delta), None, None);
+        let envs = translate_output(&ts, eval_standalone(&pred, &delta), None, None, None);
         assert_eq!(envs.len(), 0);
+    }
+
+    /// The commit LSN is stamped onto output envelopes (upsert + delete) so a subset client can
+    /// position its live tail at the page snapshot. Regression guard for the LSN-positioning feature
+    /// (`docs/superpowers/specs/2026-07-01-subset-lsn-positioning-design.md`).
+    #[test]
+    fn translate_output_stamps_commit_lsn() {
+        let ts = users();
+        // upsert path: a positive-weight row carries the commit LSN.
+        let out = vec![(Row(vec![crate::value::Value::Int(1), crate::value::Value::Text("a".into()), crate::value::Value::Bool(true)]), 1)];
+        let envs = translate_output(&ts, out, Some("tx1".into()), Some("0/2A".into()), None);
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].headers.operation, "upsert");
+        assert_eq!(envs[0].headers.lsn.as_deref(), Some("0/2A"));
+
+        // delete path (purely negative weight) also carries the LSN.
+        let out = vec![(Row(vec![crate::value::Value::Int(2), crate::value::Value::Text("b".into()), crate::value::Value::Bool(true)]), -1)];
+        let envs = translate_output(&ts, out, None, Some("0/2A".into()), None);
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].headers.operation, "delete");
+        assert_eq!(envs[0].headers.lsn.as_deref(), Some("0/2A"));
+
+        // no LSN (backfill / library mode) -> none stamped.
+        let out = vec![(Row(vec![crate::value::Value::Int(3), crate::value::Value::Text("c".into()), crate::value::Value::Bool(true)]), 1)];
+        let envs = translate_output(&ts, out, None, None, None);
+        assert_eq!(envs[0].headers.lsn, None);
+    }
+
+    fn agg(func: AggFn, col: Option<usize>) -> AggShape {
+        let ts = users();
+        let pred = Arc::new(
+            CompiledPredicate::compile_opt(
+                Some(&serde_json::from_value(serde_json::json!({ "col": "active", "op": "eq", "value": true })).unwrap()),
+                &ts,
+            )
+            .unwrap(),
+        );
+        AggShape {
+            pred,
+            func,
+            col,
+            stream_path: "x".into(),
+            seed_lsn: 0,
+            count: 0,
+            sum: 0.0,
+            multiset: std::collections::BTreeMap::new(),
+            last: None,
+        }
+    }
+    // Columns are stored sorted: active(0), id(1), name(2).
+    fn active(id: i64) -> Row {
+        Row(vec![Value::Bool(true), Value::Int(id), Value::Text("n".into())])
+    }
+    fn inactive(id: i64) -> Row {
+        Row(vec![Value::Bool(false), Value::Int(id), Value::Text("n".into())])
+    }
+
+    /// COUNT over `active = true`, maintained incrementally through inserts, deletes, and predicate-
+    /// crossing updates (a row moving in/out of the filter).
+    #[test]
+    fn aggregate_count_incremental() {
+        let mut a = agg(AggFn::Count, None);
+        a.apply(&vec![Tup2(active(1), 1), Tup2(active(2), 1), Tup2(inactive(3), 1)]);
+        assert_eq!(a.value(), serde_json::json!(2)); // only the two active rows count
+
+        a.apply(&vec![Tup2(active(1), -1), Tup2(active(4), 1)]); // one leaves, one enters
+        assert_eq!(a.value(), serde_json::json!(2));
+
+        a.apply(&vec![Tup2(inactive(3), -1), Tup2(active(3), 1)]); // update: crosses INTO the filter
+        assert_eq!(a.value(), serde_json::json!(3));
+
+        a.apply(&vec![Tup2(active(2), -1), Tup2(inactive(2), 1)]); // update: crosses OUT of the filter
+        assert_eq!(a.value(), serde_json::json!(2));
+    }
+
+    /// MIN(id) over the filtered set restores the previous extreme on retraction (the multiset).
+    #[test]
+    fn aggregate_min_with_retraction() {
+        let mut a = agg(AggFn::Min, Some(1)); // col 1 = id (sorted: active,id,name)
+        a.apply(&vec![Tup2(active(5), 1), Tup2(active(3), 1), Tup2(active(8), 1)]);
+        assert_eq!(a.value(), serde_json::json!(3));
+        a.apply(&vec![Tup2(active(3), -1)]); // remove the current min → next-smallest surfaces
+        assert_eq!(a.value(), serde_json::json!(5));
+        let mut mx = agg(AggFn::Max, Some(1));
+        mx.apply(&vec![Tup2(active(5), 1), Tup2(active(8), 1)]);
+        assert_eq!(mx.value(), serde_json::json!(8));
+        mx.apply(&vec![Tup2(active(8), -1)]);
+        assert_eq!(mx.value(), serde_json::json!(5));
     }
 }

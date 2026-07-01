@@ -1,13 +1,21 @@
 # electric-lite — architecture
 
 A reactive read-path: clients declare **shapes** (filtered views of a table); the system keeps each
-shape's result set live as the base table changes, delivering incremental updates. Built on
-incremental dataflow (dbsp), durable streams for transport/persistence, and a stream-db + TanStack DB
-client for materialization.
+shape's result set live as the base table changes, delivering incremental updates. It uses the
+**dbsp** Z-set data model (rows with signed weights) for deltas, durable streams for
+transport/persistence, and a stream-db + TanStack DB client for materialization.
 
-This document describes the system as built. For the narrower design records see
-`docs/superpowers/specs/` (electric-lite-decisions, shape-pipeline-sharing-design, conformance-expansion,
-benchmark-findings, postgres-logical-replication).
+> **Read this first.** This document is a layered historical record: the body (§4–§5, §8, §10) was
+> written for the original design — an in-memory `table_state` plus a shared **dbsp join circuit per
+> equality template** — and is corrected in place by the two blockquotes below. The **current**
+> as-built model is a stateless delta router (key routing + stateless filters + a shared-node subquery
+> registry) holding **no table copy and no per-shape circuit**. For the clean as-built description and
+> the analytical cost model, read **[docs/ivm-engine-internals.md](ivm-engine-internals.md)**; treat
+> the superseded sections here as background.
+
+For the narrower design records see `docs/superpowers/specs/` (electric-lite-decisions,
+shape-pipeline-sharing-design, conformance-expansion, benchmark-findings, postgres-logical-replication,
+reduce-engine-memory-design, subqueries-design).
 
 > **Postgres mode (current default for deployment).** electric-lite now runs with **Postgres as the
 > system of record**: applications write to Postgres, the engine ingests changes via **logical
@@ -68,7 +76,7 @@ benchmark-findings, postgres-logical-replication).
         │                                                   ▼        │
         │                                            ┌──────────────────┐
         └──────────────────────────────────────────  │   engine (Rust)  │
-                     (reads shape streams)            │  dbsp + tailer   │
+                     (reads shape streams)            │ tailer + routing │
                                                       └──────────────────┘
 ```
 
@@ -78,9 +86,13 @@ benchmark-findings, postgres-logical-replication).
 - **API / core** (`apps/api`) — thin tRPC surface. Writes are translated to State-Protocol envelopes
   and appended **directly to the table stream** (it does *not* go through the engine). Schema and shape
   lifecycle are forwarded to the engine over HTTP.
-- **engine** (`apps/engine`, Rust) — tails each table stream, maintains authoritative table state,
-  computes per-change deltas, fans them out to all shapes via two execution strategies, and appends the
-  resulting upsert/delete envelopes to shape streams. Holds all dataflow state.
+- **engine** (`apps/engine`, Rust) — tails each table stream, computes per-change deltas from the
+  envelope's old+new tuples (no resident table copy), fans them out to matching shapes via three
+  strategies (key routing for equality templates, stateless filters for everything else, and a
+  shared-node subquery registry), and appends the resulting upsert/delete envelopes to shape streams.
+  Retained state is per-shape metadata + shared subquery inner-sets — *not* table rows. (The §4
+  "authoritative table state" / per-template dbsp circuit is the superseded model; see the blockquotes
+  above and `docs/ivm-engine-internals.md`.)
 - **client** (`packages/client`) — `createClient` exposes typed writes (tRPC) and `shape()` which
   creates a shape and returns a **TanStack DB collection** kept live by a stream-db reader on the shape
   stream. `awaitTxId` resolves when a given write's txid is observed in the shape stream. The collection

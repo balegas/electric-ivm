@@ -174,8 +174,20 @@ describe('tableDDL', () => {
 })
 
 describe('changeEventToDML', () => {
-  it('upserts on insert/update', () => {
+  it('upserts the full row on insert', () => {
     const f = changeEventToDML('users', users, { op: 'insert', pk: 1, row: alice })
+    expect(f.text).toContain('INSERT INTO "users"')
+    expect(f.text).toContain('ON CONFLICT ("id") DO UPDATE SET')
+    expect(f.text).toContain('"name" = EXCLUDED."name"')
+    expect(f.params).toEqual([1, 'Alice', 30, true, 9.5])
+  })
+  it('updates only the columns present in the row (partial patch)', () => {
+    const f = changeEventToDML('users', users, { op: 'update', pk: 1, row: { name: 'Alicia', age: 31 } })
+    expect(f.text).toBe('UPDATE "users" SET "name" = $1, "age" = $2 WHERE "id" = $3')
+    expect(f.params).toEqual(['Alicia', 31, 1])
+  })
+  it('upserts when a full row is given (an update with a new pk inserts it — Electric semantics)', () => {
+    const f = changeEventToDML('users', users, { op: 'update', pk: 1, row: alice })
     expect(f.text).toContain('INSERT INTO "users"')
     expect(f.text).toContain('ON CONFLICT ("id") DO UPDATE SET')
     expect(f.text).toContain('"name" = EXCLUDED."name"')

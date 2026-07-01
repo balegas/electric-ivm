@@ -1,5 +1,5 @@
-import type { SubsetSubscription } from '@electric-lite/client'
-import type { Row, ShapeDef, SubsetDef } from '@electric-lite/protocol'
+import type { AggregateSubscription, SubsetSubscription } from '@electric-lite/client'
+import type { AggregateDef, Row, ShapeDef, SubsetDef } from '@electric-lite/protocol'
 import { createCollection, type Collection } from '@tanstack/db'
 import { useLiveQuery } from '@tanstack/react-db'
 import { useCallback, useEffect, useState } from 'react'
@@ -141,4 +141,40 @@ export function useSubset<T extends Row = Row>(
     loadMore,
     hasMore: sub?.hasMore() ?? false,
   }
+}
+
+/**
+ * A live scalar **aggregation** (COUNT/SUM/…) over a filtered set, maintained incrementally by the
+ * engine. Recreated whenever `def` changes (keyed by JSON) and closed on unmount. Returns the running
+ * `value` and matching-row `count` — e.g. the top-of-list issue counter, which is a real COUNT over the
+ * visible set rather than a client-side length of the loaded window.
+ */
+export function useAggregate(def: AggregateDef | null): { value: number | null; count: number } {
+  const [state, setState] = useState<{ value: number | null; count: number }>({ value: null, count: 0 })
+  const key = def ? JSON.stringify(def) : null
+
+  useEffect(() => {
+    if (!def) {
+      setState({ value: null, count: 0 })
+      return
+    }
+    let closed = false
+    let sub: AggregateSubscription | undefined
+    void client.aggregate(def).then((s) => {
+      if (closed) {
+        void s.close()
+        return
+      }
+      sub = s
+      setState({ value: s.value(), count: s.count() })
+      s.subscribe((v) => setState({ value: v, count: s.count() }))
+    })
+    return () => {
+      closed = true
+      if (sub) void sub.close()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key])
+
+  return state
 }

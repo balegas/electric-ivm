@@ -254,6 +254,27 @@ impl SubqueryRegistry {
         self.nodes.len()
     }
 
+    /// The live **inner-set index** of one node (the visualizer's "see the index" view): up to `cap`
+    /// `(value, contributor-count)` pairs, most-shared first, plus the true distinct count, refcount, and
+    /// whether the list was truncated. This is the actual dbsp-maintained set, not derivable from topology.
+    pub fn node_value_index(
+        &self,
+        sig: &str,
+        cap: usize,
+    ) -> Option<(usize, usize, Vec<(serde_json::Value, usize)>, bool)> {
+        let n = self.nodes.get(sig)?;
+        let mut vals: Vec<(serde_json::Value, usize)> = n
+            .contributors
+            .iter()
+            .filter(|(_, pks)| !pks.is_empty())
+            .map(|(v, pks)| (v.to_json(), pks.len()))
+            .collect();
+        vals.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.to_string().cmp(&b.0.to_string())));
+        let truncated = vals.len() > cap;
+        vals.truncate(cap);
+        Some((n.distinct_values(), n.refcount, vals, truncated))
+    }
+
     /// Memory-relevant registry totals: maintained nodes, total contributor pks across all nodes (the
     /// dominant per-node state — one entry per inner row producing a value), distinct values, shapes,
     /// and edges. Used by the memory probe to attribute subquery state growth.
@@ -335,6 +356,7 @@ impl SubqueryRegistry {
                 let envs = crate::engine::translate_output(
                     &outer_ts,
                     out,
+                    None,
                     None,
                     out_cols.as_deref().map(Vec::as_slice),
                 );
@@ -594,7 +616,7 @@ impl SubqueryRegistry {
                 (r, w)
             })
             .collect();
-        let envs = crate::engine::translate_output(&ts, out, txid, shape.out_cols.as_deref().map(Vec::as_slice));
+        let envs = crate::engine::translate_output(&ts, out, txid, None, shape.out_cols.as_deref().map(Vec::as_slice));
         if !envs.is_empty() {
             self.ds.append(&shape.stream_path, &envs).await?;
         }
@@ -639,7 +661,7 @@ impl SubqueryRegistry {
         if out.is_empty() {
             return Ok(());
         }
-        let envs = crate::engine::translate_output(ts, out, txid, shape.out_cols.as_deref().map(Vec::as_slice));
+        let envs = crate::engine::translate_output(ts, out, txid, None, shape.out_cols.as_deref().map(Vec::as_slice));
         if !envs.is_empty() {
             self.ds.append(&shape.stream_path, &envs).await?;
         }
@@ -666,7 +688,7 @@ impl SubqueryRegistry {
                     .into_iter()
                     .map(|r| { let w: ZWeight = if pred.matches_ctx(&r, self) { 1 } else { -1 }; (r, w) })
                     .collect();
-                let envs = crate::engine::translate_output(&ts, out, txid, out_cols.as_deref().map(Vec::as_slice));
+                let envs = crate::engine::translate_output(&ts, out, txid, None, out_cols.as_deref().map(Vec::as_slice));
                 if !envs.is_empty() {
                     self.ds.append(&stream_path, &envs).await?;
                 }

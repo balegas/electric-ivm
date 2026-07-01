@@ -15,10 +15,11 @@ Deliberately simpler than Electric:
   gte`) combined with `and` / `or` / `not`, and `in` subqueries. Subqueries are maintained by a
   cross-table registry that shares one node per distinct inner query (see
   `docs/superpowers/specs/2026-06-29-subqueries-design.md`).
-- Two optional knobs keep large shapes cheap to sync: **`columns`** (output projection — sync only
-  the columns a view needs; the pk is always included) and **`orderBy` + `limit`** (a backfill
-  window — read only the first *N* rows in order, the basis for cursor/keyset pagination). Both
-  affect what is *synced*, not what is *matched*; omitting them syncs the full matching set.
+- One optional knob keeps large shapes cheap to sync: **`columns`** (output projection — sync only
+  the columns a view needs; the pk is always included). It affects what is *synced*, not what is
+  *matched*; omitting it syncs the full matching set. Ordered windows (`orderBy` + `limit`, the
+  basis for cursor/keyset pagination) are **not** a shape knob — they live in **subset queries**
+  (see `docs/superpowers/specs/2026-06-29-subset-queries-design.md`).
 
 ## Design in three layers
 
@@ -37,7 +38,7 @@ database changes* — each with a single responsibility and a clean seam to the 
    │  DURABLE STREAMS   table/<name>  (the log)                                │
    │                       │  tail                                             │
    │                       ▼                                                   │
-   │  DBSP ENGINE   one filter circuit per shape ──matched deltas──►           │
+   │  ENGINE   route/filter each delta to matching shapes ──matched deltas──►  │
    │                       │  append                                           │
    │                       ▼                                                   │
    │  DURABLE STREAMS   shape/<id>  (the feed)                                 │
@@ -72,11 +73,13 @@ commit LSN (rather than the record LSN) is what prevents silently dropping rows 
 were in flight while the snapshot was taken. (Regression-guarded by
 `packages/conformance/src/conformance-concurrency.test.ts`.)
 
-### 2. dbsp — the incremental query engine
+### 2. The engine — incremental query maintenance
 
 A shape is *one table + a predicate*. The predicate is a **JSON AST** (not SQL); the engine compiles
-it to a Rust closure. Each row change arrives as a **Z-set delta** (rows with `+1`/`-1` weights), and
-the engine maintains the shape's result incrementally:
+it to a Rust predicate closure. Each row change arrives as a **Z-set delta** (rows with `+1`/`-1`
+weights), and the engine maintains the shape's result incrementally with no copy of any table. The
+*shape of the predicate* picks one of three strategies (none of which is a per-shape circuit or
+thread):
 
 - **Standalone shapes** (ranges, OR, NOT, …) are a stateless filter applied directly to the delta —
   no per-shape thread, no state. The matching rows (and their enter/leave/update transitions) fall
@@ -85,6 +88,14 @@ the engine maintains the shape's result incrementally:
   routes each change only to the shapes watching its key (independent of shape count). Each shape
   backfills its rows directly from Postgres (`WHERE key = const`), so the engine keeps **no copy of the
   table** — only `O(#shapes)` routing metadata.
+- **Subquery shapes** (`col [NOT] IN (SELECT …)`) route through a cross-table registry that maintains
+  one **shared inner-set node** per distinct inner query; an inner-set change moves the affected outer
+  rows in/out (see `docs/superpowers/specs/2026-06-29-subqueries-design.md`).
+
+> **What `dbsp` is here.** The engine borrows dbsp's *data model* — rows with signed weights,
+> a Z-set delta — but runs **no dbsp circuit and no per-shape thread**: dbsp survives only as the
+> `Row`/`Tup2`/`ZWeight` value types. The live path is key routing + stateless predicate evaluation.
+> Full internals and cost model: **[docs/ivm-engine-internals.md](docs/ivm-engine-internals.md)**.
 
 Working from the change delta (rather than recomputing) keeps the live set exactly equal to the query
 result, never an approximation that drifts. (The engine holds no table data; backfill reads only the
@@ -102,7 +113,7 @@ Everything is a stream, which is what decouples the layers:
   DB collection** and re-renders on every delta.
 
 Because the predicate has a single definition, it has two derivations with no drift: the engine
-compiles it to a Rust `dbsp.filter` closure; the oracle translates it to a SQL `WHERE`. The
+compiles it to a Rust predicate-match closure; the oracle translates it to a SQL `WHERE`. The
 conformance suite asserts the two always agree.
 
 ### Two-level querying: server shape vs client live query
@@ -110,9 +121,9 @@ conformance suite asserts the two always agree.
 There are two query layers, and they do different jobs:
 
 - The **server-side shape predicate** (engine) decides *what crosses the network* — one table + a
-  `WHERE` over its columns, optionally narrowed by a `columns` projection and an `orderBy`+`limit`
-  window. It's the sync boundary: only matching rows (and only the projected columns) are materialized
-  on the client, and the engine maintains that set incrementally as Postgres changes.
+  `WHERE` over its columns, optionally narrowed by a `columns` projection. It's the sync boundary:
+  only matching rows (and only the projected columns) are materialized on the client, and the engine
+  maintains that set incrementally as Postgres changes.
 - A **client-side live query** (TanStack DB `useLiveQuery`) runs *over the already-materialized
   collection* for the things the shape predicate can't express — ordering (`ORDER BY`), text search
   (`ilike`/`LIKE`), and any finer filtering — without re-syncing. Because it's a live query, it's
@@ -121,11 +132,11 @@ There are two query layers, and they do different jobs:
 
 So: shape = *what you sync*, live query = *how you present it*. The example apps follow this split —
 the engine filters by status/priority/id; the client orders by date/kanban-order and searches by text
-in the live query. **Windowed / infinite-scroll sync** uses the `orderBy`+`limit` window: the browse
-list syncs one ordered page at a time and loads the next page on scroll by folding a keyset cursor
-(`col < lastSeen OR (col = lastSeen AND id < lastId)`) into the shape's `WHERE` — so each page is a
-bounded range query, no stateful top-N operator. The render layer is **virtualized** (only on-screen
-rows are mounted), so a 20k-row view stays a few dozen DOM nodes.
+in the live query. **Windowed / infinite-scroll sync** uses **subset queries** (`orderBy`+`limit`,
+*not* a shape knob): the browse list reads one ordered page at a time and loads the next on scroll by
+folding a keyset cursor (`col < lastSeen OR (col = lastSeen AND id < lastId)`) into the query's
+`WHERE` — so each page is a bounded range query, no stateful top-N operator. The render layer is
+**virtualized** (only on-screen rows are mounted), so a 20k-row view stays a few dozen DOM nodes.
 
 > Postgres is the default source of record. The engine can also run **without** Postgres — writes
 > append directly to `table/<name>` through the tRPC `ingest.write` API — which is how the
@@ -137,7 +148,7 @@ rows are mounted), so a 20k-row view stays a few dozen DOM nodes.
 
 | Path | Lang | Responsibility |
 |---|---|---|
-| `apps/engine` | Rust | dbsp filter circuit per shape, per-table tailer, Postgres ingestor + backfill, control-plane HTTP |
+| `apps/engine` | Rust | per-table tailer, key-routing + stateless-filter + subquery-registry fan-out, Postgres ingestor + backfill, control-plane HTTP |
 | `apps/api` | TS | tRPC server: `schema.define`, `ingest.write`, `shapes.create/get` |
 | `packages/protocol` | TS | shared contract: schema/predicate/change-event types, predicate→SQL / schema→DDL / change→DML compilers |
 | `packages/client` | TS | `createClient()`: typed tRPC client + stream-db materialization (`currentRows`, `awaitTxId`) |

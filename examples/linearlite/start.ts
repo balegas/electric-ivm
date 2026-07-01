@@ -40,11 +40,13 @@ let engineProc: ChildProcess | undefined
 let api: ApiServer | undefined
 let vite: ViteDevServer | undefined
 let caddyProc: ChildProcess | undefined
+let vizProc: ChildProcess | undefined
 let shuttingDown = false
 
 async function shutdown(code = 0): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
+  vizProc?.kill('SIGKILL')
   caddyProc?.kill('SIGKILL')
   engineProc?.kill('SIGKILL')
   if (pg) {
@@ -145,31 +147,45 @@ try {
   const SEED_COUNT = Math.max(0, Number(process.env.DEMO_SEED_COUNT ?? 512))
   const SEED_PRIORITIES = ['none', 'low', 'medium', 'high'] as const // upstream never seeds 'urgent'
 
-  // Fixed roster + projects so visibility is demonstrable: each user belongs to an overlapping subset of
-  // projects, so switching the current user visibly changes which issues are in scope. Kept in sync with
-  // examples/linearlite/src/demo-data.ts (the client reads the same ids/names for the user switcher).
-  const USERS = ['alice', 'bob', 'carol', 'dave', 'erin', 'frank'] // user id = index + 1
-  const PROJECTS = [
-    { name: 'Web App', color: '#5e6ad2' },
-    { name: 'Mobile', color: '#26a269' },
-    { name: 'Infra', color: '#c64600' },
-    { name: 'Design System', color: '#a347ba' },
-    { name: 'Marketing', color: '#0a7ea4' },
-  ] // project id = index + 1
-  // Membership: project ids each user belongs to (overlapping; 'frank' is in everything).
-  const MEMBERSHIP: number[][] = [
-    [1, 2, 3], // alice
-    [2, 3, 4], // bob
-    [3, 4, 5], // carol
-    [1, 4, 5], // dave
-    [1, 2, 5], // erin
-    [1, 2, 3, 4, 5], // frank
-  ]
-
   if (SEED_COUNT > 0) {
     const t0 = Date.now()
     faker.seed(42)
     const now = Date.now()
+
+    // Roster scales with the workload (DEMO_USERS users over DEMO_PROJECTS projects; default 6/5). Each
+    // user belongs to an overlapping random subset of projects so switching the current user changes which
+    // issues are in scope. The first few keep the classic names/projects; the rest are faker-generated.
+    // The app reads the roster back from the users/projects tables, so the "Viewing as" switcher adapts.
+    const NUM_USERS = Math.max(1, Number(process.env.DEMO_USERS ?? 6))
+    const NUM_PROJECTS = Math.max(1, Number(process.env.DEMO_PROJECTS ?? 5))
+    const CLASSIC_USERS = ['alice', 'bob', 'carol', 'dave', 'erin', 'frank']
+    const CLASSIC_PROJECTS = [
+      { name: 'Web App', color: '#5e6ad2' },
+      { name: 'Mobile', color: '#26a269' },
+      { name: 'Infra', color: '#c64600' },
+      { name: 'Design System', color: '#a347ba' },
+      { name: 'Marketing', color: '#0a7ea4' },
+    ]
+    const PALETTE = ['#5e6ad2', '#26a269', '#c64600', '#a347ba', '#0a7ea4', '#b8860b', '#d1477a', '#2f855a']
+    const USERS = Array.from({ length: NUM_USERS }, (_, i) =>
+      i < CLASSIC_USERS.length ? CLASSIC_USERS[i]! : `${faker.person.firstName().toLowerCase()}_${i + 1}`,
+    ) // user id = index + 1
+    const PROJECTS = Array.from({ length: NUM_PROJECTS }, (_, i) =>
+      i < CLASSIC_PROJECTS.length
+        ? CLASSIC_PROJECTS[i]!
+        : { name: `${faker.commerce.department()} ${i + 1}`, color: PALETTE[i % PALETTE.length]! },
+    ) // project id = index + 1
+    // Membership: the classic overlapping sets at the default size (6 users / ≥5 projects) so the stock
+    // demo is unchanged; scaled-up extra users join 2..min(6, NUM_PROJECTS) random distinct projects.
+    const CLASSIC_MEMBERSHIP = [[1, 2, 3], [2, 3, 4], [3, 4, 5], [1, 4, 5], [1, 2, 5], [1, 2, 3, 4, 5]]
+    const MEMBERSHIP: number[][] = USERS.map((_, ui) => {
+      if (ui < CLASSIC_MEMBERSHIP.length && NUM_PROJECTS >= 5) return CLASSIC_MEMBERSHIP[ui]!
+      const k = Math.max(1, Math.min(NUM_PROJECTS, 2 + Math.floor(Math.random() * 5)))
+      const ids = new Set<number>()
+      while (ids.size < k) ids.add(1 + Math.floor(Math.random() * NUM_PROJECTS))
+      return [...ids]
+    })
+
     const projectRows: unknown[][] = PROJECTS.map((p, i) => [i + 1, p.name, p.color])
     const userRows: unknown[][] = USERS.map((n, i) => [i + 1, n])
     const memberRows: unknown[][] = []
@@ -348,6 +364,23 @@ try {
     } else {
       console.log('\n(Install `caddy` to also serve over HTTPS/HTTP-2 and avoid the browser ~6-connection HTTP/1.1 cap on live streams.)')
     }
+  }
+
+  // Optional pipeline visualizer (the learning tool): a small web GUI attached to THIS engine that
+  // renders the maintained dbsp pipeline — shapes, shared equality families, and shared subquery nodes.
+  // Auto-launched pointed at the engine; set DEMO_VIZ=0 to skip, DEMO_VIZ_PORT to change the port.
+  if (process.env.DEMO_VIZ !== '0') {
+    const vizPort = process.env.DEMO_VIZ_PORT ?? '5180'
+    vizProc = spawn('pnpm', ['--filter', '@electric-lite/pipeline-viz', 'dev'], {
+      cwd: repoRoot(),
+      env: { ...process.env, ELECTRIC_LITE_ENGINE_URL: engineUrl, VIZ_PORT: vizPort },
+      stdio: 'ignore',
+    })
+    vizProc.on('exit', (c) => {
+      if (!shuttingDown) console.warn(`pipeline visualizer exited (${c})`)
+    })
+    console.log(`\n🔬 Pipeline visualizer →  http://localhost:${vizPort}/`)
+    console.log('   The live dbsp pipeline of this engine — click shapes to see how they are maintained.')
   }
 
   console.log(`\n👉 Open a URL above. LinearLite (${PRIORITIES.length} priorities, ${STATUSES.length} statuses)`)

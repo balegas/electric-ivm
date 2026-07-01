@@ -1,14 +1,28 @@
 import { ilike, or } from '@tanstack/db'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 
+import type { AggregateDef, Predicate } from '@electric-lite/protocol'
+
 import type { Filters } from '../App'
 import { navigate } from '../App'
-import { type Issue, type IssueQuery, issuesShapeDef, projectIssuesSubsetDef, updateIssue } from '../electric'
+import { type Issue, type IssueQuery, issuesShapeDef, moveIssue, projectIssuesSubsetDef, updateIssue } from '../electric'
 import { PRIORITY_RANK } from '../schema'
 import { useCurrentUser } from '../lib/CurrentUser'
-import { useShapeRows, useSubset } from '../lib/useShape'
+import { useAggregate, useShapeRows, useSubset } from '../lib/useShape'
+
+/** Build a browse-view filter predicate (project visibility + status/priority/my-tasks) for the counter. */
+function inList(col: string, vals: (string | number)[]): Predicate {
+  return vals.length === 1 ? { col, op: 'eq', value: vals[0] } : { or: vals.map((v) => ({ col, op: 'eq', value: v })) }
+}
+function buildBrowseWhere(projectIds: number[], filters: Filters, userName: string): Predicate {
+  const clauses: Predicate[] = [inList('project_id', projectIds)]
+  if (filters.statuses.length) clauses.push(inList('status', filters.statuses))
+  if (filters.priorities.length) clauses.push(inList('priority', filters.priorities))
+  if (filters.myTasksOnly) clauses.push({ col: 'username', op: 'eq', value: userName })
+  return clauses.length === 1 ? clauses[0] : { and: clauses }
+}
 import { Virtual } from '../lib/Virtual'
-import { Avatar, displayId, formatDate, PriorityMenu, ProjectBadge, StatusMenu } from './ui'
+import { Avatar, displayId, formatDate, PriorityMenu, ProjectMenu, StatusMenu } from './ui'
 import { TopFilter } from './TopFilter'
 
 /** Derive the engine-side issue query (visibility + filters) from the UI filters and the current user. */
@@ -24,7 +38,7 @@ function toIssueQuery(filters: Filters, userId: number, userName: string): Issue
 }
 
 function IssueRow({ issue }: { issue: Issue }): JSX.Element {
-  const { projectById } = useCurrentUser()
+  const { projects } = useCurrentUser()
   return (
     <div className="issue-row">
       <span onClick={(e) => e.stopPropagation()}>
@@ -37,7 +51,9 @@ function IssueRow({ issue }: { issue: Issue }): JSX.Element {
       <button type="button" className="issue-title" onClick={() => navigate(`#/issue/${issue.id}`)}>
         {issue.title}
       </button>
-      <ProjectBadge project={projectById.get(issue.project_id)} />
+      <span onClick={(e) => e.stopPropagation()}>
+        <ProjectMenu value={issue.project_id} projects={projects} onChange={(project_id) => moveIssue(issue, project_id)} />
+      </span>
       <span className="issue-date">{formatDate(issue.created)}</span>
       <Avatar name={issue.username} />
     </div>
@@ -63,6 +79,7 @@ function ListChrome({
   rows,
   loading,
   onEndReached,
+  count,
 }: {
   filters: Filters
   setFilters: (f: Filters) => void
@@ -70,10 +87,18 @@ function ListChrome({
   rows: Issue[]
   loading: boolean
   onEndReached?: () => void
+  /** Server-maintained COUNT of the matching set; falls back to the loaded-rows length when absent. */
+  count?: number | null
 }): JSX.Element {
   return (
     <div className="list-pane">
-      <TopFilter title={listTitle(filters, showSearch)} count={rows.length} filters={filters} setFilters={setFilters} showSearch={showSearch} />
+      <TopFilter
+        title={listTitle(filters, showSearch)}
+        count={count ?? rows.length}
+        filters={filters}
+        setFilters={setFilters}
+        showSearch={showSearch}
+      />
       {loading && <div className="empty">Loading…</div>}
       {!loading && rows.length === 0 && <div className="empty">No issues match.</div>}
       {!loading && rows.length > 0 && (
@@ -181,6 +206,13 @@ function BrowseList({ filters, setFilters }: { filters: Filters; setFilters: (f:
     }
   }
 
+  // The header count is a real **server-maintained COUNT aggregation** over the visible+filtered set —
+  // the true total, updating live on writes — not the length of the client-loaded (paginated) window.
+  const aggDef: AggregateDef | null = activeIds.length
+    ? { table: 'issues', where: buildBrowseWhere(activeIds, filters, currentUserName), fn: 'count' }
+    : null
+  const agg = useAggregate(aggDef)
+
   return (
     <>
       {memberIds.map((pid) => (
@@ -190,6 +222,7 @@ function BrowseList({ filters, setFilters }: { filters: Filters; setFilters: (f:
         filters={filters}
         setFilters={setFilters}
         rows={rendered}
+        count={activeIds.length ? agg.value : 0}
         loading={feeds.size === 0 && memberIds.length > 0}
         onEndReached={() => {
           if (hasMore) loadMore()

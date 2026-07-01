@@ -2,7 +2,19 @@
 // (`@durable-streams/state/db`) for materializing a shape into a live TanStack DB collection.
 
 import type { AppRouter } from '@electric-lite/api'
-import type { Op, Row, Schema, ShapeDef, SubsetDef, SubsetResult, TableDef, Value } from '@electric-lite/protocol'
+import type {
+  AggregateDef,
+  Op,
+  Row,
+  Schema,
+  ShapeDef,
+  StreamEnvelope,
+  SubsetDef,
+  SubsetResult,
+  TableDef,
+  Value,
+} from '@electric-lite/protocol'
+import { stream } from '@durable-streams/client'
 import { createStateSchema, createStreamDB } from '@durable-streams/state/db'
 import { createTRPCClient, httpBatchLink } from '@trpc/client'
 import { z } from 'zod'
@@ -10,6 +22,9 @@ import { z } from 'zod'
 import { createSubset, type SubsetSubscription } from './subset.js'
 
 export type { SubsetSubscription } from './subset.js'
+// LSN-positioning primitives (also unit-tested in subset.test.ts) — exported so integration tests can
+// exercise the real merge logic against the live engine.
+export { lsnToU64, mergeFeedDelta, type SubsetView, type MergeAction } from './subset.js'
 
 export interface ShapeHandle {
   shapeId: string
@@ -38,6 +53,16 @@ export interface TableApi {
   delete(pk: Value, txid?: string): Promise<{ txid: string }>
 }
 
+/** A live scalar aggregation (COUNT/SUM/AVG/MIN/MAX) maintained by the engine. */
+export interface AggregateSubscription {
+  /** Current aggregate value (null before the first value, or empty avg/min/max). */
+  value(): number | null
+  /** Count of rows matching the predicate (available for every aggregation). */
+  count(): number
+  subscribe(cb: (value: number | null) => void): () => void
+  close(): Promise<void>
+}
+
 export interface ElectricLiteClient {
   defineSchema(schema: Schema): Promise<unknown>
   write(input: { table: string; op: Op; pk: Value; row?: Row; txid?: string }): Promise<{ txid: string }>
@@ -58,6 +83,8 @@ export interface ElectricLiteClient {
    * never stores the page; a change is matched against one base predicate, never fanned across ranges.
    */
   subset(def: SubsetDef): Promise<SubsetSubscription>
+  /** Open a live scalar **aggregation** over a filtered set (electric-lite extension). */
+  aggregate(def: AggregateDef): Promise<AggregateSubscription>
   close(): Promise<void>
 }
 
@@ -87,7 +114,9 @@ export function createClient(opts: {
   liveMode?: boolean | 'sse' | 'long-poll'
 }): ElectricLiteClient {
   const trpc = createTRPCClient<AppRouter>({ links: [httpBatchLink({ url: opts.apiUrl })] })
-  const open: ShapeMaterialization[] = []
+  // Everything the client opens (shape materializations AND aggregate subscriptions) so `close()` can
+  // tear them all down — otherwise an aggregate's live stream leaks and blocks shutdown.
+  const open: { close: () => Promise<void> }[] = []
 
   const write = (input: { table: string; op: Op; pk: Value; row?: Row; txid?: string }) =>
     trpc.ingest.write.mutate(input)
@@ -173,6 +202,64 @@ export function createClient(opts: {
         },
         def,
       )
+    },
+
+    async aggregate(def) {
+      const handle = (await trpc.aggregate.create.mutate({
+        table: def.table,
+        where: def.where as never,
+        fn: def.fn,
+        col: def.col,
+      })) as ShapeHandle
+      const url = opts.dsBaseUrl
+        ? `${opts.dsBaseUrl.replace(/\/$/, '')}/${handle.streamPath}`
+        : handle.streamUrl
+      let current: number | null = null
+      let n = 0
+      const subs = new Set<(v: number | null) => void>()
+      const ac = new AbortController()
+      // The engine streams the running aggregate as `{ value, n }` envelopes (keyed "agg"); keep the latest.
+      void (async () => {
+        try {
+          const resp = await stream<StreamEnvelope>({
+            url,
+            offset: '-1',
+            live: opts.liveMode === true ? 'long-poll' : (opts.liveMode ?? 'long-poll'),
+            contentType: 'application/json',
+            signal: ac.signal,
+          })
+          for await (const env of resp.jsonStream()) {
+            const v = env.value as { value?: number | null; n?: number } | undefined
+            if (v && 'value' in v) {
+              current = (v.value ?? null) as number | null
+              n = v.n ?? 0
+              for (const cb of subs) cb(current)
+            }
+          }
+        } catch (e) {
+          if (!ac.signal.aborted) console.error('aggregate stream error', e)
+        }
+      })()
+      const sub: AggregateSubscription = {
+        value: () => current,
+        count: () => n,
+        subscribe: (cb) => {
+          subs.add(cb)
+          return () => {
+            subs.delete(cb)
+          }
+        },
+        close: async () => {
+          ac.abort()
+          try {
+            await trpc.shapes.delete.mutate({ id: handle.shapeId })
+          } catch {
+            /* best effort */
+          }
+        },
+      }
+      open.push(sub)
+      return sub
     },
 
     async close() {

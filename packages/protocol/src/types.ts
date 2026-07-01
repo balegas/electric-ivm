@@ -165,6 +165,20 @@ export interface SubsetResult {
   lsn: string
 }
 
+/** Scalar aggregation functions (an electric-lite extension — not part of the Electric protocol). */
+export type AggFn = 'count' | 'sum' | 'avg' | 'min' | 'max'
+
+/** A scalar aggregation over a filtered set, maintained incrementally by the engine and streamed as a
+ * single value that updates as rows enter/leave the predicate. `col` is required for all but `count`. */
+export interface AggregateDef {
+  table: string
+  /** Filter over the table's columns (no subqueries). Omitted = all rows. */
+  where?: Predicate
+  fn: AggFn
+  /** The column to aggregate — required for sum/avg/min/max, ignored for count. */
+  col?: string
+}
+
 // --- Change events (the unit on every stream) --------------------------------
 
 /**

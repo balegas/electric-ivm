@@ -17,13 +17,17 @@ export async function createApiServer(opts: {
   dsUrl: string
   engineUrl: string
   port?: number
+  /** Bind host. Default `127.0.0.1`; pass `0.0.0.0` to accept connections from other hosts/containers. */
+  host?: string
 }): Promise<ApiServer> {
   const core = createCore({ dsUrl: opts.dsUrl, engineUrl: opts.engineUrl })
   const server = createHTTPServer({ router: appRouter, createContext: () => ({ core }) })
-  await new Promise<void>((resolve) => server.listen(opts.port ?? 0, '127.0.0.1', () => resolve()))
+  const bind = opts.host ?? '127.0.0.1'
+  await new Promise<void>((resolve) => server.listen(opts.port ?? 0, bind, () => resolve()))
   const addr = server.address() as AddressInfo
+  const host = bind === '0.0.0.0' || bind === '::' ? '127.0.0.1' : bind
   return {
-    url: `http://127.0.0.1:${addr.port}`,
+    url: `http://${host}:${addr.port}`,
     core,
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   }

@@ -101,8 +101,16 @@ export function leaveProject(memberId: number) {
 }
 
 export function updateIssue(issue: Issue, patch: Partial<Issue>) {
-  const next = { ...issue, ...patch, modified: Date.now() }
-  void pgWrite({ table: 'issues', op: 'update', pk: issue.id, row: next })
+  // Send only the changed columns (a partial update). List/board rows sync a projected subset of
+  // columns (no `description`), so writing the whole row back would null the omitted columns.
+  void pgWrite({ table: 'issues', op: 'update', pk: issue.id, row: { ...patch, modified: Date.now() } })
+}
+
+/** Move an issue to another project. This changes the issue's **visibility** (the per-project subset
+ * feeds and the `project_id IN (SELECT …)` visibility subquery), so it live-moves in/out of members'
+ * views — a good demonstration of incremental move-in/move-out. */
+export function moveIssue(issue: Issue, projectId: number) {
+  updateIssue(issue, { project_id: projectId })
 }
 
 export function deleteIssue(id: number) {

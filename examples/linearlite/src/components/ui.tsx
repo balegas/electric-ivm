@@ -194,4 +194,37 @@ export function PriorityMenu({ value, onChange }: { value: Priority; onChange: (
   )
 }
 
+/** Pick the issue's project — moving an issue between projects changes its visibility (subquery + feeds). */
+export function ProjectMenu({
+  value,
+  projects,
+  onChange,
+}: {
+  value: number
+  projects: { id: number; name: string; color: string }[]
+  onChange: (projectId: number) => void
+}): JSX.Element {
+  const current = projects.find((p) => p.id === value)
+  return (
+    <Menu trigger={current ? <ProjectBadge project={current} /> : <span className="project-badge">— project —</span>}>
+      {(close) =>
+        projects.map((p) => (
+          <button
+            key={p.id}
+            type="button"
+            className={`menu-item ${p.id === value ? 'active' : ''}`}
+            onClick={(e) => {
+              e.stopPropagation()
+              onChange(p.id)
+              close()
+            }}
+          >
+            <span className="project-dot" style={{ background: p.color }} /> {p.name}
+          </button>
+        ))
+      }
+    </Menu>
+  )
+}
+
 export { PRIORITIES, STATUSES }

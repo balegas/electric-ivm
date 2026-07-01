@@ -118,6 +118,23 @@ export const appRouter = t.router({
         ctx.core.createSubsetFeed({ table: input.table, where: input.where as never, columns: input.columns }),
       ),
   }),
+
+  // Scalar aggregations (COUNT/SUM/AVG/MIN/MAX) over a filter — an electric-lite extension, maintained
+  // incrementally by the engine and streamed as a single live value.
+  aggregate: t.router({
+    create: t.procedure
+      .input(
+        z.object({
+          table: z.string(),
+          where: predicateSchema.optional(),
+          fn: z.enum(['count', 'sum', 'avg', 'min', 'max']),
+          col: z.string().optional(),
+        }),
+      )
+      .mutation(async ({ input, ctx }) =>
+        ctx.core.createAggregate({ table: input.table, where: input.where as never, fn: input.fn, col: input.col }),
+      ),
+  }),
 })
 
 export type AppRouter = typeof appRouter

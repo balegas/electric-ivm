@@ -246,7 +246,7 @@ async function runSize(size: number): Promise<{ samples: Sample[]; backfill: { r
     const m = await getMemory(engine.url)
     const { rss, virt, ...card } = m
     samples.push({ users, shapes, rssMib: rss / MIB, virtMib: virt / MIB, card })
-    process.stdout.write(`  users=${String(users).padStart(4)} shapes=${String(shapes).padStart(4)}  RSS=${(rss / MIB).toFixed(1)}MiB  sqNodes=${card.subquery_nodes} contributors=${card.subquery_contributors} families=${card.families}\n`)
+    process.stdout.write(`  users=${String(users).padStart(4)} requested=${String(shapes).padStart(4)} engineShapes=${String(card.shapes).padStart(4)}  RSS=${(rss / MIB).toFixed(1)}MiB  sqNodes=${card.subquery_nodes} contributors=${card.subquery_contributors} families=${card.families}\n`)
   }
 
   await sampleAt(0, 0) // baseline after init

@@ -217,7 +217,9 @@ async fn shape_inner(engine: Engine, mut p: ShapeParams) -> anyhow::Result<Respo
     // ---- Snapshot: offset=-1 (or no handle) -> create the shape and emit the current rows as inserts.
     if offset == "-1" || p.handle.is_none() {
         let pred = crate::where_sql::parse_where(p.where_.as_deref().unwrap_or(""))?;
-        let rec = engine.create_shape(&p.table, pred, columns.clone(), false).await?;
+        // share = false: the Electric handle model keys live cursor state by shape id per request, so
+        // each /v1/shape request needs its own shape (no id sharing).
+        let rec = engine.create_shape(&p.table, pred, columns.clone(), false, false).await?;
         let (rows, tail) = materialize(&engine, &rec.stream_path).await?;
 
         let mut messages = Vec::with_capacity(rows.len() + 1);

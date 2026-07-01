@@ -1,13 +1,13 @@
 import { useEffect, useState } from 'react'
 
 import { navigate } from '../App'
-import { addComment, type Comment, commentsShapeDef, deleteComment, deleteIssue, type Issue, updateIssue } from '../electric'
+import { addComment, type Comment, commentsShapeDef, deleteComment, deleteIssue, type Issue, moveIssue, updateIssue } from '../electric'
 import { useCurrentUser } from '../lib/CurrentUser'
 import { useShapeRows } from '../lib/useShape'
-import { Avatar, displayId, formatDate, PriorityMenu, ProjectBadge, StatusMenu } from './ui'
+import { Avatar, displayId, formatDate, PriorityMenu, ProjectMenu, StatusMenu } from './ui'
 
 export function IssueDetail({ id }: { id: number }): JSX.Element {
-  const { currentUserName, projectById } = useCurrentUser()
+  const { currentUserName, projects } = useCurrentUser()
   // Live single-issue shape + a live per-issue comments shape (created/closed with this view).
   const { rows: issues, loading } = useShapeRows<Issue>({ table: 'issues', where: { col: 'id', op: 'eq', value: id } })
   // Comments ordered oldest-first in the live query.
@@ -131,7 +131,7 @@ export function IssueDetail({ id }: { id: number }): JSX.Element {
           <div className="side-field">
             <span className="side-label">Project</span>
             <span className="side-value">
-              <ProjectBadge project={projectById.get(issue.project_id)} />
+              <ProjectMenu value={issue.project_id} projects={projects} onChange={(project_id) => moveIssue(issue, project_id)} />
             </span>
           </div>
           <div className="side-field">

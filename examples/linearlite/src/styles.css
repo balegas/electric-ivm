@@ -78,6 +78,9 @@ body {
   font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 999px;
   border: 1px solid currentColor; background: transparent; white-space: nowrap; flex: none;
 }
+.project-dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 999px; flex: none; margin-right: 2px;
+}
 .sidebar-footer { margin-top: auto; display: flex; flex-direction: column; gap: 4px; font-size: 11px; padding: 8px; }
 .sidebar-footer a { color: var(--muted); text-decoration: none; }
 .sidebar-footer a:hover { color: var(--accent); }
@@ -128,6 +131,9 @@ body {
 .menu-trigger:hover { background: var(--panel-2); }
 .menu-popover { position: absolute; top: calc(100% + 4px); left: 0; z-index: 20; background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 5px; min-width: 180px; box-shadow: 0 12px 32px rgba(0,0,0,0.4); }
 .menu-popover.wide { min-width: 220px; }
+/* Each virtualized row wrapper has its own transform-induced stacking context, so a row's open
+   popover would otherwise be painted under later rows. Elevate whichever row holds an open menu. */
+.issue-list-viewport [data-index]:has(.menu-popover) { z-index: 30; }
 .menu-item { display: flex; align-items: center; gap: 9px; width: 100%; text-align: left; background: transparent; border: none; color: var(--text); padding: 7px 9px; border-radius: 7px; cursor: pointer; font-size: 13.5px; }
 .menu-item:hover { background: var(--panel); }
 .menu-item.active { color: #fff; font-weight: 600; }

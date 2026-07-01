@@ -1,0 +1,27 @@
+{
+  "name": "@electric-lite/loadgen",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "el-loadgen": "src/run.ts"
+  },
+  "scripts": {
+    "loadgen": "tsx src/run.ts",
+    "sweep": "tsx src/sweep.ts"
+  },
+  "dependencies": {
+    "@durable-streams/server": "^0.3.7",
+    "@electric-lite/api": "workspace:*",
+    "@electric-lite/client": "workspace:*",
+    "@electric-lite/protocol": "workspace:*",
+    "@faker-js/faker": "^10.5.0",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

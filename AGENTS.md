@@ -15,13 +15,19 @@ shapes**; **durable streams** is the log between them; a TanStack-DB client mate
 | `packages/conformance` | The real test suite — engine vs an oracle, incl. live Postgres replication, fuzz, nulls, concurrency. |
 | `packages/oracle` | Reference implementation shapes are checked against. |
 | `packages/bench` | Throughput/memory benchmarks. |
+| `packages/loadgen` | Headless load generator: state-machine "users" drive the client for reads + Postgres for writes; boots/teardowns infra; samples engine RSS/CPU + PG/ds disk vs workload size (`src/run.ts`, `src/user.ts`, `src/infra.ts`, Docker in `docker/`). |
+| `apps/pipeline-viz` | Web GUI attached to a running engine — the shape/dbsp pipeline explorer. Two views (logical topology + raw dbsp operator circuit), node-click details incl. live indexes. Reads `GET /graph` + `GET /graph/node`. |
 | `examples/linearlite` | The flagship demo (LinearLite on electric-lite). `start.ts` boots the whole stack. |
+| `scripts/linearlite.sh` | All-inclusive control script: `start <size>` / `stop` / `status` for the demo at a chosen workload size (see **Running the stack**). |
 
 ## Docs (read these before designing)
 
-- `README.md` — the three-layer model + shape semantics. **Stale spot:** it still lists `orderBy + limit`
-  as a *shape* knob; that was reverted — ranges/limits now live only in **subset queries**, never shapes.
-- `docs/ARCHITECTURE.md` — system architecture.
+- `README.md` — the three-layer model + shape semantics.
+- `docs/ivm-engine-internals.md` — the **as-built** engine model (routing + stateless filters +
+  subquery registry) and the analytical cost model. Prefer this over `ARCHITECTURE.md` §4–§10.
+- `docs/shapes-and-subqueries-guide.md` — user/integrator guide: defining shapes/subqueries, setup, sizing.
+- `docs/ARCHITECTURE.md` — system architecture (note: §4–§5/§8/§10 describe the superseded
+  `table_state`/dbsp-circuit model, corrected in place by the blockquotes at its top).
 - `docs/deployment-postgres.md` — Postgres-as-source-of-record (slot, REPLICA IDENTITY, backfill).
 - `docs/superpowers/specs/` — design records, one per feature. Most relevant:
   - `2026-06-29-subset-queries-design.md` — **shapes vs subset queries** (the current pagination model).
@@ -35,8 +41,8 @@ New designs go in `docs/superpowers/specs/YYYY-MM-DD-<topic>-design.md` and get 
 
 ```bash
 pnpm engine:build          # cargo build -p electric-lite-engine
-pnpm engine:test           # cargo test  -p electric-lite-engine   (30 tests, fast)
-pnpm test                  # vitest run — full suite incl. conformance (103 tests, ~40s; spins up its own PG)
+pnpm engine:test           # cargo test  -p electric-lite-engine   (36 tests, fast)
+pnpm test                  # vitest run — full suite incl. conformance (114 tests, ~40s; spins up its own PG)
 pnpm test:conformance      # just the conformance package
 pnpm test:fuzz             # random-predicate fuzz vs oracle
 pnpm demo:linearlite       # boot the LinearLite demo (ephemeral PG + engine + ds + api + vite + caddy)
@@ -46,6 +52,45 @@ pnpm demo:linearlite       # boot the LinearLite demo (ephemeral PG + engine + d
 transpile-only). To check TS: run `pnpm test`, transpile-load a module with `npx tsx -e "import(...)"`,
 or have the running Vite server transform it (`curl localhost:5174/src/<file>` → 500 on error). Always
 run `pnpm engine:test` + `pnpm test` before claiming done.
+
+## Running the stack (workload sizes, explorer, load testing)
+
+**`scripts/linearlite.sh` — all-inclusive demo at a chosen workload size.** One command boots the whole
+stack (ephemeral PG + logical replication, durable-streams, engine, API, the LinearLite web UI, **and**
+the shape/dbsp pipeline explorer) and prints both URLs; another tears it all down cleanly (graceful
+`start.ts` shutdown that drops the slot + stops PG, then force-cleans remnants).
+
+```bash
+scripts/linearlite.sh start <size>   # size = small | medium | large | xlarge | <number-of-issues>
+scripts/linearlite.sh stop
+scripts/linearlite.sh status
+```
+
+The **workload size is a number of issues**; the seeded **users and projects scale with it** (users
+~√issues, projects ~users/2.5) — `small`=1k→8 users, `medium`=20k→35, `large`=100k→79, `xlarge`=500k→177.
+It sets `DEMO_SEED_COUNT` / `DEMO_USERS` / `DEMO_PROJECTS`; `start.ts` generates the roster (classic
+names first, faker beyond) and the app reads it back from the DB, so the "Viewing as" switcher adapts.
+The default `pnpm demo:linearlite` (no `DEMO_USERS`) is unchanged (6 users / classic memberships).
+It manages **one instance at a time** (its `stop` matches by process pattern + ports). Ports:
+`DEMO_HTTPS_PORT` (web UI, 8443), `DEMO_VIZ_PORT` (explorer, 5180), `DEMO_VIZ=0` to skip the explorer.
+
+**Demo env knobs** (`examples/linearlite/start.ts`): `DEMO_SEED_COUNT` (issues), `DEMO_USERS`,
+`DEMO_PROJECTS`, `DEMO_HTTPS`/`DEMO_HTTPS_PORT` (Caddy), `DEMO_VIZ`/`DEMO_VIZ_PORT` (pipeline explorer).
+
+**`packages/loadgen` — observe memory/CPU/disk vs workload.** Headless state-machine users drive the
+real client for reads (subset feeds + COUNT aggregation + board subquery-shapes) and write to Postgres.
+Boots/tears down its own infra, samples metrics → CSV + summary.
+
+```bash
+USERS=100 SEED_ISSUES=20000 DURATION_S=90 pnpm --filter @electric-lite/loadgen loadgen  # single run
+SWEEP_USERS=10,50,150 pnpm --filter @electric-lite/loadgen sweep                        # comparison table
+```
+
+Modes: `all` (self-contained), `infra` (boot + keep + sample; for docker clients), `client` (connect to
+an existing infra + run users). Docker scales client "nodes" (`packages/loadgen/docker/`). Connection
+budget ≈ `USERS × FEEDS_PER_USER`; it checks `ulimit -n`. Use `DS_MEMORY=1` for high concurrency (the
+file-backed durable-streams fsync-per-append is the bottleneck at scale, not the engine). See
+`packages/loadgen/README.md`.
 
 ## Conventions
 
@@ -114,7 +159,23 @@ run `pnpm engine:test` + `pnpm test` before claiming done.
 - **Vite binds IPv6 `[::1]:5174` only.** `http://localhost:5174` can fail to resolve to it; prefer the
   **`https://localhost:8443`** Caddy proxy (HTTP/2 — also dodges the browser's ~6-connection HTTP/1.1
   cap that freezes multi-stream apps). `DEMO_HTTPS=0` disables the proxy. Caddy's local CA is trusted.
-- **Reverting code ≠ reverting docs.** When you revert a feature, realign README/specs in the same pass
-  (the README's orderBy/limit paragraph is the current casualty).
+- **Reverting code ≠ reverting docs.** When you revert a feature, realign README/specs in the same pass.
+  (The README's old orderBy/limit-as-a-shape-knob paragraph was one such casualty — now fixed.)
 - **Verify against the live stack, not just types.** A headless `tsx` script driving the real
   `client.subset()` against a running demo caught behavior the (absent) typechecker never could.
+- **Under load the durable-streams *test server* is the ceiling, not the engine.** In loadgen runs the
+  engine stayed ~30–48 MB RSS / <1 core even at ~180 concurrent users, while the single-process ds
+  server saturated: file-backed mode fsyncs every append (throttles shape creation → the ramp crawls),
+  and even in-memory an aggressive ramp burst gives `ECONNRESET` on appends. Mitigate with `DS_MEMORY=1`
+  + a staggered ramp; the real fix for scale is a production durable-streams backend (matches
+  `ARCHITECTURE.md §9`: storage-bound, not engine-bound). Open finding: under heavy subset/board
+  open-close churn, engine shape count grows over time at a *fixed* user count (drops lag creates —
+  likely the shared changes-only feed refcount or client `subset.close → shapes.delete`); memory impact
+  is tiny (~0.8 KB/shape) but it's a real leak worth fixing.
+- **One ephemeral demo at a time — teardown is pattern-based.** `scripts/linearlite.sh stop` and the
+  manual `pkill -f "start.ts"` / `pgrep -f el-linearlite-pg` cleanups match *all* demos. If two are
+  running (e.g. a load test beside a live demo), scope kills precisely: identify a demo's `start.ts` by
+  the parent of its Caddy (`ps -o ppid= -p $(lsof -ti :<httpsPort>)`) or its `DEMO_HTTPS_PORT` env, and
+  `SIGTERM` that pid so its own `shutdown()` drops the slot + `pg_ctl -m immediate` stops PG. A
+  SIGKILL/premature force-kill mid-shutdown leaks the ephemeral Postgres (postmaster ignores plain
+  SIGTERM while a client is attached).

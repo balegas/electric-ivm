@@ -59,7 +59,7 @@ function bootEphemeralPg(): string {
   let port = 0
   for (let attempt = 0; attempt < 8; attempt++) {
     port = 55000 + Math.floor(Math.random() * 4000)
-    execFileSync('bash', ['-c', `printf '\\nwal_level=logical\\nmax_replication_slots=10\\nmax_wal_senders=10\\nmax_connections=500\\nlisten_addresses=\\047127.0.0.1\\047\\nunix_socket_directories=\\047/tmp\\047\\nport=${port}\\nfsync=off\\n' >> ${pgData}/postgresql.conf`])
+    execFileSync('bash', ['-c', `printf '\\nwal_level=logical\\nmax_replication_slots=10\\nmax_wal_senders=10\\nmax_connections=1200\\nlisten_addresses=\\047127.0.0.1\\047\\nunix_socket_directories=\\047/tmp\\047\\nport=${port}\\nfsync=off\\n' >> ${pgData}/postgresql.conf`])
     try {
       execFileSync('pg_ctl', ['-D', pgData, '-l', join(pgDir, 'log'), '-w', 'start'], { stdio: 'ignore' })
       return `postgres://postgres@127.0.0.1:${port}/postgres`

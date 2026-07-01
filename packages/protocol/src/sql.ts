@@ -95,6 +95,19 @@ export function changeEventToDML(name: string, def: TableDef, ev: ChangeEvent): 
   }
   if (!ev.row) throw new Error(`change event op="${ev.op}" requires a row`)
   const columns = Object.keys(def.columns)
+  // A *partial* update (the row omits some columns — e.g. a projected list view that never synced
+  // `description`) becomes a plain UPDATE of only the provided columns, so the omitted ones aren't
+  // clobbered to NULL. A *full* row falls through to the upsert below, preserving Electric's semantics
+  // that an "update" carrying an as-yet-unseen pk inserts the row (a partial upsert can't — Postgres
+  // checks NOT NULL on the proposed insert tuple before conflict resolution).
+  if (ev.op === 'update' && !columns.every((c) => c in ev.row!)) {
+    const cols = columns.filter((c) => c !== pk && c in ev.row!)
+    if (cols.length === 0) return { text: `SELECT 1`, params: [] }
+    const set = cols.map((c, i) => `${q(c)} = $${i + 1}`)
+    const params: Value[] = cols.map((c) => ev.row![c] ?? null)
+    params.push(ev.pk)
+    return { text: `UPDATE ${q(name)} SET ${set.join(', ')} WHERE ${q(pk)} = $${cols.length + 1}`, params }
+  }
   const params: Value[] = columns.map((c) => ev.row![c] ?? null)
   const placeholders = columns.map((_, i) => `$${i + 1}`)
   const updates = columns

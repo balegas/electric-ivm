@@ -3,6 +3,7 @@
 // tails it). Schema definition and shape lifecycle are forwarded to the Rust engine.
 
 import {
+  type AggregateDef,
   type Op,
   type Row,
   type Schema,
@@ -45,6 +46,9 @@ export interface ElectricCore {
    * feed's deltas, re-checking view membership — so paging never becomes server-side range state.
    */
   createSubsetFeed(def: Pick<SubsetDef, 'table' | 'where' | 'columns'>): Promise<ShapeHandle>
+  /** Register a scalar **aggregation** (COUNT/SUM/AVG/MIN/MAX) over a filter — an electric-lite
+   * extension (not in the Electric protocol). Streams a single value maintained incrementally. */
+  createAggregate(def: AggregateDef): Promise<ShapeHandle>
 }
 
 export interface CoreOptions {
@@ -116,6 +120,13 @@ export function createCore(opts: CoreOptions): ElectricCore {
           columns: def.columns ?? null,
           changesOnly: true,
         }),
+      })
+    },
+
+    async createAggregate(def) {
+      return engineJson<ShapeHandle>('/aggregate', {
+        method: 'POST',
+        body: JSON.stringify({ table: def.table, where: def.where ?? null, fn: def.fn, col: def.col ?? null }),
       })
     },
 

@@ -2,12 +2,12 @@
 //! compiled to a positional evaluator captured by a dbsp `filter` closure.
 
 use anyhow::Result;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::schema::TableSchema;
 use crate::value::{Row, Value};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LeafOp {
     Eq,
@@ -23,7 +23,7 @@ pub enum LeafOp {
 
 /// Inner subquery reference: `(SELECT project FROM table WHERE where)`. `where` may itself contain
 /// `In` leaves (nested subqueries). Single column only.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SubqueryJson {
     pub table: String,
     pub project: String,
@@ -33,7 +33,7 @@ pub struct SubqueryJson {
 
 /// JSON predicate shape: a leaf `{col,op,value}`, a combinator `{and|or:[...]}` / `{not:{}}`, or a
 /// subquery leaf `{col, in:{table,project,where?}, negated?}`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum PredicateJson {
     Leaf { col: String, op: LeafOp, value: serde_json::Value },
