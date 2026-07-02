@@ -106,6 +106,10 @@ export interface Harness {
 export interface BootOptions {
   /** TEST-ONLY: inject an engine fault (e.g. 'drop_deletes', 'off_by_one_cmp') for negative controls. */
   fault?: string
+  /** TEST-ONLY: raw DDL run (before the engine starts) INSTEAD of createPgTables — for exercising real
+   * Postgres column types the coarse protocol Schema can't express (e.g. `uuid`). Must create every
+   * table in `schema` with `REPLICA IDENTITY FULL`. */
+  ddl?: string
 }
 
 function adminUrl(): string {
@@ -182,8 +186,15 @@ export async function bootHarness(schema: Schema, opts: BootOptions = {}): Promi
 
   try {
     // Create the tables (with REPLICA IDENTITY FULL) before the engine starts so its startup
-    // introspection + slot creation see them.
-    await createPgTables(pgUrl, schema)
+    // introspection + slot creation see them. `opts.ddl` overrides for real column types (e.g. uuid).
+    if (opts.ddl) {
+      const d = new pgpkg.Client({ connectionString: pgUrl })
+      await d.connect()
+      await d.query(opts.ddl)
+      await d.end()
+    } else {
+      await createPgTables(pgUrl, schema)
+    }
     // Drain-barrier sentinel: a single-row counter table the replicator decodes (but does not treat
     // as a data table). drainEngine bumps it and waits for the engine to report it (see drainEngine).
     const c = new pgpkg.Client({ connectionString: pgUrl })

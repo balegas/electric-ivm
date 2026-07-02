@@ -1,26 +1,40 @@
 // Params conformance: `GET /v1/shape` with a subquery `where` + `params` (the benchmarking-fleet's
 // load_generator_subqueries form, e.g. `project_id IN (SELECT id FROM projects WHERE owner_id = $1)`).
-// The engine substitutes `$N` from `params` before parsing, so the backfill returns exactly the rows
-// matching the substituted predicate. Asserts correct rows for two different param values (proving
-// distinct params never collide onto one shape) and the Electric-style 400s.
+// Uses real UUID columns like the fleet's issue_tracker schema (uuid PK + uuid FK) — the exact case
+// that 500'd ("cannot convert String -> uuid") before the backfill bound params as `col::text = $n`.
+// Asserts correct rows for two param values (proving distinct params never collide onto one shape),
+// a nested/depth-2 subquery hitting a second table's backfill, and the Electric-style 400s.
 
 import type { Schema } from '@electric-ivm/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { applyOp, bootHarness, drainEngine, type Harness } from './harness.js'
 
+// The engine coarsens uuid -> text on introspection, so the protocol schema declares these as text;
+// the real Postgres columns are uuid (created by the ddl below), which is what triggered the bug.
 const schema: Schema = {
   tables: {
     projects: { columns: { id: { type: 'text' }, owner_id: { type: 'text' } }, primaryKey: 'id' },
     issues: { columns: { id: { type: 'text' }, project_id: { type: 'text' } }, primaryKey: 'id' },
+    comments: { columns: { id: { type: 'text' }, issue_id: { type: 'text' } }, primaryKey: 'id' },
   },
 }
 
-/** Fetch a snapshot from /v1/shape and return the inserted row keys, sorted. */
+const ddl = `
+  CREATE TABLE projects (id uuid PRIMARY KEY, owner_id uuid NOT NULL);
+  ALTER TABLE projects REPLICA IDENTITY FULL;
+  CREATE TABLE issues (id uuid PRIMARY KEY, project_id uuid NOT NULL REFERENCES projects(id));
+  ALTER TABLE issues REPLICA IDENTITY FULL;
+  CREATE TABLE comments (id uuid PRIMARY KEY, issue_id uuid NOT NULL REFERENCES issues(id));
+  ALTER TABLE comments REPLICA IDENTITY FULL;
+`
+
+const uuid = () => crypto.randomUUID()
+
 async function shapeKeys(engineUrl: string, params: Record<string, string>): Promise<string[]> {
   const q = new URLSearchParams(params)
   const res = await fetch(`${engineUrl}/v1/shape?${q.toString()}`)
   if (res.status !== 200) throw new Error(`expected 200, got ${res.status}: ${await res.text()}`)
-  const msgs = (await res.json()) as Array<{ headers: { operation?: string; control?: string }; key?: string }>
+  const msgs = (await res.json()) as Array<{ headers: { operation?: string }; key?: string }>
   return msgs
     .filter((m) => m.headers.operation === 'insert')
     .map((m) => m.key as string)
@@ -34,18 +48,36 @@ async function shapeStatus(engineUrl: string, params: Record<string, string>): P
   return { status: res.status, message: body.message }
 }
 
-const WHERE = 'project_id IN (SELECT id FROM projects WHERE owner_id = $1)'
+// owners u1,u2; projects p1,p3 -> u1, p2 -> u2; issues fan across projects; comments on issues.
+const u1 = uuid()
+const u2 = uuid()
+const p1 = uuid()
+const p2 = uuid()
+const p3 = uuid()
+const i1 = uuid()
+const i2 = uuid()
+const i3 = uuid()
+const i4 = uuid()
+const c1 = uuid()
+const c2 = uuid()
+const c3 = uuid()
 
-describe('conformance: /v1/shape params ($N substitution)', () => {
+const SUB = 'project_id IN (SELECT id FROM projects WHERE owner_id = $1)'
+const NESTED = 'issue_id IN (SELECT id FROM issues WHERE project_id IN (SELECT id FROM projects WHERE owner_id = $1))'
+
+describe('conformance: /v1/shape params over uuid columns', () => {
   let h: Harness
   beforeAll(async () => {
-    h = await bootHarness(schema)
-    // projects p1,p3 owned by u1; p2 owned by u2. issues fan across them.
-    for (const [id, owner_id] of [['p1', 'u1'], ['p2', 'u2'], ['p3', 'u1']] as const) {
+    h = await bootHarness(schema, { ddl })
+    for (const [id, owner_id] of [[p1, u1], [p2, u2], [p3, u1]] as const) {
       await applyOp(h, 'projects', { op: 'insert', pk: id, row: { id, owner_id } })
     }
-    for (const [id, project_id] of [['i1', 'p1'], ['i2', 'p2'], ['i3', 'p3'], ['i4', 'p2']] as const) {
+    for (const [id, project_id] of [[i1, p1], [i2, p2], [i3, p3], [i4, p2]] as const) {
       await applyOp(h, 'issues', { op: 'insert', pk: id, row: { id, project_id } })
+    }
+    // comments c1,c2 on issues of u1's projects (i1,i3); c3 on i2 (u2's).
+    for (const [id, issue_id] of [[c1, i1], [c2, i3], [c3, i2]] as const) {
+      await applyOp(h, 'comments', { op: 'insert', pk: id, row: { id, issue_id } })
     }
     await drainEngine(h)
   }, 60000)
@@ -53,31 +85,36 @@ describe('conformance: /v1/shape params ($N substitution)', () => {
     await h?.shutdown()
   })
 
-  it('returns exactly the rows matching the substituted subquery param', async () => {
+  it('returns rows (not 500) for a uuid subquery param', async () => {
     // owner u1 -> projects p1,p3 -> issues i1,i3.
-    const u1 = await shapeKeys(h.engineUrl, { table: 'issues', offset: '-1', where: WHERE, 'params[1]': 'u1' })
-    expect(u1).toEqual(['i1', 'i3'])
+    const rows = await shapeKeys(h.engineUrl, { table: 'issues', offset: '-1', where: SUB, 'params[1]': u1 })
+    expect(rows).toEqual([i1, i3].sort())
   })
 
   it('distinct param values yield distinct row sets (no collision)', async () => {
-    // owner u2 -> project p2 -> issues i2,i4. Same where string, different param value.
-    const u2 = await shapeKeys(h.engineUrl, { table: 'issues', offset: '-1', where: WHERE, 'params[1]': 'u2' })
-    expect(u2).toEqual(['i2', 'i4'])
+    const rows = await shapeKeys(h.engineUrl, { table: 'issues', offset: '-1', where: SUB, 'params[1]': u2 })
+    expect(rows).toEqual([i2, i4].sort())
   })
 
-  it('accepts the JSON params form too', async () => {
-    const u1 = await shapeKeys(h.engineUrl, { table: 'issues', offset: '-1', where: WHERE, params: '{"1":"u1"}' })
-    expect(u1).toEqual(['i1', 'i3'])
+  it('nested/depth-2 subquery hits a second table backfill', async () => {
+    // comments whose issue belongs to a project owned by u1 -> c1 (i1), c2 (i3).
+    const rows = await shapeKeys(h.engineUrl, { table: 'comments', offset: '-1', where: NESTED, 'params[1]': u1 })
+    expect(rows).toEqual([c1, c2].sort())
+  })
+
+  it('accepts the JSON params form', async () => {
+    const rows = await shapeKeys(h.engineUrl, { table: 'issues', offset: '-1', where: SUB, params: JSON.stringify({ 1: u1 }) })
+    expect(rows).toEqual([i1, i3].sort())
   })
 
   it('400s when a referenced $N has no param', async () => {
-    const r = await shapeStatus(h.engineUrl, { table: 'issues', offset: '-1', where: WHERE })
+    const r = await shapeStatus(h.engineUrl, { table: 'issues', offset: '-1', where: SUB })
     expect(r.status).toBe(400)
     expect(r.message).toContain('parameter $1 was not provided')
   })
 
   it('400s on non-sequential param keys', async () => {
-    const r = await shapeStatus(h.engineUrl, { table: 'issues', offset: '-1', where: WHERE, 'params[2]': 'u1' })
+    const r = await shapeStatus(h.engineUrl, { table: 'issues', offset: '-1', where: SUB, 'params[2]': u1 })
     expect(r.status).toBe(400)
     expect(r.message).toContain('Parameters must be numbered sequentially')
   })

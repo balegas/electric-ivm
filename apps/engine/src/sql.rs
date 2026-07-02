@@ -53,8 +53,14 @@ fn build(p: &CompiledPredicate, ts: &TableSchema, params: &mut Vec<String>) -> S
                 Value::Float(f) => format!("{name} {o} {}", f.0),
                 Value::Bool(b) => format!("{name} {o} {}", if *b { "true" } else { "false" }),
                 Value::Text(s) => {
+                    // Bind text as a `$n` param, but compare the column cast to text. Our schema
+                    // coarsens uuid/timestamptz/… to `Text`, so the real Postgres column may be uuid;
+                    // binding a Rust `String` against a uuid param is refused by tokio-postgres
+                    // (`cannot convert String -> uuid`). `col::text = $n` forces the param to bind as
+                    // text and compares as text — consistent with how the engine already models these
+                    // columns (backfill projects them `::text`, replication reads text_decoding text).
                     params.push(s.clone());
-                    format!("{name} {o} ${}", params.len())
+                    format!("{name}::text {o} ${}", params.len())
                 }
             }
         }
@@ -108,13 +114,15 @@ fn build_json(p: &PredicateJson, start: usize, params: &mut Vec<String>) -> Stri
                 serde_json::Value::Bool(b) => format!("{name} {o} {}", if *b { "true" } else { "false" }),
                 serde_json::Value::Number(n) => format!("{name} {o} {n}"),
                 serde_json::Value::String(s) => {
+                    // See the `Value::Text` note in `build`: `col::text = $n` so the param binds as
+                    // text (works whether the real column is text or uuid/timestamptz/…).
                     params.push(s.clone());
-                    format!("{name} {o} ${}", start + params.len() - 1)
+                    format!("{name}::text {o} ${}", start + params.len() - 1)
                 }
                 other => {
                     // Arrays/objects are not valid leaf literals; stringify defensively as a param.
                     params.push(other.to_string());
-                    format!("{name} {o} ${}", start + params.len() - 1)
+                    format!("{name}::text {o} ${}", start + params.len() - 1)
                 }
             }
         }
@@ -183,7 +191,7 @@ mod tests {
     #[test]
     fn leaf_text_is_parameterized() {
         let (w, p) = sql(serde_json::json!({"col": "name", "op": "eq", "value": "Alice"}));
-        assert_eq!(w, r#""name" = $1"#);
+        assert_eq!(w, r#""name"::text = $1"#);
         assert_eq!(p, vec!["Alice".to_string()]);
     }
 
@@ -205,7 +213,7 @@ mod tests {
                 { "not": { "col": "active", "op": "eq", "value": false } }
             ]
         }));
-        assert_eq!(w, r#"("name" = $1 AND ("id" > 5 OR "name" = $2) AND (NOT "active" = false))"#);
+        assert_eq!(w, r#"("name"::text = $1 AND ("id" > 5 OR "name"::text = $2) AND (NOT "active" = false))"#);
         assert_eq!(p, vec!["a".to_string(), "b".to_string()]);
     }
 
@@ -230,7 +238,7 @@ mod tests {
             "col": "pid", "negated": true,
             "in": { "table": "p", "project": "id", "where": { "col": "name", "op": "eq", "value": "x" } }
         }));
-        assert_eq!(w, r#""pid" NOT IN (SELECT "id" FROM "p" WHERE "name" = $1)"#);
+        assert_eq!(w, r#""pid" NOT IN (SELECT "id" FROM "p" WHERE "name"::text = $1)"#);
         assert_eq!(p, vec!["x".to_string()]);
     }
 
@@ -245,7 +253,7 @@ mod tests {
         }));
         assert_eq!(
             w,
-            r#"("tag" = $1 AND "l3" IN (SELECT "id" FROM "level_3" WHERE "l2" IN (SELECT "id" FROM "level_2" WHERE "name" = $2)))"#
+            r#"("tag"::text = $1 AND "l3" IN (SELECT "id" FROM "level_3" WHERE "l2" IN (SELECT "id" FROM "level_2" WHERE "name"::text = $2)))"#
         );
         assert_eq!(p, vec!["a".to_string(), "b".to_string()]);
     }
@@ -254,7 +262,7 @@ mod tests {
     fn text_value_with_quote_is_a_param_not_inlined() {
         // Injection-style input stays a bound parameter (no inlining), so it can't break the SQL.
         let (w, p) = sql(serde_json::json!({"col": "name", "op": "eq", "value": "x'); DROP TABLE users;--"}));
-        assert_eq!(w, r#""name" = $1"#);
+        assert_eq!(w, r#""name"::text = $1"#);
         assert_eq!(p, vec!["x'); DROP TABLE users;--".to_string()]);
     }
 }
