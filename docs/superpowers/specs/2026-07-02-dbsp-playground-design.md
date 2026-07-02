@@ -155,3 +155,26 @@ Layout (one consistent screen; scenes change focus, not chrome):
   `pnpm demo:playground` script in the style of `demo:linearlite`.
 - Hosted: one Fly machine running Postgres, engine, and the playground server serving built
   assets. Operator wipe = reset DB + bump epoch; clients self-heal.
+
+---
+
+# v2 — Shape-API-first rebuild (2026-07-02, post colleague review)
+
+Review findings: the food-delivery app layer obscured the sync lesson (app data model mixed into
+the graph), latency made unacknowledged buttons feel broken, and the workspace concept front-loaded
+complexity. Core insight to preserve: **creating a shape and watching the graph change**.
+
+## Revised decisions
+
+| Decision | Choice |
+| --- | --- |
+| Domain | **Issue tracker**: `issues(id, workspace_id, title, status: todo/in_progress/done, priority 1–4, project_id)` + `projects(id, workspace_id, name, team)`. Matches the README/linearlite narrative. |
+| App layer | **Dropped.** No device cards / verbs / domain chrome. Left panel = plain editable data grids (issues, projects) whose cell edits are the writes. |
+| Primary interaction | **Shape composer** (create shape: table, WHERE builder, optional IN-subquery, optional aggregate) + per-shape **API request shown** (`POST /shapes` body). Scenes pre-create their shapes; the composer is always available. |
+| Right panel | **Live results**: one card per shape — scrubbed predicate, live result table (or scalar), collapsible API request. |
+| Workspaces | **Silent**: server scoping unchanged (`AND workspace_id = $ws` everywhere), but the UI strips the conjunct from every displayed predicate/key, hides the workspace chip, and hides foreign trace pulses. An **“under the hood”** toggle reveals the real predicates, the shared ×N badges, and foreign pulses — multi-tenancy becomes an advanced lesson instead of scene 1. |
+| Scenes | Slower, one concept each: 0 Start here · 1 Your first shape (todo issues) · 2 Deltas & drops · 3 Shapes share machinery · 4 Subqueries (issues in team’s projects; move a project between teams) · 5 Live aggregations · 6 Subset queries. dbsp-view alternative explainers kept. |
+| Feedback | Buttons/cells acknowledge instantly (pressed state, in-flight spinner, disabled during round-trip) — no optimistic engine results. |
+
+Unchanged: engine `/trace`, playground server architecture (workspaces, epoch reset, caps, rate
+limits, trace fan-out tagging), scenes idempotency, canvas + detail panel + animation, deployment.
