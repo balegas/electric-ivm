@@ -18,7 +18,9 @@
 //!   same response (write-fanout: N clients long-poll one handle at one offset — serializing them behind
 //!   the mutex would hand each a full long-poll timeout in turn). A live request keeps re-polling the
 //!   ds stream until data arrives or `ELECTRIC_LIVE_TIMEOUT_MS` (default 20000, Electric-like ~20s)
-//!   elapses, then returns `204` — the deadline is decoupled from the ds server's own long-poll timeout.
+//!   elapses, then returns `204`. Every individual ds poll is bounded by the *remaining* deadline
+//!   (`poll_live_until`): the ds server's own long-poll window can exceed ours, and an idle stream
+//!   must still produce the 204 on time.
 //! - Handles are evicted after sitting idle for `ELECTRIC_HANDLE_TTL` seconds (default 600): the engine
 //!   shape and its durable stream are dropped, and a late request on the evicted handle gets the
 //!   standard `409 must-refetch` (the client re-snapshots). Without this every initial `GET` leaks a
@@ -522,10 +524,48 @@ where
     }
 }
 
+/// The live polling loop: repeatedly `read(from)` until a page carries envelopes or `deadline`
+/// elapses. Each poll is bounded by the **remaining** deadline — the ds server holds an idle
+/// long-poll far longer than our window, so an unbounded read would blow straight through the
+/// deadline (observed: idle `live=true` requests hanging >60s instead of 204 at ~20s). On expiry
+/// the last empty page is returned so a `next_offset` advanced past empty pages is preserved;
+/// expiry mid-poll (no page yet) yields an offset-less empty result, leaving the handle offset
+/// unchanged.
+async fn poll_live_until<F, Fut, E>(
+    mut from: String,
+    deadline: Instant,
+    mut read: F,
+) -> Result<ReadResult, E>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<ReadResult, E>>,
+{
+    let mut last = ReadResult { envelopes: Vec::new(), next_offset: None, up_to_date: false };
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(last);
+        }
+        match tokio::time::timeout(remaining, read(from.clone())).await {
+            Err(_elapsed) => return Ok(last),
+            Ok(page) => {
+                let page = page?;
+                if !page.envelopes.is_empty() {
+                    return Ok(page);
+                }
+                if let Some(n) = &page.next_offset {
+                    from = n.clone();
+                }
+                last = page;
+            }
+        }
+    }
+}
+
 /// The serialized (per-handle state mutex) resync+read+apply path shared by non-live requests and the
 /// live leader. Holds the state mutex across the whole read loop so only one request mutates
-/// [`HandleState`]; for `live`, keeps re-polling the ds stream until data arrives or [`live_timeout`]
-/// elapses (the ds server's own long-poll timeout just paces the loop).
+/// [`HandleState`]; for `live`, keeps re-polling the ds stream via [`poll_live_until`] until data
+/// arrives or [`live_timeout`] elapses, every poll bounded by the remaining deadline.
 async fn positioned_read(
     engine: &Engine,
     entry: &HandleEntry,
@@ -540,17 +580,20 @@ async fn positioned_read(
         st.keys = keys_as_of(engine, &entry.stream_path, offset).await?;
         st.offset = offset.to_string();
     }
-    let mut from = offset.to_string();
-    let mut r = engine.read_shape_stream(&entry.stream_path, &from, live).await?;
-    if live {
+    let from = offset.to_string();
+    let r = if live {
         let deadline = Instant::now() + live_timeout();
-        while r.envelopes.is_empty() && Instant::now() < deadline {
-            if let Some(n) = &r.next_offset {
-                from = n.clone();
-            }
-            r = engine.read_shape_stream(&entry.stream_path, &from, true).await?;
-        }
-    }
+        let read_engine = engine.clone();
+        let path = entry.stream_path.clone();
+        poll_live_until(from, deadline, move |f| {
+            let engine = read_engine.clone();
+            let path = path.clone();
+            async move { engine.read_shape_stream(&path, &f, true).await }
+        })
+        .await?
+    } else {
+        engine.read_shape_stream(&entry.stream_path, &from, false).await?
+    };
 
     if let Some(n) = &r.next_offset {
         st.offset = n.clone();
@@ -814,6 +857,65 @@ mod tests {
         fold.apply_page(page(vec![], "01", false));
         assert!(fold.done);
         assert_eq!(fold.offset, "01");
+    }
+
+    // The idle-live-poll bug: the ds server holds an idle long-poll far longer than our live
+    // deadline, so each poll must be bounded by the *remaining* deadline or the 204 never fires
+    // (observed in-container: idle live requests hung >60s instead of 204 at ~20s).
+    #[tokio::test(start_paused = true)]
+    async fn live_poll_deadline_fires_through_hanging_read() {
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let r = poll_live_until("00".into(), deadline, |_from| async {
+            // Simulates the ds server parking an idle long-poll indefinitely.
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            Ok::<ReadResult, ()>(page(vec![], "01", false))
+        })
+        .await
+        .unwrap();
+        assert!(r.envelopes.is_empty());
+        assert_eq!(r.next_offset, None, "mid-poll expiry must not advance the offset");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_poll_returns_data_before_deadline() {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let r = poll_live_until("00".into(), deadline, |_from| async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok::<ReadResult, ()>(page(vec![env("upsert", "k1", "01")], "01", false))
+        })
+        .await
+        .unwrap();
+        assert_eq!(r.envelopes.len(), 1, "data arriving before the deadline must be served");
+        assert_eq!(r.next_offset.as_deref(), Some("01"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_poll_deadline_after_empty_pages_keeps_advanced_offset() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let c = calls.clone();
+        let r = poll_live_until("00".into(), deadline, move |from| {
+            let c = c.clone();
+            async move {
+                if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                    assert_eq!(from, "00");
+                    // Empty page but the offset advanced (e.g. skipped envelopes) — not data.
+                    Ok::<ReadResult, ()>(page(vec![], "05", false))
+                } else {
+                    assert_eq!(from, "05", "later polls must resume from the advanced offset");
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    Ok(page(vec![], "06", false))
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(r.envelopes.is_empty());
+        assert_eq!(
+            r.next_offset.as_deref(),
+            Some("05"),
+            "the last empty page's offset must survive to the 204 so the client resumes past it"
+        );
     }
 
     // C2: rebuilding the key set as of the client's *requested* offset (not the tail).

@@ -56,3 +56,5 @@ prometheus = "0.13"
 [dev-dependencies]
 # Drive the axum router in-process (Service::oneshot) for the /v1/health + endpoint tests.
 tower = { version = "0.5", features = ["util"] }
+# start_paused tests for the live long-poll deadline (deterministic virtual time).
+tokio = { version = "1", features = ["full", "test-util"] }
