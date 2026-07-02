@@ -124,7 +124,7 @@ export default function App() {
         </aside>
       </div>
 
-      <SceneStrip scene={scene} onScene={enterScene} />
+      <SceneStrip scene={scene} view={view} onScene={enterScene} />
 
       {welcomeOpen ? (
         <Welcome

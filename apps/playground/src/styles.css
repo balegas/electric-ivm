@@ -577,6 +577,19 @@ button {
   max-width: 1100px;
   font-size: 12.5px;
 }
+.scene-view-tag {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #c4b5fd;
+  border: 1px solid #4c1d95;
+  background: #2e1065;
+  border-radius: 999px;
+  padding: 1px 8px;
+  margin-bottom: 4px;
+}
 .scene-try {
   display: flex;
   gap: 8px;

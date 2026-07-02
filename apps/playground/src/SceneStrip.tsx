@@ -12,9 +12,19 @@ export function currentScene(): number {
   return Number(localStorage.getItem(SCENE_KEY) ?? 0)
 }
 
-export function SceneStrip({ scene, onScene }: { scene: number; onScene: (n: number) => void }) {
+export function SceneStrip({
+  scene,
+  view,
+  onScene,
+}: {
+  scene: number
+  /** Current canvas view — the dbsp-circuit view swaps in each scene's operator-level explainer. */
+  view: 'logical' | 'dbsp'
+  onScene: (n: number) => void
+}) {
   const [open, setOpen] = useState(true)
   const def = SCENES.find((s) => s.n === scene)
+  const text = view === 'dbsp' && def?.dbsp ? def.dbsp : def?.body
   return (
     <div className={`scenes${open ? '' : ' scenes-closed'}`}>
       <div className="scenes-tabs">
@@ -35,9 +45,10 @@ export function SceneStrip({ scene, onScene }: { scene: number; onScene: (n: num
           {open ? '▾' : '▴'}
         </button>
       </div>
-      {open && def ? (
+      {open && def && text ? (
         <div className="scene-card">
-          {def.body.split('\n\n').map((p, i) => (
+          {view === 'dbsp' && def.dbsp ? <span className="scene-view-tag">dbsp circuit view</span> : null}
+          {text.split('\n\n').map((p, i) => (
             <p key={i} className="scene-body">
               {p}
             </p>
