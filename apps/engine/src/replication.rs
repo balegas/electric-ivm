@@ -522,9 +522,9 @@ mod tests {
 
     fn users() -> HashMap<String, TableSchema> {
         let mut columns = BTreeMap::new();
-        columns.insert("id".to_string(), ColumnDef { ty: ColumnType::Int });
-        columns.insert("tenant".to_string(), ColumnDef { ty: ColumnType::Int });
-        columns.insert("name".to_string(), ColumnDef { ty: ColumnType::Text });
+        columns.insert("id".to_string(), ColumnDef { ty: ColumnType::Int, pg_type: None });
+        columns.insert("tenant".to_string(), ColumnDef { ty: ColumnType::Int, pg_type: None });
+        columns.insert("name".to_string(), ColumnDef { ty: ColumnType::Text, pg_type: None });
         let def = TableDef { columns, primary_key: vec!["id".to_string()] };
         let mut m = HashMap::new();
         m.insert("users".to_string(), TableSchema::from_def("users", &def).unwrap());
@@ -595,8 +595,8 @@ mod tests {
     fn quoted_identifiers() {
         // Quoted, schema-qualified table name + quoted column name resolve to the unquoted form.
         let mut columns = BTreeMap::new();
-        columns.insert("id".to_string(), ColumnDef { ty: ColumnType::Int });
-        columns.insert("name".to_string(), ColumnDef { ty: ColumnType::Text });
+        columns.insert("id".to_string(), ColumnDef { ty: ColumnType::Int, pg_type: None });
+        columns.insert("name".to_string(), ColumnDef { ty: ColumnType::Text, pg_type: None });
         let def = TableDef { columns, primary_key: vec!["id".to_string()] };
         let mut m = HashMap::new();
         m.insert("users".to_string(), TableSchema::from_def("users", &def).unwrap());
@@ -633,9 +633,9 @@ mod tests {
     #[test]
     fn array_type_names_do_not_truncate_the_row() {
         let mut columns = BTreeMap::new();
-        columns.insert("id".to_string(), ColumnDef { ty: ColumnType::Int });
-        columns.insert("tags".to_string(), ColumnDef { ty: ColumnType::Text });
-        columns.insert("name".to_string(), ColumnDef { ty: ColumnType::Text });
+        columns.insert("id".to_string(), ColumnDef { ty: ColumnType::Int, pg_type: None });
+        columns.insert("tags".to_string(), ColumnDef { ty: ColumnType::Text, pg_type: None });
+        columns.insert("name".to_string(), ColumnDef { ty: ColumnType::Text, pg_type: None });
         let def = TableDef { columns, primary_key: vec!["id".to_string()] };
         let mut m = HashMap::new();
         m.insert("users".to_string(), TableSchema::from_def("users", &def).unwrap());

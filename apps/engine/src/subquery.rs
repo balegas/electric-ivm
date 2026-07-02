@@ -402,7 +402,7 @@ impl SubqueryRegistry {
         let gate = if changes_only {
             crate::pg::SnapshotGate::passthrough()
         } else {
-            let (wsql, params) = crate::sql::predicate_json_to_sql(where_json, 1);
+            let (wsql, params) = crate::sql::predicate_json_to_sql(where_json, 1, &self.schemas, outer_table);
             let bf = {
                 let client = self.pg().await?;
                 crate::pg::backfill_where(&client, &outer_ts, Some((wsql, params))).await?
@@ -448,7 +448,8 @@ impl SubqueryRegistry {
                 (n.inner_table.clone(), n.where_json.clone(), n.proj_col)
             };
             let ts = self.schemas.get(&inner_table).cloned().context("seed: unknown inner table")?;
-            let wsql = where_json.as_ref().map(|w| crate::sql::predicate_json_to_sql(w, 1));
+            let wsql =
+                where_json.as_ref().map(|w| crate::sql::predicate_json_to_sql(w, 1, &self.schemas, &inner_table));
             let bf = crate::pg::backfill_where(&client, &ts, wsql).await?;
             let node = self.nodes.get_mut(&sig).context("seed: node vanished")?;
             node.gate = bf.gate;

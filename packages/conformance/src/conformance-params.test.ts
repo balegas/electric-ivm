@@ -6,6 +6,7 @@
 // a nested/depth-2 subquery hitting a second table's backfill, and the Electric-style 400s.
 
 import type { Schema } from '@electric-ivm/protocol'
+import pgpkg from 'pg'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { applyOp, bootHarness, drainEngine, type Harness } from './harness.js'
 
@@ -21,6 +22,7 @@ const schema: Schema = {
 
 const ddl = `
   CREATE TABLE projects (id uuid PRIMARY KEY, owner_id uuid NOT NULL);
+  CREATE INDEX projects_owner_idx ON projects (owner_id);
   ALTER TABLE projects REPLICA IDENTITY FULL;
   CREATE TABLE issues (id uuid PRIMARY KEY, project_id uuid NOT NULL REFERENCES projects(id));
   ALTER TABLE issues REPLICA IDENTITY FULL;
@@ -117,5 +119,26 @@ describe('conformance: /v1/shape params over uuid columns', () => {
     const r = await shapeStatus(h.engineUrl, { table: 'issues', offset: '-1', where: SUB, 'params[2]': u1 })
     expect(r.status).toBe(400)
     expect(r.message).toContain('Parameters must be numbered sequentially')
+  })
+
+  // The point of casting `$n::text::uuid` (vs `owner_id::text = $n`) is to keep the inner select
+  // index-eligible. EXPLAIN the two forms with seqscan disabled: the cast form can use the owner_id
+  // btree index; the text-cast form cannot (the `::text` expression doesn't match the index).
+  it('the $n::text::uuid cast keeps the inner select on an index scan', async () => {
+    const c = new pgpkg.Client({ connectionString: h.pgUrl })
+    await c.connect()
+    try {
+      await c.query('SET enable_seqscan = off')
+      const plan = async (sql: string) => {
+        const r = await c.query(`EXPLAIN (FORMAT JSON) ${sql}`, [u1])
+        return JSON.stringify(r.rows[0]['QUERY PLAN'])
+      }
+      const cast = await plan('SELECT id FROM projects WHERE owner_id = $1::text::uuid')
+      const textCast = await plan('SELECT id FROM projects WHERE owner_id::text = $1')
+      expect(cast).toContain('Index') // Index Scan / Bitmap Index Scan — uses projects_owner_idx
+      expect(textCast).toContain('Seq Scan') // the ::text expression can't use the btree index
+    } finally {
+      await c.end()
+    }
   })
 })

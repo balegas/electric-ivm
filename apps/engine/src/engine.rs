@@ -421,9 +421,12 @@ impl Engine {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<(Vec<serde_json::Value>, String)> {
-        let ts = {
+        let (ts, schemas) = {
             let st = self.state.lock().await;
-            st.tables.get(table).cloned().ok_or_else(|| anyhow::anyhow!("unknown table '{table}'"))?
+            let ts = st.tables.get(table).cloned().ok_or_else(|| anyhow::anyhow!("unknown table '{table}'"))?;
+            // Clone the table schemas so the subquery SQL emitter can cast each leaf's param to its
+            // column's native Postgres type (query_subset is one-shot; the clone is off the hot path).
+            (ts, st.tables.clone())
         };
         let out_cols = resolve_columns(&ts, columns)?;
         let order = match order_by {
@@ -433,7 +436,9 @@ impl Engine {
         // Subquery predicates are evaluated natively by Postgres in the one-shot query-back (no engine
         // subquery state needed for a non-live page); other predicates use the compiled-form emitter.
         let where_sql = match where_.as_ref() {
-            Some(p) if crate::subquery::predicate_has_subquery(p) => Some(crate::sql::predicate_json_to_sql(p, 1)),
+            Some(p) if crate::subquery::predicate_has_subquery(p) => {
+                Some(crate::sql::predicate_json_to_sql(p, 1, &schemas, table))
+            }
             Some(p) => {
                 let cp = CompiledPredicate::compile_opt(Some(p), &ts)?;
                 crate::sql::predicate_to_sql(&cp, &ts)
