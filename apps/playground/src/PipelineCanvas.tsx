@@ -6,11 +6,12 @@ import { Background, Controls, ReactFlow, type Edge, type Node, type NodeProps }
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { buildDbspGraph } from '@viz/build-dbsp'
-import { buildGraph, type VizNodeData } from '@viz/build-graph'
+import { buildGraph, type NodeRef, type VizNodeData } from '@viz/build-graph'
 import { PipelineNode } from '@viz/nodes'
 import type { EngineGraph } from '@viz/types'
 
 import type { TraceEvent } from '../shared/types.ts'
+import { DetailPanel } from './DetailPanel.tsx'
 import { edgeTypes, type PulseEdgeData } from './edges.tsx'
 import { eventDecor, mergeDecor, type Decor, type FlashKind } from './trace-anim.ts'
 import { useTrace } from './useTrace.ts'
@@ -46,12 +47,15 @@ export function PipelineCanvas({
 }) {
   const [decor, setDecor] = useState<Decor | null>(null)
   const decorTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Click-to-inspect: the focused node's id (for connection highlighting) and its entity ref.
+  const [focus, setFocus] = useState<{ id: string; ref: NodeRef } | null>(null)
 
   const { nodes, edges } = useMemo<{ nodes: Node[]; edges: Edge[] }>(() => {
     if (!graph || mine.length === 0) return { nodes: [], edges: [] }
     const sel = new Set(mine)
-    return view === 'dbsp' ? buildDbspGraph(graph, sel) : buildGraph(graph, sel)
-  }, [graph, mine, view])
+    const f = focus?.id ?? null
+    return view === 'dbsp' ? buildDbspGraph(graph, sel, f) : buildGraph(graph, sel, f)
+  }, [graph, mine, view, focus])
 
   // Refs so the trace callback maps events against the CURRENT render without re-subscribing.
   const edgesRef = useRef(edges)
@@ -88,10 +92,22 @@ export function PipelineCanvas({
   return (
     <div className="canvas">
       <div className="viewtoggle">
-        <button className={view === 'logical' ? 'on' : ''} onClick={() => onViewChange('logical')}>
+        <button
+          className={view === 'logical' ? 'on' : ''}
+          onClick={() => {
+            onViewChange('logical')
+            setFocus(null)
+          }}
+        >
           Logical
         </button>
-        <button className={view === 'dbsp' ? 'on' : ''} onClick={() => onViewChange('dbsp')}>
+        <button
+          className={view === 'dbsp' ? 'on' : ''}
+          onClick={() => {
+            onViewChange('dbsp')
+            setFocus(null)
+          }}
+        >
           dbsp circuit
         </button>
       </div>
@@ -105,12 +121,30 @@ export function PipelineCanvas({
           edgeTypes={edgeTypes}
           fitView
           minZoom={0.15}
+          onNodeClick={(_e, n) => setFocus({ id: n.id, ref: (n.data as VizNodeData).ref })}
+          onPaneClick={() => setFocus(null)}
           proOptions={{ hideAttribution: true }}
         >
           <Background gap={20} color="#eef2f7" />
           <Controls />
         </ReactFlow>
       )}
+      {focus && graph && workspaceId ? (
+        <DetailPanel
+          node={focus.ref}
+          graph={graph}
+          workspaceId={workspaceId}
+          mine={mine}
+          onClose={() => setFocus(null)}
+          onSelectShape={(id) => {
+            const nid = view === 'dbsp' ? `snk:${id}` : `shape:${id}`
+            const ref: NodeRef = graph.shapes.find((s) => s.id === id)?.aggregate
+              ? { kind: 'aggshape', shapeId: id }
+              : { kind: 'shape', shapeId: id }
+            setFocus({ id: nid, ref })
+          }}
+        />
+      ) : null}
     </div>
   )
 }

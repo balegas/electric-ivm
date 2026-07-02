@@ -249,6 +249,15 @@ export async function createPlaygroundServer(opts: PlaygroundServerOptions): Pro
       return json(res, 200, { graph, mine: mine.map((s) => s.id) })
     }
 
+    // Subquery-node inner-set index (introspection, same visibility class as /graph).
+    if (p === '/api/graph/node' && m === 'GET') {
+      const ws = await guard(res, url.searchParams.get('workspace'), false)
+      if (!ws) return
+      const sig = url.searchParams.get('sig')
+      if (!sig) return json(res, 400, { error: 'sig required' })
+      return json(res, 200, await engine.nodeIndex(sig))
+    }
+
     match = p.match(/^\/api\/shapes\/([^/]+)\/rows$/)
     if (match && m === 'GET') {
       const ws = await guard(res, url.searchParams.get('workspace'), false)

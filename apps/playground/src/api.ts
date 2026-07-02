@@ -50,6 +50,14 @@ export const api = {
     req<{ rows: { key: string; value: Record<string, unknown> }[]; count: number; changesOnly: boolean }>(
       `/api/shapes/${encodeURIComponent(id)}/rows?workspace=${encodeURIComponent(workspace)}&limit=${limit}`,
     ),
+  nodeIndex: (workspace: string, sig: string) =>
+    req<{
+      sig: string
+      distinctValues: number
+      refcount: number
+      values: { value: unknown; contributors: number }[]
+      truncated: boolean
+    }>(`/api/graph/node?sig=${encodeURIComponent(sig)}&workspace=${encodeURIComponent(workspace)}`),
   subset: (workspace: string, orderBy: { col: string; desc?: boolean }, limit: number) =>
     req<{ rows: Record<string, unknown>[]; lsn: string }>('/api/subset', {
       method: 'POST',

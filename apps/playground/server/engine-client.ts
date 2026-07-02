@@ -49,6 +49,10 @@ export class EngineClient {
     return this.req('/graph')
   }
 
+  nodeIndex(sig: string, cap = 200): Promise<unknown> {
+    return this.req(`/graph/node?sig=${encodeURIComponent(sig)}&cap=${cap}`)
+  }
+
   shapeRows(id: string, limit: number): Promise<unknown> {
     return this.req(`/shapes/${encodeURIComponent(id)}/rows?limit=${limit}`)
   }
