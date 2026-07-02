@@ -213,7 +213,7 @@ export function DetailPanel({
       </>
     )
   } else if (node.kind === 'family') {
-    title = `Family router · (${node.keyCols.join(', ')})`
+    title = `Router · (${node.keyCols.join(', ')})`
     const members = graph.shapes.filter(
       (s) => s.table === node.table && s.familyKey && s.familyKey.join(',') === node.keyCols.join(','),
     )
@@ -334,7 +334,7 @@ export function DetailPanel({
   } else {
     // shape
     const s = graph.shapes.find((x) => x.id === node.shapeId)
-    title = `Shape · ${node.shapeId}`
+    title = `Live query · ${node.shapeId}`
     const kind = s?.isSubquery ? 'subquery' : s?.familyKey ? `family(${s.familyKey.join(',')})` : 'standalone'
     body = (
       <>

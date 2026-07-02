@@ -7,8 +7,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { buildDbspGraph } from '@viz/build-dbsp'
 import { buildGraph, type NodeRef, type VizNodeData } from '@viz/build-graph'
-import { PipelineNode } from '@viz/nodes'
 import type { EngineGraph } from '@viz/types'
+
+import { PipelineNode } from './nodes.tsx'
 
 import type { TraceEvent } from '../shared/types.ts'
 import { DetailPanel } from './DetailPanel.tsx'
