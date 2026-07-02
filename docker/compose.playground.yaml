@@ -1,0 +1,43 @@
+# Overlay that adds the dbsp playground to the base stack:
+#   docker compose -f docker/compose.yaml -f docker/compose.playground.yaml up
+# (or: pnpm docker:playground)
+#
+# Ordering matters: the playground server creates the restaurants/orders tables (REPLICA IDENTITY
+# FULL) at boot, and the engine introspects Postgres at ITS boot — so the engine is made to wait
+# for the playground's healthcheck (tables exist once /api/health responds).
+services:
+  engine:
+    environment:
+      # Only the playground's data tables are replicated; playground_* meta tables stay out.
+      ELECTRIC_IVM_PG_TABLES: restaurants,orders
+    depends_on:
+      playground:
+        condition: service_healthy
+
+  playground:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.node
+    working_dir: /repo
+    command:
+      [
+        'sh',
+        '-c',
+        'pnpm --filter @electric-ivm/playground build && PLAYGROUND_STATIC=/repo/apps/playground/dist pnpm --filter @electric-ivm/playground start',
+      ]
+    environment:
+      PLAYGROUND_PG_URL: postgres://postgres:password@postgres:5432/electric
+      PLAYGROUND_ENGINE_URL: http://engine:7010
+      PLAYGROUND_PORT: 5199
+      PLAYGROUND_EPOCH: '${PLAYGROUND_EPOCH:-1}'
+      PLAYGROUND_WS_TTL_H: '${PLAYGROUND_WS_TTL_H:-24}'
+    ports:
+      - '${PLAYGROUND_PORT:-5199}:5199'
+    depends_on:
+      postgres:
+        condition: service_started
+    healthcheck:
+      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:5199/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 4s
+      retries: 60

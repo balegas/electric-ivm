@@ -96,14 +96,22 @@ export async function createShape(
   const resp = spec.aggregate
     ? await deps.engine.createAggregate(spec.table, where, spec.aggregate.func, spec.aggregate.col)
     : await deps.engine.createShape(spec.table, where)
-  await deps.db.query(
+  // The engine SHARES identical feeds: an equal spec (same workspace, same predicate) returns an
+  // EXISTING shape id. In that case the meta row already describes this stream — keep it (a DO
+  // UPDATE here would hijack a scene shape's provenance) and hand the caller the existing card.
+  const ins = await deps.db.query(
     `INSERT INTO playground_shapes (shape_id, workspace_id, scene, skey, role, label, spec, where_json)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-     ON CONFLICT (shape_id) DO UPDATE SET workspace_id = EXCLUDED.workspace_id, scene = EXCLUDED.scene,
-       skey = EXCLUDED.skey, role = EXCLUDED.role, label = EXCLUDED.label, spec = EXCLUDED.spec,
-       where_json = EXCLUDED.where_json`,
+     ON CONFLICT (shape_id) DO NOTHING`,
     [resp.shapeId, ws, scene, skey, role, label, JSON.stringify(spec), JSON.stringify(where)],
   )
+  if (ins.rowCount === 0) {
+    // Shared with an existing shape: the engine bumped its refcount — undo that so meta stays 1:1
+    // with engine registrations, then return the existing card.
+    await deps.engine.deleteShape(resp.shapeId)
+    const existing = await deps.db.query('SELECT * FROM playground_shapes WHERE shape_id = $1', [resp.shapeId])
+    return rowToShape(existing.rows[0])
+  }
   return { id: resp.shapeId, workspaceId: ws, scene, role, label, spec, where: where as PlaygroundShape['where'] }
 }
 

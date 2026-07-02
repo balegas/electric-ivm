@@ -21,7 +21,8 @@
     "bench": "pnpm --filter @electric-ivm/bench bench",
     "bench:fleet": "pnpm --filter @electric-ivm/bench electric-fleet",
     "docker:build": "docker compose -f docker/compose.yaml build",
-    "docker:up": "docker compose -f docker/compose.yaml up"
+    "docker:up": "docker compose -f docker/compose.yaml up",
+    "docker:playground": "docker compose -f docker/compose.yaml -f docker/compose.playground.yaml up"
   },
   "devDependencies": {
     "typescript": "^5.7.2",

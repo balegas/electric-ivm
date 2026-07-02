@@ -51,10 +51,16 @@ export default function App() {
     },
     [w.enterScene, loadGraph], // eslint-disable-line react-hooks/exhaustive-deps
   )
-  // Provision the stored scene once the workspace is ready.
+  // Provision on boot: scene 1's base shape always exists (so a wiped-and-reminted workspace is
+  // never empty), then the stored scene's shapes.
   const ready = w.status === 'ready'
   useEffect(() => {
-    if (ready) void w.enterScene(scene).then(loadGraph)
+    if (!ready) return
+    void (async () => {
+      await w.enterScene(1)
+      if (scene !== 1) await w.enterScene(scene)
+      await loadGraph()
+    })()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ready])
 
