@@ -11,37 +11,34 @@ export function Welcome({ onClose }: { onClose: () => void }) {
     <div className="modal-back">
       <div className="modal welcome">
         <div className="welcome-title">
-          Watch your writes become <em>deltas</em>
+          X-ray a <em>sync engine</em>
         </div>
         <p className="welcome-lead">
-          <b>electric-ivm</b> keeps SQL queries — <b>shapes</b> — live over Postgres by running them
-          as incremental <b>DBSP pipelines</b>: every write becomes a weighted delta (
-          <span className="pos">+1</span> insert, <span className="neg">−1</span> delete) that flows
-          through routers, filters, joins and folds, touching only the shapes it affects. This
-          playground lets you <b>watch that happen</b> — on a real Postgres and a real engine, in
-          your own sandbox.
+          A <b>shape</b> is a database query whose results stay up to date on every screen that
+          subscribes to it — that's how Electric-style sync works. This playground is an x-ray of
+          the engine that makes it happen: change some data in a little food-delivery world and
+          watch, live, how the change reaches exactly the screens that care — and nothing else.
         </p>
         <div className="welcome-grid">
           <div>
             <span className="welcome-ico">🍕</span>
-            <b>Left — the world.</b> A food-delivery app. Every button is one SQL write to
-            Postgres: place an order, start cooking, deliver…
+            <b>Left — the world.</b> Every button changes real data in Postgres: place an order,
+            start cooking, deliver…
           </div>
           <div>
             <span className="welcome-ico">🔀</span>
-            <b>Middle — the pipeline.</b> The engine's actual maintained dataflow. Your write
-            animates through it live; a red ✕ shows where a delta gets dropped. Toggle{' '}
-            <i>Logical</i> / <i>dbsp circuit</i> up top.
+            <b>Middle — inside the engine.</b> Your change travels through the engine's machinery,
+            live. A red ✕ shows where a change stops because nobody needs it.
           </div>
           <div>
             <span className="welcome-ico">📱</span>
-            <b>Right — the subscribers.</b> Each card is a live shape (a kitchen screen, a rider's
-            phone, a dashboard). Its contents are maintained incrementally — never re-queried.
+            <b>Right — the screens.</b> Each card is a subscriber — a kitchen display, a rider's
+            phone, a dashboard. They update the instant a change concerns them.
           </div>
           <div>
             <span className="welcome-ico">🎬</span>
-            <b>Bottom — six scenes.</b> A short walkthrough of the ideas, from “a shape is a
-            filter” to subqueries and live aggregations. Every scene is free play.
+            <b>Bottom — start here.</b> Six short scenes explain what you're seeing, one idea at a
+            time. Everything stays clickable throughout.
           </div>
         </div>
         <div className="modal-actions welcome-actions">
