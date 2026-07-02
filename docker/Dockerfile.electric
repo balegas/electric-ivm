@@ -1,0 +1,69 @@
+# Single self-contained "electric" image: a drop-in replacement for electricsql/electric in the
+# benchmarking-fleet (see docs/fleet-conformance.md). One container runs BOTH the durable-streams
+# server (the append log) and the Rust engine (replication ingest + Electric-compatible /v1/shape
+# and /v1/health), wired together by docker/electric-entrypoint.sh.
+#
+# Build context is the repo root:
+#   docker build -f docker/Dockerfile.electric -t electric-ivm-electric .
+
+# --- stage 1: build the Rust engine -----------------------------------------
+FROM rust:1-bookworm AS engine-build
+RUN apt-get update && apt-get install -y --no-install-recommends cmake pkg-config && rm -rf /var/lib/apt/lists/*
+WORKDIR /repo
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY apps/engine/Cargo.toml apps/engine/Cargo.toml
+# Pre-build the (heavy dbsp) dependency tree against a stub crate so the dependency layer is
+# cached across engine source edits. rm the stub so the real sources land clean next.
+RUN mkdir -p apps/engine/src \
+ && echo 'fn main() {}' > apps/engine/src/main.rs \
+ && echo '' > apps/engine/src/lib.rs \
+ && cargo build --release -p electric-ivm-engine \
+ && rm -rf apps/engine/src target/release/electric-ivm-engine target/release/deps/electric_ivm_engine-*
+COPY apps/engine apps/engine
+# touch so cargo re-fingerprints our crate (mtime) and rebuilds it from the real sources.
+RUN touch apps/engine/src/main.rs apps/engine/src/lib.rs \
+ && cargo build --release -p electric-ivm-engine
+
+# --- stage 2: node deps for the durable-streams server ----------------------
+FROM node:22-slim AS node-deps
+# python3 + a C++ toolchain so node-gyp can build the durable-streams native deps (lmdb, and the
+# optional msgpackr-extract accelerator) when a prebuilt isn't available for the target arch. This
+# is a builder stage only — none of it lands in the runtime image.
+RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ \
+ && rm -rf /var/lib/apt/lists/* \
+ && corepack enable
+WORKDIR /repo
+COPY . .
+# The server is run at runtime with tsx (a direct devDependency, on PATH via /repo/node_modules/.bin).
+RUN pnpm install --frozen-lockfile
+
+# --- stage 3: runtime -------------------------------------------------------
+FROM node:22-slim
+# curl is MANDATORY: the fleet health check shells out to it. ca-certificates for good measure.
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+ENV APP_ROOT=/app \
+    DS_DIR=/repo/docker \
+    NODE_ENV=production \
+    ELECTRIC_PORT=3000 \
+    PATH=/repo/node_modules/.bin:$PATH
+
+COPY --from=node-deps /repo /repo
+COPY --from=engine-build /repo/target/release/electric-ivm-engine /usr/local/bin/electric-ivm-engine
+COPY docker/electric-entrypoint.sh /usr/local/bin/electric-entrypoint.sh
+
+RUN chmod +x /usr/local/bin/electric-entrypoint.sh /usr/local/bin/electric-ivm-engine \
+ && mkdir -p /app \
+ && chown -R node:node /app
+
+USER node
+WORKDIR /app
+
+EXPOSE 3000
+# The fleet uses its own curl-based check; this HEALTHCHECK mirrors it for docker/compose. It stays
+# unhealthy until the engine exposes /v1/health (added alongside the ELECTRIC_* env work).
+HEALTHCHECK --start-period=10s --interval=5s --timeout=3s --retries=3 \
+  CMD curl --fail "http://localhost:${ELECTRIC_PORT:-3000}/v1/health" || exit 1
+
+ENTRYPOINT ["/usr/local/bin/electric-entrypoint.sh"]

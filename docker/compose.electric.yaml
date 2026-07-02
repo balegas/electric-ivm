@@ -1,0 +1,46 @@
+# Local test harness for the single fleet-conformance "electric" image (docker/Dockerfile.electric).
+# It mirrors exactly what the benchmarking-fleet does to the image: one container, the fleet's env
+# vars, host.docker.internal reachable for the StatsD sink. See docs/fleet-conformance.md §1.
+#
+#   docker compose -f docker/compose.electric.yaml up --build
+#
+# Postgres here plays the role the fleet's toxiproxy-fronted Postgres plays (wal_level=logical,
+# user postgres / password password / db postgres).
+
+name: electric-ivm-fleet
+
+services:
+  postgres:
+    image: postgres:16
+    command: ["postgres", "-c", "wal_level=logical"]
+    environment:
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: postgres
+    ports:
+      - "${PG_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  electric:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.electric
+    # init: true -> tini as PID 1, mirroring the fleet's `use_init: true`.
+    init: true
+    environment:
+      # Exactly the env the fleet sets on the container.
+      DATABASE_URL: postgresql://postgres:password@postgres:5432/postgres?sslmode=disable
+      ELECTRIC_INSECURE: "true"
+      ELECTRIC_INSTANCE_ID: test-instance-1
+      ELECTRIC_STATSD_HOST: host.docker.internal
+      TELEMETRY_POLLER_PERIOD: "200"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${ELECTRIC_PORT:-3000}:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
