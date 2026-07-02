@@ -68,51 +68,46 @@ export function SceneStrip({
       {open && def ? (
         <div className="scene-card">
           <div className="scene-cols">
-            <div className="scene-concept">
-              {view === 'dbsp' && def.dbsp ? <span className="scene-view-tag">dbsp circuit view</span> : null}
+            <section className="scene-sec">
+              <div className="scene-sec-h sec-idea">
+                the idea
+                {view === 'dbsp' && def.dbsp ? <span className="scene-view-tag">dbsp circuit view</span> : null}
+              </div>
               {concept.map((p, i) => (
                 <p key={i} className="scene-body">
                   {p}
                 </p>
               ))}
-            </div>
+            </section>
             {canvasNotes.length > 0 ? (
-              <div className="scene-note">
-                <div className="scene-note-h">on the canvas</div>
+              <section className="scene-sec">
+                <div className="scene-sec-h sec-canvas">on the canvas</div>
                 {canvasNotes.map((p, i) => (
                   <p key={i} className="scene-body">
                     {p}
                   </p>
                 ))}
-              </div>
+              </section>
             ) : null}
-            <div className="scene-actions">
+            <section className="scene-sec">
+              <div className="scene-sec-h sec-try">try it</div>
               {needsShapes ? (
                 created ? (
                   <div className="scene-created">✓ shape{def.shapes.length > 1 ? 's' : ''} created</div>
                 ) : (
-                  <>
-                    <div className="scene-shape-list">
-                      {def.shapes.map((d) => (
-                        <div key={d.key} className="scene-shape-item">
-                          {d.label}
-                        </div>
-                      ))}
-                    </div>
-                    <button className="primary scene-create" disabled={provisioning} onClick={() => onProvision(def.n)}>
-                      {provisioning ? 'creating…' : `Create the shape${def.shapes.length > 1 ? 's' : ''} →`}
-                    </button>
-                  </>
+                  <button className="scene-create" disabled={provisioning} onClick={() => onProvision(def.n)}>
+                    {provisioning
+                      ? 'creating…'
+                      : `Create ${def.shapes.length > 1 ? 'the shapes' : `“${def.shapes[0]!.label}”`} →`}
+                  </button>
                 )
               ) : null}
-              <div className="scene-try">
+              <ol className="scene-steps">
                 {def.try.map((t) => (
-                  <span key={t} className="try-chip">
-                    → {t}
-                  </span>
+                  <li key={t}>{t}</li>
                 ))}
-              </div>
-            </div>
+              </ol>
+            </section>
           </div>
         </div>
       ) : null}

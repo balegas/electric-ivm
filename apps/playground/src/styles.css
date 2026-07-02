@@ -599,7 +599,7 @@ button {
   color: #64748b;
 }
 .scene-card {
-  padding: 8px 14px 10px;
+  padding: 10px 12px 12px;
   border-top: 1px solid #e2e8f0;
   background: #0f172a;
   color: #cbd5e1;
@@ -1114,62 +1114,98 @@ button {
   flex: 1;
 }
 
-/* ── scene card structure: concept | on-the-canvas | actions ─────────────── */
+/* ── scene card: three equal labeled sections ────────────────────────────── */
 .scene-cols {
   display: grid;
-  grid-template-columns: 1.3fr 1fr 260px;
-  gap: 18px;
-  align-items: start;
+  grid-template-columns: 1.25fr 1.1fr 0.85fr;
+  gap: 12px;
+  align-items: stretch;
 }
-.scene-note {
-  background: #1e293b;
-  border: 1px solid #334155;
-  border-radius: 9px;
-  padding: 8px 12px;
+.scene-sec {
+  background: #16213a;
+  border: 1px solid #27334f;
+  border-radius: 10px;
+  padding: 10px 14px 8px;
+  min-width: 0;
 }
-.scene-note-h {
-  font-size: 10px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: #7dd3fc;
-  margin-bottom: 4px;
-}
-.scene-note .scene-body {
-  margin: 0 0 6px;
+.scene-sec .scene-body {
+  margin: 0 0 8px;
   color: #cbd5e1;
+  font-size: 12.5px;
+  line-height: 1.55;
 }
-.scene-actions {
+.scene-sec-h {
   display: flex;
-  flex-direction: column;
+  align-items: center;
   gap: 8px;
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin: 0 0 7px;
+  padding-bottom: 5px;
+  border-bottom: 1px solid #27334f;
 }
-.scene-shape-list {
+.sec-idea {
+  color: #7dd3fc;
+}
+.sec-canvas {
+  color: #c4b5fd;
+}
+.sec-try {
+  color: #4ade80;
+}
+.scene-steps {
+  margin: 0;
+  padding: 0 0 0 2px;
+  list-style: none;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 7px;
 }
-.scene-shape-item {
-  font-size: 11.5px;
+.scene-steps li {
+  font-size: 12px;
+  line-height: 1.45;
   color: #cbd5e1;
-  background: #1e293b;
-  border: 1px solid #334155;
-  border-radius: 7px;
-  padding: 4px 9px;
+  padding-left: 18px;
+  position: relative;
+}
+.scene-steps li::before {
+  content: '→';
+  position: absolute;
+  left: 0;
+  color: #4ade80;
+  font-weight: 700;
 }
 .scene-create {
+  width: 100%;
+  border: 0;
   background: #0ea5e9;
-  color: #0f172a;
+  color: #082f49;
+  font-weight: 800;
+  font-size: 12.5px;
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  transition: transform 0.06s, background 0.15s;
+}
+.scene-create:hover {
+  background: #38bdf8;
+}
+.scene-create:active {
+  transform: scale(0.97);
 }
 .scene-create:disabled {
   opacity: 0.6;
 }
 .scene-created {
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 800;
   color: #4ade80;
-}
-.scene-cols .scene-try {
-  flex-direction: column;
-  align-items: flex-start;
+  background: #0d2818;
+  border: 1px solid #14532d;
+  border-radius: 8px;
+  padding: 6px 10px;
+  margin-bottom: 10px;
+  text-align: center;
 }
