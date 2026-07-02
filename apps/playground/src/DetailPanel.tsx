@@ -335,7 +335,11 @@ export function DetailPanel({
     // shape
     const s = graph.shapes.find((x) => x.id === node.shapeId)
     title = `Live query · ${node.shapeId}`
-    const kind = s?.isSubquery ? 'subquery' : s?.familyKey ? `family(${s.familyKey.join(',')})` : 'standalone'
+    const kind = s?.isSubquery
+      ? 'subquery'
+      : s?.familyKey
+        ? `routed by (${s.familyKey.join(', ')})`
+        : 'standalone filter'
     body = (
       <>
         <Row k="table" v={s?.table} />
@@ -351,7 +355,7 @@ export function DetailPanel({
           {s?.isSubquery
             ? 'Membership is driven by the shared subquery node(s) upstream plus the outer-row filter.'
             : s?.familyKey
-              ? 'Routed by key through a shared family — the engine keeps only per-shape metadata, no table rows.'
+              ? 'Routed by key through a shared router — the engine keeps only per-query metadata, no table rows.'
               : 'A stateless filter over the change stream — enter/leave falls out of filtering each delta.'}
         </div>
       </>

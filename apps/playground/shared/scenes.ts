@@ -68,10 +68,10 @@ export const SCENES: SceneDef[] = [
     n: 3,
     title: 'Shapes share machinery',
     body:
-      'Equality shapes on the same columns collapse into one shared family router: a single ' +
+      'Equality queries on the same columns collapse into one shared router: a single ' +
       'index-and-route join keyed by (workspace_id, status) dispatches each delta to exactly the ' +
-      'shapes registered on its key — one lookup no matter how many shapes exist. The router is ' +
-      "genuinely shared with other visitors' shapes too: that's the shared ×N badge.",
+      'queries registered on its key — one lookup no matter how many exist. The router is ' +
+      "genuinely shared with other visitors' queries too: that's the shared ×N badge.",
     try: [
       'Move one order through cooking → riding → delivered and watch it hop between screens',
       'Note the shared ×N badge — one route lookup per write, however many shapes listen',
