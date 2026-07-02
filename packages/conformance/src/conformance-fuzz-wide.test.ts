@@ -2,7 +2,7 @@
 // occasional empty combinators, over more shapes and a longer op stream than the default fuzz.
 // Deterministic (fixed base seed) so it runs in CI and replays exactly; env tunables scale it.
 
-import type { Schema } from '@electric-lite/protocol'
+import type { Schema } from '@electric-ivm/protocol'
 import { describe, expect, it } from 'vitest'
 import { formatCompare } from './compare.js'
 import { applyOp, bootHarness, drainEngine, waitForConvergence } from './harness.js'

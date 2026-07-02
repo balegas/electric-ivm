@@ -1,21 +1,21 @@
-# The whole electric-lite server stack, containerized:
+# The whole electric-ivm server stack, containerized:
 #
 #   postgres  — the system of record (wal_level=logical; the engine creates its replication slot)
 #   ds        — durable-streams server (the log: table/<name> in, shape/<id> out)
 #   engine    — the Rust engine: replication ingest, shape/subquery/aggregation maintenance,
 #               control-plane HTTP + the Electric-compatible GET /v1/shape (port 7010)
-#   api       — the extended tRPC API (shapes/subsets/aggregations for @electric-lite/client, port 8790)
+#   api       — the extended tRPC API (shapes/subsets/aggregations for @electric-ivm/client, port 8790)
 #
 #   docker compose -f docker/compose.yaml up --build
 #
-# Then point an ElectricSQL client at http://localhost:7010/v1/shape, or @electric-lite/client at
+# Then point an ElectricSQL client at http://localhost:7010/v1/shape, or @electric-ivm/client at
 # http://localhost:8790 (API) + http://localhost:8791 (streams).
 #
-# Note: the engine introspects the table set at startup (ELECTRIC_LITE_PG_TABLES=* = every public
+# Note: the engine introspects the table set at startup (ELECTRIC_IVM_PG_TABLES=* = every public
 # table with a primary key). Create your tables first — or `docker compose restart engine` after a
 # migration — for them to be picked up.
 
-name: electric-lite
+name: electric-ivm
 
 services:
   postgres:
@@ -57,10 +57,10 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.engine
     environment:
-      ELECTRIC_LITE_DS_URL: http://ds:8791
-      ELECTRIC_LITE_PG_URL: postgres://postgres:password@postgres:5432/electric
-      ELECTRIC_LITE_PG_TABLES: "${ELECTRIC_LITE_PG_TABLES:-*}"
-      ELECTRIC_LITE_BIND: 0.0.0.0:7010
+      ELECTRIC_IVM_DS_URL: http://ds:8791
+      ELECTRIC_IVM_PG_URL: postgres://postgres:password@postgres:5432/electric
+      ELECTRIC_IVM_PG_TABLES: "${ELECTRIC_IVM_PG_TABLES:-*}"
+      ELECTRIC_IVM_BIND: 0.0.0.0:7010
     ports:
       - "${ENGINE_PORT:-7010}:7010"
     depends_on:

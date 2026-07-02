@@ -1,4 +1,4 @@
-// Cross-language contract for electric-lite.
+// Cross-language contract for electric-ivm.
 //
 // These JSON shapes are the single source of truth shared by the TS API/oracle/client
 // and the Rust dbsp engine (which mirrors them with serde). Keep them minimal and stable.
@@ -179,7 +179,7 @@ export interface SubsetResult {
   lsn: string
 }
 
-/** Scalar aggregation functions (an electric-lite extension — not part of the Electric protocol). */
+/** Scalar aggregation functions (an electric-ivm extension — not part of the Electric protocol). */
 export type AggFn = 'count' | 'sum' | 'avg' | 'min' | 'max'
 
 /** A scalar aggregation over a filtered set, maintained incrementally by the engine and streamed as a

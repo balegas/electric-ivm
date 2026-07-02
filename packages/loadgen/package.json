@@ -1,5 +1,5 @@
 {
-  "name": "@electric-lite/loadgen",
+  "name": "@electric-ivm/loadgen",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -12,9 +12,9 @@
   },
   "dependencies": {
     "@durable-streams/server": "^0.3.7",
-    "@electric-lite/api": "workspace:*",
-    "@electric-lite/client": "workspace:*",
-    "@electric-lite/protocol": "workspace:*",
+    "@electric-ivm/api": "workspace:*",
+    "@electric-ivm/client": "workspace:*",
+    "@electric-ivm/protocol": "workspace:*",
     "@faker-js/faker": "^10.5.0",
     "pg": "^8.13.1"
   },

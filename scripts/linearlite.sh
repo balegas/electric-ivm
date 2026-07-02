@@ -83,7 +83,7 @@ stop() {
   for _ in $(seq 1 10); do lsof -ti :"${HTTPS_PORT}" >/dev/null 2>&1 || break; sleep 1; done
   # 2. force-clean anything left (idempotent; scoped to the linearlite demo).
   pkill -9 -f "examples/linearlite/start.ts" 2>/dev/null
-  pkill -9 -f "filter @electric-lite/linearlite" 2>/dev/null
+  pkill -9 -f "filter @electric-ivm/linearlite" 2>/dev/null
   pkill -9 -f "pipeline-viz" 2>/dev/null
   lsof -ti :"${HTTPS_PORT}" 2>/dev/null | while read -r p; do kill -9 "$p" 2>/dev/null; done
   lsof -ti :"${VIZ_PORT}" 2>/dev/null | while read -r p; do kill -9 "$p" 2>/dev/null; done

@@ -1,7 +1,7 @@
-// electric-lite client: a thin wrapper over a typed tRPC client plus stream-db
+// electric-ivm client: a thin wrapper over a typed tRPC client plus stream-db
 // (`@durable-streams/state/db`) for materializing a shape into a live TanStack DB collection.
 
-import type { AppRouter } from '@electric-lite/api'
+import type { AppRouter } from '@electric-ivm/api'
 import type {
   AggregateDef,
   Op,
@@ -13,7 +13,7 @@ import type {
   SubsetResult,
   TableDef,
   Value,
-} from '@electric-lite/protocol'
+} from '@electric-ivm/protocol'
 import { stream } from '@durable-streams/client'
 import { createStateSchema, createStreamDB } from '@durable-streams/state/db'
 import { createTRPCClient, httpBatchLink } from '@trpc/client'
@@ -63,7 +63,7 @@ export interface AggregateSubscription {
   close(): Promise<void>
 }
 
-export interface ElectricLiteClient {
+export interface ElectricIvmClient {
   defineSchema(schema: Schema): Promise<unknown>
   write(input: { table: string; op: Op; pk: Value; row?: Row; txid?: string }): Promise<{ txid: string }>
   /** Schema-derived typed ingestion API, one entry per table. */
@@ -83,7 +83,7 @@ export interface ElectricLiteClient {
    * never stores the page; a change is matched against one base predicate, never fanned across ranges.
    */
   subset(def: SubsetDef): Promise<SubsetSubscription>
-  /** Open a live scalar **aggregation** over a filtered set (electric-lite extension). */
+  /** Open a live scalar **aggregation** over a filtered set (electric-ivm extension). */
   aggregate(def: AggregateDef): Promise<AggregateSubscription>
   close(): Promise<void>
 }
@@ -112,7 +112,7 @@ export function createClient(opts: {
   dsBaseUrl?: string
   /** Live mode passed to stream-db. 'long-poll' is the most proxy-friendly. Default true (SSE). */
   liveMode?: boolean | 'sse' | 'long-poll'
-}): ElectricLiteClient {
+}): ElectricIvmClient {
   const trpc = createTRPCClient<AppRouter>({ links: [httpBatchLink({ url: opts.apiUrl })] })
   // Everything the client opens (shape materializations, subset subscriptions AND aggregate
   // subscriptions) so `close()` can tear them all down — otherwise a live stream leaks and blocks

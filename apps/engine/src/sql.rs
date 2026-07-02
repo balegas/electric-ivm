@@ -1,6 +1,6 @@
 //! Compile a shape's predicate to a parameterized SQL `WHERE` fragment, so backfill can read only the
 //! rows a shape needs (`SELECT … WHERE <predicate>`) instead of the whole table. Mirrors the
-//! TypeScript `predicateToSql` in `@electric-lite/protocol` (and therefore the oracle's `WHERE`), so
+//! TypeScript `predicateToSql` in `@electric-ivm/protocol` (and therefore the oracle's `WHERE`), so
 //! the SQL filter agrees with the engine's `CompiledPredicate::matches` (three-valued NULL included).
 //!
 //! Numeric / boolean / null literals are inlined directly (they are typed Rust scalars — only digits,

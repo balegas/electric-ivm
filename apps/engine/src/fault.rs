@@ -1,6 +1,6 @@
 //! TEST-ONLY fault injection.
 //!
-//! Reads `ELECTRIC_LITE_FAULT` once at startup. With the env var unset — the default in every
+//! Reads `ELECTRIC_IVM_FAULT` once at startup. With the env var unset — the default in every
 //! real deployment and every normal test run — [`active`] returns [`Fault::None`] and this module
 //! has **zero** effect on engine behaviour. It exists solely so the conformance suite can prove,
 //! via a negative control, that the oracle harness actually catches engine bugs (a green suite is
@@ -21,7 +21,7 @@ pub enum Fault {
 }
 
 fn detect() -> Fault {
-    match std::env::var("ELECTRIC_LITE_FAULT").ok().as_deref() {
+    match std::env::var("ELECTRIC_IVM_FAULT").ok().as_deref() {
         Some("drop_deletes") => Fault::DropDeletes,
         Some("off_by_one_cmp") => Fault::OffByOneCmp,
         _ => Fault::None,

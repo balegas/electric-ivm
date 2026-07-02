@@ -5,7 +5,7 @@
 // whose change record precedes the snapshot but which COMMITS after it would be in neither the
 // backfill nor the live stream -> a silently lost row. We assert every shape converges to the oracle.
 
-import type { Schema, ShapeDef } from '@electric-lite/protocol'
+import type { Schema, ShapeDef } from '@electric-ivm/protocol'
 import pgpkg from 'pg'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { formatCompare } from './compare.js'

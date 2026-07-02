@@ -1,21 +1,21 @@
-defmodule Support.ElLiteSetup do
+defmodule Support.ElIvmSetup do
   @moduledoc """
-  Boots the `electric-lite` stack (durable-streams + engine + Electric `/v1/shape` adapter) on an
+  Boots the `electric-ivm` stack (durable-streams + engine + Electric `/v1/shape` adapter) on an
   ephemeral Postgres and points `Electric.Client` at it — a drop-in replacement for
   `with_unique_db` + `with_complete_stack` + `with_electric_client` so Electric's integration tests run
-  against electric-lite instead of Electric's own sync-service.
+  against electric-ivm instead of Electric's own sync-service.
 
-  Two-phase: `el_lite_pg/1` boots the launcher, captures the ephemeral PG URL, and exposes `db_conn` so
-  Electric's schema setups (`with_parent_child_tables`, `with_sql_execute`, …) populate it. `el_lite_client/1`
+  Two-phase: `el_ivm_pg/1` boots the launcher, captures the ephemeral PG URL, and exposes `db_conn` so
+  Electric's schema setups (`with_parent_child_tables`, `with_sql_execute`, …) populate it. `el_ivm_client/1`
   then signals "schema ready" (creates a sentinel table), which makes the launcher introspect every table
   (`ADAPTER_PG_TABLES=*`) and start the engine + adapter, and builds `ctx.client`.
   """
   import ExUnit.Callbacks
 
-  @lite_dir System.get_env("ELECTRIC_LITE_DIR") || Path.expand("../../../../../dbsp-ds", __DIR__)
+  @lite_dir System.get_env("ELECTRIC_IVM_DIR") || Path.expand("../../../../../dbsp-ds", __DIR__)
 
-  def el_lite_pg(_ctx) do
-    cmd = "cd #{@lite_dir} && exec pnpm --filter @electric-lite/bench exec tsx src/electric-adapter.ts"
+  def el_ivm_pg(_ctx) do
+    cmd = "cd #{@lite_dir} && exec pnpm --filter @electric-ivm/bench exec tsx src/electric-adapter.ts"
 
     port =
       Port.open({:spawn_executable, "/bin/bash"}, [
@@ -49,7 +49,7 @@ defmodule Support.ElLiteSetup do
     %{el_port: port, db_conn: db_conn, pool: db_conn, db_plain: db_plain, pg_url: pg_url}
   end
 
-  def el_lite_client(ctx) do
+  def el_ivm_client(ctx) do
     # Signal "schema ready" → launcher introspects all tables and starts the engine + adapter.
     Postgrex.query!(ctx.db_conn, "CREATE TABLE IF NOT EXISTS __el_ready (id INT PRIMARY KEY)", [])
     base_url = read_line(ctx.el_port, "ADAPTER_LISTENING ", 90_000)
@@ -67,12 +67,12 @@ defmodule Support.ElLiteSetup do
         end
 
       {^port, {:exit_status, status}} ->
-        raise "electric-lite launcher exited (#{status}) while waiting for #{prefix}"
+        raise "electric-ivm launcher exited (#{status}) while waiting for #{prefix}"
 
       {:DOWN, _ref, :port, ^port, reason} ->
-        raise "electric-lite launcher down (#{inspect(reason)}) while waiting for #{prefix}"
+        raise "electric-ivm launcher down (#{inspect(reason)}) while waiting for #{prefix}"
     after
-      timeout -> raise "timed out waiting for '#{prefix}' from electric-lite launcher"
+      timeout -> raise "timed out waiting for '#{prefix}' from electric-ivm launcher"
     end
   end
 

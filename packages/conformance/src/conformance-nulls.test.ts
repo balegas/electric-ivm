@@ -7,7 +7,7 @@
 // Non-pk columns are nullable by contract (the oracle DDL emits no NOT NULL; the engine stores
 // Value::Null; the client zod schema allows null cells). The pk is never null.
 
-import type { Row, Schema, ShapeDef } from '@electric-lite/protocol'
+import type { Row, Schema, ShapeDef } from '@electric-ivm/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { formatCompare } from './compare.js'
 import { applyOp, bootHarness, drainEngine, type Harness, waitForConvergence } from './harness.js'

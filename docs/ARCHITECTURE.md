@@ -1,4 +1,4 @@
-# electric-lite — architecture
+# electric-ivm — architecture
 
 The as-built system architecture. Companion documents:
 
@@ -32,7 +32,7 @@ The as-built system architecture. Companion documents:
                                   │ read / long-poll
                                   ▼
                                CLIENTS
-                                  ├─ @electric-lite/client  (shapes, subset queries, aggregations)
+                                  ├─ @electric-ivm/client  (shapes, subset queries, aggregations)
                                   └─ ElectricSQL client     (GET /v1/shape on the engine)
 ```
 
@@ -59,7 +59,7 @@ Three ideas carry the whole design:
 - **engine** (`apps/engine`, Rust) — the core: replication ingest, per-change Z-set deltas, fan-out to
   shapes/subqueries/aggregations, the control-plane HTTP API, and the Electric-compatible
   `GET /v1/shape` endpoint.
-- **API** (`apps/api`, tRPC) — the extended surface used by `@electric-lite/client`: `schema.define`,
+- **API** (`apps/api`, tRPC) — the extended surface used by `@electric-ivm/client`: `schema.define`,
   `ingest.write` (library mode), `shapes.create/get/delete`, `subset.query/live`, `aggregate`.
 - **client** (`packages/client`) — `shape()` (a live TanStack DB collection), `subset()` (an ordered,
   windowed page + a shared live tail), `aggregate()` (a live scalar), typed writes, `awaitTxId`.
@@ -159,7 +159,7 @@ The shape of the predicate picks the strategy (full detail + cost model: interna
   delta. No state; O(K) evals per change across the K standalone shapes on the table.
 - **Subqueries** (`col [NOT] IN (SELECT …)`) → the cross-table registry (§6).
 
-**Aggregations** (electric-lite extension, not part of the Electric-compatible API): a scalar
+**Aggregations** (electric-ivm extension, not part of the Electric-compatible API): a scalar
 COUNT/SUM/AVG/MIN/MAX over a non-subquery predicate, maintained incrementally as a fold over the
 delta — COUNT/SUM/AVG hold running scalars, MIN/MAX a `value → net-weight` multiset so retractions
 restore the previous extreme. SQL NULL semantics are mirrored exactly: aggregates ignore NULL values,

@@ -1,4 +1,4 @@
-// Electric benchmarking-fleet runner against electric-lite. For each benchmark it: boots our stack
+// Electric benchmarking-fleet runner against electric-ivm. For each benchmark it: boots our stack
 // (durable-streams + engine + /v1/shape adapter on an ephemeral Postgres) via the launcher, seeds the
 // benchmark's schema at scale, runs the (unmodified) ElectricSQL byo_electric benchmark `.exs` script
 // pointed at our adapter, collects the statsd/UDP telemetry the script emits, and reports latency
@@ -111,7 +111,7 @@ async function bootStack(waitTable: string, tables: string): Promise<Stack> {
   // (killing just pnpm orphans the tsx launcher, its Rust engine, and an ephemeral Postgres per bench).
   const proc = spawn(
     'bash',
-    ['-lc', `cd ${repoRoot()} && exec env ADAPTER_WAIT_TABLE=${waitTable} ADAPTER_PG_TABLES=${tables} ADAPTER_LONGPOLL_MS=1000 ADAPTER_LIVE_TIMEOUT_MS=20000 pnpm --filter @electric-lite/bench exec tsx src/electric-adapter.ts`],
+    ['-lc', `cd ${repoRoot()} && exec env ADAPTER_WAIT_TABLE=${waitTable} ADAPTER_PG_TABLES=${tables} ADAPTER_LONGPOLL_MS=1000 ADAPTER_LIVE_TIMEOUT_MS=20000 pnpm --filter @electric-ivm/bench exec tsx src/electric-adapter.ts`],
     { stdio: ['ignore', 'pipe', 'inherit'], detached: true },
   )
   // One persistent handler accumulates all output; waiters poll the parsed values (no lost lines).
@@ -306,9 +306,9 @@ async function main() {
     console.error(`benchmarking-fleet not found at ${FLEET_DIR}. Set FLEET_DIR=/path/to/benchmarking-fleet`)
     process.exit(1)
   }
-  if (!existsSync(join(repoRoot(), 'target', 'release', 'electric-lite-engine'))) {
-    console.log('building the release engine (cargo build --release -p electric-lite-engine)…')
-    execFileSync('cargo', ['build', '--release', '-p', 'electric-lite-engine'], {
+  if (!existsSync(join(repoRoot(), 'target', 'release', 'electric-ivm-engine'))) {
+    console.log('building the release engine (cargo build --release -p electric-ivm-engine)…')
+    execFileSync('cargo', ['build', '--release', '-p', 'electric-ivm-engine'], {
       cwd: repoRoot(),
       stdio: 'inherit',
     })
@@ -320,7 +320,7 @@ async function main() {
     lines.push(s)
     process.stdout.write(`${s}\n`)
   }
-  log(`# Electric benchmarking-fleet — results vs electric-lite`)
+  log(`# Electric benchmarking-fleet — results vs electric-ivm`)
   log('')
   log(`Generated ${new Date().toISOString()} on ${process.platform}/${process.arch}. Scale ${SCALE}.`)
   log(`Each row runs the unmodified ElectricSQL \`byo_electric\` benchmark \`.exs\` against our \`/v1/shape\``)

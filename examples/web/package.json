@@ -1,5 +1,5 @@
 {
-  "name": "@electric-lite/web",
+  "name": "@electric-ivm/web",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -8,9 +8,9 @@
     "vite": "vite"
   },
   "dependencies": {
-    "@electric-lite/protocol": "workspace:*",
-    "@electric-lite/api": "workspace:*",
-    "@electric-lite/client": "workspace:*",
+    "@electric-ivm/protocol": "workspace:*",
+    "@electric-ivm/api": "workspace:*",
+    "@electric-ivm/client": "workspace:*",
     "@durable-streams/server": "^0.3.7",
     "@durable-streams/state": "^0.3.1",
     "@tanstack/db": "^0.6.12",

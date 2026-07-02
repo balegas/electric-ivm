@@ -9,7 +9,7 @@ const repoRoot = fileURLToPath(new URL('../..', import.meta.url))
 // collisions), plus the `/pg/write` middleware. Vite auto-increments its own port if 5174 is taken.
 export default defineConfig({
   plugins: [react()],
-  optimizeDeps: { exclude: ['@electric-lite/client', '@electric-lite/protocol', '@electric-lite/api'] },
+  optimizeDeps: { exclude: ['@electric-ivm/client', '@electric-ivm/protocol', '@electric-ivm/api'] },
   server: {
     port: 5174,
     fs: { allow: [repoRoot] },

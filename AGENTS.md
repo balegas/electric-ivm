@@ -1,10 +1,10 @@
 # AGENTS.md
 
-Guidance for AI agents working in **electric-lite** — an Electric-style reactive sync engine. App
+Guidance for AI agents working in **electric-ivm** — an Electric-style reactive sync engine. App
 writes go to **Postgres**; a Rust engine turns logical-replication changes into **live shapes**
 (incrementally maintained, fully de-duplicated); **durable streams** is the log between them. Two
 client surfaces: the Electric-compatible `GET /v1/shape` (works with the ElectricSQL TS client) and
-the extended `@electric-lite/client` API (shapes + subset queries + live aggregations — the surface
+the extended `@electric-ivm/client` API (shapes + subset queries + live aggregations — the surface
 the project is growing toward).
 
 ## Layout
@@ -38,8 +38,8 @@ the project is growing toward).
 ## Build & test
 
 ```bash
-pnpm engine:build          # cargo build -p electric-lite-engine
-pnpm engine:test           # cargo test  -p electric-lite-engine   (fast)
+pnpm engine:build          # cargo build -p electric-ivm-engine
+pnpm engine:test           # cargo test  -p electric-ivm-engine   (fast)
 pnpm test                  # vitest run — full suite incl. conformance (~60s; boots its own PG)
 pnpm test:conformance      # just the conformance package
 pnpm test:fuzz             # random-predicate fuzz vs oracle
@@ -60,7 +60,7 @@ projects scale with it (users ~√issues). Boots PG + ds + engine + API + web UI
 explorer; `stop` tears down cleanly; `status` reports. One instance at a time (teardown is
 pattern-based). Ports: `DEMO_HTTPS_PORT` (8443), `DEMO_VIZ_PORT` (5180), `DEMO_VIZ=0` to skip.
 
-`packages/loadgen` — `USERS=100 SEED_ISSUES=20000 DURATION_S=90 pnpm --filter @electric-lite/loadgen
+`packages/loadgen` — `USERS=100 SEED_ISSUES=20000 DURATION_S=90 pnpm --filter @electric-ivm/loadgen
 loadgen`; `SWEEP_USERS=…` for comparison tables; Docker client scaling in `packages/loadgen/docker/`.
 Use `DS_MEMORY=1` at high concurrency (the file-backed test server fsyncs per append — the ceiling is
 storage, not the engine).
@@ -128,7 +128,7 @@ storage, not the engine).
   users ⇒ shared engine families). LinearLite's browse list does this.
 - **The demo boots an _ephemeral_ Postgres each run** (`mkdtemp`); data does not persist. **Kill
   stale demos before restarting** — a leftover `tsx start.ts`/`caddy` serves OLD code and reads as a
-  mysterious schema mismatch. `scripts/linearlite.sh stop`, or `pkill -f electric-lite-engine`,
+  mysterious schema mismatch. `scripts/linearlite.sh stop`, or `pkill -f electric-ivm-engine`,
   `pkill -f "tsx start.ts"`, `pkill -f caddy`. If two demos run, scope kills by port
   (`ps -o ppid= -p $(lsof -ti :<httpsPort>)`) — a SIGKILL mid-shutdown leaks the ephemeral Postgres.
 - **Vite binds IPv6 `[::1]` only** — prefer the `https://localhost:8443` Caddy proxy (HTTP/2 also

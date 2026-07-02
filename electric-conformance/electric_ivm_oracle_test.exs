@@ -1,13 +1,13 @@
-defmodule Electric.Integration.ElectricLiteOracleTest do
+defmodule Electric.Integration.ElectricIvmOracleTest do
   @moduledoc """
   Runs Electric's oracle harness (ShapeChecker / OracleHarness — the real comparison-against-Postgres
-  logic) against an EXTERNAL sync server: the `electric-lite` engine's Electric `/v1/shape` adapter.
+  logic) against an EXTERNAL sync server: the `electric-ivm` engine's Electric `/v1/shape` adapter.
 
-  We boot the electric-lite stack (durable-streams + engine + adapter) via its launcher, point
+  We boot the electric-ivm stack (durable-streams + engine + adapter) via its launcher, point
   `Electric.Client` at it, and reuse `Support.OracleHarness.test_against_oracle/4` unchanged. This proves
-  electric-lite speaks Electric's wire protocol well enough for the official client + oracle checks.
+  electric-ivm speaks Electric's wire protocol well enough for the official client + oracle checks.
 
-  Target the launcher with `ELECTRIC_LITE_DIR` (default ../../../dbsp-ds relative to this repo).
+  Target the launcher with `ELECTRIC_IVM_DIR` (default ../../../dbsp-ds relative to this repo).
   """
   use ExUnit.Case, async: false
 
@@ -17,7 +17,7 @@ defmodule Electric.Integration.ElectricLiteOracleTest do
 
   setup do
     lite_dir =
-      System.get_env("ELECTRIC_LITE_DIR") ||
+      System.get_env("ELECTRIC_IVM_DIR") ||
         Path.expand("../../../../../dbsp-ds", __DIR__)
 
     {pg_url, base_url, port} = boot_adapter(lite_dir)
@@ -54,7 +54,7 @@ defmodule Electric.Integration.ElectricLiteOracleTest do
   defp m(sql), do: %{sql: sql, name: sql}
 
   @tag timeout: 180_000
-  test "electric-lite passes the oracle harness on the level_1..4 schema", ctx do
+  test "electric-ivm passes the oracle harness on the level_1..4 schema", ctx do
     shapes = [
       shape("l1_active", "level_1", "active = true"),
       shape("l3_all", "level_3", "TRUE"),
@@ -103,12 +103,12 @@ defmodule Electric.Integration.ElectricLiteOracleTest do
              )
   end
 
-  # --- boot the electric-lite adapter via its launcher; read discovery lines off stdout ----------
+  # --- boot the electric-ivm adapter via its launcher; read discovery lines off stdout ----------
   defp boot_adapter(lite_dir) do
     launcher = Path.join(lite_dir, @launcher_rel)
     unless File.exists?(launcher), do: flunk("launcher not found at #{launcher}")
 
-    cmd = "cd #{lite_dir} && exec pnpm --filter @electric-lite/bench exec tsx src/electric-adapter.ts"
+    cmd = "cd #{lite_dir} && exec pnpm --filter @electric-ivm/bench exec tsx src/electric-adapter.ts"
     port = Port.open({:spawn, "bash -lc '#{cmd}'"}, [:binary, :exit_status, line: 100_000])
 
     {pg_url, base_url} = read_discovery(port, %{}, 60_000)
@@ -136,9 +136,9 @@ defmodule Electric.Integration.ElectricLiteOracleTest do
         read_discovery(port, acc, timeout)
 
       {^port, {:exit_status, status}} ->
-        flunk("electric-lite launcher exited early (status #{status})")
+        flunk("electric-ivm launcher exited early (status #{status})")
     after
-      timeout -> flunk("timed out waiting for electric-lite launcher discovery lines")
+      timeout -> flunk("timed out waiting for electric-ivm launcher discovery lines")
     end
   end
 

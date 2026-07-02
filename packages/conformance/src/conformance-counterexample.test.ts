@@ -1,5 +1,5 @@
 // Negative control: the conformance suite is only trustworthy if a deliberately-WRONG engine
-// makes it go red. We boot the engine with a test-only injected fault (ELECTRIC_LITE_FAULT) and
+// makes it go red. We boot the engine with a test-only injected fault (ELECTRIC_IVM_FAULT) and
 // assert the oracle comparison DETECTS the divergence — and that the identical scenario on a
 // normal engine still converges. A pure-TS unit control guards the comparator itself.
 //
@@ -7,7 +7,7 @@
 // the "leave" envelope is never emitted, so we rely on `drainEngine` (the offset barrier still
 // advances) instead of awaitTxId, then take a single snapshot comparison.
 
-import type { Schema, ShapeDef } from '@electric-lite/protocol'
+import type { Schema, ShapeDef } from '@electric-ivm/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
 import { compareShapeSets, formatCompare } from './compare.js'
 import { applyOp, bootHarness, drainEngine, type Harness, snapshotCompare, waitForConvergence } from './harness.js'

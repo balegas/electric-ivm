@@ -4,7 +4,7 @@
 // the id space, so subquery membership actually changes); the SAME op stream drives the engine and the
 // pg oracle, so any divergence is a real bug.
 
-import type { ChangeEvent, Row, Schema } from '@electric-lite/protocol'
+import type { ChangeEvent, Row, Schema } from '@electric-ivm/protocol'
 
 export interface SimOp {
   table: string

@@ -137,7 +137,7 @@ struct AggregateReq {
     col: Option<String>,
 }
 
-/// Create a scalar aggregation shape (electric-lite extension; not in the Electric protocol).
+/// Create a scalar aggregation shape (electric-ivm extension; not in the Electric protocol).
 async fn create_aggregate(
     State(engine): State<Engine>,
     Json(req): Json<AggregateReq>,

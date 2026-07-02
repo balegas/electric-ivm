@@ -12,8 +12,8 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import type { DurableStreamTestServer } from '@durable-streams/server'
-import { type ApiServer, createApiServer } from '@electric-lite/api'
-import type { Schema } from '@electric-lite/protocol'
+import { type ApiServer, createApiServer } from '@electric-ivm/api'
+import type { Schema } from '@electric-ivm/protocol'
 import { faker } from '@faker-js/faker'
 import pgpkg from 'pg'
 
@@ -67,7 +67,7 @@ export const schema: Schema = {
   },
 }
 
-const SLOT = 'electric_lite_loadgen'
+const SLOT = 'electric_ivm_loadgen'
 
 function repoRoot(): string {
   let d = dirname(fileURLToPath(import.meta.url))
@@ -200,17 +200,17 @@ export async function bootInfra(seedIssues: number, opts: InfraOpts = {}, log = 
     // the externally-reachable host + the same ports.
     const dsUrl = `http://127.0.0.1:${dsPort}`
 
-    execFileSync('cargo', ['build', '-p', 'electric-lite-engine'], { cwd: repoRoot(), stdio: 'ignore' })
-    engineProc = spawn(join(repoRoot(), 'target', 'debug', 'electric-lite-engine'), [], {
+    execFileSync('cargo', ['build', '-p', 'electric-ivm-engine'], { cwd: repoRoot(), stdio: 'ignore' })
+    engineProc = spawn(join(repoRoot(), 'target', 'debug', 'electric-ivm-engine'), [], {
       env: {
         ...process.env,
-        ELECTRIC_LITE_DS_URL: dsUrl,
-        ELECTRIC_LITE_BIND: '127.0.0.1:0',
-        ELECTRIC_LITE_LOG: 'warn',
-        ELECTRIC_LITE_PG_URL: pgUrl,
-        ELECTRIC_LITE_PG_TABLES: Object.keys(schema.tables).join(','),
-        ELECTRIC_LITE_PG_SLOT: SLOT,
-        ELECTRIC_LITE_PG_POLL_MS: '25',
+        ELECTRIC_IVM_DS_URL: dsUrl,
+        ELECTRIC_IVM_BIND: '127.0.0.1:0',
+        ELECTRIC_IVM_LOG: 'warn',
+        ELECTRIC_IVM_PG_URL: pgUrl,
+        ELECTRIC_IVM_PG_TABLES: Object.keys(schema.tables).join(','),
+        ELECTRIC_IVM_PG_SLOT: SLOT,
+        ELECTRIC_IVM_PG_POLL_MS: '25',
       },
       stdio: ['ignore', 'pipe', 'inherit'],
     })

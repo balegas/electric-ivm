@@ -1,4 +1,4 @@
-//! Predicate AST (deserialized from the control-plane JSON, mirroring `@electric-lite/protocol`)
+//! Predicate AST (deserialized from the control-plane JSON, mirroring `@electric-ivm/protocol`)
 //! compiled to a positional evaluator captured by a dbsp `filter` closure.
 
 use anyhow::Result;
@@ -335,7 +335,7 @@ impl Tri {
 }
 
 /// Compare a cell against a literal under SQL three-valued semantics: any NULL operand yields
-/// UNKNOWN (mirrors Postgres and `@electric-lite/protocol`'s evaluator).
+/// UNKNOWN (mirrors Postgres and `@electric-ivm/protocol`'s evaluator).
 fn cmp(cell: &Value, op: LeafOp, value: &Value) -> Tri {
     if matches!(cell, Value::Null) || matches!(value, Value::Null) {
         return Tri::Unknown;
@@ -352,7 +352,7 @@ fn cmp(cell: &Value, op: LeafOp, value: &Value) -> Tri {
             // does not arise in practice).
             let Some(ord) = ordering(cell, value) else { return Tri::Unknown };
             // TEST-ONLY: the `off_by_one_cmp` fault makes `<=`/`>=` strict, so rows exactly on a
-            // boundary literal are mishandled. No-op unless ELECTRIC_LITE_FAULT=off_by_one_cmp.
+            // boundary literal are mishandled. No-op unless ELECTRIC_IVM_FAULT=off_by_one_cmp.
             let off_by_one = matches!(crate::fault::active(), crate::fault::Fault::OffByOneCmp);
             match op {
                 LeafOp::Lt => ord.is_lt(),

@@ -610,7 +610,7 @@ impl Engine {
     }
 
     /// Create a scalar **aggregation** shape (COUNT/SUM/AVG/MIN/MAX over `where`), maintained
-    /// incrementally. An electric-lite extension — not part of the Electric-compatible API. Rejects
+    /// incrementally. An electric-ivm extension — not part of the Electric-compatible API. Rejects
     /// subquery predicates (use a plain filter); SUM/AVG/MIN/MAX require a column.
     pub async fn create_aggregate(
         &self,
@@ -1589,7 +1589,7 @@ pub(crate) fn translate_output(
         });
     }
     // TEST-ONLY: the `drop_deletes` fault suppresses "leave" envelopes so rows that exit a shape
-    // linger in the client. No-op unless ELECTRIC_LITE_FAULT=drop_deletes (see `fault`).
+    // linger in the client. No-op unless ELECTRIC_IVM_FAULT=drop_deletes (see `fault`).
     let drop_deletes = matches!(crate::fault::active(), crate::fault::Fault::DropDeletes);
     for pk in &neg {
         if pos.contains_key(pk) || drop_deletes {

@@ -9,10 +9,10 @@
 // latency.
 //
 // Run it twice, identical except for the engine's storage env:
-//   in-memory:  pnpm --filter @electric-lite/bench exec tsx src/memtest.ts
-//   on-disk:    ELECTRIC_LITE_STORAGE_DIR=/tmp/s ELECTRIC_LITE_STORAGE_CACHE=feldera \
-//               ELECTRIC_LITE_STORAGE_CACHE_MIB=128 ELECTRIC_LITE_STORAGE_MIN_BYTES=1048576 \
-//               pnpm --filter @electric-lite/bench exec tsx src/memtest.ts
+//   in-memory:  pnpm --filter @electric-ivm/bench exec tsx src/memtest.ts
+//   on-disk:    ELECTRIC_IVM_STORAGE_DIR=/tmp/s ELECTRIC_IVM_STORAGE_CACHE=feldera \
+//               ELECTRIC_IVM_STORAGE_CACHE_MIB=128 ELECTRIC_IVM_STORAGE_MIN_BYTES=1048576 \
+//               pnpm --filter @electric-ivm/bench exec tsx src/memtest.ts
 //
 // Config: MEM_FAMILIES (8), MEM_PAYLOAD bytes (512), MEM_DURATION s (45), MEM_CONC (8).
 
@@ -23,9 +23,9 @@ import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 
 import { DurableStreamTestServer } from '@durable-streams/server'
-import { createApiServer } from '@electric-lite/api'
-import { createClient } from '@electric-lite/client'
-import type { Schema } from '@electric-lite/protocol'
+import { createApiServer } from '@electric-ivm/api'
+import { createClient } from '@electric-ivm/client'
+import type { Schema } from '@electric-ivm/protocol'
 
 const execFileP = promisify(execFile)
 const env = (k: string, d: number) => (process.env[k] ? Number(process.env[k]) : d)
@@ -33,7 +33,7 @@ const M = env('MEM_FAMILIES', 8)
 const W = env('MEM_PAYLOAD', 512)
 const DURATION = env('MEM_DURATION', 45)
 const CONC = env('MEM_CONC', 8)
-const STORAGE_DIR = process.env.ELECTRIC_LITE_STORAGE_DIR || ''
+const STORAGE_DIR = process.env.ELECTRIC_IVM_STORAGE_DIR || ''
 
 const OUTFILE = process.env.MEM_OUT ?? join(dirname(fileURLToPath(import.meta.url)), '..', 'memtest.txt')
 const log = (line = '') => {
@@ -67,8 +67,8 @@ const HOT = 7 // hot-shape constant on k0; the firehose never writes k0=7
 let enginePid = 0
 
 async function spawnEngine(dsUrl: string) {
-  const proc = spawn(join(repoRoot(), 'target', 'release', 'electric-lite-engine'), [], {
-    env: { ...process.env, ELECTRIC_LITE_DS_URL: dsUrl, ELECTRIC_LITE_BIND: '127.0.0.1:0', ELECTRIC_LITE_LOG: 'warn' },
+  const proc = spawn(join(repoRoot(), 'target', 'release', 'electric-ivm-engine'), [], {
+    env: { ...process.env, ELECTRIC_IVM_DS_URL: dsUrl, ELECTRIC_IVM_BIND: '127.0.0.1:0', ELECTRIC_IVM_LOG: 'warn' },
     stdio: ['ignore', 'pipe', 'inherit'],
   })
   const url = await new Promise<string>((resolve, reject) => {
@@ -130,9 +130,9 @@ function randomRow(id: number): Record<string, unknown> {
 
 async function main() {
   writeFileSync(OUTFILE, '')
-  log(`\n=== memtest: ${M} families, ${W}B payload, ${DURATION}s, conc=${CONC}, storage=${STORAGE_DIR ? `on (${process.env.ELECTRIC_LITE_STORAGE_CACHE || 'page'})` : 'OFF (in-memory)'} ===`)
-  if (!existsSync(join(repoRoot(), 'target', 'release', 'electric-lite-engine'))) {
-    console.error('build first: cargo build --release -p electric-lite-engine')
+  log(`\n=== memtest: ${M} families, ${W}B payload, ${DURATION}s, conc=${CONC}, storage=${STORAGE_DIR ? `on (${process.env.ELECTRIC_IVM_STORAGE_CACHE || 'page'})` : 'OFF (in-memory)'} ===`)
+  if (!existsSync(join(repoRoot(), 'target', 'release', 'electric-ivm-engine'))) {
+    console.error('build first: cargo build --release -p electric-ivm-engine')
     process.exit(1)
   }
 

@@ -1,8 +1,8 @@
-# ElectricSQL benchmarking-fleet — results vs electric-lite
+# ElectricSQL benchmarking-fleet — results vs electric-ivm
 
 Generated 2026-07-02 on darwin/arm64. We ran ElectricSQL's **own** `byo_electric` benchmarks
 (unmodified `.exs` scripts from [electric-sql/benchmarking-fleet](https://github.com/electric-sql/benchmarking-fleet))
-against electric-lite's Electric-protocol `/v1/shape` adapter, the same way the fleet benchmarks the real
+against electric-ivm's Electric-protocol `/v1/shape` adapter, the same way the fleet benchmarks the real
 Electric sync-service. This is a load/throughput companion to the oracle conformance tests.
 
 ## Method

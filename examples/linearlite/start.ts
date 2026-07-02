@@ -1,18 +1,18 @@
-// Dev entrypoint for LinearLite on electric-lite, wired to the Postgres backend. Boots an ephemeral
+// Dev entrypoint for LinearLite on electric-ivm, wired to the Postgres backend. Boots an ephemeral
 // Postgres with logical replication, the engine in Postgres mode (it ingests changes via the
 // replication slot and reads rows back for backfill), durable-streams + the API for the read/shape
 // path, and Vite. Browser writes go to Postgres through a /pg/write middleware — Postgres is the
 // system of record. durable-streams + API use ephemeral ports; Vite proxies to them dynamically.
-//   pnpm --filter @electric-lite/linearlite start     (or: pnpm demo:linearlite)
+//   pnpm --filter @electric-ivm/linearlite start     (or: pnpm demo:linearlite)
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
 import { appendFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { type ApiServer, createApiServer } from '@electric-lite/api'
+import { type ApiServer, createApiServer } from '@electric-ivm/api'
 import { DurableStreamTestServer } from '@durable-streams/server'
-import { changeEventToDML } from '@electric-lite/protocol'
+import { changeEventToDML } from '@electric-ivm/protocol'
 import { faker } from '@faker-js/faker'
 import pgpkg from 'pg'
 import { createServer as createViteServer, type Plugin, type ViteDevServer } from 'vite'
@@ -29,7 +29,7 @@ function repoRoot(): string {
   throw new Error('repo root not found')
 }
 
-const SLOT = 'electric_lite_linearlite'
+const SLOT = 'electric_ivm_linearlite'
 
 // Resources to tear down (in reverse order) on shutdown or partial-boot failure.
 let pgDir: string | undefined
@@ -250,17 +250,17 @@ try {
   const dsUrl = await ds.start()
   console.log('durable-streams →', dsUrl)
 
-  execFileSync('cargo', ['build', '-p', 'electric-lite-engine'], { cwd: repoRoot(), stdio: 'inherit' })
-  engineProc = spawn(join(repoRoot(), 'target', 'debug', 'electric-lite-engine'), [], {
+  execFileSync('cargo', ['build', '-p', 'electric-ivm-engine'], { cwd: repoRoot(), stdio: 'inherit' })
+  engineProc = spawn(join(repoRoot(), 'target', 'debug', 'electric-ivm-engine'), [], {
     env: {
       ...process.env,
-      ELECTRIC_LITE_DS_URL: dsUrl,
-      ELECTRIC_LITE_BIND: '127.0.0.1:0',
-      ELECTRIC_LITE_LOG: 'warn',
-      ELECTRIC_LITE_PG_URL: pgUrl,
-      ELECTRIC_LITE_PG_TABLES: Object.keys(schema.tables).join(','),
-      ELECTRIC_LITE_PG_SLOT: SLOT,
-      ELECTRIC_LITE_PG_POLL_MS: '25',
+      ELECTRIC_IVM_DS_URL: dsUrl,
+      ELECTRIC_IVM_BIND: '127.0.0.1:0',
+      ELECTRIC_IVM_LOG: 'warn',
+      ELECTRIC_IVM_PG_URL: pgUrl,
+      ELECTRIC_IVM_PG_TABLES: Object.keys(schema.tables).join(','),
+      ELECTRIC_IVM_PG_SLOT: SLOT,
+      ELECTRIC_IVM_PG_POLL_MS: '25',
     },
     stdio: ['ignore', 'pipe', 'inherit'],
   })
@@ -284,7 +284,7 @@ try {
 
   // --- 3. Vite + the /pg/write middleware (writes go to Postgres) --------------------------------
   const pgWritePlugin: Plugin = {
-    name: 'electric-lite-pg-write',
+    name: 'electric-ivm-pg-write',
     configureServer(server) {
       server.middlewares.use('/pg/write', (req, res) => {
         if (req.method !== 'POST') {
@@ -371,9 +371,9 @@ try {
   // Auto-launched pointed at the engine; set DEMO_VIZ=0 to skip, DEMO_VIZ_PORT to change the port.
   if (process.env.DEMO_VIZ !== '0') {
     const vizPort = process.env.DEMO_VIZ_PORT ?? '5180'
-    vizProc = spawn('pnpm', ['--filter', '@electric-lite/pipeline-viz', 'dev'], {
+    vizProc = spawn('pnpm', ['--filter', '@electric-ivm/pipeline-viz', 'dev'], {
       cwd: repoRoot(),
-      env: { ...process.env, ELECTRIC_LITE_ENGINE_URL: engineUrl, VIZ_PORT: vizPort },
+      env: { ...process.env, ELECTRIC_IVM_ENGINE_URL: engineUrl, VIZ_PORT: vizPort },
       stdio: 'ignore',
     })
     vizProc.on('exit', (c) => {
@@ -384,7 +384,7 @@ try {
   }
 
   console.log(`\n👉 Open a URL above. LinearLite (${PRIORITIES.length} priorities, ${STATUSES.length} statuses)`)
-  console.log('   on electric-lite: writes go to Postgres, replicate into the engine, and the')
+  console.log('   on electric-ivm: writes go to Postgres, replicate into the engine, and the')
   console.log('   board/list shapes update live.\n')
 } catch (e) {
   console.error('linearlite: startup failed:', e)

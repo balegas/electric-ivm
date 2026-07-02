@@ -22,7 +22,7 @@ defmodule Electric.Integration.SubqueryDependencyUpdateTest do
   import Support.DbStructureSetup
   import Support.IntegrationSetup
   import Support.StreamConsumer
-  import Support.ElLiteSetup
+  import Support.ElIvmSetup
 
   alias Electric.Client
   alias Electric.Client.ShapeDefinition
@@ -44,9 +44,9 @@ defmodule Electric.Integration.SubqueryDependencyUpdateTest do
   """
 
   describe "dependency tracking when intermediate rows move between parents" do
-    setup :el_lite_pg
+    setup :el_ivm_pg
     setup [:with_org_team_project_task_tables, :with_sql_execute]
-    setup :el_lite_client
+    setup :el_ivm_client
 
     @tag with_sql: [
            # Two organizations, both premium
@@ -172,9 +172,9 @@ defmodule Electric.Integration.SubqueryDependencyUpdateTest do
     # the record didn't match other parts of the WHERE clause. The old code would
     # incorrectly skip the change, assuming the move-in would cover it.
 
-    setup :el_lite_pg
+    setup :el_ivm_pg
     setup [:with_simple_parent_child_tables, :with_sql_execute]
-    setup :el_lite_client
+    setup :el_ivm_client
 
     # Shape: children of active parents, but only if child is published
     # This combines a subquery with a simple column condition using AND

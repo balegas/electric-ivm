@@ -1,6 +1,6 @@
 # @faker-js/faker for deterministic, seeded simulator data
 
-Research brief for electric-lite's simulator: schema-conforming row generation
+Research brief for electric-ivm's simulator: schema-conforming row generation
 (int/text/bool/float columns) plus a reproducible random stream of insert/update/
 delete ops where a printed seed exactly replays a failing run.
 
@@ -226,7 +226,7 @@ call sequence is unchanged.
 ## Open questions / unverified
 
 - **Cross-major-version stability:** faker does not guarantee identical streams across
-  major versions. Confirm whether electric-lite needs replay across faker upgrades; if
+  major versions. Confirm whether electric-ivm needs replay across faker upgrades; if
   so, pin the exact version and record it alongside the seed. (Documented behavior;
   not separately tested here.)
 - **Exact import path of `generateMersenne53Randomizer`** for v10.5.0 — docs show it
@@ -242,4 +242,4 @@ call sequence is unchanged.
   worker its own seeded instance if parallelizing.
 - **Unicode/length edge cases for text columns:** `string.sample` emits printable ASCII
   range 33..125 only; if columns must hold arbitrary UTF-8, choose a generator
-  accordingly (unverified against electric-lite's column constraints).
+  accordingly (unverified against electric-ivm's column constraints).

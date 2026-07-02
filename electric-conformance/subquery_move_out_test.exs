@@ -14,7 +14,7 @@ defmodule Electric.Integration.SubqueryMoveOutTest do
   import Support.DbStructureSetup
   import Support.IntegrationSetup
   import Support.StreamConsumer
-  import Support.ElLiteSetup
+  import Support.ElIvmSetup
 
   alias Electric.Client
   alias Electric.Client.ShapeDefinition
@@ -26,10 +26,10 @@ defmodule Electric.Integration.SubqueryMoveOutTest do
   @subquery_where "parent_id IN (SELECT id FROM parent WHERE active = true)"
 
   describe "subquery move-out with parent/child tables" do
-    setup :el_lite_pg
+    setup :el_ivm_pg
     setup [:with_parent_child_tables, :with_sql_execute]
 
-    setup :el_lite_client
+    setup :el_ivm_client
 
     setup _ctx do
       shape = ShapeDefinition.new!("child", where: @subquery_where)
@@ -169,10 +169,10 @@ defmodule Electric.Integration.SubqueryMoveOutTest do
   end
 
   describe "tag handling during updates" do
-    setup :el_lite_pg
+    setup :el_ivm_pg
     setup [:with_parent_child_tables, :with_sql_execute]
 
-    setup :el_lite_client
+    setup :el_ivm_client
 
     setup _ctx do
       shape = ShapeDefinition.new!("child", where: @subquery_where)
@@ -272,10 +272,10 @@ defmodule Electric.Integration.SubqueryMoveOutTest do
   end
 
   describe "tag consistency across streams" do
-    setup :el_lite_pg
+    setup :el_ivm_pg
     setup [:with_parent_child_tables, :with_sql_execute]
 
-    setup :el_lite_client
+    setup :el_ivm_client
 
     setup _ctx do
       shape = ShapeDefinition.new!("child", where: @subquery_where)
@@ -314,10 +314,10 @@ defmodule Electric.Integration.SubqueryMoveOutTest do
   end
 
   describe "resume preserves move-out state" do
-    setup :el_lite_pg
+    setup :el_ivm_pg
     setup [:with_parent_child_tables, :with_sql_execute]
 
-    setup :el_lite_client
+    setup :el_ivm_client
 
     setup _ctx do
       shape = ShapeDefinition.new!("child", where: @subquery_where)
@@ -359,9 +359,9 @@ defmodule Electric.Integration.SubqueryMoveOutTest do
   end
 
   describe "negated subquery move-in and move-out" do
-    setup :el_lite_pg
+    setup :el_ivm_pg
     setup [:with_inner_outer_tables, :with_sql_execute]
-    setup :el_lite_client
+    setup :el_ivm_client
 
     # Shape: outer rows whose inner row is NOT active
     @negated_where "inner_id NOT IN (SELECT id FROM inner_table WHERE active = true)"

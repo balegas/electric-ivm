@@ -1,6 +1,6 @@
 # Durable Streams — Protocol & Implementation Brief
 
-Research date: 2026-06-27. For "electric-lite" (Node/TS appender → Rust tailer → TS live reader).
+Research date: 2026-06-27. For "electric-ivm" (Node/TS appender → Rust tailer → TS live reader).
 
 Durable Streams is an open protocol (by ElectricSQL / electric.ax) that extends plain HTTP
 with ordered, replayable, offset-resumable streams plus live tailing (long-poll + SSE) and
@@ -312,7 +312,7 @@ curl -I "http://127.0.0.1:4437/v1/stream/shapes/orders-active"
 
 ---
 
-## Mapping to electric-lite
+## Mapping to electric-ivm
 
 - **Node/TS API → per-table streams**: PUT-create one JSON stream per table; use
   `IdempotentProducer` (or `DurableStream.append`) with a stable `Producer-Id` per API

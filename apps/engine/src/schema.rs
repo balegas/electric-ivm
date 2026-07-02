@@ -1,4 +1,4 @@
-//! Schema types (deserialized from the control-plane JSON, mirroring `@electric-lite/protocol`)
+//! Schema types (deserialized from the control-plane JSON, mirroring `@electric-ivm/protocol`)
 //! and their compiled, positional runtime form.
 
 use std::collections::BTreeMap;

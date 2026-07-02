@@ -1,13 +1,13 @@
 # Conformance Suite Expansion Plan
 
-**Goal:** verify the correctness of electric-lite across a much wider slice of its query
+**Goal:** verify the correctness of electric-ivm across a much wider slice of its query
 expressiveness and system behaviour, and *prove* the oracle approach actually catches bugs with a
 negative-control (counter-example) test. Everything runs through the real tRPC API + stream-db
 client against the pglite oracle, with the `drainEngine` soundness barrier before every comparison.
 
 ## Invariant under test
 
-For any shape `S` and any op stream applied to **both** electric-lite and pglite:
+For any shape `S` and any op stream applied to **both** electric-ivm and pglite:
 `client.materialize(S)  ==  pglite.SELECT * FROM table WHERE <S.where>`
 (set equality keyed by stringified pk, comparing declared non-pk columns by value).
 
@@ -58,7 +58,7 @@ ops, fixed seed) runs in CI without env tuning; env tunables still scale it furt
 ### D. Negative control — the counter-example (`conformance-counterexample.test.ts`)
 
 The whole suite is only trustworthy if a *wrong* engine makes it go red. We add **test-only fault
-injection** to the Rust engine, gated by `ELECTRIC_LITE_FAULT` (zero effect when unset):
+injection** to the Rust engine, gated by `ELECTRIC_IVM_FAULT` (zero effect when unset):
 
 - `drop_deletes` — never emit shape "leave" (delete) envelopes, so a row that exits a shape
   lingers in the client forever (`apps/engine/src/engine.rs::translate_output`).
@@ -97,6 +97,6 @@ predicates) — all compared row-for-row to pglite. Unit proofs: `predicate.rs`
 
 ## Harness changes
 
-`bootHarness(schema, { fault })` threads `ELECTRIC_LITE_FAULT` into the spawned engine's env. All
+`bootHarness(schema, { fault })` threads `ELECTRIC_IVM_FAULT` into the spawned engine's env. All
 existing call sites keep the no-arg form (normal, fault-free). No other harness changes; new tests
 reuse `applyOp` / `drainEngine` / `waitForConvergence` / `compareShapeSets`.

@@ -1,6 +1,6 @@
 # tRPC v11 — Standalone Node HTTP Server + Vanilla Client
 
-Research brief for `electric-lite`: expose `schema.define`, `ingest.write`, `shapes.create`,
+Research brief for `electric-ivm`: expose `schema.define`, `ingest.write`, `shapes.create`,
 `shapes.get` over tRPC, run as a standalone Node HTTP server (no Next.js, no React),
 and call it from Node test code with a fully typed vanilla client.
 
@@ -48,7 +48,7 @@ import { initTRPC, TRPCError } from '@trpc/server';
 // Context is whatever createContext returns (see server below).
 export type Context = {
   // e.g. db handle, request-scoped state
-  electric: ElectricLite;
+  electric: ElectricIvm;
 };
 
 const t = initTRPC.context<Context>().create();
@@ -140,7 +140,7 @@ const server = createHTTPServer({
   middleware: cors(), // optional; handles OPTIONS preflight + CORS headers
   createContext(opts): Context {
     // opts has { req, res, info }. Build request-scoped context here.
-    return { electric: getElectricLite() };
+    return { electric: getElectricIvm() };
   },
   // basePath: '/trpc/', // optional, default is '/'
   onError({ error, path }) {
@@ -300,12 +300,12 @@ server.close();
 
 ## Open questions
 
-- **electric-lite return types**: the `.input()` schemas above are illustrative
+- **electric-ivm return types**: the `.input()` schemas above are illustrative
   (`z.record`, `z.enum([...])`). Confirm the real column/row/op shapes and `shapes.create`
   return value so `.input()`/`.output()` match exactly.
-- **Sync vs async electric-lite methods**: snippets assume the methods may be sync; if any
+- **Sync vs async electric-ivm methods**: snippets assume the methods may be sync; if any
   return Promises, the resolvers already `return` them so it's fine — just confirm.
-- **Context lifetime**: whether `electric-lite` is a singleton (build once, reuse in
+- **Context lifetime**: whether `electric-ivm` is a singleton (build once, reuse in
   `createContext`) or per-request. Affects how `createContext` is written.
 - **errorFormatter for Zod**: decide whether tests need structured Zod issues
   (`shape.data.zodError`) or whether the default message string suffices.

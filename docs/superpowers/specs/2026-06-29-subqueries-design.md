@@ -107,7 +107,7 @@ non-null pks/tags, so this path is exercised only defensively).
 
 ## AST & SQL
 
-New predicate leaf (single-column `IN`/`NOT IN`), added to `@electric-lite/protocol` and mirrored in Rust:
+New predicate leaf (single-column `IN`/`NOT IN`), added to `@electric-ivm/protocol` and mirrored in Rust:
 
 ```jsonc
 { "col": "parent_id",

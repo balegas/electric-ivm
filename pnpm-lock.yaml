@@ -20,7 +20,7 @@ importers:
 
   apps/api:
     dependencies:
-      '@electric-lite/protocol':
+      '@electric-ivm/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol
       '@trpc/server':
@@ -66,7 +66,7 @@ importers:
       '@durable-streams/server':
         specifier: ^0.3.7
         version: 0.3.7(@tanstack/db@0.6.12(typescript@5.9.3))
-      '@electric-lite/api':
+      '@electric-ivm/api':
         specifier: workspace:*
         version: link:../apps/api
     devDependencies:
@@ -79,13 +79,13 @@ importers:
       '@durable-streams/server':
         specifier: ^0.3.7
         version: 0.3.7(@tanstack/db@0.6.12(typescript@5.9.3))
-      '@electric-lite/api':
+      '@electric-ivm/api':
         specifier: workspace:*
         version: link:../apps/api
-      '@electric-lite/client':
+      '@electric-ivm/client':
         specifier: workspace:*
         version: link:../packages/client
-      '@electric-lite/protocol':
+      '@electric-ivm/protocol':
         specifier: workspace:*
         version: link:../packages/protocol
       tsx:
@@ -100,13 +100,13 @@ importers:
       '@durable-streams/state':
         specifier: ^0.3.1
         version: 0.3.1(@tanstack/db@0.6.12(typescript@5.9.3))
-      '@electric-lite/api':
+      '@electric-ivm/api':
         specifier: workspace:*
         version: link:../../apps/api
-      '@electric-lite/client':
+      '@electric-ivm/client':
         specifier: workspace:*
         version: link:../../packages/client
-      '@electric-lite/protocol':
+      '@electric-ivm/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol
       '@faker-js/faker':
@@ -164,13 +164,13 @@ importers:
       '@durable-streams/state':
         specifier: ^0.3.1
         version: 0.3.1(@tanstack/db@0.6.12(typescript@5.9.3))
-      '@electric-lite/api':
+      '@electric-ivm/api':
         specifier: workspace:*
         version: link:../../apps/api
-      '@electric-lite/client':
+      '@electric-ivm/client':
         specifier: workspace:*
         version: link:../../packages/client
-      '@electric-lite/protocol':
+      '@electric-ivm/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol
       '@tanstack/db':
@@ -219,13 +219,13 @@ importers:
       '@durable-streams/server':
         specifier: ^0.3.7
         version: 0.3.7(@tanstack/db@0.6.12(typescript@5.9.3))
-      '@electric-lite/api':
+      '@electric-ivm/api':
         specifier: workspace:*
         version: link:../../apps/api
-      '@electric-lite/client':
+      '@electric-ivm/client':
         specifier: workspace:*
         version: link:../client
-      '@electric-lite/protocol':
+      '@electric-ivm/protocol':
         specifier: workspace:*
         version: link:../protocol
       pg:
@@ -243,10 +243,10 @@ importers:
       '@durable-streams/state':
         specifier: ^0.3.1
         version: 0.3.1(@tanstack/db@0.6.12(typescript@5.9.3))
-      '@electric-lite/api':
+      '@electric-ivm/api':
         specifier: workspace:*
         version: link:../../apps/api
-      '@electric-lite/protocol':
+      '@electric-ivm/protocol':
         specifier: workspace:*
         version: link:../protocol
       '@tanstack/db':
@@ -270,16 +270,16 @@ importers:
       '@durable-streams/state':
         specifier: ^0.3.1
         version: 0.3.1(@tanstack/db@0.6.12(typescript@5.9.3))
-      '@electric-lite/api':
+      '@electric-ivm/api':
         specifier: workspace:*
         version: link:../../apps/api
-      '@electric-lite/client':
+      '@electric-ivm/client':
         specifier: workspace:*
         version: link:../client
-      '@electric-lite/oracle':
+      '@electric-ivm/oracle':
         specifier: workspace:*
         version: link:../oracle
-      '@electric-lite/protocol':
+      '@electric-ivm/protocol':
         specifier: workspace:*
         version: link:../protocol
       '@electric-sql/pglite':
@@ -310,13 +310,13 @@ importers:
       '@durable-streams/server':
         specifier: ^0.3.7
         version: 0.3.7(@tanstack/db@0.6.12(typescript@5.9.3))
-      '@electric-lite/api':
+      '@electric-ivm/api':
         specifier: workspace:*
         version: link:../../apps/api
-      '@electric-lite/client':
+      '@electric-ivm/client':
         specifier: workspace:*
         version: link:../client
-      '@electric-lite/protocol':
+      '@electric-ivm/protocol':
         specifier: workspace:*
         version: link:../protocol
       '@faker-js/faker':
@@ -341,7 +341,7 @@ importers:
 
   packages/oracle:
     dependencies:
-      '@electric-lite/protocol':
+      '@electric-ivm/protocol':
         specifier: workspace:*
         version: link:../protocol
       '@electric-sql/pglite':

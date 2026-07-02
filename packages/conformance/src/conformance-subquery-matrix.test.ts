@@ -3,7 +3,7 @@
 // deterministic FK-respecting mutation stream, and assert every shape converges to the pg oracle (which
 // evaluates the subquery natively). This is the engine's analog of Electric's oracle property test.
 
-import type { Predicate, ShapeDef } from '@electric-lite/protocol'
+import type { Predicate, ShapeDef } from '@electric-ivm/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { formatCompare } from './compare.js'
 import { applyOp, bootHarness, drainEngine, type Harness, waitForConvergence } from './harness.js'

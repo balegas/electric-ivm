@@ -1,7 +1,7 @@
-# LinearLite on electric-lite
+# LinearLite on electric-ivm
 
 A port of [ElectricSQL's LinearLite](https://github.com/electric-sql/electric/tree/main/examples/linearlite)
-(a Linear-style issue tracker) to the **electric-lite** prototype. It demonstrates the prototype's
+(a Linear-style issue tracker) to the **electric-ivm** prototype. It demonstrates the prototype's
 model end-to-end: **Postgres is the system of record**, the app writes to Postgres, and the engine
 keeps each filtered view (a *shape*) live by ingesting Postgres **logical replication** and reading
 rows back for backfill.
@@ -44,18 +44,18 @@ in Postgres mode, durable-streams, the API, and Vite. Open the printed Local URL
 Every mutation is a real `INSERT`/`UPDATE`/`DELETE` against Postgres (via the dev server's `/pg/write`
 middleware); the engine observes it over the replication slot and updates the relevant shapes live.
 
-## How it maps onto electric-lite
+## How it maps onto electric-ivm
 
-electric-lite shapes are *one table + a `WHERE` over that table's own columns* (no joins), with value
+electric-ivm shapes are *one table + a `WHERE` over that table's own columns* (no joins), with value
 types `int | float | text | bool` and a single-column primary key. The port adapts the original
 accordingly:
 
-- **Schema** (`src/schema.ts`): `issues` and `comments`. electric-lite's value types are
-  `int | float | text | bool`, so the original's UUID ids and `timestamptz` become electric-lite **`int`**
+- **Schema** (`src/schema.ts`): `issues` and `comments`. electric-ivm's value types are
+  `int | float | text | bool`, so the original's UUID ids and `timestamptz` become electric-ivm **`int`**
   columns (Linear-style numeric issue ids; epoch-millis timestamps, so `created`/`modified` are
   sortable/filterable). Because the client mints ids from `Date.now()` (which overflows Postgres `int4`),
   `start.ts` creates the underlying Postgres columns as **`BIGINT`** explicitly rather than via the
-  default `tableDDL` (which would emit `int4`) — the electric-lite type is `int`, the physical Postgres
+  default `tableDDL` (which would emit `int4`) — the electric-ivm type is `int`, the physical Postgres
   type is `BIGINT`. `status` and `priority` are stored as their lowercase string constants, exactly as
   upstream.
 - **No cross-table queries**: the issue↔comments relationship is expressed as a per-issue comments
@@ -67,7 +67,7 @@ accordingly:
   priority sort is a small client-side step (a rank over a text enum, no integer column). See
   `src/lib/useShape.ts` and the [ARCHITECTURE client-query-layer section](../../docs/ARCHITECTURE.md#12-client-query-layer-two-level-querying).
 - The Electric sync-engine columns (`deleted`, `new`, `synced`, …) and the offline write path are
-  dropped — electric-lite's ingestion *is* Postgres logical replication.
+  dropped — electric-ivm's ingestion *is* Postgres logical replication.
 
 ## Files
 

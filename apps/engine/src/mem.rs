@@ -140,7 +140,7 @@ pub fn init_otel() -> SdkMeterProvider {
     let _ = PROM_REGISTRY.set(registry);
 
     let provider = SdkMeterProvider::builder().with_reader(exporter).build();
-    let meter = provider.meter("electric_lite_engine");
+    let meter = provider.meter("electric_ivm_engine");
 
     // One observable gauge per metric; each callback reads the lock-free published snapshot.
     macro_rules! gauge {
@@ -165,7 +165,7 @@ pub fn init_otel() -> SdkMeterProvider {
     gauge!("engine_subquery_edges", "Subquery dependency edges", subquery_edges, "");
 
     // Touch a KeyValue so the import is used even if labels are added later.
-    let _ = KeyValue::new("service.name", "electric-lite-engine");
+    let _ = KeyValue::new("service.name", "electric-ivm-engine");
     provider
 }
 

@@ -1,4 +1,4 @@
-//! electric-lite query engine.
+//! electric-ivm query engine.
 //!
 //! Takes change events from per-table durable streams and fans each change out to registered shapes.
 //! The engine holds **no table data** — only per-shape metadata: equality shapes are routed by key
@@ -6,7 +6,7 @@
 //! non-shareable shapes (ranges / OR / NOT / inequality) are stateless filters evaluated directly on
 //! each delta. Matching deltas are appended (as State-Protocol envelopes) to per-shape durable
 //! streams. The Z-set element is a dynamically-typed [`value::Row`] (positional `Vec<Value>`); the
-//! schema gives names to the positions. See `docs/superpowers/specs/2026-06-27-electric-lite-decisions.md`
+//! schema gives names to the positions. See `docs/superpowers/specs/2026-06-27-electric-ivm-decisions.md`
 //! and `docs/superpowers/specs/2026-06-29-reduce-engine-memory-design.md`.
 
 pub mod ds;

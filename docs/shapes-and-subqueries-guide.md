@@ -1,6 +1,6 @@
 # Guide: shapes and subqueries
 
-Audience: people integrating against electric-lite — defining shapes and subqueries, wiring the
+Audience: people integrating against electric-ivm — defining shapes and subqueries, wiring the
 engine to Postgres, and sizing a deployment. For how the engine works internally and the full
 analytical cost model, see the companion `docs/ivm-engine-internals.md`.
 
@@ -56,10 +56,10 @@ identical either way.)
 
 | env var | meaning |
 |---|---|
-| `ELECTRIC_LITE_PG_URL` | Postgres connection string. Its presence selects Postgres mode. |
-| `ELECTRIC_LITE_PG_TABLES` | comma-separated table list, or `*`/empty to **introspect every public table that has a primary key** (skipping the engine's `__el_sync` bookkeeping table). |
-| `ELECTRIC_LITE_PG_SLOT` | replication slot name (`test_decoding`). |
-| `ELECTRIC_LITE_PG_POLL_MS` | slot poll interval. |
+| `ELECTRIC_IVM_PG_URL` | Postgres connection string. Its presence selects Postgres mode. |
+| `ELECTRIC_IVM_PG_TABLES` | comma-separated table list, or `*`/empty to **introspect every public table that has a primary key** (skipping the engine's `__el_sync` bookkeeping table). |
+| `ELECTRIC_IVM_PG_SLOT` | replication slot name (`test_decoding`). |
+| `ELECTRIC_IVM_PG_POLL_MS` | slot poll interval. |
 
 On boot the engine introspects the configured tables (columns, types, primary key — composite
 keys ordered by index position), sets `REPLICA IDENTITY FULL`, creates the replication slot,
@@ -92,7 +92,7 @@ Postgres oracle always agree).
 ### Via the client (tRPC + stream-db)
 
 ```ts
-import { createClient } from '@electric-lite/client'
+import { createClient } from '@electric-ivm/client'
 
 const client = createClient({ apiUrl, schema })
 

@@ -1,7 +1,7 @@
-# Deploying electric-lite with Postgres
+# Deploying electric-ivm with Postgres
 
-electric-lite can run **Postgres as the system of record**: your application writes to Postgres
-normally, and electric-lite keeps every declared shape (a filtered view of a table) live by ingesting
+electric-ivm can run **Postgres as the system of record**: your application writes to Postgres
+normally, and electric-ivm keeps every declared shape (a filtered view of a table) live by ingesting
 changes from Postgres **logical replication** and reading rows back from Postgres for backfill. There
 is no separate write API and no in-memory table copy to keep in sync — Postgres is the source of truth.
 
@@ -19,9 +19,9 @@ is no separate write API and no in-memory table copy to keep in sync — Postgre
   install). Managed Postgres works if it allows `wal_level = logical` and a logical replication slot
   (RDS, Cloud SQL, Supabase, Neon, etc. all do).
 - **A durable-streams server** (the transport/persistence layer). Set its base URL in
-  `ELECTRIC_LITE_DS_URL`.
-- **The engine binary** (`apps/engine`, Rust): `cargo build -p electric-lite-engine --release` →
-  `target/release/electric-lite-engine`.
+  `ELECTRIC_IVM_DS_URL`.
+- **The engine binary** (`apps/engine`, Rust): `cargo build -p electric-ivm-engine --release` →
+  `target/release/electric-ivm-engine`.
 
 ## Step 1 — Configure Postgres
 
@@ -47,38 +47,38 @@ The engine sets everything else up for you on startup, per configured table:
 
 > **One slot per engine instance.** Replication-slot names are unique across the whole Postgres
 > instance. If you run more than one engine against the same database, give each a distinct
-> `ELECTRIC_LITE_PG_SLOT`.
+> `ELECTRIC_IVM_PG_SLOT`.
 
 ## Step 2 — Run the engine
 
 Point it at Postgres, list the tables to watch, and give it the durable-streams URL:
 
 ```sh
-export ELECTRIC_LITE_DS_URL="https://streams.internal:8080"
-export ELECTRIC_LITE_PG_URL="postgres://user:pass@db.internal:5432/appdb"
-export ELECTRIC_LITE_PG_TABLES="users,projects,tasks"
-export ELECTRIC_LITE_BIND="0.0.0.0:9000"
+export ELECTRIC_IVM_DS_URL="https://streams.internal:8080"
+export ELECTRIC_IVM_PG_URL="postgres://user:pass@db.internal:5432/appdb"
+export ELECTRIC_IVM_PG_TABLES="users,projects,tasks"
+export ELECTRIC_IVM_BIND="0.0.0.0:9000"
 
-./electric-lite-engine
+./electric-ivm-engine
 ```
 
 On startup the engine introspects each table, sets `REPLICA IDENTITY FULL`, ensures the slot, starts
-the replication ingestor, and begins serving the control API on `ELECTRIC_LITE_BIND`. It prints
+the replication ingestor, and begins serving the control API on `ELECTRIC_IVM_BIND`. It prints
 `ENGINE_LISTENING <addr>` once ready.
 
 ### Configuration reference
 
 | Variable                  | Required | Default          | Meaning |
 |---------------------------|:--------:|------------------|---------|
-| `ELECTRIC_LITE_DS_URL`    | yes      | —                | durable-streams base URL. |
-| `ELECTRIC_LITE_PG_URL`    | yes¹     | —                | Postgres connection string. Setting it enables Postgres mode. |
-| `ELECTRIC_LITE_PG_TABLES` | yes¹     | (empty)          | Comma-separated tables to watch (in schema `public`). |
-| `ELECTRIC_LITE_PG_SLOT`   | no       | `electric_lite`  | Logical replication slot name (unique per engine). |
-| `ELECTRIC_LITE_PG_POLL_MS`| no       | `50`             | How often (ms) to poll the slot for new changes. |
-| `ELECTRIC_LITE_BIND`      | no       | `127.0.0.1:0`    | Address for the control/HTTP API. |
-| `ELECTRIC_LITE_LOG`       | no       | `info`           | Log filter (`error`, `warn`, `info`, `debug`). |
+| `ELECTRIC_IVM_DS_URL`    | yes      | —                | durable-streams base URL. |
+| `ELECTRIC_IVM_PG_URL`    | yes¹     | —                | Postgres connection string. Setting it enables Postgres mode. |
+| `ELECTRIC_IVM_PG_TABLES` | yes¹     | (empty)          | Comma-separated tables to watch (in schema `public`). |
+| `ELECTRIC_IVM_PG_SLOT`   | no       | `electric_ivm`  | Logical replication slot name (unique per engine). |
+| `ELECTRIC_IVM_PG_POLL_MS`| no       | `50`             | How often (ms) to poll the slot for new changes. |
+| `ELECTRIC_IVM_BIND`      | no       | `127.0.0.1:0`    | Address for the control/HTTP API. |
+| `ELECTRIC_IVM_LOG`       | no       | `info`           | Log filter (`error`, `warn`, `info`, `debug`). |
 
-¹ Omit `ELECTRIC_LITE_PG_URL` to run in library/no-source mode (shapes start empty; used by tests).
+¹ Omit `ELECTRIC_IVM_PG_URL` to run in library/no-source mode (shapes start empty; used by tests).
 
 ## Step 3 — Connect the client
 
@@ -86,7 +86,7 @@ The client subscribes to shapes over the engine's API and materializes them with
 Writes go to **Postgres**, not the client:
 
 ```ts
-import { createClient } from '@electric-lite/client'
+import { createClient } from '@electric-ivm/client'
 
 const client = createClient({ apiUrl: 'http://engine.internal:9000', schema })
 
@@ -100,12 +100,12 @@ activeUsers.subscribe((rows) => render(rows))
 
 // To change data, write to Postgres however you already do (psql, your ORM, etc.):
 //   UPDATE users SET active = false WHERE id = 42;
-// electric-lite picks it up via logical replication and updates the shape.
+// electric-ivm picks it up via logical replication and updates the shape.
 ```
 
 ## Operating notes
 
-- **Adding a table:** add it to `ELECTRIC_LITE_PG_TABLES` and restart the engine. It will introspect
+- **Adding a table:** add it to `ELECTRIC_IVM_PG_TABLES` and restart the engine. It will introspect
   and set replica identity on the new table at startup.
 - **Replication slot lag:** an engine that is stopped for a long time holds its slot, and Postgres
   retains WAL for it. If you decommission an engine, drop its slot:

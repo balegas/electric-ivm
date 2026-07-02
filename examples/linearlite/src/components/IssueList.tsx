@@ -1,7 +1,7 @@
 import { ilike, or } from '@tanstack/db'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 
-import type { AggregateDef, Predicate } from '@electric-lite/protocol'
+import type { AggregateDef, Predicate } from '@electric-ivm/protocol'
 
 import type { Filters } from '../App'
 import { navigate } from '../App'

@@ -274,7 +274,7 @@ multiple inputs). The constructor's return value `T` is whatever bundle of handl
 you want.
 
 **But the circuit graph is FIXED at build time.** You cannot add operators/inputs
-after `RootCircuit::build` returns. For electric-lite, where shapes register at
+after `RootCircuit::build` returns. For electric-ivm, where shapes register at
 runtime with *different* WHERE predicates (captured as closures at build time), the
 two viable models are:
 
@@ -433,4 +433,4 @@ let (mut circuit, (input_handle, output_handle)) =
    impls; verify no extra bound surfaces for the `Value` enum at compile time.
 6. **Predicate updates.** Changing a shape's WHERE clause means rebuilding the
    circuit (graph is fixed at build). Confirm the intended lifecycle (drop old
-   circuit, build new, replay state) for electric-lite's re-subscription path.
+   circuit, build new, replay state) for electric-ivm's re-subscription path.

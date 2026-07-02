@@ -1,4 +1,4 @@
-# electric-lite — Design Spec
+# electric-ivm — Design Spec
 
 **Status:** Approved (engine fork decided: Rust `dbsp` service)
 **Date:** 2026-06-27
@@ -13,7 +13,7 @@ engine based on [`dbsp`](https://crates.io/crates/dbsp), with storage on
 matches that query, live.
 
 This is modelled on [ElectricSQL](https://electric-sql.com/) but deliberately
-simpler. The system is called **electric-lite**. All documents are written in English.
+simpler. The system is called **electric-ivm**. All documents are written in English.
 
 ### Non-goals (deliberate constraints)
 - **No cross-table queries.** A shape is exactly *one table* + a *WHERE clause over
@@ -106,7 +106,7 @@ the pglite `SELECT … WHERE <predicate>` result-set**.
 
 - Boots durable-streams + engine + api on random ports / temp dirs; tears down clean.
 - **Snapshot test:** seeded faker generates a schema, shapes, and a random op stream →
-  apply the *same* ops to electric-lite (via tRPC) and the oracle (pglite) → wait for
+  apply the *same* ops to electric-ivm (via tRPC) and the oracle (pglite) → wait for
   convergence → assert per-shape set-equality. On failure, print the seed for replay and
   shrink toward a minimal failing trace.
 - **Live-propagation test:** materialize a known-correct shape via the real client; issue

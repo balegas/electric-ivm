@@ -1,4 +1,4 @@
-# electric-lite — Research-driven decisions (concretizing the spec)
+# electric-ivm — Research-driven decisions (concretizing the spec)
 
 Date: 2026-06-27. Derived from the seven briefs in `docs/superpowers/research/`.
 These pin the spec's abstractions to real, verified APIs.
@@ -91,7 +91,7 @@ On-stream JSON item shape (what `createStreamDB` consumes):
   declared columns by value (those keep their JS types: text→string, bool→boolean, num→number).
 
 ## D6 — Oracle & client comparison
-- pglite `PGlite.create('memory://')`; DDL/DML/SELECT from `@electric-lite/protocol`
+- pglite `PGlite.create('memory://')`; DDL/DML/SELECT from `@electric-ivm/protocol`
   compilers; int/text/bool/float round-trip to JS primitives exactly.
 - Client materialization via `createStreamDB(...).preload()` then `collection.toArray` /
   `collection.state`. **Strip virtual props** (`$synced/$origin/$key/$collectionId`, `_seq`)

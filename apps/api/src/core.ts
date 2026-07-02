@@ -1,4 +1,4 @@
-// electric-lite "core": the logic behind the tRPC procedures. Writes append State-Protocol
+// electric-ivm "core": the logic behind the tRPC procedures. Writes append State-Protocol
 // envelopes directly to the durable-streams table stream (decoupled from the engine, which
 // tails it). Schema definition and shape lifecycle are forwarded to the Rust engine.
 
@@ -12,7 +12,7 @@ import {
   type SubsetResult,
   toTableEnvelope,
   type Value,
-} from '@electric-lite/protocol'
+} from '@electric-ivm/protocol'
 
 export interface WriteInput {
   table: string
@@ -46,7 +46,7 @@ export interface ElectricCore {
    * feed's deltas, re-checking view membership — so paging never becomes server-side range state.
    */
   createSubsetFeed(def: Pick<SubsetDef, 'table' | 'where' | 'columns'>): Promise<ShapeHandle>
-  /** Register a scalar **aggregation** (COUNT/SUM/AVG/MIN/MAX) over a filter — an electric-lite
+  /** Register a scalar **aggregation** (COUNT/SUM/AVG/MIN/MAX) over a filter — an electric-ivm
    * extension (not in the Electric protocol). Streams a single value maintained incrementally. */
   createAggregate(def: AggregateDef): Promise<ShapeHandle>
 }

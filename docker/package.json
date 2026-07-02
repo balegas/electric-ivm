@@ -1,5 +1,5 @@
 {
-  "name": "@electric-lite/docker",
+  "name": "@electric-ivm/docker",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -9,7 +9,7 @@
   },
   "dependencies": {
     "@durable-streams/server": "^0.3.7",
-    "@electric-lite/api": "workspace:*"
+    "@electric-ivm/api": "workspace:*"
   },
   "devDependencies": {
     "tsx": "^4.19.2"

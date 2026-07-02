@@ -75,7 +75,7 @@ it('validates inner where against the inner table', () => {
 })
 ```
 
-- [ ] **Step 2: Run** `pnpm --filter @electric-lite/protocol test` → FAIL (isInSubquery undefined).
+- [ ] **Step 2: Run** `pnpm --filter @electric-ivm/protocol test` → FAIL (isInSubquery undefined).
 
 - [ ] **Step 3:** In `types.ts` add the interfaces + guard and extend `Predicate`:
 
@@ -165,7 +165,7 @@ it('emits NOT IN', () => {
 
 - [ ] **Step 1: Failing test** in `oracle.test.ts`: create a 2-table schema (parent/child), insert parents (some active) + children, then `queryShape({ table: 'child', where: { col: 'parent_id', in: { table: 'parent', project: 'id', where: { col: 'active', op: 'eq', value: true } } } })` and assert it equals the children whose parent is active.
 
-- [ ] **Step 2: Run** `pnpm --filter @electric-lite/oracle test` → expect PASS if Task 2 is correct (pglite runs the subquery). If FAIL, fix `shapeSelectSql` plumbing.
+- [ ] **Step 2: Run** `pnpm --filter @electric-ivm/oracle test` → expect PASS if Task 2 is correct (pglite runs the subquery). If FAIL, fix `shapeSelectSql` plumbing.
 
 - [ ] **Step 3: Commit** `test(oracle): subquery shape via SELECT … IN (SELECT …)`.
 
@@ -186,7 +186,7 @@ it('emits NOT IN', () => {
 
 - [ ] **Step 1: Failing test** — compile a JSON `{col,in:{table,project,where},negated}` and assert the `sig` is stable and equals that of an identical subquery, and differs when the inner where differs.
 
-- [ ] **Step 2: Run** `cargo test -p electric-lite-engine predicate` → FAIL.
+- [ ] **Step 2: Run** `cargo test -p electric-ivm-engine predicate` → FAIL.
 
 - [ ] **Step 3:** Implement. Because compiling the inner predicate needs the **inner** table's schema (for column indices) and must register a node, thread a collector:
 
@@ -281,7 +281,7 @@ impl SubqueryEval for SubqueryRegistry { fn contains(..); fn has_null(..); }
   - NULL value: add pk with `present_value=Some(Null)` ⇒ `[NullEnter]` (and bucket tracked); removing last ⇒ `[NullLeave]`.
   - Changing a row's value (reconcile with new value) removes from old bucket, adds to new — caller passes the new `present_value`; provide a `reconcile_row` that first removes pk from **all** buckets it's in (track a reverse `pk -> value` map per node) then adds to the new bucket. Test: pk "a" 5 then reconcile "a" 7 ⇒ `[Leave(5), Enter(7)]`.
 
-- [ ] **Step 2: Run** `cargo test -p electric-lite-engine subquery` → FAIL.
+- [ ] **Step 2: Run** `cargo test -p electric-ivm-engine subquery` → FAIL.
 
 - [ ] **Step 3:** Implement `SubqueryNode` with `contributors: HashMap<Value, HashSet<String>>` + `pk_value: HashMap<String, Value>` (reverse map, Value::Null for null bucket) so `reconcile_row` is O(1)-ish and history-independent. `contains(value)` = bucket non-empty; `has_null` = null bucket non-empty.
 

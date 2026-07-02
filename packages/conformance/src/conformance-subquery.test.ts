@@ -2,7 +2,7 @@
 // oracle (which evaluates the subquery natively) through inner- and outer-table mutations. The engine
 // maintains a shared inner-set node and moves outer rows in/out; the oracle is `SELECT … WHERE <sub>`.
 
-import type { InSubqueryPredicate, Schema, ShapeDef } from '@electric-lite/protocol'
+import type { InSubqueryPredicate, Schema, ShapeDef } from '@electric-ivm/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { formatCompare } from './compare.js'
 import { applyOp, bootHarness, drainEngine, type Harness, waitForConvergence } from './harness.js'

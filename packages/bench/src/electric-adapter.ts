@@ -2,7 +2,7 @@
 // so Electric's oracle harness (or a curl smoke test) can drive shapes against our engine.
 //
 //   Standalone (seeds its own minimal standard schema, for curl testing):
-//     pnpm --filter @electric-lite/bench exec tsx src/electric-adapter.ts
+//     pnpm --filter @electric-ivm/bench exec tsx src/electric-adapter.ts
 //   Driven by Electric's Elixir harness (it provides the DB + schema):
 //     ADAPTER_PG_URL=postgres://... ADAPTER_PG_TABLES=level_1,level_2,... \
 //       tsx src/electric-adapter.ts     # prints ADAPTER_LISTENING <url>, stays up until killed
@@ -25,7 +25,7 @@ function repoRoot(): string {
   }
   throw new Error('repo root not found')
 }
-const SLOT = process.env.ADAPTER_PG_SLOT || 'electric_lite_conformance'
+const SLOT = process.env.ADAPTER_PG_SLOT || 'electric_ivm_conformance'
 
 // Electric's full standard schema (level_1..4 + composite-PK *_tags side tables).
 const STANDARD_DDL = [
@@ -71,8 +71,8 @@ function bootEphemeralPg(): string {
 }
 
 async function main() {
-  if (!existsSync(join(repoRoot(), 'target', 'release', 'electric-lite-engine'))) {
-    console.error('build first: cargo build --release -p electric-lite-engine')
+  if (!existsSync(join(repoRoot(), 'target', 'release', 'electric-ivm-engine'))) {
+    console.error('build first: cargo build --release -p electric-ivm-engine')
     process.exit(1)
   }
 
@@ -120,17 +120,17 @@ async function main() {
   // benchmark runner sets ADAPTER_LIVE_TIMEOUT_MS=20000 for Electric-like ~20s live behavior.
   const liveTimeoutMs = Number(process.env.ADAPTER_LIVE_TIMEOUT_MS || longPollMs)
 
-  engineProc = spawn(join(repoRoot(), 'target', 'release', 'electric-lite-engine'), [], {
+  engineProc = spawn(join(repoRoot(), 'target', 'release', 'electric-ivm-engine'), [], {
     env: {
       ...process.env,
       ELECTRIC_LIVE_TIMEOUT_MS: String(liveTimeoutMs),
-      ELECTRIC_LITE_DS_URL: dsUrl,
-      ELECTRIC_LITE_BIND: '127.0.0.1:0',
-      ELECTRIC_LITE_LOG: process.env.ADAPTER_LOG || 'warn',
-      ELECTRIC_LITE_PG_URL: pgUrl,
-      ELECTRIC_LITE_PG_TABLES: tables,
-      ELECTRIC_LITE_PG_SLOT: SLOT,
-      ELECTRIC_LITE_PG_POLL_MS: '25',
+      ELECTRIC_IVM_DS_URL: dsUrl,
+      ELECTRIC_IVM_BIND: '127.0.0.1:0',
+      ELECTRIC_IVM_LOG: process.env.ADAPTER_LOG || 'warn',
+      ELECTRIC_IVM_PG_URL: pgUrl,
+      ELECTRIC_IVM_PG_TABLES: tables,
+      ELECTRIC_IVM_PG_SLOT: SLOT,
+      ELECTRIC_IVM_PG_POLL_MS: '25',
     },
     stdio: ['ignore', 'pipe', 'inherit'],
   })

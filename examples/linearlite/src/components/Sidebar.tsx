@@ -68,7 +68,7 @@ export function Sidebar({
         <span className="brand-mark">◆</span>
         <div>
           <div className="brand-name">LinearLite</div>
-          <div className="brand-sub">on electric-lite</div>
+          <div className="brand-sub">on electric-ivm</div>
         </div>
       </div>
 

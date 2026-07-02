@@ -3,15 +3,15 @@
 //   infra            boot infra + seed, print URLs, sample server metrics until SIGINT (for docker clients)
 //   client           connect to an existing infra (ENGINE_URL/API_URL/DS_URL/PG_URL) + run users (no infra)
 //
-// Reads go through @electric-lite/client (one shared client; each user opens its own subscriptions).
+// Reads go through @electric-ivm/client (one shared client; each user opens its own subscriptions).
 // Writes go through Postgres (a shared, bounded write pool). Observe engine memory/CPU + Postgres /
 // durable-streams disk in the emitted CSV + the printed summary, across USERS / SEED_ISSUES.
 
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { createClient } from '@electric-lite/client'
-import { changeEventToDML, type ChangeEvent } from '@electric-lite/protocol'
+import { createClient } from '@electric-ivm/client'
+import { changeEventToDML, type ChangeEvent } from '@electric-ivm/protocol'
 import pgpkg from 'pg'
 
 import { type Config, ensureFdLimit, loadConfig } from './config'

@@ -1,7 +1,7 @@
 # Electric protocol conformance: run Electric's oracle tests against our engine
 
 Design record — 2026-06-30. Status: **✅ done — Electric's oracle property test passes against our engine.**
-Branch `electric-protocol-conformance`. Goal: make electric-lite speak Electric's `GET /v1/shape` HTTP
+Branch `electric-protocol-conformance`. Goal: make electric-ivm speak Electric's `GET /v1/shape` HTTP
 protocol faithfully enough that Electric's **own** oracle tests (driven by the real Elixir
 `Electric.Client`) pass against our engine.
 

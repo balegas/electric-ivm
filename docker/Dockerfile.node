@@ -1,9 +1,9 @@
-# electric-lite NODE image: one image for the two JS services, selected by CMD —
+# electric-ivm NODE image: one image for the two JS services, selected by CMD —
 #   - durable-streams server:  tsx docker/ds-server.ts   (the log between Postgres/engine/clients)
 #   - tRPC API server:         tsx docker/api-server.ts  (the extended read/write/shape/subset/aggregate API)
 #
 # Build context is the repo root (a .dockerignore prunes node_modules/target/.git):
-#   docker build -f docker/Dockerfile.node -t electric-lite-node .
+#   docker build -f docker/Dockerfile.node -t electric-ivm-node .
 
 FROM node:22-slim
 

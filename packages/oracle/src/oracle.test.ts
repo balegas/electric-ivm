@@ -1,4 +1,4 @@
-import type { Schema } from '@electric-lite/protocol'
+import type { Schema } from '@electric-ivm/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { createOracle, type Oracle } from './index.js'
 

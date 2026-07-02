@@ -54,12 +54,12 @@ ingestor routes rows to per-table streams.
 ## Configuration (kept simple)
 
 Engine env:
-- `ELECTRIC_LITE_PG_URL` — `postgres://user:pass@host:port/db`. Presence switches the engine into
+- `ELECTRIC_IVM_PG_URL` — `postgres://user:pass@host:port/db`. Presence switches the engine into
   Postgres mode (ingestor + query-back; `table_state` disabled).
-- `ELECTRIC_LITE_PG_TABLES` — comma-separated table names to replicate. The engine introspects their
+- `ELECTRIC_IVM_PG_TABLES` — comma-separated table names to replicate. The engine introspects their
   columns/types/primary key from Postgres (no separate schema needed).
-- `ELECTRIC_LITE_PG_SLOT` — replication slot name (default `electric_lite`).
-- `ELECTRIC_LITE_PG_POLL_MS` — slot poll interval (default 50).
+- `ELECTRIC_IVM_PG_SLOT` — replication slot name (default `electric_ivm`).
+- `ELECTRIC_IVM_PG_POLL_MS` — slot poll interval (default 50).
 
 On startup in PG mode the engine: introspects the tables, runs `ALTER TABLE … REPLICA IDENTITY FULL`,
 creates the slot if absent (`pg_create_logical_replication_slot(slot,'test_decoding')`), and starts the
@@ -89,8 +89,8 @@ the monotonic-slot + idempotent-upsert approach converges.)
 
 ## Testing
 
-The oracle becomes a **real Postgres** (`@electric-lite/oracle` gains a `pg` backend reusing the existing
-`tableDDL`/`changeEventToDML`/`shapeSelectSql` from `@electric-lite/protocol`). The harness boots one
+The oracle becomes a **real Postgres** (`@electric-ivm/oracle` gains a `pg` backend reusing the existing
+`tableDDL`/`changeEventToDML`/`shapeSelectSql` from `@electric-ivm/protocol`). The harness boots one
 ephemeral PG, points the oracle (writes + SELECT) and the engine (ingestor + backfill) at it. `applyOp`
 writes to PG only; the change flows PG→slot→ingestor→stream→engine→shape. The drain barrier (as built)
 bumps a per-database `__el_sync` sentinel counter and waits for the ingestor to report having

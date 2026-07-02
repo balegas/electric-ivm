@@ -3,7 +3,7 @@
 // Sharing is verified via the engine's `GET /tables/:name/families` introspection endpoint.
 // See docs/superpowers/specs/2026-06-27-shape-pipeline-sharing-design.md.
 
-import type { Schema, ShapeDef } from '@electric-lite/protocol'
+import type { Schema, ShapeDef } from '@electric-ivm/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { formatCompare } from './compare.js'
 import { applyOp, bootHarness, drainEngine, type Harness, waitForConvergence } from './harness.js'

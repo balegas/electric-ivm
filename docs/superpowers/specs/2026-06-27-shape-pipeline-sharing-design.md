@@ -1,4 +1,4 @@
-# electric-lite — shape pipeline sharing (equality-first)
+# electric-ivm — shape pipeline sharing (equality-first)
 
 Status: **IMPLEMENTED** (phases 1–4). Equality shapes now share one dbsp family circuit per
 template; the full conformance suite (84 tests) stays green vs pglite, and a dedicated test proves

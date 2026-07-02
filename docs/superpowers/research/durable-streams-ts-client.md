@@ -1,6 +1,6 @@
 # Durable Streams TypeScript client: materializing a stream into a reactive collection
 
-Research brief for electric-lite. Goal: subscribe to a per-shape durable stream
+Research brief for electric-ivm. Goal: subscribe to a per-shape durable stream
 (a feed of `{op, pk, row}` change-events), materialize the current set + receive
 live updates, then read the current materialized state in **Node (no React)** and
 assert set-equality vs an oracle.
@@ -261,7 +261,7 @@ or `queryOnce`. Both are re-exported from `@durable-streams/state/db`.
 
 ### 4.1 Simplest path for a test: bypass TanStack entirely
 
-For the electric-lite test (read current set, compare to oracle) you don't even
+For the electric-ivm test (read current set, compare to oracle) you don't even
 need the reactive layer. The db-free entry ships `MaterializedState`, a plain
 in-memory reducer over `ChangeEvent`s (verified `src/materialized-state.ts`):
 
@@ -303,7 +303,7 @@ schema.users.upsert({ value: row })
 schema.users.insert({ value: row, headers: { txid: crypto.randomUUID() } })
 ```
 
-Append raw (your own API path — what electric-lite does):
+Append raw (your own API path — what electric-ivm does):
 
 ```ts
 await db.stream.append(JSON.stringify(schema.users.insert({ value: row })))
@@ -419,4 +419,4 @@ For a dependency-light test materializer, see §4.1 (`MaterializedState`).
   `state`) is stable across 0.6.x but could shift before 1.0.
 - **Server availability.** This brief assumes a running durable-streams server
   speaking the base protocol + State Protocol (JSON content-type, batch reads,
-  up-to-date signal, control messages). electric-lite must provide/point at one.
+  up-to-date signal, control messages). electric-ivm must provide/point at one.

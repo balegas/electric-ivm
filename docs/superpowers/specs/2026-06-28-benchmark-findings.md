@@ -1,4 +1,4 @@
-# electric-lite stress benchmark — findings & improvements (2026-06-28)
+# electric-ivm stress benchmark — findings & improvements (2026-06-28)
 
 Goal: stress the system (max shapes, write throughput, subscribers), use engine telemetry to find
 bottlenecks, drive improvements, and keep memory/CPU bounded under sustained load — targeting 100k
@@ -123,7 +123,7 @@ via sysctl, or point the bench at a keep-alive production storage backend.
 ## Reproduce
 
 ```
-cargo build --release -p electric-lite-engine
+cargo build --release -p electric-ivm-engine
 # 100k shapes end-to-end (chunked registration + bounded hot set), p99 latency:
 BENCH_SHAPES=100000 BENCH_CHUNK=12000 BENCH_CHUNK_PAUSE=30 BENCH_HOTSET=200 \
   BENCH_SUBS=100 BENCH_CONC=4 BENCH_DURATION=15 pnpm bench

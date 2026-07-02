@@ -1,4 +1,4 @@
-# electric-lite
+# electric-ivm
 
 A reactive sync engine in the style of [Electric](https://electric-sql.com/), built on incremental
 view maintenance. Your app writes to **Postgres**; a Rust engine turns logical-replication changes
@@ -8,7 +8,7 @@ is the log that carries everything in between. It speaks **two client protocols*
 - **The Electric protocol** — `GET /v1/shape` on the engine, compatible with the ElectricSQL TS
   client and validated against Electric's own oracle/property/integration tests
   ([`electric-conformance/`](electric-conformance/README.md)).
-- **The extended API** (`@electric-lite/client`) — shapes plus the pieces the Electric API doesn't
+- **The extended API** (`@electric-ivm/client`) — shapes plus the pieces the Electric API doesn't
   cover today: **subset queries** (ordered, windowed pages with a shared live tail) and **live
   aggregations** (COUNT/SUM/AVG/MIN/MAX maintained incrementally). This surface is where the API is
   headed; the Electric endpoint is the compatibility layer.
@@ -28,7 +28,7 @@ is the log that carries everything in between. It speaks **two client protocols*
                       DURABLE STREAMS   shape/<id>         (ONE feed per DISTINCT shape)
                          │  read / long-poll
                          ▼
-                      CLIENTS   Electric client (/v1/shape)  or  @electric-lite/client
+                      CLIENTS   Electric client (/v1/shape)  or  @electric-ivm/client
 ```
 
 1. **The engine holds no copy of any table.** Row-count-scale state lives in Postgres; shapes
@@ -95,7 +95,7 @@ pnpm install
 pnpm engine:build
 
 pnpm demo               # headless live-shape demo
-pnpm demo:linearlite    # LinearLite (issue tracker) on electric-lite — the flagship demo
+pnpm demo:linearlite    # LinearLite (issue tracker) on electric-ivm — the flagship demo
 scripts/linearlite.sh start large   # same, at a 100k-issue workload + the pipeline explorer
 ```
 
@@ -108,13 +108,13 @@ pipeline — shapes, shared families, shared subquery nodes, per-node indexes, l
 pnpm docker:up    # Postgres + durable-streams + engine (+ extended API) — see docker/README.md
 ```
 
-Point an ElectricSQL client at `http://localhost:7010/v1/shape`, or `@electric-lite/client` at
+Point an ElectricSQL client at `http://localhost:7010/v1/shape`, or `@electric-ivm/client` at
 `http://localhost:8790`.
 
 ### Using the extended client
 
 ```ts
-import { createClient } from '@electric-lite/client'
+import { createClient } from '@electric-ivm/client'
 const client = createClient({ apiUrl, schema })
 
 // a live shape (materialized TanStack DB collection)

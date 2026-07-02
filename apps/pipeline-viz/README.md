@@ -1,6 +1,6 @@
-# @electric-lite/pipeline-viz
+# @electric-ivm/pipeline-viz
 
-A web GUI **attached to a running electric-lite engine** that visualizes the dbsp query pipeline it is
+A web GUI **attached to a running electric-ivm engine** that visualizes the dbsp query pipeline it is
 maintaining — a learning tool for seeing how shapes are executed and shared.
 
 ## Two views (toggle top-left)
@@ -50,8 +50,8 @@ pnpm demo:linearlite        # prints:  🔬 Pipeline visualizer → http://local
 Against any engine, standalone:
 
 ```bash
-ELECTRIC_LITE_ENGINE_URL=http://127.0.0.1:<engine-port> VIZ_PORT=5180 \
-  pnpm --filter @electric-lite/pipeline-viz dev
+ELECTRIC_IVM_ENGINE_URL=http://127.0.0.1:<engine-port> VIZ_PORT=5180 \
+  pnpm --filter @electric-ivm/pipeline-viz dev
 ```
 
 The Vite dev server proxies `/engine/*` to that engine (no CORS needed).
