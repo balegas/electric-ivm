@@ -37,7 +37,11 @@ export function SceneStrip({ scene, onScene }: { scene: number; onScene: (n: num
       </div>
       {open && def ? (
         <div className="scene-card">
-          <p className="scene-body">{def.body}</p>
+          {def.body.split('\n\n').map((p, i) => (
+            <p key={i} className="scene-body">
+              {p}
+            </p>
+          ))}
           <div className="scene-try">
             {def.try.map((t) => (
               <span key={t} className="try-chip">

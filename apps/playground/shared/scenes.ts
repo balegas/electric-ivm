@@ -39,11 +39,15 @@ export const SCENES: SceneDef[] = [
     n: 1,
     title: 'Your workspace',
     body:
-      'This playground runs a real electric-ivm engine on a real Postgres. Everyone shares the same ' +
-      'two tables — restaurants and orders — and every row carries a workspace_id. Yours was just ' +
-      'minted and seeded. Every shape you see includes `workspace_id = <yours>` in its predicate: ' +
-      'that is honest multi-tenancy, and you will see it in every pipeline. If the server gets ' +
-      'wiped, the app notices and offers you a fresh workspace — nothing here is precious.',
+      'This playground runs a real electric-ivm engine on a real Postgres. Your workspace was ' +
+      'just minted and seeded with a restaurant and a few orders. If the server gets wiped, the ' +
+      'app notices and offers you a fresh one — nothing here is precious.' +
+      '\n\n' +
+      'Everyone here shares the same database — the same two tables, restaurants and orders. ' +
+      'Multi-tenancy is workspace isolation, and workspace isolation is itself just a shape ' +
+      'filter: every query you see carries `workspace_id = <yours>` in its predicate. Data that ' +
+      "isn't yours never reaches you for the same reason a delivered order never reaches the " +
+      'kitchen screen — the filter drops it.',
     try: ['Place an order and watch the delta reach the shape', 'Open the device card to see raw upserts'],
     shapes: [
       {
