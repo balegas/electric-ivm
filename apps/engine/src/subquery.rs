@@ -58,9 +58,9 @@ pub struct SubqueryNode {
     pub pred: Arc<CompiledPredicate>,
     /// The inner `where` as raw JSON (for seeding SQL, which must emit nested `IN (SELECT …)`).
     pub where_json: Option<PredicateJson>,
-    /// `pg_current_wal_lsn()` at the node's backfill snapshot; inner deltas with commit LSN strictly
-    /// `< seed_lsn` are already counted and are skipped.
-    pub seed_lsn: u64,
+    /// The node's backfill-snapshot fence: inner deltas already visible to the seed snapshot are
+    /// skipped (xid visibility, LSN fallback — see [`crate::pg::SnapshotGate`]).
+    pub gate: crate::pg::SnapshotGate,
     /// projected value -> set of contributing inner-row pks (stringified).
     contributors: HashMap<Value, HashSet<String>>,
     /// inner-row pk -> its current projected value (reverse index, for O(1) reconciliation).
@@ -76,7 +76,6 @@ impl SubqueryNode {
         proj_col: usize,
         pk_col: usize,
         pred: Arc<CompiledPredicate>,
-        seed_lsn: u64,
     ) -> Self {
         SubqueryNode {
             sig,
@@ -85,7 +84,7 @@ impl SubqueryNode {
             pk_col,
             pred,
             where_json: None,
-            seed_lsn,
+            gate: crate::pg::SnapshotGate::passthrough(),
             contributors: HashMap::new(),
             pk_value: HashMap::new(),
             refcount: 0,
@@ -159,6 +158,13 @@ pub struct Edge {
     /// Column index (in the dependent's table) connecting to the node.
     pub connecting_col: usize,
     pub negated: bool,
+    /// True iff a NULL entering/leaving the node's set can change this dependent's membership. That is
+    /// the case when the `IN` leaf is itself negated (`NOT IN` — SQL: a NULL in the set makes it
+    /// UNKNOWN) **or** sits under any `Not{…}` wrapper: with no negation anywhere above the leaf, a
+    /// NULL only moves the leaf between FALSE and UNKNOWN, and AND/OR are monotone in
+    /// FALSE < UNKNOWN < TRUE, so overall TRUE-ness (inclusion) cannot change. Any negation breaks the
+    /// monotonicity, so those dependents must be fully re-derived on a NULL flip.
+    pub null_sensitive: bool,
 }
 
 /// A registered outer subquery shape: an ordinary materialized shape whose predicate contains
@@ -171,9 +177,8 @@ pub struct SubqueryShape {
     /// The outer predicate (with `InSubquery` leaves resolving against this registry's nodes).
     pub pred: Arc<CompiledPredicate>,
     pub out_cols: Option<Arc<Vec<usize>>>,
-    /// `pg_current_wal_lsn()` of the shape's backfill; outer deltas with commit LSN `< seed_lsn` are
-    /// already in the backfill and skipped.
-    pub seed_lsn: u64,
+    /// The shape's backfill-snapshot fence; outer deltas already visible to the backfill are skipped.
+    pub gate: crate::pg::SnapshotGate,
 }
 
 /// A `TableSchema` lookup shared with the engine's compiled schema.
@@ -200,6 +205,11 @@ pub struct SubqueryRegistry {
     pub shapes: HashMap<String, SubqueryShape>,
     /// Nodes created but not yet seeded from Postgres (deepest-first).
     pending_seed: Vec<SubquerySig>,
+    /// Every node-refcount increment made by the in-flight `create_subquery_shape` (one entry per
+    /// `collect()` call). On failure the create is rolled back exactly: each logged sig is decremented
+    /// once, and nodes that return to zero are removed. The registry mutex is held for the whole
+    /// create, so the log can't interleave with another create.
+    collect_log: Vec<SubquerySig>,
     ds: DsClient,
     pg_url: Option<String>,
     schemas: SchemaMap,
@@ -216,6 +226,7 @@ impl SubqueryRegistry {
             edges: Vec::new(),
             shapes: HashMap::new(),
             pending_seed: Vec::new(),
+            collect_log: Vec::new(),
             ds,
             pg_url,
             schemas: Arc::new(HashMap::new()),
@@ -315,7 +326,51 @@ impl SubqueryRegistry {
 
     /// Register an outer subquery shape: compile the outer predicate (creating/deduping nodes + edges),
     /// seed any new nodes from Postgres, backfill the shape, and record it. Idempotent per shape id.
+    ///
+    /// **Atomic**: on any failure (unknown table, seed error, backfill/append error) every refcount
+    /// increment, node, edge, and pending-seed entry made by this call is rolled back, so a failed
+    /// create leaves the registry exactly as it was — no half-registered node that would silently
+    /// serve wrong (unseeded) membership to a later identical create.
     pub async fn create_subquery_shape(
+        &mut self,
+        shape_id: &str,
+        outer_table: &str,
+        stream_path: &str,
+        where_json: &PredicateJson,
+        out_cols: Option<Arc<Vec<usize>>>,
+        changes_only: bool,
+    ) -> Result<()> {
+        let edges_checkpoint = self.edges.len();
+        self.collect_log.clear();
+        let res = self
+            .create_subquery_shape_inner(shape_id, outer_table, stream_path, where_json, out_cols, changes_only)
+            .await;
+        if res.is_err() {
+            self.rollback_create(edges_checkpoint);
+        }
+        res
+    }
+
+    /// Undo an in-flight create: drop the edges it appended and decrement each logged node refcount
+    /// once, removing nodes that return to zero (with their pending-seed entries and any stray edges).
+    fn rollback_create(&mut self, edges_checkpoint: usize) {
+        self.edges.truncate(edges_checkpoint);
+        let log = std::mem::take(&mut self.collect_log);
+        for sig in log {
+            if let Some(n) = self.nodes.get_mut(&sig) {
+                n.refcount = n.refcount.saturating_sub(1);
+                if n.refcount == 0 {
+                    self.nodes.remove(&sig);
+                    self.pending_seed.retain(|s| s != &sig);
+                    self.edges.retain(|e| {
+                        e.node_sig != sig && !matches!(&e.dependent, Dependent::Node(s) if s == &sig)
+                    });
+                }
+            }
+        }
+    }
+
+    async fn create_subquery_shape_inner(
         &mut self,
         shape_id: &str,
         outer_table: &str,
@@ -329,12 +384,13 @@ impl SubqueryRegistry {
         // 1. Compile the outer predicate, discovering/deduping nodes (deepest-first) + node edges.
         let pred = Arc::new(CompiledPredicate::compile_with(where_json, &outer_ts, self)?);
         // 2. Record shape-level edges (the outer predicate's `IN` leaves).
-        for (col, sig, negated) in collect_in_leaves(&pred) {
+        for leaf in collect_in_leaves(&pred) {
             self.edges.push(Edge {
-                node_sig: sig,
+                node_sig: leaf.sig,
                 dependent: Dependent::Shape(shape_id.to_string()),
-                connecting_col: col,
-                negated,
+                connecting_col: leaf.col,
+                negated: leaf.negated,
+                null_sensitive: leaf.null_sensitive,
             });
         }
         // 3. Seed newly-created nodes from Postgres (Postgres evaluates nested subqueries natively).
@@ -342,9 +398,9 @@ impl SubqueryRegistry {
         //    evaluate live membership.
         self.seed_pending_nodes().await?;
         // 4. Backfill the outer shape and append its initial members — UNLESS this is a `changes_only`
-        //    feed (a subset's live tail), which forwards only future membership deltas (seed_lsn 0).
-        let seed_lsn = if changes_only {
-            0
+        //    feed (a subset's live tail), which forwards only future membership deltas (passthrough).
+        let gate = if changes_only {
+            crate::pg::SnapshotGate::passthrough()
         } else {
             let (wsql, params) = crate::sql::predicate_json_to_sql(where_json, 1);
             let bf = {
@@ -362,7 +418,7 @@ impl SubqueryRegistry {
                 );
                 self.ds.append(stream_path, &envs).await?;
             }
-            crate::pg::lsn_to_u64(&bf.seed_lsn)
+            bf.gate
         };
         // 5. Record the shape.
         self.shapes.insert(
@@ -373,7 +429,7 @@ impl SubqueryRegistry {
                 stream_path: stream_path.to_string(),
                 pred,
                 out_cols,
-                seed_lsn,
+                gate,
             },
         );
         Ok(())
@@ -394,9 +450,8 @@ impl SubqueryRegistry {
             let ts = self.schemas.get(&inner_table).cloned().context("seed: unknown inner table")?;
             let wsql = where_json.as_ref().map(|w| crate::sql::predicate_json_to_sql(w, 1));
             let bf = crate::pg::backfill_where(&client, &ts, wsql).await?;
-            let seed_lsn = crate::pg::lsn_to_u64(&bf.seed_lsn);
             let node = self.nodes.get_mut(&sig).context("seed: node vanished")?;
-            node.seed_lsn = seed_lsn;
+            node.gate = bf.gate;
             for r in &bf.rows {
                 let pk = ts.key_string(r).unwrap_or_default();
                 let pv = r.0.get(proj_col).cloned().unwrap_or(Value::Null);
@@ -411,7 +466,7 @@ impl SubqueryRegistry {
     pub fn drop_subquery_shape(&mut self, shape_id: &str) {
         let Some(shape) = self.shapes.remove(shape_id) else { return };
         // Sigs this shape pointed at, then drop the shape's edges.
-        let sigs: Vec<SubquerySig> = collect_in_leaves(&shape.pred).into_iter().map(|(_, s, _)| s).collect();
+        let sigs: Vec<SubquerySig> = collect_in_leaves(&shape.pred).into_iter().map(|l| l.sig).collect();
         self.edges.retain(|e| !matches!(&e.dependent, Dependent::Shape(id) if id == shape_id));
         for sig in sigs {
             self.decref_node(&sig);
@@ -426,7 +481,7 @@ impl SubqueryRegistry {
         }
         // Refcount hit zero: gather child sigs, remove the node + its incoming/outgoing edges, recurse.
         let child_sigs: Vec<SubquerySig> =
-            collect_in_leaves(&node.pred).into_iter().map(|(_, s, _)| s).collect();
+            collect_in_leaves(&node.pred).into_iter().map(|l| l.sig).collect();
         self.nodes.remove(sig);
         self.edges
             .retain(|e| &e.node_sig != sig && !matches!(&e.dependent, Dependent::Node(s) if s == sig));
@@ -446,6 +501,7 @@ impl SubqueryRegistry {
         ts: &TableSchema,
         delta: &[Tup2<Row, ZWeight>],
         lsn: u64,
+        xid: Option<u64>,
         txid: Option<String>,
     ) -> Result<()> {
         let table = ts.name.clone();
@@ -456,8 +512,7 @@ impl SubqueryRegistry {
         let node_sigs: Vec<SubquerySig> =
             self.nodes.iter().filter(|(_, n)| n.inner_table == table).map(|(s, _)| s.clone()).collect();
         for sig in node_sigs {
-            let seed_lsn = self.nodes.get(&sig).map(|n| n.seed_lsn).unwrap_or(0);
-            if lsn != 0 && lsn < seed_lsn {
+            if self.nodes.get(&sig).is_some_and(|n| n.gate.should_skip(lsn, xid)) {
                 continue;
             }
             let evals = self.node_present_values(&sig, ts, delta);
@@ -474,8 +529,7 @@ impl SubqueryRegistry {
             .map(|(id, _)| id.clone())
             .collect();
         for id in shape_ids {
-            let seed_lsn = self.shapes.get(&id).map(|s| s.seed_lsn).unwrap_or(0);
-            if lsn != 0 && lsn < seed_lsn {
+            if self.shapes.get(&id).is_some_and(|s| s.gate.should_skip(lsn, xid)) {
                 continue;
             }
             self.emit_shape_delta(&id, ts, delta, txid.clone()).await?;
@@ -484,11 +538,13 @@ impl SubqueryRegistry {
         // 3. Propagate flips up the DAG.
         while let Some((sig, flip)) = work.pop_front() {
             for edge in self.edges_of(&sig) {
-                // A NULL-value flip only matters to negated dependents (SQL `NOT IN` with NULL). It can
-                // shift *every* dependent row, so re-derive the dependent fully; non-negated dependents
-                // are unaffected by a NULL in the set, so skip.
+                // A NULL-value flip only matters to NULL-sensitive dependents — a `NOT IN` leaf, or an
+                // `IN` leaf under any `Not{…}` (SQL: a NULL in the set makes the leaf UNKNOWN, which
+                // negation turns into a membership change). It can shift *every* dependent row, so
+                // re-derive the dependent fully; NULL-insensitive dependents can't change (AND/OR are
+                // monotone over FALSE < UNKNOWN < TRUE), so skip.
                 if matches!(flip.value, Value::Null) {
-                    if edge.negated {
+                    if edge.null_sensitive {
                         self.rederive_dependent(&edge, txid.clone(), &mut work).await?;
                     }
                     continue;
@@ -618,7 +674,8 @@ impl SubqueryRegistry {
             .collect();
         let envs = crate::engine::translate_output(&ts, out, txid, None, shape.out_cols.as_deref().map(Vec::as_slice));
         if !envs.is_empty() {
-            self.ds.append(&shape.stream_path, &envs).await?;
+            // Reliable: a dropped move envelope is permanent divergence for the shape's subscribers.
+            self.ds.append_reliable(&shape.stream_path, &envs).await;
         }
         Ok(())
     }
@@ -663,7 +720,7 @@ impl SubqueryRegistry {
         }
         let envs = crate::engine::translate_output(ts, out, txid, None, shape.out_cols.as_deref().map(Vec::as_slice));
         if !envs.is_empty() {
-            self.ds.append(&shape.stream_path, &envs).await?;
+            self.ds.append_reliable(&shape.stream_path, &envs).await;
         }
         Ok(())
     }
@@ -690,7 +747,7 @@ impl SubqueryRegistry {
                     .collect();
                 let envs = crate::engine::translate_output(&ts, out, txid, None, out_cols.as_deref().map(Vec::as_slice));
                 if !envs.is_empty() {
-                    self.ds.append(&stream_path, &envs).await?;
+                    self.ds.append_reliable(&stream_path, &envs).await;
                 }
             }
             Dependent::Node(parent_sig) => {
@@ -743,6 +800,7 @@ impl SubqueryCollector for SubqueryRegistry {
         let sig = subquery_sig(table, project, where_);
         if let Some(n) = self.nodes.get_mut(&sig) {
             n.refcount += 1;
+            self.collect_log.push(sig.clone());
             return Ok(sig);
         }
         let inner_ts = self.schemas.get(table).cloned().context("subquery: unknown inner table")?;
@@ -751,20 +809,22 @@ impl SubqueryCollector for SubqueryRegistry {
             None => CompiledPredicate::MatchAll,
         };
         // Record edges from each child node to THIS node (so a child flip re-derives this node's rows).
-        for (col, child_sig, negated) in collect_in_leaves(&inner_pred) {
+        for leaf in collect_in_leaves(&inner_pred) {
             self.edges.push(Edge {
-                node_sig: child_sig,
+                node_sig: leaf.sig,
                 dependent: Dependent::Node(sig.clone()),
-                connecting_col: col,
-                negated,
+                connecting_col: leaf.col,
+                negated: leaf.negated,
+                null_sensitive: leaf.null_sensitive,
             });
         }
         let proj_col = inner_ts.column_index(project)?;
         let mut node =
-            SubqueryNode::new(sig.clone(), table.to_string(), proj_col, inner_ts.pk_index, Arc::new(inner_pred), 0);
+            SubqueryNode::new(sig.clone(), table.to_string(), proj_col, inner_ts.pk_index, Arc::new(inner_pred));
         node.where_json = where_.cloned();
         node.refcount = 1;
         self.nodes.insert(sig.clone(), node);
+        self.collect_log.push(sig.clone());
         self.pending_seed.push(sig.clone());
         Ok(sig)
     }
@@ -779,19 +839,37 @@ impl SubqueryEval for SubqueryRegistry {
     }
 }
 
-/// Find all `IN (SELECT …)` leaves in a compiled predicate: `(connecting column index, node sig,
-/// negated)` for each. Used to record dependency edges.
-pub fn collect_in_leaves(p: &CompiledPredicate) -> Vec<(usize, SubquerySig, bool)> {
+/// One `IN (SELECT …)` leaf found in a compiled predicate, with the context needed to build its
+/// dependency edge.
+pub struct InLeaf {
+    pub col: usize,
+    pub sig: SubquerySig,
+    pub negated: bool,
+    /// leaf negated OR under any `Not{…}` wrapper — see [`Edge::null_sensitive`].
+    pub null_sensitive: bool,
+}
+
+/// Find all `IN (SELECT …)` leaves in a compiled predicate, tracking whether each sits under a `Not`
+/// (which makes it NULL-sensitive even when the leaf itself isn't negated — `NOT (x IN S)` flips
+/// membership when a NULL enters `S`, exactly like `x NOT IN S`).
+pub fn collect_in_leaves(p: &CompiledPredicate) -> Vec<InLeaf> {
     let mut out = Vec::new();
-    fn go(p: &CompiledPredicate, out: &mut Vec<(usize, SubquerySig, bool)>) {
+    fn go(p: &CompiledPredicate, under_not: bool, out: &mut Vec<InLeaf>) {
         match p {
-            CompiledPredicate::And(v) | CompiledPredicate::Or(v) => v.iter().for_each(|c| go(c, out)),
-            CompiledPredicate::Not(b) => go(b, out),
-            CompiledPredicate::InSubquery { col, sig, negated } => out.push((*col, sig.clone(), *negated)),
+            CompiledPredicate::And(v) | CompiledPredicate::Or(v) => {
+                v.iter().for_each(|c| go(c, under_not, out))
+            }
+            CompiledPredicate::Not(b) => go(b, true, out),
+            CompiledPredicate::InSubquery { col, sig, negated } => out.push(InLeaf {
+                col: *col,
+                sig: sig.clone(),
+                negated: *negated,
+                null_sensitive: *negated || under_not,
+            }),
             _ => {}
         }
     }
-    go(p, &mut out);
+    go(p, false, &mut out);
     out
 }
 
@@ -802,7 +880,7 @@ pub fn predicate_has_subquery(p: &PredicateJson) -> bool {
         PredicateJson::And { and } => and.iter().any(predicate_has_subquery),
         PredicateJson::Or { or } => or.iter().any(predicate_has_subquery),
         PredicateJson::Not { not } => predicate_has_subquery(not),
-        PredicateJson::Leaf { .. } => false,
+        PredicateJson::Leaf { .. } | PredicateJson::IsNull { .. } => false,
     }
 }
 
@@ -822,7 +900,7 @@ pub fn referenced_tables(p: &PredicateJson) -> Vec<String> {
             PredicateJson::And { and } => and.iter().for_each(|c| go(c, out)),
             PredicateJson::Or { or } => or.iter().for_each(|c| go(c, out)),
             PredicateJson::Not { not } => go(not, out),
-            PredicateJson::Leaf { .. } => {}
+            PredicateJson::Leaf { .. } | PredicateJson::IsNull { .. } => {}
         }
     }
     go(p, &mut out);
@@ -847,7 +925,7 @@ mod tests {
     use super::*;
 
     fn node() -> SubqueryNode {
-        SubqueryNode::new("sig".into(), "t".into(), 0, 1, Arc::new(CompiledPredicate::MatchAll), 0)
+        SubqueryNode::new("sig".into(), "t".into(), 0, 1, Arc::new(CompiledPredicate::MatchAll))
     }
 
     #[test]
@@ -897,6 +975,84 @@ mod tests {
         assert!(n.has_null());
         assert_eq!(n.reconcile_row("a", None), vec![Flip { value: Value::Null, dir: FlipDir::Leave }]);
         assert!(!n.has_null());
+    }
+
+    /// `NOT (x IN S)` is exactly as NULL-sensitive as `x NOT IN S`: a NULL entering `S` turns the leaf
+    /// UNKNOWN, and the enclosing NOT converts that into a membership change. The edge must record it,
+    /// or a NULL flip silently skips the re-derivation and members go stale.
+    #[test]
+    fn null_sensitivity_tracks_not_wrappers_and_negated_leaves() {
+        use crate::schema::TableDef;
+        let ts = {
+            let def: TableDef = serde_json::from_value(serde_json::json!({
+                "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id"
+            }))
+            .unwrap();
+            crate::schema::TableSchema::from_def("outer_t", &def).unwrap()
+        };
+        struct Rec;
+        impl crate::predicate::SubqueryCollector for Rec {
+            fn collect(&mut self, t: &str, p: &str, w: Option<&PredicateJson>) -> Result<SubquerySig> {
+                Ok(crate::predicate::subquery_sig(t, p, w))
+            }
+        }
+        let compile = |j: serde_json::Value| {
+            CompiledPredicate::compile_with(&serde_json::from_value(j).unwrap(), &ts, &mut Rec).unwrap()
+        };
+        let in_sub = serde_json::json!({"col":"gid","in":{"table":"outer_t","project":"gid"}});
+
+        // plain IN: not NULL-sensitive (FALSE↔UNKNOWN can't change inclusion without negation)
+        let leaves = collect_in_leaves(&compile(in_sub.clone()));
+        assert!(!leaves[0].negated && !leaves[0].null_sensitive);
+
+        // NOT IN leaf: NULL-sensitive
+        let mut neg = in_sub.clone();
+        neg["negated"] = serde_json::json!(true);
+        let leaves = collect_in_leaves(&compile(neg));
+        assert!(leaves[0].negated && leaves[0].null_sensitive);
+
+        // IN under a Not wrapper: NULL-sensitive even though the leaf isn't negated
+        let leaves = collect_in_leaves(&compile(serde_json::json!({"not": in_sub.clone()})));
+        assert!(!leaves[0].negated && leaves[0].null_sensitive);
+
+        // IN nested under Not(And(...)): still NULL-sensitive
+        let leaves = collect_in_leaves(&compile(serde_json::json!({
+            "not": {"and": [ {"col":"id","op":"gt","value":0}, in_sub ]}
+        })));
+        assert!(leaves[0].null_sensitive);
+    }
+
+    /// A failed create (here: no Postgres to seed from) must roll the registry back to exactly its
+    /// prior state — no orphaned node, edge, or pending-seed entry that a later identical create
+    /// would silently join and read unseeded (wrong) membership from.
+    #[tokio::test]
+    async fn failed_create_rolls_back_nodes_and_edges() {
+        use crate::schema::TableDef;
+        let mk = |name: &str| {
+            let def: TableDef = serde_json::from_value(serde_json::json!({
+                "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id"
+            }))
+            .unwrap();
+            crate::schema::TableSchema::from_def(name, &def).unwrap()
+        };
+        let mut schemas = HashMap::new();
+        schemas.insert("outer_t".to_string(), mk("outer_t"));
+        schemas.insert("inner_t".to_string(), mk("inner_t"));
+        // No pg_url: node seeding must fail after collect() has already registered the node.
+        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+        reg.set_schemas(Arc::new(schemas));
+        let where_json: PredicateJson = serde_json::from_value(serde_json::json!({
+            "col":"gid","in":{"table":"inner_t","project":"gid"}
+        }))
+        .unwrap();
+        let res = reg
+            .create_subquery_shape("s1", "outer_t", "shape/s1", &where_json, None, false)
+            .await;
+        assert!(res.is_err());
+        assert_eq!(reg.nodes.len(), 0, "failed create left an orphaned node");
+        assert_eq!(reg.edges.len(), 0, "failed create left orphaned edges");
+        assert_eq!(reg.pending_seed.len(), 0, "failed create left a pending seed");
+        assert!(reg.shapes.is_empty());
     }
 
     #[test]

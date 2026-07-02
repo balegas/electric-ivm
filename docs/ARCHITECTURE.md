@@ -1,439 +1,385 @@
 # electric-lite — architecture
 
-A reactive read-path: clients declare **shapes** (filtered views of a table); the system keeps each
-shape's result set live as the base table changes, delivering incremental updates. It uses the
-**dbsp** Z-set data model (rows with signed weights) for deltas, durable streams for
-transport/persistence, and a stream-db + TanStack DB client for materialization.
+The as-built system architecture. Companion documents:
 
-> **Read this first.** This document is a layered historical record: the body (§4–§5, §8, §10) was
-> written for the original design — an in-memory `table_state` plus a shared **dbsp join circuit per
-> equality template** — and is corrected in place by the two blockquotes below. The **current**
-> as-built model is a stateless delta router (key routing + stateless filters + a shared-node subquery
-> registry) holding **no table copy and no per-shape circuit**. For the clean as-built description and
-> the analytical cost model, read **[docs/ivm-engine-internals.md](ivm-engine-internals.md)**; treat
-> the superseded sections here as background.
+- **[ivm-engine-internals.md](ivm-engine-internals.md)** — the engine's execution strategies and the
+  analytical cost model (what grows with shapes/users/rows).
+- **[shapes-and-subqueries-guide.md](shapes-and-subqueries-guide.md)** — the user/integrator guide.
+- **[deployment-postgres.md](deployment-postgres.md)** — running against your Postgres.
+- `docs/superpowers/specs/` — one design record per feature, with the decision history.
 
-For the narrower design records see `docs/superpowers/specs/` (electric-lite-decisions,
-shape-pipeline-sharing-design, conformance-expansion, benchmark-findings, postgres-logical-replication,
-reduce-engine-memory-design, subqueries-design).
+---
 
-> **Postgres mode (current default for deployment).** electric-lite now runs with **Postgres as the
-> system of record**: applications write to Postgres, the engine ingests changes via **logical
-> replication** (built-in `test_decoding`), and shape **backfill reads rows back from Postgres** with a
-> snapshot `SELECT`. The in-memory `table_state` described in §4.1–4.2 has been **removed entirely** (in
-> *all* modes): delta computation now uses the replicated/envelope **old + new** tuples
-> (`REPLICA IDENTITY FULL` in Postgres mode) instead of a local table copy, so §4.1–4.2 (and the
-> `table_state` row of the §8 trade-off table) describe the original design and no longer reflect the
-> code. The API write path (§3) now applies only to the legacy/library mode (no `ELECTRIC_LITE_PG_URL`).
->
-> The ingestor (`replication.rs`) reads the slot non-consuming (`peek`), buffers each transaction, and
-> stamps every change with its transaction's **COMMIT LSN** (taken from the `COMMIT` record), then
-> appends to durable-streams and only **then** advances the slot (so a failed append re-reads rather
-> than loses data). Backfill (`pg.rs`) records the snapshot's `pg_current_wal_lsn()` as `seed_lsn`, and
-> the engine skips replicated changes whose **commit LSN is strictly `< seed_lsn`** — transactions that
-> committed before the snapshot are already in the backfill; those committing at/after it
-> (`>= seed_lsn`) are taken from the live stream. Comparing the *commit* LSN (not the per-change record
-> LSN) is what keeps rows of transactions in flight during the snapshot from being dropped, so each row
-> counts exactly once (guarded by `conformance-concurrency.test.ts`). The output translation (§4.4) and
-> the durable-streams transport are unchanged. See `docs/deployment-postgres.md` to run it and
-> `docs/superpowers/specs/2026-06-29-postgres-logical-replication.md` for the design.
-
-> **Routing model (supersedes the dbsp family circuit, §4.3a / §5 / §8 / §10).** The engine no longer
-> keeps any table data in memory. Equality-template shapes are no longer a shared dbsp **join** whose
-> data trace is a full copy of the table; they are a **key routing index** (`key_tuple -> {shapes}`,
-> one per template) holding only per-shape metadata. A new equality shape **backfills directly from
-> Postgres** (`SELECT … WHERE key = const`, the Phase-1 predicate pushdown) and registers in the index;
-> a live change is routed by its old/new key to exactly the shapes on that key (membership = key match)
-> and emits delete(old)/upsert(new), each shape applying its own `seed_lsn`. Standalone shapes are
-> unchanged (stateless filters; their backfill now also pushes the predicate into the `SELECT`). So the
-> engine holds **O(#shapes)** routing metadata and **zero table copies** (was `O(#templates × table)`);
-> `FamilyActor` and the per-template OS thread are gone (dbsp remains only for the `Row`/`Tup2`/`ZWeight`
-> Z-set value types). §4.3(a), the family rows of §5 and §8, and §10 (dbsp trace storage) describe the
-> superseded design. Backfill never reads the whole table any more. See
-> `docs/superpowers/specs/2026-06-29-reduce-engine-memory-design.md`.
+## 0. System in one diagram
 
 ```
-  Postgres mode:
-   app ──writes──▶  Postgres  ──logical replication──▶  engine  ──append──▶  durable-streams
-                      ▲                                   │                    (shape/<id>)
-                      └──────────── backfill SELECT ──────┘                         │
-                                                                                    ▼
-                                                                           client (live rows)
+  app ──ordinary SQL writes──▶ POSTGRES (system of record; wal_level=logical)
+                                  │ logical replication (test_decoding slot, REPLICA IDENTITY FULL)
+                                  ▼
+                               INGESTOR (replication.rs)
+                                  │ decode commits → envelopes stamped (commit LSN, xid, seq)
+                                  │ append, then advance the slot (read-then-commit)
+                                  ▼
+                               DURABLE STREAMS  table/<name>       (the change log)
+                                  │ tail (one tailer task per table; (lsn,seq) de-dup)
+                                  ▼
+                               ENGINE (engine.rs)
+                                  │ Z-set delta → key routing ⊕ stateless filters
+                                  │              ⊕ subquery registry ⊕ aggregations
+                                  │ reliable append (retry-until-landed)
+                                  ▼
+                               DURABLE STREAMS  shape/<id>         (one feed per DISTINCT shape)
+                                  │ read / long-poll
+                                  ▼
+                               CLIENTS
+                                  ├─ @electric-lite/client  (shapes, subset queries, aggregations)
+                                  └─ ElectricSQL client     (GET /v1/shape on the engine)
 ```
+
+Three ideas carry the whole design:
+
+1. **Postgres is the system of record; the engine holds no copy of any table.** State that scales
+   with row count lives in Postgres. The engine keeps per-shape routing metadata and shared subquery
+   inner-sets only; shape backfills read just the matching rows back from Postgres.
+2. **Everything between layers is an append-only stream.** The write path (replication → table
+   streams) and the read path (shape streams → clients) never talk directly; the engine is a
+   restartable consumer in the middle.
+3. **Every maintained result is de-duplicated.** Two equal shapes — same table, canonical predicate,
+   projection, and kind — share one maintained stream, ref-counted. Identical subqueries share one
+   inner-set node. Identical aggregations share one running fold. The engine maintains and appends
+   once for all subscribers.
 
 ---
 
 ## 1. Components
 
-```
-   ┌─────────┐   write (tRPC)   ┌─────────┐   append    ┌──────────────────┐
-   │ client  │ ───────────────▶ │  API    │ ──────────▶ │  durable-streams  │
-   │ (TS)    │                  │ (core)  │  table/<t>  │  (table + shape   │
-   │         │ ◀─ subscribe ─── │         │             │   streams)        │
-   └─────────┘   shape/<id>     └─────────┘             └──────────────────┘
-        ▲                                                   │        ▲
-        │ live rows (TanStack DB)                      tail │        │ append shape/<id>
-        │                                                   ▼        │
-        │                                            ┌──────────────────┐
-        └──────────────────────────────────────────  │   engine (Rust)  │
-                     (reads shape streams)            │ tailer + routing │
-                                                      └──────────────────┘
-```
-
-- **durable-streams** — append-only, offset-addressed JSON streams with long-poll/SSE tailing. One
-  `table/<name>` stream per table (the write log) and one `shape/<id>` stream per shape (the result
-  feed). Source of truth and the decoupling boundary between write and read paths.
-- **API / core** (`apps/api`) — thin tRPC surface. Writes are translated to State-Protocol envelopes
-  and appended **directly to the table stream** (it does *not* go through the engine). Schema and shape
-  lifecycle are forwarded to the engine over HTTP.
-- **engine** (`apps/engine`, Rust) — tails each table stream, computes per-change deltas from the
-  envelope's old+new tuples (no resident table copy), fans them out to matching shapes via three
-  strategies (key routing for equality templates, stateless filters for everything else, and a
-  shared-node subquery registry), and appends the resulting upsert/delete envelopes to shape streams.
-  Retained state is per-shape metadata + shared subquery inner-sets — *not* table rows. (The §4
-  "authoritative table state" / per-template dbsp circuit is the superseded model; see the blockquotes
-  above and `docs/ivm-engine-internals.md`.)
-- **client** (`packages/client`) — `createClient` exposes typed writes (tRPC) and `shape()` which
-  creates a shape and returns a **TanStack DB collection** kept live by a stream-db reader on the shape
-  stream. `awaitTxId` resolves when a given write's txid is observed in the shape stream. The collection
-  is consumed reactively via `@tanstack/react-db`'s `useLiveQuery` (see §12, the client query layer).
-
-The write path and read path are **decoupled through durable-streams**: the API never blocks on the
-engine, and the engine is a stateless-restartable consumer of the durable log.
+- **durable-streams** — append-only, offset-addressed JSON streams with long-poll tailing. One
+  `table/<name>` stream per table (the write log), one `shape/<id>` stream per distinct shape (the
+  result feed). The decoupling boundary between write and read paths.
+- **engine** (`apps/engine`, Rust) — the core: replication ingest, per-change Z-set deltas, fan-out to
+  shapes/subqueries/aggregations, the control-plane HTTP API, and the Electric-compatible
+  `GET /v1/shape` endpoint.
+- **API** (`apps/api`, tRPC) — the extended surface used by `@electric-lite/client`: `schema.define`,
+  `ingest.write` (library mode), `shapes.create/get/delete`, `subset.query/live`, `aggregate`.
+- **client** (`packages/client`) — `shape()` (a live TanStack DB collection), `subset()` (an ordered,
+  windowed page + a shared live tail), `aggregate()` (a live scalar), typed writes, `awaitTxId`.
+- **oracle + conformance** (`packages/oracle`, `packages/conformance`) — a Postgres/pglite reference
+  implementation and the harness asserting engine ≡ oracle for the same op stream, through the real
+  API + client, including live replication, fuzzing, NULLs, and concurrent writers.
 
 ---
 
 ## 2. Data model
 
-- **`Value`** (`value.rs`) — dynamically-typed scalar: `Int | Float | Text | Bool | Null`. NULL is
-  first-class for three-valued predicate logic.
-- **`Row`** = `Vec<Value>` — positional. The schema names the positions; the engine works positionally.
-- **Z-set delta** — `Vec<Tup2<Row, ZWeight>>` where `ZWeight` is a signed `i64` multiplicity. A change
-  is expressed as weights: insert = `(row, +1)`; delete = `(row, −1)`; update = `(old, −1), (new, +1)`.
-  This is the dbsp incremental-computation currency.
-- **State-Protocol envelope** (`ds.rs::Envelope`) — what lives on streams: `{ type, key, value,
-  headers{ operation, txid, offset } }`. Table-stream ops are `insert/update/upsert/delete`; shape-stream
-  ops are `upsert` (row enters/updates the result) or `delete` (row leaves).
+- **`Value`** (`value.rs`) — `Int | Float | Text | Bool | Null`. NULL is first-class (three-valued
+  logic). **`Row`** = positional `Vec<Value>`; the schema names the positions.
+- **Z-set delta** — `Vec<Tup2<Row, ZWeight>>`, `ZWeight` a signed i64: insert = `(row,+1)`, delete =
+  `(old,−1)`, update = `(old,−1),(new,+1)`. `old` comes from the replication envelope
+  (`REPLICA IDENTITY FULL`), so no local table state is needed to retract a row. This is all that
+  remains of [`dbsp`](https://crates.io/crates/dbsp) here: the value types. **No dbsp circuit runs**;
+  the live path is key routing + stateless predicate evaluation (see internals doc §1).
+- **Envelope** (`ds.rs`) — the unit on every stream:
+  `{ type, key, value, old, headers{ operation, txid, offset, lsn, seq } }`. The ingestor stamps
+  `lsn` (transaction **commit** LSN), `txid` (the Postgres **xid**), and `seq` (the change's position
+  within its transaction).
 
 ---
 
-## 3. Write path
+## 3. Ingest: logical replication, exactly-once effect
 
-1. `client.tables.<t>.update(row)` → tRPC `write`.
-2. `core.write` builds a table envelope (`toTableEnvelope`) with a generated `txid` and **POSTs it to
-   `durable-streams` `table/<t>`**. Returns `{ txid }` immediately.
-3. The engine's tailer observes the appended envelope on its next read.
+`replication.rs` polls a `test_decoding` slot with a **capped, non-consuming peek**
+(`pg_logical_slot_peek_changes`, cap 5000, escalating only when a single transaction exceeds it). Each
+transaction's changes are buffered and stamped at its `COMMIT` record with `(commit LSN, xid, seq)`,
+appended to `table/<name>`, and only **then** is the slot advanced — a failed append re-reads rather
+than loses data.
 
-The txid threads through: the same txid is copied onto every shape envelope produced from this change,
-so the client's `awaitTxId(txid)` can detect when the write has been fully materialized into a shape.
+Delivery to the table streams is therefore **at-least-once** (a crash between append and advance, or a
+partial multi-table append failure, re-appends whole batches). Deltas are *not* idempotent for
+aggregates and subquery contributor weights, so the consumer side restores exactly-once **effect**:
 
----
+- **Tailer de-duplication.** `(commit LSN, seq)` uniquely identifies a change and is strictly
+  increasing per table stream. Each tailer keeps a highwater mark and skips anything at or below it.
+- The drain-barrier sentinel (`__el_sync`) is published only after the slot actually advanced, so the
+  barrier can never claim "drained" while a batch is still due for re-append.
 
-## 4. Engine internals
-
-### 4.1 One tailer task per table
-
-`spawn_tailer` runs `tailer_loop` (a tokio task) per table. It owns, single-threaded:
-
-- `table_state: HashMap<Value, Row>` — authoritative current rows keyed by primary key. The source for
-  delta computation (old row on update/delete) and for backfilling newly-registered shapes.
-- `shapes: HashMap<String, StandaloneShape>` — non-shareable shapes (direct eval).
-- `families: HashMap<Vec<usize>, Family>` — shared circuits, keyed by the template's sorted key columns.
-- `family_of` — reverse index for shape removal.
-
-The loop `select!`s (biased) between control commands (`AddShape`/`RemoveShape`) and a long-poll
-`ds.read` on the table stream. Processing a change is **serial within a table** — ordering and state
-mutation are trivially correct; the only intra-batch parallelism is the append flush (§4.5).
-
-### 4.2 Delta computation — `apply_envelope`
-
-Converts a table envelope into a Z-set delta against `table_state`:
-
-- insert/upsert of a brand-new pk → `[(row, +1)]`
-- update of an existing pk → `[(old, −1), (row, +1)]` (or empty if the row is byte-identical — a no-op,
-  which is why the firehose's same-value writes don't count as envelopes)
-- delete → `[(old, −1)]`
-
-`table_state` is updated in place; the delta + txid are returned.
-
-### 4.3 Two execution strategies
-
-A shape's predicate decides how it runs. `predicate.equality_template()` returns `Some(key_cols)` iff
-the predicate is a **conjunction of non-null equality leaves on distinct columns** (e.g.
-`tenant = 7 AND region = 'eu'`); otherwise `None`.
-
-**(a) Shared family circuits — equality templates** (`family.rs`)
-
-All shapes with the *same set of equality columns* (regardless of the constants) share **one** dbsp
-circuit:
-
-```
-data_s   ── map_index(row -> (key_of(row, key_cols), row)) ──┐
-                                                             ├─ join ─▶ (shape_id, row) ─▶ output
-params_s ── map_index((key,shape) -> (key, shape)) ──────────┘
-```
-
-The table is indexed once by the template's key columns; a `Params{(key_tuple, shape_id)}` collection
-holds one entry per member shape. An **equi-join** emits `(shape_id, row)` for every row whose key
-matches a shape's constants. So a write touching key `k` is routed only to the shapes registered on `k`
-— in O(log N) over the params arrangement, *independent of the number of shapes*.
-
-- **Adding a shape** = insert `(key_tuple, shape_id)` into Params. The incremental join emits the
-  shape's backfill automatically (joining the new param against the accumulated data trace). A brand-new
-  family is primed with the current `table_state` in the same step.
-- **Dropping a shape** = delete the param; the join emits negative weights (its rows leave). When a
-  family's last shape leaves, the family (and its trace) is discarded.
-
-`collect_family_output` demultiplexes the `(shape_id, row, weight)` output back to per-shape streams.
-
-**(b) Standalone direct evaluation — everything else** (ranges, OR, NOT, inequality, match-all)
-
-A `WHERE` filter is **stateless**, so it needs no circuit and no thread:
-
-```rust
-fn eval_standalone(pred, delta) -> Vec<(Row, ZWeight)> {
-    delta.iter().filter(|t| pred.matches(&t.0)).map(|t| (t.0.clone(), t.1)).collect()
-}
-```
-
-Backfill on registration evaluates the predicate over `table_state`. Cost is O(K) predicate evals per
-write for K standalone shapes — CPU-bound, but with **no thread, no circuit, no per-shape delta clone**.
-
-### 4.4 Output translation — `translate_output`
-
-A shape's output delta is grouped by pk: any positive-weight row → `upsert` envelope (the row entered or
-updated the shape); a purely negative pk → `delete` (it left). The originating txid is stamped on each.
-
-### 4.5 Batched, concurrent append flush
-
-Per read batch, all shape envelopes are staged in `pending: HashMap<stream_path, Vec<Envelope>>`, then
-`flush_pending` appends them, **bounded-concurrently (CAP=32)** via a `JoinSet`. Appends (HTTP
-round-trips to storage) dominate engine time, so coalescing per stream and parallelizing across streams
-is the primary throughput/latency lever. Envelopes are never merged, so each keeps its own txid and
-`awaitTxId` still works.
-
-### 4.6 Convergence barrier
-
-After a batch is fully fanned out *and* flushed, the tailer publishes the processed offset
-(`GET /tables/<t>/offset`). A harness can poll this against the stream tail to know the engine has
-caught up — a sound (no false-green) convergence check used by the conformance suite.
+Degraded/unsupported forms are **loud, never silent**: an `UPDATE` without an old image or a `DELETE`
+without tuple data (REPLICA IDENTITY no longer FULL) and `TRUNCATE` log errors describing the staleness
+they cause; unparseable values (e.g. `NaN` floats) log errors when degraded to NULL.
 
 ---
 
-## 5. Threading model
+## 4. Backfill and the consistency fence (SnapshotGate)
+
+A shape's initial rows come from a single `REPEATABLE READ` snapshot with the predicate pushed into
+the `SELECT`. Live and backfill must then be reconciled so every change counts exactly once.
+
+**LSN comparison alone is not sound.** `pg_current_wal_lsn()` is a WAL *write* position, but snapshot
+visibility is decided later, at `ProcArrayEndTransaction` (after the commit record is fsynced). A
+transaction whose commit record is already in the WAL can be **invisible** to a snapshot taken during
+that window — skipping its replicated change "because commit LSN < seed LSN" would drop the row from
+both the backfill and the live stream, permanently. Conversely, a visible commit can sit exactly at
+the boundary and be replayed as a duplicate.
+
+The fence is therefore **transaction visibility** (`pg::SnapshotGate`): the backfill transaction
+captures `pg_current_snapshot()` (xmin / xmax / in-progress xids) in the same statement that
+establishes the snapshot, and the engine skips a replicated change **iff its xid was visible to that
+snapshot** (every xid seen on the slot is committed, so visibility is `xid < xmin`, or
+`xmin ≤ xid < xmax` and not in the in-progress list). Changes without a parseable xid (library mode)
+fall back to the strict-`<` LSN comparison. Every seeded structure — routed shapes, standalone shapes,
+aggregations, subquery nodes, subquery shapes — carries its own gate; `changes_only` feeds carry a
+passthrough gate (no backfill ⇒ forward everything).
+
+The backfill row representation is normalized to match the live path: text-mapped columns are read
+with `::text` casts so a cell's value is Postgres's *text output* — the same form `test_decoding`
+prints — rather than `to_jsonb`'s (which would make the same timestamp compare unequal between a
+backfilled row and its first live update).
+
+*Known residual:* the **client-side subset seam** (§7) still positions by LSN watermarks; the same
+visibility window theoretically applies to a subset page's snapshot vs its live tail and would need
+the page query-back to also return the snapshot's xid list. Engine-maintained state is fully fenced.
+
+---
+
+## 5. The engine: fan-out, sharing, lifecycle
+
+### 5.1 Tailer model
+
+One tokio task per table. Processing is serial within a table (ordering and state are trivially
+correct); the only intra-batch parallelism is the append flush (bounded-concurrent, CAP=32). After a
+batch is fully fanned out **and every append has landed**, the tailer publishes its processed offset —
+the convergence barrier used by the conformance harness (`GET /tables/<t>/offset`).
+
+### 5.2 Three execution strategies
+
+The shape of the predicate picks the strategy (full detail + cost model: internals doc §3):
+
+- **Equality templates** (`a = 1 AND b = 2`) → **key routing**: one shared `KeyRouter` per key-column
+  set; `key_tuple → {shapes}`. Routing is O(log N), independent of shape count; zero table rows held.
+- **Standalone** (ranges, OR, NOT, …) → a stateless three-valued filter evaluated directly on the
+  delta. No state; O(K) evals per change across the K standalone shapes on the table.
+- **Subqueries** (`col [NOT] IN (SELECT …)`) → the cross-table registry (§6).
+
+**Aggregations** (electric-lite extension, not part of the Electric-compatible API): a scalar
+COUNT/SUM/AVG/MIN/MAX over a non-subquery predicate, maintained incrementally as a fold over the
+delta — COUNT/SUM/AVG hold running scalars, MIN/MAX a `value → net-weight` multiset so retractions
+restore the previous extreme. SQL NULL semantics are mirrored exactly: aggregates ignore NULL values,
+`COUNT(col)` counts non-NULLs (`COUNT(*)` counts rows), AVG divides by the non-NULL count, and
+SUM/AVG/MIN/MAX over zero non-NULL values are NULL. The feed carries the current value as a
+single-row stream (`{ value, n }`).
+
+### 5.3 Shape de-duplication (the sharing layer)
+
+Any two **equal** shapes share one maintained stream, ref-counted:
+
+- **Signature.** Row shapes: `(table, canonical predicate, sorted projection, changes_only)` —
+  predicate canonicalization is order-insensitive (`a AND b` ≡ `b AND a`). Aggregations:
+  `(table, canonical predicate, function, column)`, namespaced so the two kinds never collide.
+- **Join.** A create whose signature already exists increments the refcount and returns the *same*
+  shape id + stream. Joiners **wait for the creator's backfill to land** (a watch channel in the
+  share entry) so no caller ever sees a stream whose snapshot isn't readable yet — and a *failed*
+  creation propagates to every waiting joiner rather than handing them a dead stream.
+- **Drop.** Deletes decrement; the shape, its routing/registry entries, **and its durable stream**
+  are torn down when the last subscriber leaves. (Without the stream deletion every dropped shape
+  leaked its stream on the storage server — found under load-generator churn.) N joiners hold the
+  same id and must each delete exactly once; the client enforces one-shot `close()`.
+- The Electric `/v1/shape` adapter opts out (`share=false`) — its protocol needs per-request handles.
+
+### 5.4 Creation is atomic; failures never leave zombies
+
+`create_shape` returns `Ok` only after registration + backfill actually succeeded. On any failure —
+backfill error, subquery seeding error, append error — the shape record, share entries, tailer
+registration, and (for subqueries) every node refcount/edge/pending-seed added by the attempt are
+rolled back, waiting joiners get the error, and the stream is deleted. A previously-observed failure
+mode — a "zombie" shape that is registered, streams nothing, and pins its signature so all future
+identical creates silently join a dead feed — is structurally excluded.
+
+### 5.5 Reliability: appends never drop silently
+
+A lost shape-stream append is a permanent divergence for every subscriber, so live-path appends use
+`append_reliable`: transient failures retry with capped backoff (backpressuring the tailer — the same
+stance as the ingestor's read-then-commit), and the only non-retried case is 404 (the shape was
+dropped mid-flush; discard is correct). Because shape envelopes are absolute per-pk
+(`upsert`/`delete` by key), an ambiguous-failure double-append is idempotent for readers.
+
+---
+
+## 6. Subqueries: shared inner-set nodes
+
+(Design record: `docs/superpowers/specs/2026-06-29-subqueries-design.md`; cost model: internals §3.3.)
+
+A predicate leaf `col [NOT] IN (SELECT proj FROM inner WHERE …)` routes through a registry shared by
+all tailers:
+
+- **Node** — one per distinct inner query (canonical signature), ref-counted: a map
+  `projected value → set of contributing inner-row pks`. A value is in the set iff its contributor
+  set is non-empty; tracking pks (not counts) makes maintenance reconcile-by-identity — idempotent
+  and order-independent.
+- **Edges** — `node → dependent` (an outer shape, or a *parent node* for nested subqueries), labeled
+  with the connecting column. When a node **flips** a value (∅→non-empty or back), the registry
+  queries the dependent rows with `connecting_col = value` and re-evaluates them, recursing up the DAG.
+- **Absolute emission** — the correctness rule that makes cross-table ordering irrelevant: for each
+  touched pk the registry emits the row's *current* membership (`upsert` if it matches now, else
+  `delete` by pk), never a history-dependent delta. Per-table tailers process tables out of global
+  commit order; a delta-based "delete only if the old row matched" would miss move-outs whenever the
+  inner set runs ahead. Absolute emission converges regardless of interleaving — which is why the
+  Electric-style LSN-buffering/tag protocol isn't needed here.
+- **NULL sensitivity** — SQL: a NULL in the inner set makes `x NOT IN S` UNKNOWN. A NULL flip
+  re-derives exactly the dependents that can change: those whose `IN` leaf is negated **or sits under
+  any `Not{…}`** (with no negation above the leaf, NULL only moves the leaf between FALSE and
+  UNKNOWN, and AND/OR are monotone over FALSE < UNKNOWN < TRUE, so inclusion can't change).
+- **Atomicity** — node creation/refcounts/edges roll back exactly on a failed shape create (§5.4).
+
+---
+
+## 7. Subset queries and client positioning
+
+A **subset query** is the non-materialized counterpart to a shape: one
+`SELECT … WHERE … ORDER BY … LIMIT/OFFSET` page against Postgres (subquery predicates evaluated
+natively by Postgres) + a **shared** `changes_only` live feed for the base predicate. Ranges live
+*only* here — they are never live-tailed, so a change is matched against one base predicate, never
+split across ranges. `orderBy`/`limit` are subset knobs, not shape knobs.
+
+The client (`packages/client/src/subset.ts`) merges the page(s) and the live tail by **per-pk LSN
+watermarks**: the page's snapshot LSN, and each applied delta's commit LSN. Engine output envelopes
+carry their commit LSN for exactly this. Key invariants (all regression-tested):
+
+- The feed is created and its head offset captured **before** the page snapshot, so no delta can fall
+  in the gap; overlap reconciles idempotently by pk (`delta lsn ≥ snapshot lsn` applies; the engine's
+  backfill-visible side is strictly below).
+- **Deletes leave tombstone watermarks** (including for pks never seen): a `loadMore` page whose
+  snapshot predates a delete must not resurrect the row / insert a ghost. Tombstones prune when no
+  page is in flight.
+- Close is one-shot; the feed is deleted with retries; a failed page query-back deletes the
+  just-created feed before rethrowing (no refcount pinning).
+
+---
+
+## 8. Electric protocol adapter
+
+`GET /v1/shape` (`electric.rs`) serves the ElectricSQL client protocol directly from the engine:
+`table` + SQL `where` (+ `columns`) are parsed (`where_sql.rs`) into the same predicate AST used
+everywhere else, one engine shape is created per handle (`share=false`), the shape stream is folded
+into the Electric message shape (insert/update/delete + `up-to-date` control messages), and live
+requests long-poll. Handles are evicted after an idle TTL (`ELECTRIC_HANDLE_TTL`), dropping the
+backing shape + stream; a request with an evicted handle gets `409 must-refetch`, which the Electric
+client handles by re-syncing. Conformance against Electric's own oracle + integration tests lives in
+`electric-conformance/` (see its README for scope and known gaps — e.g. row `tags` are not emitted;
+absolute membership emission makes them unnecessary for convergence).
+
+---
+
+## 9. Consistency & durability model (summary)
+
+| seam | mechanism | guarantee |
+|---|---|---|
+| backfill ↔ live | `SnapshotGate` (xid visibility; LSN fallback) | each change counts exactly once per shape/aggregate/node |
+| ingestor → table streams | peek → append → advance + `(lsn,seq)` tailer de-dup | at-least-once delivery, exactly-once effect |
+| engine → shape streams | `append_reliable` + offset published only after landing | no silently-lost deltas; barrier implies subscriber streams reflect the batch |
+| cross-table subquery order | absolute membership emission + flip query-backs | convergence independent of tailer interleaving |
+| shared shapes | signature + refcount + ready-watch + atomic rollback | joiners see a live, backfilled stream or an error; last drop tears everything down |
+| subset page ↔ live tail | per-pk LSN watermarks + delete tombstones | no double-count, no resurrections/ghosts across the seam (LSN-based; see §4 residual) |
+| client lifecycle | one-shot close, delete-with-retry | balanced create/drop; no refcount pinning or steal |
+
+The invariant the conformance suite asserts end-to-end: *for any shape and any op stream, the
+client-materialized set equals the oracle's `SELECT … WHERE <predicate>`* — through the real API,
+stream, and client, including live replication, batched mutations, NULLs, and concurrent writers.
+
+---
+
+## 10. Threading model
 
 | unit | threads | notes |
 |------|---------|-------|
-| API / core | tokio (Node) | stateless |
-| engine main | tokio multi-thread | tailer tasks + append flush run here |
+| engine main | tokio multi-thread | tailers + flush run here |
 | tailer (per table) | 1 task | serial change processing |
-| standalone shapes | **0** | direct eval on the tailer task |
-| family circuit (per template) | **1 OS thread** | dbsp join needs a runtime; `FamilyActor` owns a `std::thread` with `blocking_recv` |
+| shapes (any kind) | **0** | no per-shape thread or circuit |
+| replication ingestor | 1 task | peek/decode/append/advance |
+| subquery registry | 0 (a mutex) | every tailer calls into it |
 
-So engine threads ≈ `1 + #templates + tokio workers` — flat in the number of *shapes* (benchmarks show
-~16–18 threads at 100k shapes). It grows with the number of distinct equality **templates**, not shapes.
-
----
-
-## 6. Predicate compilation & NULL
-
-`predicate.rs` compiles the JSON predicate to a `CompiledPredicate` tree (column indices resolved
-against the schema). `matches(row)` evaluates with SQL **three-valued logic** (`Tri{True,False,Unknown}`):
-a NULL operand yields UNKNOWN, AND/OR follow SQL truth tables, `NOT UNKNOWN = UNKNOWN`, and a row is
-included only when the predicate is TRUE. The same evaluator backs both strategies (standalone eval and,
-implicitly, equality routing), so they agree by construction.
+Threads are flat in shapes *and* in templates (the earlier per-template dbsp circuit thread is gone).
 
 ---
 
-## 7. Telemetry
+## 11. Telemetry
 
-`GET /metrics` (+ `POST /metrics/reset`): lock-free atomic counters (`envelopes_processed`,
-`shape_appends`, `family_steps`) and log-bucket latency histograms (`process_envelope`, `family_step`,
-`append`) with p50/p99/p999/max. `GET /tables/<t>/families` exposes the live topology (families + their
-member counts, standalone count) for tests and capacity analysis.
-
----
-
-## 8. Trade-offs
-
-| decision | benefit | cost / risk |
-|----------|---------|-------------|
-| **Shared family per equality template** | N same-template shapes → 1 circuit; per-write routing O(log N), independent of shape count | each family holds a **full copy of the table** in its dbsp data trace → memory `O(#templates × table)`. Bounded by template count (small), not shapes. |
-| **Standalone direct eval (no dbsp) for non-equality** | no thread, no circuit, no per-shape delta clone; scales to many shapes | **O(K) predicate evals per write** (K standalone shapes) — CPU-bound; no pruning, every shape is tested on every change. |
-| **Per-envelope processing** | each shape envelope carries the exact originating txid (clean `awaitTxId`) | more channel round-trips / family steps than batching the whole read-batch into one step. |
-| **Per-family delta clone** (`step(delta.clone())`) | dbsp input consumes its Vec; clone gives each family its own | one delta clone per family per write. Cheap (few families) but real. |
-| **`table_state` separate from family traces** | one authoritative state for delta computation + standalone backfill; works even with no families | the table is materialized `1 + #families` times. |
-| **Single tailer per table** | trivial ordering & state correctness | change processing (delta + family steps + standalone evals) is **serial** on one task; only the append flush parallelizes. |
-| **Decoupled write path (API → table stream, engine tails)** | durable, replayable, API never blocks on engine; engine restart-safe | adds a storage round-trip of latency between write and materialization. |
-| **One durable stream per shape** | clean per-shape subscription, independent offsets | creating/touching N streams = N storage round-trips; under a non-keep-alive local server this is bounded by ephemeral ports (see benchmark-findings). |
-| **Family circuit = 1 OS thread** | dbsp join gets its required runtime; deterministic, isolated | threads grow with template count; a workload with thousands of *distinct* templates would need a worker pool. |
+- `GET /metrics` — atomic counters (`envelopes_processed`, `shape_appends`, `family_steps`) +
+  log-bucket latency histograms (`process_envelope`, `family_step`, `append`) with p50/p99/p999/max.
+- `GET /memory` + OTel gauges (`engine_shapes`, `engine_subquery_nodes`, `engine_subquery_contributors`,
+  `engine_family_circuits`, …) — the cardinalities that drive RSS; `GET /metrics/prometheus` exports.
+- `GET /graph`, `GET /graph/node?sig=…`, `GET /shapes/{id}/rows` — the live pipeline topology + node
+  indexes + shape contents, consumed by the **pipeline explorer** (`apps/pipeline-viz`).
+- `GET /tables/<t>/families`, `GET /subqueries` — sharing topology (proof that N shapes share one
+  router/node).
 
 ---
 
-## 9. Potential speedups
+## 12. Potential speedups
 
-Ordered roughly by expected impact. Telemetry (§7) shows the engine's internal per-change cost is
-already <1ms p99 at 100k shapes; the current end-to-end ceiling under max load is **storage throughput**,
-not the engine. So the highest-leverage items target the append/storage path and the standalone O(K).
+The engine's internal per-change cost is <1 ms p99 at 100k shapes; the end-to-end ceiling under load
+is **storage throughput** (the single-process durable-streams test server), not engine compute.
 
-**Storage / append path (current throughput ceiling)**
-1. **Multi-stream append** — one request appending to many shape streams at once (if storage supports
-   it) collapses the per-stream round-trip; today fan-out to M streams = M requests even when batched
-   concurrently.
-2. **HTTP/2 multiplexing or persistent pipelined connections** to storage — removes per-append
-   connection setup and the socket churn that bounds local scale.
-3. **Sharded / parallel tailers** — partition a table's shapes (or key space) across multiple tailer
-   tasks so fan-out and flush use multiple cores; today one tailer per table is the serial point.
-4. A production durable-streams backend (vs. the single-process test server) — the benchmarks are
-   storage-bound, not engine-bound.
+**Storage / append path (current ceiling)**
+1. Multi-stream append (one request, many streams) — fan-out to M streams is M HTTP requests today.
+2. HTTP/2 multiplexing / persistent pipelined connections to storage.
+3. Sharded tailers (partition a table's shapes/key-space across tasks).
+4. A production durable-streams backend (the test server fsyncs per append when file-backed).
 
-**Standalone evaluation (O(K) per write)**
-5. **Predicate indexing** — instead of testing all K standalone predicates per change, index them by
-   `(column, op)`: an interval/segment tree for range predicates on a column finds matching shapes in
-   `O(log K + matches)`; equality-ish leaves can route like families. Turns O(K) into output-sensitive.
-6. **Promote more predicates into shared circuits** — e.g. single-column range *templates* sharing one
-   indexed circuit, the same way equality templates share a join. Widens the "shared" class beyond pure
-   equality.
+**Standalone evaluation (O(K) per change)**
+5. Predicate indexing by `(column, op)` — interval trees turn O(K) into output-sensitive.
+6. Widen the shared class beyond pure equality (e.g. single-column range templates).
 
-**Engine compute**
-7. **Batch the whole read-batch into one family step** — accumulate all envelopes' deltas and step each
-   family once per batch instead of per envelope; cuts channel round-trips and `transaction()` calls.
-   Trade-off: per-row txid attribution is lost in the combined output, so either carry a txid *set* per
-   shape envelope or keep per-envelope stepping for subscribed/probe streams only.
-8. **Drop the per-family driver thread** — run the circuit via `spawn_blocking` or inline so a family is
-   0 dedicated OS threads, removing the thread-per-template growth.
-9. **Avoid the per-family delta clone** — share the delta as `Arc<[Tup2]>` and clone only at the dbsp
-   input boundary; or feed families from a single shared indexed arrangement (also removes the
-   table-copy-per-family amplification — the biggest remaining memory item).
-10. **Subsume `table_state` into a shared arrangement** — keep one indexed copy of the table that both
-    delta computation and family joins read, instead of `table_state` + one trace per family.
-
-**Representation**
-11. **Intern / `Arc<str>` stream paths and txids** to cut String clones in the hot `pending` map and
-    `translate_output`.
-12. **Columnar / packed `Value`** (smaller enum, string interning) to shrink `Row` and speed predicate
-    evaluation and joins.
+**Engine compute / representation**
+7. Backfill connection pooling for burst shape creation (the fleet benchmark's p99 driver).
+8. Intern stream paths/txids; pack `Value` (smaller enum, interned strings).
 
 ---
 
-## 10. Running dbsp from disk (memory beyond RAM)
+## 13. Appendix — dbsp trace storage: a negative result (historical)
 
-dbsp 0.299 has a full storage subsystem: on-disk columnar batch files (`trace/ord/file/`) paged
-through a cache, with a per-batch spill threshold and memory-pressure-driven spilling. It is wired
-into `FamilyActor` (`family.rs::circuit_config`) and **disabled by default** (in-memory). When enabled,
-a family's join data trace + Params arrangement spill to disk instead of living wholly in RAM — this is
-the lever for the table-copy-per-family amplification (§8). It does **not** touch `table_state` (our own
-`HashMap`), which stays in RAM until separately moved to an embedded KV.
+An earlier design ran a shared dbsp join circuit per equality template, whose data trace held a full
+table copy; dbsp 0.299's disk-backed trace storage was wired up to bound that memory. Measured
+honestly: on our ephemeral, hand-built circuit it did **not** offload the steady-state working set
+(`MIN_BYTES=0` spilled ~2 MB while ~570 MB stayed resident; `FelderaCache` made RSS *worse*).
+Effective spill appears tied to dbsp's persistent-id/checkpoint machinery we didn't use. The routing
+model then removed the table copies entirely, mooting the problem — there is little resident state
+left to spill. Kept here as the record of why "run dbsp from disk" is not the memory lever, and why
+the engine holds no table data instead. Do not resurrect `MIN_BYTES=0` / `FelderaCache`.
 
-Enabled via env (per-family subdirs are created under the base dir, scoped by pid):
+---
 
-| env var | effect |
-|---------|--------|
-| `ELECTRIC_LITE_STORAGE_DIR` | base dir; **presence enables storage**. Unset = in-memory. |
-| `ELECTRIC_LITE_STORAGE_CACHE` | `page` (default, OS page cache) or `feldera` (dbsp's internal LRU) |
-| `ELECTRIC_LITE_STORAGE_CACHE_MIB` | LRU budget in MiB (FelderaCache only) |
-| `ELECTRIC_LITE_STORAGE_MIN_BYTES` | per-batch spill threshold (dbsp default 10 MiB; `0` spills everything) |
-| `ELECTRIC_LITE_MAX_RSS_MB` | process memory target driving pressure-based spilling |
+## 14. Client query layer (two-level querying)
 
-**Verified:** conformance stays 84-green with storage forced fully on-disk (`MIN_BYTES=0`); `.feldera`
-batch files + dirlocks are written. Output is identical — storage is transparent.
+There are **two query layers** with different jobs:
 
-**A/B at 5,000 shapes, moderate load (measured):**
+1. **Server-side shape predicate** — *what crosses the network*. One table + a `WHERE` over its
+   columns (+ subqueries), optionally narrowed by a `columns` projection (sync only what a view
+   needs; the pk is always included). The engine maintains exactly this set on the shape stream.
+2. **Client-side live query** (TanStack DB `useLiveQuery` over the materialized collection) — *how
+   it's presented*: ordering, text search, finer filtering. Maintained incrementally on the client;
+   a refinement (typing in a search box) never touches the engine or re-syncs.
 
-| config | e2e p99 | RSS peak | notes |
-|--------|---------|----------|-------|
-| in-memory (default) | 8.2ms | 42MB | baseline |
-| on-disk, PageCache, `MIN_BYTES=0` | 7.4ms | **556MB** | pathological — forcing every tiny batch to disk makes mmap'd pages + write buffers count toward RSS |
-| on-disk, FelderaCache 64 MiB, default threshold | 7.5ms | **34MB** | nothing spills (working set < 10 MiB); behaves like in-memory |
+**Windowed / infinite-scroll sync** uses **subset queries** (§7): each page is a bounded keyset range
+query (`col < lastSeen OR (col = lastSeen AND id < lastId)` folded into the `WHERE`), no stateful
+top-N anywhere. The render layer is virtualized, so a 100k-row deployment stays a few dozen DOM nodes.
+For permissioned/faceted lists, prefer **per-facet feeds reused across filter changes** + a client
+merge (identical predicates across users ⇒ shared engine families) over folding UI filters into the
+predicate (which recreates the feed per click) — see AGENTS.md "lessons".
 
-**Large-scale test (`packages/bench/src/memtest.ts`, `pnpm --filter @electric-lite/bench memtest`).**
-8 distinct equality templates (8 families, so the table is held 8× in trace memory — the §8
-amplification) + a growing table of ~130k wide rows (512B payload). Measured engine RSS peak:
-
-| config | RSS peak | spilled to disk |
-|--------|----------|-----------------|
-| in-memory (default) | 401MB | — |
-| on-disk, FelderaCache 128 MiB, `MIN_BYTES=1MiB` | **1538MB** | 41MB |
-| on-disk, PageCache, `MAX_RSS_MB=300`, `MIN_BYTES=0` | 469MB | **2MB** |
-
-**Conclusion (honest negative result):** in dbsp 0.299, enabling storage on our **ephemeral,
-hand-built** circuit does **not** offload the join's steady-state data trace to disk for this workload.
-`MIN_BYTES=0` wrote only ~2MB while the ~570MB of 8× trace data stayed resident; `FelderaCache` made
-RSS *worse* (cache + write buffers + un-spilled batches, and it is documented as under-development).
-Effective spill appears tied to dbsp's persistent-id / checkpoint machinery, which our circuit does not
-use (`Mode::Ephemeral`; `Mode::Persistent` requires compiler-assigned operator ids we don't have). So
-the wiring is correct and transparent (conformance green), but it is **not** a usable memory-bounding
-lever as-is.
-
-**Caveats / next steps:**
-- Don't ship `MIN_BYTES=0` or `FelderaCache` — both inflate RSS here.
-- Getting real spill likely needs deeper dbsp work (persistent mode + checkpoint cadence), validation on
-  Linux (where the storage path is primarily developed and file-I/O RSS accounting differs), and/or a
-  newer dbsp release. Treat the env flags as experimental until that's done.
-- The higher-confidence path to "run from disk" for *this* engine is the part we fully control:
-  back `table_state` (and optionally the shape index) with an embedded KV (redb/lmdb/sled), independent
-  of dbsp's trace storage.
-- Spilled family subdirs are not yet garbage-collected on family drop (families are long-lived; minor).
-
-## 11. File map
+## 15. File map
 
 | path | role |
 |------|------|
-| `apps/engine/src/engine.rs` | tailer, delta computation, key routing + standalone fan-out, flush, backfill↔replication LSN reconciliation |
-| `apps/engine/src/replication.rs` | Postgres logical-replication ingestor: peek slot, buffer per-txn, stamp commit LSN, append, advance |
-| `apps/engine/src/pg.rs` | Postgres connect/introspect, `REPLICA IDENTITY FULL`, slot create, predicate-pushdown backfill (`seed_lsn`) |
-| `apps/engine/src/sql.rs` | predicate → parameterized SQL `WHERE` (backfill pushdown; mirrors the TS compiler / oracle) |
-| `apps/engine/src/predicate.rs` | predicate compilation, three-valued `matches`, `equality_template` |
-| `apps/engine/src/ds.rs` | durable-streams HTTP client (`ensure_stream`/`append`/`read`) |
-| `apps/engine/src/value.rs` | `Value`, `Row` |
-| `apps/engine/src/schema.rs` | schema compilation, JSON⇄Row, pk handling |
-| `apps/engine/src/metrics.rs` | counters + latency histograms |
-| `apps/engine/src/http.rs` | engine control-plane HTTP |
-| `apps/api/src/core.ts` | write path + schema/shape forwarding |
-| `packages/client/src/index.ts` | typed writes + `shape()` live collections |
-| `packages/bench/src/run.ts` | stress benchmark harness |
-| `examples/linearlite/src/lib/useShape.ts` | client query layer: shape→collection + `useLiveQuery` (§12) |
-```
-
----
-
-## 12. Client query layer (two-level querying)
-
-There are **two query layers** with different jobs, and keeping them distinct is what lets the system
-sync a bounded set yet still present it flexibly:
-
-1. **Server-side shape predicate** (the engine, §4) — *what crosses the network*. One table + a
-   `WHERE` over its columns (eq/neq/lt/lte/gt/gte + and/or/not), optionally narrowed by two knobs that
-   bound *what is synced* (not what is matched): an output **`columns` projection** (sync only the
-   columns a view needs; the pk is always included — e.g. the browse list drops a large `description`
-   it never renders) and an **`orderBy`+`limit` window** (read only the first *N* rows in order — the
-   engine appends the pk as a tiebreaker for a total order). The engine maintains exactly this set on
-   the client's `shape/<id>` stream, incrementally, as Postgres changes. This is the sync boundary:
-   rows outside the predicate are never materialized.
-2. **Client-side live query** (`@tanstack/react-db`'s `useLiveQuery` over the materialized TanStack DB
-   collection) — *how the synced set is presented*. Ordering (`orderBy`), text search (`ilike`/`like`),
-   projection (`select`), and any finer filtering run here. TanStack DB maintains the query result
-   **incrementally** over the collection (it is not re-computed in JS on every delta), so a client-only
-   refinement — e.g. typing in a search box — updates the rendered rows **without changing the
-   engine-side shape or re-syncing**.
-
-The split is deliberate: text `LIKE`-style search and presentation ordering stay client-side (they are
-view concerns over an already-synced set, and pushing them server-side would couple sync to view
-state). The `orderBy`+`limit` window is the **sync-bounding** counterpart — it powers windowed /
-infinite-scroll sync: the client syncs one ordered page, then loads the next by folding a keyset cursor
-(`col < lastSeen OR (col = lastSeen AND id < lastId)`) into the shape's `WHERE`, so each page is a
-bounded range query — no stateful top-N operator in the engine. A page is a backfill bound, not a
-live-maintained top-N: live changes matching the predicate still flow into a loaded page. The example
-apps pair this with a **virtualized** render layer (only on-screen rows are mounted), so a 20k-row view
-holds a few dozen DOM nodes; see `examples/linearlite` (`lib/Virtual.tsx`, `components/IssueList.tsx`).
-
-**Binding pattern (the example apps).** `useShapeCollection(def)` creates the engine-side shape and
-returns its live collection (async; `null` while loading or when `def` is `null`), recreating it when
-`def` changes and closing it on unmount. `useShapeRows(def, build?, deps?)` runs `useLiveQuery` over
-that collection, where `build` pushes `.where()/.orderBy()/.select()` into the query and `deps` carry
-any values `build` closes over (so a search term re-runs the *client* query without re-syncing). A
-shared always-ready empty placeholder collection is queried while the real one is still loading, so
-`useLiveQuery` can be called unconditionally (React rules of hooks). LinearLite filters by
-status/priority/id server-side (the shape) and orders by date/kanban-order and searches by text in the
-live query; the one exception is priority ordering, which is a rank over a *text* enum (no integer
-column) and so is applied as a small client-side sort over the live-query result.
+| `apps/engine/src/engine.rs` | tailers, delta computation, routing + standalone + aggregation fan-out, shape sharing/lifecycle, reliable flush |
+| `apps/engine/src/subquery.rs` | subquery registry: shared nodes, edges, flips, absolute emission, atomic create/rollback |
+| `apps/engine/src/replication.rs` | ingestor: capped peek, per-txn buffering, (lsn, xid, seq) stamping, append-then-advance |
+| `apps/engine/src/pg.rs` | connect/introspect, slot + REPLICA IDENTITY, backfill (+ `SnapshotGate`), subset query-back, value normalization |
+| `apps/engine/src/predicate.rs` | predicate compile, three-valued eval, equality templates, subquery signatures |
+| `apps/engine/src/sql.rs` / `where_sql.rs` | predicate → SQL (pushdown) / SQL `WHERE` → predicate (Electric path) |
+| `apps/engine/src/electric.rs` | Electric `/v1/shape` adapter (handles, offsets, TTL eviction) |
+| `apps/engine/src/ds.rs` | durable-streams client: `append`, `append_reliable`, `delete_stream`, reads |
+| `apps/engine/src/http.rs` | control-plane HTTP |
+| `apps/api/src/core.ts` | extended API core (writes, shape/subset/aggregate forwarding) |
+| `packages/client/src/index.ts` | client: shapes/aggregations, tracked lifecycles, `awaitTxId` |
+| `packages/client/src/subset.ts` | subset queries: page merge, LSN watermarks, tombstones, feed lifecycle |
+| `docker/` | containerized stack (engine, durable-streams, API, Postgres) |
+| `apps/pipeline-viz` | live pipeline explorer over `GET /graph` |

@@ -1,6 +1,7 @@
 import {
   isAnd,
   isInSubquery,
+  isIsNull,
   isLeaf,
   isNot,
   isOr,
@@ -29,6 +30,11 @@ type Tri = boolean | null
 
 function evalTri(pred: Predicate, row: Row): Tri {
   if (isLeaf(pred)) return compare(row[pred.col], pred.op, pred.value)
+  if (isIsNull(pred)) {
+    // `IS [NOT] NULL` is two-valued: TRUE/FALSE by the cell's null-ness, never UNKNOWN.
+    const cell = row[pred.col]
+    return (cell === null || cell === undefined) === pred.isNull
+  }
   if (isAnd(pred)) {
     // FALSE dominates; else UNKNOWN if any UNKNOWN; else TRUE (empty AND => TRUE).
     let acc: Tri = true
@@ -109,6 +115,10 @@ export function validatePredicate(pred: Predicate, table: TableDef, schema?: Sch
         `value ${JSON.stringify(pred.value)} is not compatible with column "${pred.col}" of type ${col.type}`,
       )
     }
+    return
+  }
+  if (isIsNull(pred)) {
+    if (!table.columns[pred.col]) throw new PredicateError(`unknown column "${pred.col}"`)
     return
   }
   if (isAnd(pred)) {

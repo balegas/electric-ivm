@@ -67,13 +67,29 @@ async fn poll_loop(
     sync_seq: &Arc<AtomicI64>,
 ) -> Result<(), tokio_postgres::Error> {
     // PEEK (non-consuming): we only ADVANCE the slot after the batch is durably on the stream.
-    let peek = "select lsn::text, data from pg_logical_slot_peek_changes($1, NULL, NULL)";
+    // The peek is CAPPED so a long backlog doesn't materialize wholesale in memory. A transaction can
+    // be cut by the cap; decode_batch only emits transactions whose COMMIT is in the batch and the
+    // slot advances to the last complete commit, so a cut transaction is simply re-peeked next poll.
+    // If a batch is all one giant open transaction (no COMMIT at the cap), the cap escalates until
+    // the commit fits — degrading, for that poll only, toward the old unbounded read.
+    let peek = "select lsn::text, data from pg_logical_slot_peek_changes($1, NULL, $2)";
+    const PEEK_CAP: i32 = 5000;
+    let mut cap: i32 = PEEK_CAP;
     loop {
-        let rows = client.query(peek, &[&slot]).await?; // connection error -> reconnect
+        let rows = client.query(peek, &[&slot, &cap]).await?; // connection error -> reconnect
         if !rows.is_empty() {
             let pairs: Vec<(String, String)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
             let batch = decode_batch(&pairs, tables);
+            if batch.advance_to.is_none() && pairs.len() as i64 >= cap as i64 {
+                // No COMMIT in a full batch: one transaction bigger than the cap. Escalate and retry.
+                cap = cap.saturating_mul(4);
+                tracing::warn!("replicator: transaction exceeds peek cap; escalating cap to {cap}");
+                continue;
+            }
+            cap = PEEK_CAP;
             // Append every table's envelopes; advance only if ALL succeed (else re-peek next poll).
+            // Re-appends after a partial failure (or a crash before the advance) duplicate envelopes
+            // on the succeeded streams; the tailer de-duplicates by the stamped (lsn, seq).
             let mut all_ok = true;
             for (table, envs) in &batch.pending {
                 if let Err(e) = ds.append(&format!("table/{table}"), envs).await {
@@ -82,6 +98,7 @@ async fn poll_loop(
                 }
             }
             if all_ok {
+                let mut advanced = true;
                 if let Some(ref upto) = batch.advance_to {
                     // Consume everything up to the last commit we processed. The LSN is a PG-produced
                     // hex string (e.g. "0/78912C0"), formatted literally because a bound &str can't be
@@ -89,12 +106,18 @@ async fn poll_loop(
                     let q = format!("select pg_replication_slot_advance($1, '{upto}'::pg_lsn)");
                     if let Err(e) = client.execute(&q, &[&slot]).await {
                         tracing::error!("replicator: slot advance to {upto} failed: {e:#}");
+                        advanced = false;
                     } else {
                         *last_lsn.lock().unwrap() = upto.clone();
                     }
                 }
-                if let Some(n) = batch.max_sync {
-                    sync_seq.fetch_max(n, Ordering::Relaxed);
+                // Publish the drain-barrier sentinel only once the slot actually advanced: a failed
+                // advance means the whole batch is re-peeked and re-appended, and the barrier must
+                // not claim "drained" while those duplicates are still in flight.
+                if advanced {
+                    if let Some(n) = batch.max_sync {
+                        sync_seq.fetch_max(n, Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -127,9 +150,14 @@ fn decode_batch(rows: &[(String, String)], tables: &HashMap<String, TableSchema>
             tx_envs.clear();
             tx_sync = None;
         } else if data.starts_with("COMMIT") {
-            // The COMMIT row's LSN is the transaction's commit LSN; stamp the buffered changes.
-            for mut env in tx_envs.drain(..) {
+            // The COMMIT row's LSN is the transaction's commit LSN; stamp the buffered changes with
+            // it, the transaction's xid (for the backfill snapshot's xid-visibility fence), and each
+            // change's position within the transaction (for tailer-side de-duplication by (lsn, seq)).
+            let xid = data.split_whitespace().nth(1).map(str::to_string);
+            for (i, mut env) in tx_envs.drain(..).enumerate() {
                 env.headers.lsn = Some(lsn.clone());
+                env.headers.txid = xid.clone();
+                env.headers.seq = Some(i as u64);
                 pending.entry(env.type_.clone()).or_default().push(env);
             }
             if let Some(n) = tx_sync.take() {
@@ -190,7 +218,7 @@ fn build_envelope(table: &str, ts: &TableSchema, op: &str, body: &str) -> Option
         key: key_from_obj(key_src, ts),
         value,
         old,
-        headers: EnvelopeHeaders { operation: operation.to_string(), txid: None, offset: None, lsn: None },
+        headers: EnvelopeHeaders { operation: operation.to_string(), txid: None, offset: None, lsn: None, seq: None },
     };
     match op {
         "INSERT" => {
@@ -202,7 +230,16 @@ fn build_envelope(table: &str, ts: &TableSchema, op: &str, body: &str) -> Option
             // matched OUTSIDE quotes so a text value containing " new-tuple: " can't break it.
             let (old_seg, new_seg) = match find_unquoted(body, " new-tuple: ") {
                 Some(idx) => (body[..idx].strip_prefix("old-key: ").unwrap_or(&body[..idx]), &body[idx + " new-tuple: ".len()..]),
-                None => ("", body), // no old image (REPLICA IDENTITY DEFAULT) -> new only
+                None => {
+                    // No old image: the table's REPLICA IDENTITY has been reset from FULL (e.g. a
+                    // migration recreated it). The engine can't retract the prior row, so a change
+                    // that moves a row OUT of a shape leaves it stale. Degraded and loud.
+                    tracing::error!(
+                        "replicator: UPDATE on {table} carries no old image — REPLICA IDENTITY is no \
+                         longer FULL; move-outs will be missed until it is restored and shapes recreated"
+                    );
+                    ("", body)
+                }
             };
             let mut new_map = parse_cols(new_seg, ts);
             let old_map = if old_seg.is_empty() { None } else { Some(parse_cols(old_seg, ts)) };
@@ -217,8 +254,25 @@ fn build_envelope(table: &str, ts: &TableSchema, op: &str, body: &str) -> Option
             Some(make("update", Some(new.clone()), old, &new))
         }
         "DELETE" => {
+            if body.trim() == "(no-tuple-data)" {
+                // REPLICA IDENTITY reset: the delete carries no row at all. Retracting a phantom
+                // all-NULL row would be wrong either way — skip it, loudly.
+                tracing::error!(
+                    "replicator: DELETE on {table} carries no tuple data — REPLICA IDENTITY is no \
+                     longer FULL; the delete cannot be propagated and shapes will retain the row"
+                );
+                return None;
+            }
             let old = Json::Object(parse_cols(body, ts));
             Some(make("delete", None, Some(old.clone()), &old))
+        }
+        "TRUNCATE" => {
+            // Not supported: shapes/aggregates/subquery nodes would retain every truncated row.
+            tracing::error!(
+                "replicator: TRUNCATE on {table} is not supported — shapes over this table are now \
+                 stale and must be recreated"
+            );
+            None
         }
         _ => None,
     }
@@ -269,7 +323,14 @@ fn key_from_obj(obj: &Json, ts: &TableSchema) -> String {
         match obj.get(name) {
             Some(Json::Null) | None => "null".to_string(),
             Some(Json::String(s)) => s.clone(),
-            Some(Json::Number(n)) => n.to_string(),
+            // Canonicalize through f64 for float pk columns so the envelope key matches the
+            // engine's `Value::to_key_string` (serde would print `1.0` where f64 prints `1`).
+            Some(Json::Number(n)) => match n.as_f64() {
+                Some(f) if ts.index.get(name).is_some_and(|&i| ts.columns[i].1 == ColumnType::Float) => {
+                    f.to_string()
+                }
+                _ => n.to_string(),
+            },
             Some(Json::Bool(b)) => b.to_string(),
             Some(v) => v.to_string(),
         }
@@ -321,17 +382,30 @@ fn parse_cols(seg: &str, ts: &TableSchema) -> Map<String, Json> {
             }
             name = seg[name_start..i].to_string();
         }
-        // skip "[type]"
+        // skip "[type]" — bracket-depth aware, because array types nest brackets in the type name
+        // (`tags[integer[]]:'{1,2}'`): stopping at the first `]` would mis-parse this column AND drop
+        // every column after it (they'd silently read back as NULL).
         while i < b.len() && b[i] != b'[' {
             i += 1;
         }
-        while i < b.len() && b[i] != b']' {
+        let mut depth = 0usize;
+        while i < b.len() {
+            match b[i] {
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
             i += 1;
         }
         if i >= b.len() {
             break;
         }
-        i += 1; // past ']'
+        i += 1; // past the closing ']'
         if i >= b.len() || b[i] != b':' {
             break;
         }
@@ -378,18 +452,29 @@ fn parse_cols(seg: &str, ts: &TableSchema) -> Map<String, Json> {
 }
 
 /// Convert a `test_decoding` scalar (already unquoted) to JSON per the column type. Unquoted `null`
-/// is SQL NULL; quoted values are always present (text).
+/// is SQL NULL; quoted values are always present (text). A value that fails its type's parse (e.g.
+/// `NaN`/`Infinity` floats, out-of-range numerics) degrades to NULL — logged, because a real value
+/// silently becoming SQL NULL downstream is a corruption, not a convenience.
 fn text_to_json(text: &str, is_quoted: bool, ty: ColumnType) -> Json {
     if !is_quoted && text == "null" {
         return Json::Null;
     }
+    let fail = |ty: &str| {
+        tracing::error!("replicator: unparseable {ty} value {text:?} degraded to NULL");
+        Json::Null
+    };
     match ty {
-        ColumnType::Int => text.parse::<i64>().map(Json::from).unwrap_or(Json::Null),
-        ColumnType::Float => text.parse::<f64>().ok().and_then(serde_json::Number::from_f64).map(Json::Number).unwrap_or(Json::Null),
+        ColumnType::Int => text.parse::<i64>().map(Json::from).unwrap_or_else(|_| fail("int")),
+        ColumnType::Float => text
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(Json::Number)
+            .unwrap_or_else(|| fail("float")),
         ColumnType::Bool => match text {
             "t" | "true" => Json::Bool(true),
             "f" | "false" => Json::Bool(false),
-            _ => Json::Null,
+            _ => fail("bool"),
         },
         ColumnType::Text => Json::String(text.to_string()),
     }
@@ -507,6 +592,57 @@ mod tests {
         // Stamped with the COMMIT lsn (0/20), not the per-change record lsn (0/10).
         assert_eq!(envs[0].headers.lsn.as_deref(), Some("0/20"));
         assert_eq!(batch.advance_to.as_deref(), Some("0/20"));
+    }
+
+    /// Array-typed columns nest brackets in the test_decoding type name (`tags[integer[]]`). The type
+    /// skip must be bracket-depth aware or this column AND every later column silently parse as NULL.
+    #[test]
+    fn array_type_names_do_not_truncate_the_row() {
+        let mut columns = BTreeMap::new();
+        columns.insert("id".to_string(), ColumnDef { ty: ColumnType::Int });
+        columns.insert("tags".to_string(), ColumnDef { ty: ColumnType::Text });
+        columns.insert("name".to_string(), ColumnDef { ty: ColumnType::Text });
+        let def = TableDef { columns, primary_key: vec!["id".to_string()] };
+        let mut m = HashMap::new();
+        m.insert("users".to_string(), TableSchema::from_def("users", &def).unwrap());
+        let e = parse_change(
+            "table public.users: INSERT: id[integer]:1 tags[integer[]]:'{1,2}' name[text]:'after'",
+            &m,
+        )
+        .unwrap();
+        assert_eq!(e.value.as_ref().unwrap()["tags"], "{1,2}");
+        assert_eq!(e.value.as_ref().unwrap()["name"], "after"); // the column after the array survives
+    }
+
+    /// COMMIT stamps each buffered change with the transaction's xid (the snapshot-gate fence) and its
+    /// position within the transaction (the tailer's de-duplication key).
+    #[test]
+    fn decode_batch_stamps_xid_and_seq() {
+        let t = users();
+        let batch = decode_batch(
+            &rows(&[
+                ("0/A", "BEGIN 700"),
+                ("0/10", "table public.users: INSERT: id[integer]:1 name[text]:'a'"),
+                ("0/12", "table public.users: INSERT: id[integer]:2 name[text]:'b'"),
+                ("0/20", "COMMIT 700"),
+            ]),
+            &t,
+        );
+        let envs = &batch.pending["users"];
+        assert_eq!(envs.len(), 2);
+        assert_eq!(envs[0].headers.txid.as_deref(), Some("700"));
+        assert_eq!(envs[0].headers.seq, Some(0));
+        assert_eq!(envs[1].headers.txid.as_deref(), Some("700"));
+        assert_eq!(envs[1].headers.seq, Some(1));
+    }
+
+    /// A DELETE with no tuple data (REPLICA IDENTITY no longer FULL) must be skipped, not turned into
+    /// a phantom all-NULL retraction; TRUNCATE produces no envelope.
+    #[test]
+    fn degraded_forms_are_skipped() {
+        let t = users();
+        assert!(parse_change("table public.users: DELETE: (no-tuple-data)", &t).is_none());
+        assert!(parse_change("table public.users: TRUNCATE: (no-flags)", &t).is_none());
     }
 
     #[test]

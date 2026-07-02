@@ -60,6 +60,27 @@ struct EngineState {
 struct FeedShare {
     sig: String,
     refcount: usize,
+    /// Creation outcome, observed by joiners: `None` while the creator's backfill/registration is in
+    /// flight, `Some(true)` once the shape is live (its snapshot is readable), `Some(false)` if
+    /// creation failed (the entry is removed; joiners must error, not return a dead stream).
+    ready: tokio::sync::watch::Receiver<Option<bool>>,
+}
+
+/// Wait until a shared shape's creator reports the shape live (or failed). Joining before the
+/// backfill lands would hand the caller a stream whose snapshot isn't readable yet.
+async fn await_share_ready(mut rx: tokio::sync::watch::Receiver<Option<bool>>, id: &str) -> Result<()> {
+    loop {
+        let state = *rx.borrow();
+        match state {
+            Some(true) => return Ok(()),
+            Some(false) => bail!("shared shape '{id}' failed to initialize; retry the create"),
+            None => {
+                if rx.changed().await.is_err() {
+                    bail!("shared shape '{id}' creator died before completing; retry the create");
+                }
+            }
+        }
+    }
 }
 
 /// Canonical signature for feed sharing: table + serialized predicate + sorted projection indices.
@@ -238,10 +259,11 @@ enum TailerCmd {
         /// "tail" feed). Used by subset queries: the page rows come from a `query_subset`, and this
         /// feed carries just the live deltas the client re-checks against the loaded view.
         changes_only: bool,
-        /// Signalled once the shape is registered AND its backfill has been appended to the stream, so
-        /// `create_shape` can return only after the snapshot is readable (the Electric adapter folds the
-        /// stream immediately on create).
-        ready: tokio::sync::oneshot::Sender<()>,
+        /// Signalled once the shape is registered AND its backfill has been appended to the stream —
+        /// `Ok(())` on success, `Err(reason)` if backfill/registration failed — so `create_shape` can
+        /// return only after the snapshot is readable (the Electric adapter folds the stream
+        /// immediately on create) and can propagate a failure instead of leaving a zombie shape.
+        ready: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     },
     /// Register a scalar aggregation (COUNT/SUM/AVG/MIN/MAX) over `pred`, maintained incrementally.
     AddAggregate {
@@ -250,7 +272,7 @@ enum TailerCmd {
         pred: Arc<CompiledPredicate>,
         func: AggFn,
         col: Option<usize>,
-        ready: tokio::sync::oneshot::Sender<()>,
+        ready: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     },
     RemoveShape { shape_id: String },
 }
@@ -422,7 +444,17 @@ impl Engine {
         if let Some(sig) = &feed_sig {
             if let Some(existing_id) = st.feed_by_sig.get(sig).cloned() {
                 if let Some(rec) = st.shapes.get(&existing_id).cloned() {
-                    st.feed_shares.get_mut(&existing_id).expect("share entry for live feed").refcount += 1;
+                    let share = st.feed_shares.get_mut(&existing_id).expect("share entry for live feed");
+                    share.refcount += 1;
+                    let ready = share.ready.clone();
+                    // Release the lock, then wait for the creator's backfill to land: a joiner must not
+                    // see a stream whose snapshot isn't readable yet, and must surface (not mask) a
+                    // failed creation.
+                    drop(st);
+                    if let Err(e) = await_share_ready(ready, &existing_id).await {
+                        // The failed creator already removed the share entries; undo nothing.
+                        return Err(e);
+                    }
                     return Ok(rec);
                 }
             }
@@ -466,19 +498,42 @@ impl Engine {
             };
             st.shapes.insert(id.clone(), rec.clone());
             // Register this (first) subquery shape so later identical ones join it by ref-count.
+            // Joiners wait on `ready_tx` — the shape isn't live until the registry has seeded its
+            // nodes and backfilled the stream.
+            let (ready_tx, ready_rx) = tokio::sync::watch::channel(None);
             if let Some(sig) = feed_sig {
                 st.feed_by_sig.insert(sig.clone(), id.clone());
-                st.feed_shares.insert(id.clone(), FeedShare { sig, refcount: 1 });
+                st.feed_shares.insert(id.clone(), FeedShare { sig, refcount: 1, ready: ready_rx });
             }
             // Release the engine-state lock before the registry's PG backfill (so offset polling etc.
             // aren't blocked); the registry has its own lock.
             drop(st);
-            self.subqueries
+            let res = self
+                .subqueries
                 .lock()
                 .await
                 .create_subquery_shape(&id, table, &stream_path, &where_json, out_cols, changes_only)
-                .await?;
-            return Ok(rec);
+                .await;
+            match res {
+                Ok(()) => {
+                    let _ = ready_tx.send(Some(true));
+                    return Ok(rec);
+                }
+                Err(e) => {
+                    // Registration failed (the registry rolled its own state back). Remove the shape
+                    // record + share entries so later identical creates don't join a dead stream, and
+                    // wake any joiners with the failure.
+                    let mut st = self.state.lock().await;
+                    st.shapes.remove(&id);
+                    if let Some(share) = st.feed_shares.remove(&id) {
+                        st.feed_by_sig.remove(&share.sig);
+                    }
+                    drop(st);
+                    let _ = ready_tx.send(Some(false));
+                    let _ = self.ds.delete_stream(&stream_path).await;
+                    return Err(e);
+                }
+            }
         }
 
         let pred = Arc::new(CompiledPredicate::compile_opt(where_.as_ref(), &ts)?);
@@ -519,16 +574,39 @@ impl Engine {
             aggregate: None,
         };
         st.shapes.insert(id.clone(), rec.clone());
-        // Register the (first) shared feed so later identical subset feeds join it.
+        // Register the (first) shared feed so later identical subset feeds join it. Joiners wait on
+        // `share_tx` for the backfill outcome.
+        let (share_tx, share_rx) = tokio::sync::watch::channel(None);
         if let Some(sig) = feed_sig {
             st.feed_by_sig.insert(sig.clone(), id.clone());
-            st.feed_shares.insert(id.clone(), FeedShare { sig, refcount: 1 });
+            st.feed_shares.insert(id.clone(), FeedShare { sig, refcount: 1, ready: share_rx });
         }
         // Release the engine-state lock, then wait for the tailer to finish the backfill so the shape's
         // snapshot is readable when we return (the Electric adapter folds the stream immediately).
         drop(st);
-        let _ = ready_rx.await;
-        Ok(rec)
+        let outcome = ready_rx.await.unwrap_or_else(|_| Err("tailer dropped the ready channel".to_string()));
+        match outcome {
+            Ok(()) => {
+                let _ = share_tx.send(Some(true));
+                Ok(rec)
+            }
+            Err(e) => {
+                // Backfill/registration failed: remove the record + share entries (no zombie shape a
+                // later identical create would join) and surface the error to the caller.
+                let mut st = self.state.lock().await;
+                st.shapes.remove(&id);
+                if let Some(share) = st.feed_shares.remove(&id) {
+                    st.feed_by_sig.remove(&share.sig);
+                }
+                if let Some(t) = st.tailers.get(&rec.table) {
+                    let _ = t.cmd_tx.send(TailerCmd::RemoveShape { shape_id: id.clone() });
+                }
+                drop(st);
+                let _ = share_tx.send(Some(false));
+                let _ = self.ds.delete_stream(&rec.stream_path).await;
+                bail!("shape '{id}' creation failed: {e}")
+            }
+        }
     }
 
     /// Create a scalar **aggregation** shape (COUNT/SUM/AVG/MIN/MAX over `where`), maintained
@@ -560,7 +638,11 @@ impl Engine {
         let agg_sig = agg_signature(table, &where_, &func, col_idx);
         if let Some(existing_id) = st.feed_by_sig.get(&agg_sig).cloned() {
             if let Some(rec) = st.shapes.get(&existing_id).cloned() {
-                st.feed_shares.get_mut(&existing_id).expect("share entry for aggregate").refcount += 1;
+                let share = st.feed_shares.get_mut(&existing_id).expect("share entry for aggregate");
+                share.refcount += 1;
+                let ready = share.ready.clone();
+                drop(st);
+                await_share_ready(ready, &existing_id).await?;
                 return Ok(rec);
             }
         }
@@ -604,11 +686,31 @@ impl Engine {
         };
         st.shapes.insert(id.clone(), rec.clone());
         // Register this (first) aggregate so later identical ones join it by ref-count.
+        let (share_tx, share_rx) = tokio::sync::watch::channel(None);
         st.feed_by_sig.insert(agg_sig.clone(), id.clone());
-        st.feed_shares.insert(id.clone(), FeedShare { sig: agg_sig, refcount: 1 });
+        st.feed_shares.insert(id.clone(), FeedShare { sig: agg_sig, refcount: 1, ready: share_rx });
         drop(st);
-        let _ = ready_rx.await;
-        Ok(rec)
+        let outcome = ready_rx.await.unwrap_or_else(|_| Err("tailer dropped the ready channel".to_string()));
+        match outcome {
+            Ok(()) => {
+                let _ = share_tx.send(Some(true));
+                Ok(rec)
+            }
+            Err(e) => {
+                let mut st = self.state.lock().await;
+                st.shapes.remove(&id);
+                if let Some(share) = st.feed_shares.remove(&id) {
+                    st.feed_by_sig.remove(&share.sig);
+                }
+                if let Some(t) = st.tailers.get(&rec.table) {
+                    let _ = t.cmd_tx.send(TailerCmd::RemoveShape { shape_id: id.clone() });
+                }
+                drop(st);
+                let _ = share_tx.send(Some(false));
+                let _ = self.ds.delete_stream(&rec.stream_path).await;
+                bail!("aggregate '{id}' creation failed: {e}")
+            }
+        }
     }
 
     /// Snapshot the whole maintained pipeline for the visualizer: tables, every registered shape with
@@ -701,7 +803,7 @@ impl Engine {
         // Shared subset feed: decrement the ref-count; only actually tear it down when the last
         // subscriber leaves. (A materialized shape / unshared feed is not in `feed_shares` → drops now.)
         if let Some(share) = st.feed_shares.get_mut(id) {
-            share.refcount -= 1;
+            share.refcount = share.refcount.saturating_sub(1);
             if share.refcount > 0 {
                 return Ok(());
             }
@@ -709,7 +811,8 @@ impl Engine {
             st.feed_shares.remove(id);
             st.feed_by_sig.remove(&sig);
         }
-        if let Some(rec) = st.shapes.remove(id) {
+        let removed = st.shapes.remove(id);
+        if let Some(rec) = &removed {
             if let Some(t) = st.tailers.get(&rec.table) {
                 let _ = t.cmd_tx.send(TailerCmd::RemoveShape { shape_id: id.to_string() });
             }
@@ -717,6 +820,14 @@ impl Engine {
         drop(st);
         // Subquery shapes live in the registry (a no-op here if `id` was a plain shape).
         self.subqueries.lock().await.drop_subquery_shape(id);
+        // Final drop: delete the durable stream. Without this every dropped shape orphans its stream
+        // on the storage server forever (disk leak observed under loadgen open/close churn). Any
+        // still-in-flight tailer append observes the 404 and discards cleanly (`append_reliable`).
+        if let Some(rec) = removed {
+            if let Err(e) = self.ds.delete_stream(&rec.stream_path).await {
+                tracing::warn!("failed to delete stream {} for dropped shape {id}: {e:#}", rec.stream_path);
+            }
+        }
         Ok(())
     }
 
@@ -803,9 +914,9 @@ impl Engine {
 struct StandaloneShape {
     pred: Arc<CompiledPredicate>,
     stream_path: String,
-    /// WAL LSN of this shape's backfill snapshot; replication changes whose commit LSN is strictly
-    /// `< seed_lsn` are already reflected and are skipped (see `process_envelope`).
-    seed_lsn: u64,
+    /// This shape's backfill-snapshot fence: replicated changes already visible to the backfill are
+    /// skipped by xid visibility (LSN fallback) — see [`crate::pg::SnapshotGate`].
+    gate: crate::pg::SnapshotGate,
     /// Output projection (column indices), or `None` to emit the full row.
     out_cols: Option<Arc<Vec<usize>>>,
 }
@@ -826,9 +937,8 @@ fn eval_standalone(pred: &CompiledPredicate, delta: &[Tup2<Row, ZWeight>]) -> Ve
 struct RoutedShape {
     num_id: u64,
     stream_path: String,
-    /// WAL LSN of THIS shape's own backfill snapshot; replication changes whose commit LSN is strictly
-    /// `< seed_lsn` are already in the backfill and are skipped (see `process_envelope`).
-    seed_lsn: u64,
+    /// THIS shape's own backfill-snapshot fence (see [`crate::pg::SnapshotGate`]).
+    gate: crate::pg::SnapshotGate,
     /// Output projection (column indices), or `None` to emit the full row.
     out_cols: Option<Arc<Vec<usize>>>,
 }
@@ -885,8 +995,12 @@ struct AggShape {
     func: AggFn,
     col: Option<usize>,
     stream_path: String,
-    seed_lsn: u64,
+    gate: crate::pg::SnapshotGate,
+    /// Matching rows (COUNT(*) semantics).
     count: i64,
+    /// Matching rows whose aggregated column is non-NULL — SQL aggregates ignore NULLs, so this is
+    /// the denominator for AVG, the COUNT(col) value, and the emptiness test for SUM/MIN/MAX.
+    nn_count: i64,
     sum: f64,
     multiset: std::collections::BTreeMap<Value, i64>,
     last: Option<serde_json::Value>,
@@ -894,6 +1008,7 @@ struct AggShape {
 
 impl AggShape {
     /// Fold a Z-set delta into the running aggregate. Returns true if any matching row was seen.
+    /// NULL column values are excluded from the fold (SQL semantics: aggregates ignore NULLs).
     fn apply(&mut self, delta: &[Tup2<Row, ZWeight>]) -> bool {
         let mut touched = false;
         for Tup2(row, w) in delta {
@@ -904,6 +1019,10 @@ impl AggShape {
             self.count += *w;
             if let Some(ci) = self.col {
                 let v = row.0.get(ci).cloned().unwrap_or(Value::Null);
+                if matches!(v, Value::Null) {
+                    continue; // SQL aggregates skip NULLs entirely
+                }
+                self.nn_count += *w;
                 self.sum += value_f64(&v) * (*w as f64);
                 if matches!(self.func, AggFn::Min | AggFn::Max) {
                     let e = self.multiset.entry(v.clone()).or_insert(0);
@@ -917,14 +1036,27 @@ impl AggShape {
         touched
     }
 
-    /// The current aggregate value as JSON.
+    /// The current aggregate value as JSON, mirroring Postgres: `COUNT(*)` counts rows, `COUNT(col)`
+    /// counts non-NULL values, and SUM/AVG/MIN/MAX over zero (non-NULL) values are NULL.
     fn value(&self) -> serde_json::Value {
         match self.func {
-            AggFn::Count => serde_json::json!(self.count),
-            AggFn::Sum => serde_json::json!(self.sum),
+            AggFn::Count => {
+                if self.col.is_some() {
+                    serde_json::json!(self.nn_count)
+                } else {
+                    serde_json::json!(self.count)
+                }
+            }
+            AggFn::Sum => {
+                if self.nn_count > 0 {
+                    serde_json::json!(self.sum)
+                } else {
+                    serde_json::Value::Null
+                }
+            }
             AggFn::Avg => {
-                if self.count > 0 {
-                    serde_json::json!(self.sum / self.count as f64)
+                if self.nn_count > 0 {
+                    serde_json::json!(self.sum / self.nn_count as f64)
                 } else {
                     serde_json::Value::Null
                 }
@@ -941,7 +1073,7 @@ impl AggShape {
             key: "agg".into(),
             value: Some(serde_json::json!({ "value": self.value(), "n": self.count })),
             old: None,
-            headers: EnvelopeHeaders { operation: "upsert".into(), txid, offset: None, lsn },
+            headers: EnvelopeHeaders { operation: "upsert".into(), txid, offset: None, lsn, seq: None },
         }
     }
 }
@@ -1017,6 +1149,12 @@ async fn tailer_loop(
     let mut family_of: HashMap<String, (Vec<usize>, u64, Row)> = HashMap::new();
     // Scalar aggregations maintained incrementally over a filter predicate, keyed by shape id.
     let mut aggregates: HashMap<String, AggShape> = HashMap::new();
+    // De-duplication highwater: the ingestor's delivery is at-least-once (re-peek after a partial
+    // append failure or a crash before the slot advance re-appends whole batches), and deltas are NOT
+    // idempotent for aggregates/subquery weights. Every ingestor envelope carries (commit lsn, seq =
+    // position in txn), strictly increasing per table stream, so anything at/below the highwater has
+    // already been applied and is skipped. Envelopes without both stamps (library mode) bypass this.
+    let mut highwater: Option<(u64, u64)> = None;
 
     loop {
         let off = offset.clone();
@@ -1024,22 +1162,26 @@ async fn tailer_loop(
             biased;
             cmd = cmd_rx.recv() => match cmd {
                 Some(TailerCmd::AddShape { shape_id, num_id, stream_path, pred, out_cols, changes_only, ready }) => {
-                    if let Err(e) = add_shape_routed(
+                    let res = add_shape_routed(
                         &ds, &ts, &pg_url, &mut shapes, &mut families, &mut family_of,
                         shape_id, num_id, stream_path, pred, out_cols, changes_only,
-                    ).await {
+                    ).await;
+                    if let Err(e) = &res {
                         tracing::error!("add_shape failed: {e:#}");
                     }
-                    let _ = ready.send(()); // backfill done (or failed) — unblock create_shape
+                    // Unblock create_shape with the outcome; a failure propagates so the caller can
+                    // remove the shape record instead of leaving a zombie.
+                    let _ = ready.send(res.map_err(|e| format!("{e:#}")));
                     publish_stats(&stats, &shapes, &families);
                 }
                 Some(TailerCmd::AddAggregate { shape_id, stream_path, pred, func, col, ready }) => {
-                    if let Err(e) = add_aggregate(
+                    let res = add_aggregate(
                         &ds, &ts, &pg_url, &mut aggregates, shape_id, stream_path, pred, func, col,
-                    ).await {
+                    ).await;
+                    if let Err(e) = &res {
                         tracing::error!("add_aggregate failed: {e:#}");
                     }
-                    let _ = ready.send(());
+                    let _ = ready.send(res.map_err(|e| format!("{e:#}")));
                 }
                 Some(TailerCmd::RemoveShape { shape_id }) => {
                     if aggregates.remove(&shape_id).is_some() {
@@ -1073,12 +1215,26 @@ async fn tailer_loop(
                     // parallelizing is the main throughput/latency lever.
                     let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
                     for env in rr.envelopes {
+                        // Skip redelivered changes (see `highwater` above).
+                        let pos = match (env.headers.lsn.as_deref(), env.headers.seq) {
+                            (Some(l), Some(s)) => Some((crate::pg::lsn_to_u64(l), s)),
+                            _ => None,
+                        };
+                        if let (Some(p), Some(hw)) = (pos, highwater) {
+                            if p <= hw {
+                                tracing::debug!("tailer {}: skipping duplicate change at {p:?}", ts.name);
+                                continue;
+                            }
+                        }
                         if let Err(e) = process_envelope(
                             &ts, &shapes, &families, &mut aggregates, env, &mut pending, &subqueries,
                         )
                         .await
                         {
                             tracing::error!("process_envelope failed: {e:#}");
+                        }
+                        if let Some(p) = pos {
+                            highwater = Some(p);
                         }
                     }
                     flush_pending(&ds, pending).await;
@@ -1116,8 +1272,9 @@ async fn add_aggregate(
         func,
         col,
         stream_path: stream_path.clone(),
-        seed_lsn: crate::pg::lsn_to_u64(&bf.seed_lsn),
+        gate: bf.gate.clone(),
         count: 0,
+        nn_count: 0,
         sum: 0.0,
         multiset: std::collections::BTreeMap::new(),
         last: None,
@@ -1157,10 +1314,10 @@ async fn add_shape_routed(
 
             // Per-shape backfill straight from Postgres: the predicate IS this shape's key equality, so
             // the pushdown reads only the key-matching rows — the engine never holds a table copy. Each
-            // shape records its own `seed_lsn` for the live-change reconciliation. A `changes_only` feed
-            // skips the backfill entirely and forwards every future match (seed_lsn 0).
-            let seed_lsn = if changes_only {
-                0
+            // shape records its own snapshot gate for the live-change reconciliation. A `changes_only`
+            // feed skips the backfill entirely and forwards every future match (passthrough gate).
+            let gate = if changes_only {
+                crate::pg::SnapshotGate::passthrough()
             } else {
                 let bf = pg_backfill(pg_url, ts, Some(pred.as_ref())).await?;
                 let out: Vec<(Row, ZWeight)> = bf.rows.iter().map(|r| (r.clone(), 1)).collect();
@@ -1168,7 +1325,7 @@ async fn add_shape_routed(
                     let envs = translate_output(ts, out, None, None, proj);
                     ds.append(&stream_path, &envs).await?;
                 }
-                crate::pg::lsn_to_u64(&bf.seed_lsn)
+                bf.gate
             };
 
             let router = families
@@ -1177,7 +1334,7 @@ async fn add_shape_routed(
             router.index.entry(key_tuple.clone()).or_default().push(RoutedShape {
                 num_id,
                 stream_path,
-                seed_lsn,
+                gate,
                 out_cols,
             });
             family_of.insert(shape_id, (key_cols, num_id, key_tuple));
@@ -1186,10 +1343,10 @@ async fn add_shape_routed(
             // Standalone filter: backfill = current matching rows from Postgres (emitted as upserts).
             // Push the predicate into the SELECT so only matching rows are read; `matches()` below is
             // the final authority (and a safety net if the SQL is ever a looser superset). A
-            // `changes_only` feed skips the backfill and forwards only future matches (seed_lsn 0) —
-            // this is the non-materialized live tail a subset query follows.
-            let seed_lsn = if changes_only {
-                0
+            // `changes_only` feed skips the backfill and forwards only future matches (passthrough
+            // gate) — this is the non-materialized live tail a subset query follows.
+            let gate = if changes_only {
+                crate::pg::SnapshotGate::passthrough()
             } else {
                 let bf = pg_backfill(pg_url, ts, Some(pred.as_ref())).await?;
                 let out: Vec<(Row, ZWeight)> =
@@ -1198,9 +1355,9 @@ async fn add_shape_routed(
                     let envs = translate_output(ts, out, None, None, proj);
                     ds.append(&stream_path, &envs).await?;
                 }
-                crate::pg::lsn_to_u64(&bf.seed_lsn)
+                bf.gate
             };
-            shapes.insert(shape_id, StandaloneShape { pred, stream_path, seed_lsn, out_cols });
+            shapes.insert(shape_id, StandaloneShape { pred, stream_path, gate, out_cols });
         }
     }
     Ok(())
@@ -1219,7 +1376,11 @@ async fn pg_backfill(
             let client = crate::pg::connect(url).await?;
             crate::pg::backfill(&client, ts, filter).await
         }
-        None => Ok(crate::pg::Backfill { rows: Vec::new(), seed_lsn: "0/0".to_string() }),
+        None => Ok(crate::pg::Backfill {
+            rows: Vec::new(),
+            seed_lsn: "0/0".to_string(),
+            gate: crate::pg::SnapshotGate::passthrough(),
+        }),
     }
 }
 
@@ -1239,20 +1400,18 @@ async fn process_envelope(
     }
     // `lsn` (the commit-LSN string) is stamped onto output envelopes so a subset client can position
     // its live tail at the page snapshot (drop deltas with `lsn < snapshot_lsn`); `lsn_u64` is the
-    // numeric form used for the per-shape backfill-skip compare.
+    // numeric fallback for the per-shape backfill-skip compare, and `xid` (the transaction id the
+    // ingestor stamps as `txid`) is the primary fence — see `pg::SnapshotGate` for why xid visibility,
+    // not LSN order, is the sound backfill↔replication reconciliation.
     let lsn_u64 = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0);
+    let xid = txid.as_deref().and_then(|s| s.parse::<u64>().ok());
     metrics().envelopes.fetch_add(1, Ordering::Relaxed);
     let _t = Timer::new(&metrics().process_envelope);
     // Standalone shapes: evaluate each stateless filter directly on the delta (no thread, no clone).
-    // Skip changes already reflected in the shape's backfill snapshot. `lsn` here is the change's
-    // transaction COMMIT lsn (stamped by the ingestor), and `seed_lsn` is the snapshot's
-    // `pg_current_wal_lsn()`. A transaction visible to the REPEATABLE READ backfill committed before
-    // the snapshot, so its commit lsn < seed_lsn -> skip (already in the backfill). A transaction that
-    // commits at/after the snapshot has commit lsn >= seed_lsn -> keep (not in the backfill). (Residual
-    // window: a commit whose WAL record was written but not yet visible at snapshot time; negligible
-    // for the single-ingestor model — see process_envelope docs / ARCHITECTURE.)
+    // Skip changes already visible to the shape's backfill snapshot (xid-visibility gate, LSN
+    // fallback for changes without a parseable xid).
     for shape in shapes.values() {
-        if lsn_u64 != 0 && lsn_u64 < shape.seed_lsn {
+        if shape.gate.should_skip(lsn_u64, xid) {
             continue;
         }
         let out = eval_standalone(&shape.pred, &delta);
@@ -1265,8 +1424,8 @@ async fn process_envelope(
     }
     // Equality routers: route each delta row by its key to exactly the shapes registered on that key.
     // No table copy, no dbsp — membership is the key match (an equality-template predicate matches a
-    // row iff its key equals the shape's constants). Each shape's own `seed_lsn` is applied, so changes
-    // already in that shape's backfill are skipped.
+    // row iff its key equals the shape's constants). Each shape's own snapshot gate is applied, so
+    // changes already in that shape's backfill are skipped.
     let _s = Timer::new(&metrics().family_step);
     for router in families.values() {
         type ShapeOut<'a> = (&'a str, Option<&'a [usize]>, Vec<(Row, ZWeight)>);
@@ -1275,7 +1434,7 @@ async fn process_envelope(
             let key = key_of(row, &router.key_cols);
             let Some(routed) = router.index.get(&key) else { continue };
             for rs in routed {
-                if lsn_u64 != 0 && lsn_u64 < rs.seed_lsn {
+                if rs.gate.should_skip(lsn_u64, xid) {
                     continue;
                 }
                 by_shape
@@ -1302,13 +1461,13 @@ async fn process_envelope(
     {
         let mut reg = subqueries.lock().await;
         if reg.touches(&ts.name) {
-            reg.on_table_delta(ts, &delta, lsn_u64, txid.clone()).await?;
+            reg.on_table_delta(ts, &delta, lsn_u64, xid, txid.clone()).await?;
         }
     }
     // Scalar aggregations: fold this delta into each running aggregate; emit the new value when it
-    // changes. Skips changes already counted in the seed (commit LSN < the aggregate's seed_lsn).
+    // changes. Skips changes already counted in the seed (the aggregate's snapshot gate).
     for agg in aggregates.values_mut() {
-        if lsn_u64 != 0 && lsn_u64 < agg.seed_lsn {
+        if agg.gate.should_skip(lsn_u64, xid) {
             continue;
         }
         if agg.apply(&delta) {
@@ -1325,6 +1484,12 @@ async fn process_envelope(
 
 /// Flush the batch's staged appends, bounded-concurrently. Each envelope keeps its own txid, so
 /// `awaitTxId` semantics are preserved; only the HTTP round-trips are coalesced + parallelized.
+///
+/// Appends are **reliable**: transient failures retry with backoff (`append_reliable`) rather than
+/// being dropped — a lost shape append is a permanent divergence for that shape's subscribers, and
+/// the tailer's processed-offset barrier (published after this returns) must mean "every subscriber
+/// stream reflects the batch". The only non-retried case is a 404 (the shape was dropped mid-flush),
+/// which discards cleanly.
 async fn flush_pending(ds: &DsClient, pending: HashMap<String, Vec<Envelope>>) {
     const CAP: usize = 32; // bound in-flight appends so we don't swamp the storage server
     let mut items: Vec<(String, Vec<Envelope>)> = pending.into_iter().collect();
@@ -1336,16 +1501,11 @@ async fn flush_pending(ds: &DsClient, pending: HashMap<String, Vec<Envelope>>) {
             let ds = ds.clone();
             set.spawn(async move {
                 let _t = Timer::new(&metrics().append);
-                let res = ds.append(&path, &envs).await;
+                ds.append_reliable(&path, &envs).await;
                 metrics().shape_appends.fetch_add(1, Ordering::Relaxed);
-                res
             });
         }
-        while let Some(j) = set.join_next().await {
-            if let Ok(Err(e)) = j {
-                tracing::error!("append failed: {e:#}");
-            }
-        }
+        while set.join_next().await.is_some() {}
     }
 }
 
@@ -1425,7 +1585,7 @@ pub(crate) fn translate_output(
             key: pk.clone(),
             value: Some(ts.row_to_json_cols(row, out_cols)),
             old: None,
-            headers: EnvelopeHeaders { operation: "upsert".into(), txid: txid.clone(), offset: None, lsn: lsn.clone() },
+            headers: EnvelopeHeaders { operation: "upsert".into(), txid: txid.clone(), offset: None, lsn: lsn.clone(), seq: None },
         });
     }
     // TEST-ONLY: the `drop_deletes` fault suppresses "leave" envelopes so rows that exit a shape
@@ -1440,7 +1600,7 @@ pub(crate) fn translate_output(
             key: pk.clone(),
             value: None,
             old: None,
-            headers: EnvelopeHeaders { operation: "delete".into(), txid: txid.clone(), offset: None, lsn: lsn.clone() },
+            headers: EnvelopeHeaders { operation: "delete".into(), txid: txid.clone(), offset: None, lsn: lsn.clone(), seq: None },
         });
     }
     envs
@@ -1466,7 +1626,7 @@ mod tests {
             key: key.into(),
             value,
             old,
-            headers: EnvelopeHeaders { operation: op.into(), txid: None, offset: None, lsn: None },
+            headers: EnvelopeHeaders { operation: op.into(), txid: None, offset: None, lsn: None, seq: None },
         }
     }
 
@@ -1547,8 +1707,9 @@ mod tests {
             func,
             col,
             stream_path: "x".into(),
-            seed_lsn: 0,
+            gate: crate::pg::SnapshotGate::passthrough(),
             count: 0,
+            nn_count: 0,
             sum: 0.0,
             multiset: std::collections::BTreeMap::new(),
             last: None,
@@ -1578,6 +1739,39 @@ mod tests {
 
         a.apply(&vec![Tup2(active(2), -1), Tup2(inactive(2), 1)]); // update: crosses OUT of the filter
         assert_eq!(a.value(), serde_json::json!(2));
+    }
+
+    /// SQL NULL semantics: aggregates ignore NULL values — COUNT(col) counts non-NULLs (COUNT(*)
+    /// counts rows), AVG divides by the non-NULL count, MIN/MAX never surface NULL, and SUM/AVG over
+    /// zero non-NULL values are NULL. Mirrors Postgres.
+    #[test]
+    fn aggregate_null_semantics() {
+        // Columns sorted: active(0), id(1), name(2). A row with a NULL name / NULL id.
+        let null_name = |id: i64| Row(vec![Value::Bool(true), Value::Int(id), Value::Null]);
+        let null_id = Row(vec![Value::Bool(true), Value::Null, Value::Text("n".into())]);
+
+        // COUNT(*) counts all matching rows; COUNT(name) only rows with non-NULL name.
+        let mut star = agg(AggFn::Count, None);
+        star.apply(&vec![Tup2(active(1), 1), Tup2(null_name(2), 1)]);
+        assert_eq!(star.value(), serde_json::json!(2));
+        let mut cnt_col = agg(AggFn::Count, Some(2));
+        cnt_col.apply(&vec![Tup2(active(1), 1), Tup2(null_name(2), 1)]);
+        assert_eq!(cnt_col.value(), serde_json::json!(1));
+
+        // AVG over id where one row's aggregated column is NULL: denominator excludes it.
+        let mut avg = agg(AggFn::Avg, Some(1));
+        avg.apply(&vec![Tup2(active(10), 1), Tup2(active(20), 1), Tup2(null_id.clone(), 1)]);
+        assert_eq!(avg.value(), serde_json::json!(15.0));
+
+        // MIN ignores NULLs (never surfaces NULL as the extreme).
+        let mut min = agg(AggFn::Min, Some(1));
+        min.apply(&vec![Tup2(active(5), 1), Tup2(null_id.clone(), 1)]);
+        assert_eq!(min.value(), serde_json::json!(5));
+
+        // SUM over zero non-NULL values is NULL (not 0), matching SQL.
+        let mut sum = agg(AggFn::Sum, Some(1));
+        sum.apply(&vec![Tup2(null_id, 1)]);
+        assert_eq!(sum.value(), serde_json::Value::Null);
     }
 
     /// MIN(id) over the filtered set restores the previous extreme on retraction (the multiset).

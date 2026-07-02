@@ -19,7 +19,7 @@ import { createStateSchema, createStreamDB } from '@durable-streams/state/db'
 import { createTRPCClient, httpBatchLink } from '@trpc/client'
 import { z } from 'zod'
 
-import { createSubset, type SubsetSubscription } from './subset.js'
+import { createSubset, deleteShapeWithRetry, type SubsetSubscription } from './subset.js'
 
 export type { SubsetSubscription } from './subset.js'
 // LSN-positioning primitives (also unit-tested in subset.test.ts) — exported so integration tests can
@@ -114,9 +114,25 @@ export function createClient(opts: {
   liveMode?: boolean | 'sse' | 'long-poll'
 }): ElectricLiteClient {
   const trpc = createTRPCClient<AppRouter>({ links: [httpBatchLink({ url: opts.apiUrl })] })
-  // Everything the client opens (shape materializations AND aggregate subscriptions) so `close()` can
-  // tear them all down — otherwise an aggregate's live stream leaks and blocks shutdown.
+  // Everything the client opens (shape materializations, subset subscriptions AND aggregate
+  // subscriptions) so `close()` can tear them all down — otherwise a live stream leaks and blocks
+  // shutdown. `track` wraps each close with a one-shot guard and prunes the entry on completion:
+  // the engine DELETE decrements a shared refcount per call, so every subscription must be closed
+  // exactly once (a double close would steal another subscriber's reference on a shared shape).
   const open: { close: () => Promise<void> }[] = []
+  function track<T extends { close(): Promise<void> }>(item: T): T {
+    const inner = item.close.bind(item)
+    let closing: Promise<void> | undefined
+    item.close = () => {
+      closing ??= inner().finally(() => {
+        const i = open.indexOf(item)
+        if (i >= 0) open.splice(i, 1)
+      })
+      return closing
+    }
+    open.push(item)
+    return item
+  }
 
   const write = (input: { table: string; op: Op; pk: Value; row?: Row; txid?: string }) =>
     trpc.ingest.write.mutate(input)
@@ -173,10 +189,12 @@ export function createClient(opts: {
         },
         close: async () => {
           await db.close?.()
+          // Drop our subscriber ref: creates are refcounted server-side (share=true), so every
+          // shape() must delete exactly once or the shape (and its stream) leaks forever.
+          await deleteShapeWithRetry(trpc, handle.shapeId)
         },
       }
-      open.push(mat)
-      return mat
+      return track(mat)
     },
 
     async query(def) {
@@ -192,7 +210,7 @@ export function createClient(opts: {
     },
 
     async subset(def) {
-      return createSubset(
+      const sub = await createSubset(
         {
           trpc,
           schema: opts.schema,
@@ -202,6 +220,7 @@ export function createClient(opts: {
         },
         def,
       )
+      return track(sub)
     },
 
     async aggregate(def) {
@@ -237,6 +256,8 @@ export function createClient(opts: {
             }
           }
         } catch (e) {
+          // After close() the aggregate's durable stream may already be gone (the engine deletes it
+          // on the final drop), so a racing read 404s — normal termination, not an error.
           if (!ac.signal.aborted) console.error('aggregate stream error', e)
         }
       })()
@@ -251,19 +272,16 @@ export function createClient(opts: {
         },
         close: async () => {
           ac.abort()
-          try {
-            await trpc.shapes.delete.mutate({ id: handle.shapeId })
-          } catch {
-            /* best effort */
-          }
+          await deleteShapeWithRetry(trpc, handle.shapeId)
         },
       }
-      open.push(sub)
-      return sub
+      return track(sub)
     },
 
     async close() {
-      for (const m of open) await m.close()
+      // Iterate a copy: each close() prunes itself from `open`, and anything the caller already
+      // closed is gone — so teardown is exactly-once per subscription.
+      for (const m of [...open]) await m.close()
     },
   }
 }

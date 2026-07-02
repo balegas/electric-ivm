@@ -4,3 +4,4 @@ packages:
   - 'examples'
   - 'examples/web'
   - 'examples/linearlite'
+  - 'docker'

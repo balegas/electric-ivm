@@ -37,6 +37,16 @@ export interface LeafPredicate {
   value: Value
 }
 
+/**
+ * SQL null test: `col IS NULL` (`isNull: true`) / `col IS NOT NULL` (`isNull: false`). A separate
+ * leaf because it is the one predicate that is TRUE on a NULL cell — no comparison can express it
+ * under three-valued logic. Two-valued (never UNKNOWN), so it composes soundly under `not`.
+ */
+export interface IsNullPredicate {
+  col: string
+  isNull: boolean
+}
+
 export interface AndPredicate {
   and: Predicate[]
 }
@@ -77,6 +87,7 @@ export interface InSubqueryPredicate {
  */
 export type Predicate =
   | LeafPredicate
+  | IsNullPredicate
   | AndPredicate
   | OrPredicate
   | NotPredicate
@@ -84,6 +95,9 @@ export type Predicate =
 
 export function isLeaf(p: Predicate): p is LeafPredicate {
   return 'col' in p && 'op' in p
+}
+export function isIsNull(p: Predicate): p is IsNullPredicate {
+  return 'col' in p && 'isNull' in p
 }
 export function isAnd(p: Predicate): p is AndPredicate {
   return 'and' in p

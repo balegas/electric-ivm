@@ -31,12 +31,20 @@ pub struct SubqueryJson {
     pub where_: Option<Box<PredicateJson>>,
 }
 
-/// JSON predicate shape: a leaf `{col,op,value}`, a combinator `{and|or:[...]}` / `{not:{}}`, or a
-/// subquery leaf `{col, in:{table,project,where?}, negated?}`.
+/// JSON predicate shape: a leaf `{col,op,value}`, a null test `{col, isNull}`, a combinator
+/// `{and|or:[...]}` / `{not:{}}`, or a subquery leaf `{col, in:{table,project,where?}, negated?}`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum PredicateJson {
     Leaf { col: String, op: LeafOp, value: serde_json::Value },
+    /// SQL null test: `col IS NULL` (`isNull: true`) / `col IS NOT NULL` (`isNull: false`). A separate
+    /// form because it is the one predicate that is TRUE *on* a NULL cell — no comparison can express
+    /// it under three-valued logic (every cmp over NULL is UNKNOWN, and NOT UNKNOWN stays UNKNOWN).
+    IsNull {
+        col: String,
+        #[serde(rename = "isNull")]
+        is_null: bool,
+    },
     And { and: Vec<PredicateJson> },
     Or { or: Vec<PredicateJson> },
     Not { not: Box<PredicateJson> },
@@ -60,6 +68,7 @@ pub fn canonical_pred(p: &PredicateJson) -> String {
         PredicateJson::Leaf { col, op, value } => {
             format!("L({col},{op:?},{})", serde_json::to_string(value).unwrap_or_default())
         }
+        PredicateJson::IsNull { col, is_null } => format!("U({col},{is_null})"),
         PredicateJson::And { and } => {
             let mut cs: Vec<String> = and.iter().map(canonical_pred).collect();
             cs.sort();
@@ -128,6 +137,8 @@ impl SubqueryEval for PanicEval {
 pub enum CompiledPredicate {
     MatchAll,
     Cmp { col: usize, op: LeafOp, value: Value },
+    /// SQL null test — the one leaf that is TRUE on a NULL cell (two-valued, never UNKNOWN).
+    IsNull { col: usize, is_null: bool },
     And(Vec<CompiledPredicate>),
     Or(Vec<CompiledPredicate>),
     Not(Box<CompiledPredicate>),
@@ -154,6 +165,10 @@ impl CompiledPredicate {
                 let idx = ts.column_index(col)?;
                 let v = Value::from_json(value, ts.column_type(idx))?;
                 CompiledPredicate::Cmp { col: idx, op: *op, value: v }
+            }
+            PredicateJson::IsNull { col, is_null } => {
+                let idx = ts.column_index(col)?;
+                CompiledPredicate::IsNull { col: idx, is_null: *is_null }
             }
             PredicateJson::And { and } => CompiledPredicate::And(
                 and.iter().map(|p| Self::compile_with(p, ts, collector)).collect::<Result<_>>()?,
@@ -245,6 +260,11 @@ impl CompiledPredicate {
             CompiledPredicate::Cmp { col, op, value } => {
                 let cell = row.0.get(*col).unwrap_or(&Value::Null);
                 cmp(cell, *op, value)
+            }
+            // `IS [NOT] NULL` is two-valued: TRUE/FALSE by the cell's null-ness, never UNKNOWN.
+            CompiledPredicate::IsNull { col, is_null } => {
+                let cell = row.0.get(*col).unwrap_or(&Value::Null);
+                Tri::from_bool(matches!(cell, Value::Null) == *is_null)
             }
             // AND: FALSE dominates; else UNKNOWN if any UNKNOWN; else TRUE (empty AND => TRUE).
             CompiledPredicate::And(ps) => {

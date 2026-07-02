@@ -58,6 +58,10 @@ fn build(p: &CompiledPredicate, ts: &TableSchema, params: &mut Vec<String>) -> S
                 }
             }
         }
+        CompiledPredicate::IsNull { col, is_null } => {
+            let name = quote_ident(&ts.columns[*col].0);
+            format!("{name} IS {}NULL", if *is_null { "" } else { "NOT " })
+        }
         CompiledPredicate::And(v) => {
             if v.is_empty() {
                 "TRUE".to_string()
@@ -113,6 +117,10 @@ fn build_json(p: &PredicateJson, start: usize, params: &mut Vec<String>) -> Stri
                     format!("{name} {o} ${}", start + params.len() - 1)
                 }
             }
+        }
+        PredicateJson::IsNull { col, is_null } => {
+            let name = quote_ident(col);
+            format!("{name} IS {}NULL", if *is_null { "" } else { "NOT " })
         }
         PredicateJson::And { and } => {
             if and.is_empty() {

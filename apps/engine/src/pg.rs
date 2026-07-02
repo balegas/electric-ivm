@@ -124,6 +124,82 @@ pub struct Backfill {
     /// committed strictly before it, so its commit LSN is `< seed_lsn` and its changes are already in
     /// `rows`; a transaction committing at/after the snapshot has commit LSN `>= seed_lsn`.
     pub seed_lsn: String,
+    /// The snapshot's transaction-visibility gate — the *sound* backfill↔replication fence. See
+    /// [`SnapshotGate`] for why LSN comparison alone is not.
+    pub gate: SnapshotGate,
+}
+
+/// The backfill snapshot's visibility fence for replicated changes.
+///
+/// **Why not LSN alone:** `pg_current_wal_lsn()` is a WAL *write* position, but snapshot visibility is
+/// decided at `ProcArrayEndTransaction` — which happens *after* the commit record is written and
+/// fsynced. A transaction whose commit record is already in the WAL (commit LSN `< seed_lsn`) can
+/// still be **invisible** to a snapshot taken during that window; skipping its replicated change by
+/// LSN would drop the row from both the backfill and the live stream, permanently. Conversely a
+/// visible commit can sit exactly *at* the boundary (`end_lsn == seed_lsn`) and be replayed as a
+/// duplicate. Transaction-id visibility (`pg_current_snapshot()`) decides both cases exactly:
+/// **skip a replicated change iff its xid was visible to the backfill snapshot.** (Every xid seen on
+/// the slot is committed, so visibility reduces to: `xid < xmin`, or `xmin <= xid < xmax` and not
+/// in-progress at snapshot time.)
+///
+/// The stored xids are `pg_current_snapshot()`'s xid8 values masked to 32 bits so they compare
+/// against test_decoding's 32-bit xids; the fence spans seconds around a backfill, so epoch
+/// wraparound (a ~4-billion-transaction horizon) cannot straddle it in practice.
+///
+/// When a change carries no parseable xid (library mode / non-PG sources), the gate falls back to
+/// the LSN comparison, and with neither it never skips.
+#[derive(Clone, Debug, Default)]
+pub struct SnapshotGate {
+    /// `pg_current_wal_lsn()` at the snapshot (numeric) — the fallback fence + subset positioning.
+    pub lsn: u64,
+    xmin: u64,
+    xmax: u64,
+    xip: std::collections::HashSet<u64>,
+}
+
+impl SnapshotGate {
+    /// A gate that never skips — for `changes_only` feeds (no backfill ⇒ forward everything) and
+    /// library mode (no Postgres snapshot exists).
+    pub fn passthrough() -> Self {
+        SnapshotGate::default()
+    }
+
+    /// Build from `pg_current_snapshot()::text` ("xmin:xmax:xip1,xip2,…") + the snapshot LSN.
+    pub fn parse(snapshot: &str, lsn: &str) -> Self {
+        let mask = |v: u64| v & 0xFFFF_FFFF;
+        let mut parts = snapshot.split(':');
+        let xmin = parts.next().and_then(|s| s.trim().parse::<u64>().ok()).map(mask).unwrap_or(0);
+        let xmax = parts.next().and_then(|s| s.trim().parse::<u64>().ok()).map(mask).unwrap_or(0);
+        let xip = parts
+            .next()
+            .map(|s| s.split(',').filter_map(|x| x.trim().parse::<u64>().ok()).map(mask).collect())
+            .unwrap_or_default();
+        SnapshotGate { lsn: lsn_to_u64(lsn), xmin, xmax, xip }
+    }
+
+    /// Was committed transaction `xid` visible to this snapshot (i.e. already reflected in the
+    /// backfill rows)?
+    fn visible(&self, xid: u64) -> bool {
+        if self.xmax == 0 {
+            return false; // passthrough gate: nothing is "already seeded"
+        }
+        if xid < self.xmin {
+            return true;
+        }
+        if xid >= self.xmax {
+            return false;
+        }
+        !self.xip.contains(&xid)
+    }
+
+    /// Should a replicated change (commit LSN + optional xid) be skipped because the backfill
+    /// snapshot already reflects it?
+    pub fn should_skip(&self, commit_lsn: u64, xid: Option<u64>) -> bool {
+        match xid {
+            Some(x) => self.visible(x),
+            None => commit_lsn != 0 && self.lsn != 0 && commit_lsn < self.lsn,
+        }
+    }
 }
 
 /// Read the table's current rows in a single repeatable-read snapshot, plus the snapshot LSN. The
@@ -175,23 +251,55 @@ async fn backfill_where_in_txn(
     ts: &TableSchema,
     where_sql: Option<(String, Vec<String>)>,
 ) -> Result<Backfill> {
-    let seed_lsn: String = client.query_one("select pg_current_wal_lsn()::text", &[]).await?.get(0);
+    // One statement establishes the snapshot AND captures both fences (LSN + xid snapshot)
+    // atomically with it.
+    let fence = client
+        .query_one("select pg_current_wal_lsn()::text, pg_current_snapshot()::text", &[])
+        .await?;
+    let seed_lsn: String = fence.get(0);
+    let snap: String = fence.get(1);
+    let gate = SnapshotGate::parse(&snap, &seed_lsn);
     let (where_clause, params) = match where_sql {
         Some((w, ps)) => (format!(" where {w}"), ps),
         None => (String::new(), Vec::new()),
     };
     let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
         params.iter().map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-    // to_jsonb gives one JSON object per row, so we reuse the schema's JSON->Row mapping verbatim.
-    let q = format!("select to_jsonb(t) from {} t{}", quote_ident(&ts.name), where_clause);
+    let q = format!("select {} from {} t{}", row_json_expr(ts), quote_ident(&ts.name), where_clause);
     let rows = client.query(&q, &param_refs).await.with_context(|| format!("backfill select {}", ts.name))?;
     let mut out = Vec::with_capacity(rows.len());
     for r in &rows {
         let j: serde_json::Value = r.get(0);
-        let obj = j.as_object().context("to_jsonb did not return an object")?;
+        let obj = j.as_object().context("backfill row expr did not return an object")?;
         out.push(ts.row_from_json(obj)?);
     }
-    Ok(Backfill { rows: out, seed_lsn })
+    Ok(Backfill { rows: out, seed_lsn, gate })
+}
+
+/// The per-row JSON projection used by backfill and subset query-backs. Text-mapped columns are cast
+/// with `::text` so the value is Postgres's *text output* — the same representation `test_decoding`
+/// prints on the live path. `to_jsonb(t)` would instead give e.g. ISO-8601 `T`-form timestamps and
+/// raw jsonb objects, so the same cell would compare unequal between a backfilled row and its first
+/// replicated update (breaking retractions, equality routing, and MIN/MAX multisets). Int/Float/Bool
+/// columns keep `to_jsonb` (native JSON scalars, matching the live parser). Chunked into multiple
+/// `jsonb_build_object` calls `||`-concatenated to stay under the 100-argument limit.
+fn row_json_expr(ts: &TableSchema) -> String {
+    let mut objs: Vec<String> = Vec::new();
+    for chunk in ts.columns.chunks(40) {
+        let args: Vec<String> = chunk
+            .iter()
+            .map(|(name, ty)| {
+                let lit = format!("'{}'", name.replace('\'', "''"));
+                let qi = quote_ident(name);
+                match ty {
+                    ColumnType::Text => format!("{lit}, t.{qi}::text"),
+                    _ => format!("{lit}, to_jsonb(t.{qi})"),
+                }
+            })
+            .collect();
+        objs.push(format!("jsonb_build_object({})", args.join(", ")));
+    }
+    objs.join(" || ")
 }
 
 /// Result of a one-shot subset query: the page rows + the snapshot LSN they were read at.
@@ -265,7 +373,8 @@ async fn query_subset_in_txn(
     let limit_sql = limit.map(|n| format!(" limit {}", n.max(0))).unwrap_or_default();
     let offset_sql = offset.map(|n| format!(" offset {}", n.max(0))).unwrap_or_default();
     let q = format!(
-        "select to_jsonb(t) from {} t{}{}{}{}",
+        "select {} from {} t{}{}{}{}",
+        row_json_expr(ts),
         quote_ident(&ts.name),
         where_clause,
         order_sql,
@@ -276,10 +385,51 @@ async fn query_subset_in_txn(
     let mut out = Vec::with_capacity(rows.len());
     for r in &rows {
         let j: serde_json::Value = r.get(0);
-        let obj = j.as_object().context("to_jsonb did not return an object")?;
+        let obj = j.as_object().context("subset row expr did not return an object")?;
         out.push(ts.row_from_json(obj)?);
     }
     Ok(SubsetQuery { rows: out, lsn })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The snapshot gate must skip exactly the transactions the backfill snapshot could see:
+    /// committed-before (`xid < xmin`) → skip; in-progress at snapshot (`xip`) → process; started
+    /// after (`xid >= xmax`) → process — regardless of WAL position. This is the fence that closes
+    /// the "commit record written but not yet visible" window an LSN comparison cannot express.
+    #[test]
+    fn snapshot_gate_visibility() {
+        // snapshot: xmin 100, xmax 110, in-progress {103, 107}; snapshot LSN 0/100.
+        let g = SnapshotGate::parse("100:110:103,107", "0/100");
+        // committed before the snapshot -> already in the backfill -> skip
+        assert!(g.should_skip(0, Some(99)));
+        // between xmin and xmax, not in-progress -> visible -> skip (even if its commit LSN were AT
+        // or ABOVE the snapshot LSN, the boundary-duplicate case)
+        assert!(g.should_skip(0x200, Some(105)));
+        // in-progress at snapshot time -> INVISIBLE to the backfill -> must be processed, even though
+        // its commit LSN may be below the snapshot LSN (the dropped-row race the LSN rule had)
+        assert!(!g.should_skip(0x50, Some(103)));
+        assert!(!g.should_skip(0x50, Some(107)));
+        // started after the snapshot -> process
+        assert!(!g.should_skip(0x200, Some(110)));
+        assert!(!g.should_skip(0x200, Some(200)));
+        // no xid -> LSN fallback (strict <)
+        assert!(g.should_skip(0x50, None));
+        assert!(!g.should_skip(0x100, None));
+        // passthrough gate never skips
+        let p = SnapshotGate::passthrough();
+        assert!(!p.should_skip(0x50, Some(99)));
+        assert!(!p.should_skip(0x50, None));
+    }
+
+    #[test]
+    fn lsn_parse_roundtrip() {
+        assert_eq!(lsn_to_u64("0/1A2B3C"), 0x1A2B3C);
+        assert_eq!(lsn_to_u64("2/10"), (2u64 << 32) | 0x10);
+        assert_eq!(lsn_to_u64("garbage"), 0);
+    }
 }
 
 /// Parse a Postgres LSN ("X/Y", hex) into a comparable u64. Returns 0 on parse failure.

@@ -79,6 +79,8 @@ A predicate is a JSON AST (not SQL):
 
 - **Leaf:** `{ "col": "<name>", "op": "<op>", "value": <literal> }`, where `op` ∈
   `eq neq lt lte gt gte`.
+- **Null test:** `{ "col": "<name>", "isNull": true|false }` — `col IS NULL` / `col IS NOT NULL`.
+  The one predicate that is TRUE on a NULL cell (two-valued, so it composes soundly under `not`).
 - **Boolean:** `{ "and": [ … ] }`, `{ "or": [ … ] }`, `{ "not": <pred> }`.
 - **Subquery:** `{ "col": "<name>", "in": { "table": …, "project": …, "where": … }, "negated": <bool> }`
   (§4).
@@ -258,8 +260,13 @@ To read retained state directly (independent of allocator noise), scrape the OTe
 | cross-table membership | **subquery** `col IN (SELECT …)` | single column; nestable; auto-shared |
 | exclusion | subquery `negated: true` | SQL `NOT IN` NULL semantics |
 | an ordered page / infinite scroll | **subset query** (`orderBy`+`limit`) | not a shape; no top-N state |
+| a live count / sum / avg / min / max | **aggregation** (`client.aggregate({ table, fn, col?, where })`) | one maintained fold shared by all subscribers; SQL NULL semantics; extended API only |
 | ordering / text search of a synced set | **client live query** | no re-sync |
 | Electric-compatible HTTP client | `GET /v1/shape` | snapshot + `live=true` long-poll |
+
+Identical shapes are **de-duplicated end to end**: two `shape()`/`subset()`/`aggregate()` calls with
+the same definition (predicate order doesn't matter) share one maintained stream on the engine,
+ref-counted — always `close()` what you open (close is one-shot and safe to call twice).
 
 ## 8. See also
 

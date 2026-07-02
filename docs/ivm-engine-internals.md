@@ -6,9 +6,8 @@ maintained result set, how subqueries extend that across tables, and what each c
 costs as you add shapes, users, and rows.
 
 It is grounded in the code (`apps/engine/src/`) and the design records under
-`docs/superpowers/specs/`. Where this contradicts the older "one dbsp circuit per shape"
-framing in `README.md`/`ARCHITECTURE.md` §4, **this document is correct** — that model was
-replaced by the routing model (`docs/superpowers/specs/2026-06-29-reduce-engine-memory-design.md`).
+`docs/superpowers/specs/`. `docs/ARCHITECTURE.md` is the system-level companion (ingest,
+consistency fences, reliability, adapters); this document goes deeper on execution and cost.
 
 ---
 
@@ -84,42 +83,56 @@ The `Envelope` (`ds.rs`) is the unit on every stream:
 Envelope { type, key, value, old, headers { operation, txid, offset, lsn } }
 ```
 
-### 2.2 Backfill and the LSN reconciliation
+### 2.2 Backfill and the snapshot gate (xid-visibility reconciliation)
 
 When a shape is created, its initial rows are read from Postgres in a single `REPEATABLE READ`
-snapshot (`pg.rs::backfill`), with the predicate **pushed into the `SELECT`**
-(`SELECT to_jsonb(t) FROM tbl t WHERE <predicate→SQL>`). The snapshot records
-`seed_lsn = pg_current_wal_lsn()`.
+snapshot (`pg.rs::backfill`), with the predicate **pushed into the `SELECT`**. Text-mapped
+columns are read with `::text` casts (`row_json_expr`) so backfilled values are byte-identical
+to what `test_decoding` prints on the live path (timestamps, uuids, jsonb — a representation
+mismatch breaks retractions, key routing, and MIN/MAX multisets).
 
-Live and backfill are reconciled by LSN so every row is counted exactly once:
+Live and backfill are reconciled by **transaction visibility** (`pg::SnapshotGate`), so every
+row counts exactly once. The backfill statement captures `pg_current_snapshot()` +
+`pg_current_wal_lsn()` atomically with the snapshot, and a replicated change is skipped **iff
+its xid was visible to that snapshot** (xids on the slot are always committed, so: `xid < xmin`
+→ skip; in the in-progress list or `≥ xmax` → process). Changes without a parseable xid
+(library mode) fall back to the strict `commit_lsn < seed_lsn` comparison.
 
-- a transaction visible to the backfill snapshot committed **before** it → commit LSN
-  `< seed_lsn` → already in the backfill → the engine **skips** it on the live stream;
-- a transaction committing at/after the snapshot → commit LSN `>= seed_lsn` → taken from the
-  live stream.
-
-Using the *commit* LSN (not the record LSN) is what prevents dropping rows of transactions
-that were in flight during the snapshot. Guarded by `conformance-concurrency.test.ts`.
+Why not LSN alone: a commit's WAL record is written (and `pg_current_wal_lsn()` moves past it)
+*before* the transaction becomes visible to snapshots (`ProcArrayEndTransaction`, after the WAL
+fsync). An LSN fence silently drops rows committed-but-invisible during the snapshot and
+duplicates at the exact boundary; the xid gate decides both cases. Guarded by
+`conformance-concurrency.test.ts` + `pg.rs` unit tests.
 
 ### 2.3 Tail and fan-out (`engine.rs`)
 
 There is **one tailer task per table** (`tailer_loop`). It long-polls `table/<name>`, and for
-each change runs `process_envelope`:
+each change:
 
-1. build the delta (`apply_envelope`);
-2. skip per shape if `commit_lsn < shape.seed_lsn`;
-3. evaluate **standalone** filters, **family** routers, and the **subquery registry** (the
-   three strategies, §3);
-4. stage output envelopes in `pending: HashMap<stream_path, Vec<Envelope>>`;
-5. `flush_pending` appends them, bounded-concurrently (CAP=32) across streams.
+1. **de-duplicate**: skip if the envelope's `(commit lsn, seq)` is at/below the tailer's
+   highwater — the ingestor's delivery is at-least-once (re-appends after a partial failure or
+   a crash before the slot advance), and deltas are not idempotent for aggregates/subquery
+   weights;
+2. build the delta (`apply_envelope`);
+3. skip per shape via its `SnapshotGate` (§2.2);
+4. evaluate **standalone** filters, **family** routers, **aggregations**, and the **subquery
+   registry** (§3);
+5. stage output envelopes in `pending: HashMap<stream_path, Vec<Envelope>>`;
+6. `flush_pending` appends them, bounded-concurrently (CAP=32) across streams, with
+   **`append_reliable`** — transient storage failures retry with capped backoff
+   (backpressuring the tailer) rather than dropping; the only non-retried case is 404 (the
+   shape was dropped mid-flush). A dropped shape append would be a permanent divergence for
+   every subscriber, so the batch is not "processed" until every append lands.
 
 Output is grouped per shape by pk (`translate_output`): any positive-weight row → an `upsert`
 envelope (the row entered or updated the result), a purely negative pk → a `delete` (it left).
-Each envelope keeps its originating `txid` so the client's `awaitTxId` works.
+Each envelope keeps its originating `txid` (`awaitTxId`) and its commit `lsn` (subset
+positioning).
 
 Processing is **serial within a table** (one task), which makes ordering and state trivially
 correct; the only intra-batch parallelism is the append flush. After a batch is fully fanned
-out and flushed, the tailer publishes its processed offset as a convergence barrier.
+out **and every append has landed**, the tailer publishes its processed offset as a sound
+convergence barrier.
 
 ---
 
@@ -238,6 +251,36 @@ fetched by a keyed query-back on flip.
 | Shared across shapes? | yes — 1 router / template | no (but no state to share) | yes — 1 node / `sig` |
 | Per-change compute | `O(log N)` routed | `O(K)` evals (all standalone shapes) | node reconcile + keyed query-back per flipped value |
 | Table copies | 0 | 0 | 0 |
+
+### 3.5 Full shape de-duplication (the sharing layer above the strategies)
+
+Independent of strategy, any two **equal** shapes share ONE shape id, ONE maintained
+routing/registry entry, and ONE durable stream, ref-counted (`engine.rs::feed_by_sig` /
+`feed_shares`). The signature is `(kind, table, canonical predicate, sorted projection,
+changes_only)` — canonicalization is order-insensitive, so `a AND b` ≡ `b AND a`; aggregations
+key on `(table, predicate, fn, column)` in their own namespace. Consequences:
+
+- N clients opening the same shape cost one maintenance path and one append per change —
+  per-subscriber cost collapses onto per-*distinct*-shape cost everywhere in §4.
+- A joiner waits on the share's **ready-watch** until the creator's backfill has landed (and
+  observes a creation *failure* as an error, never a dead stream).
+- Deletes decrement; the **last** drop removes the routing/registry entry AND deletes the
+  durable stream (otherwise every dropped shape leaks a stream on the storage server).
+- Creation is **atomic**: on any failure the record, share entries, and (for subqueries) every
+  node refcount/edge/pending-seed added by the attempt are rolled back
+  (`subquery.rs::rollback_create`).
+- The Electric `/v1/shape` adapter passes `share=false` (its protocol needs per-request
+  handles); everything else shares by default.
+
+### 3.6 Aggregations (extended API)
+
+A scalar COUNT/SUM/AVG/MIN/MAX over a non-subquery predicate (`AggShape`), maintained as a fold
+over the delta: COUNT/SUM/AVG are running scalars; MIN/MAX keep a `value → net-weight` multiset
+so retracting the current extreme restores the previous one. SQL NULL semantics exactly:
+aggregates ignore NULL values, `COUNT(col)` counts non-NULLs (`COUNT(*)` counts rows), AVG
+divides by the non-NULL count, and SUM/AVG/MIN/MAX over zero non-NULL values are NULL. The feed
+is a single-row stream (`{ value, n }`, key `"agg"`), emitted only when the value changes.
+State: O(1) (+ O(distinct values) for MIN/MAX). Identical aggregations share one fold (§3.5).
 
 ---
 
@@ -412,10 +455,10 @@ bounded keyset range query folded into the `WHERE`, so the engine never holds a 
 
 | path | role |
 |---|---|
-| `apps/engine/src/engine.rs` | tailer, delta computation, key routing + standalone fan-out, flush, backfill↔replication LSN reconciliation |
-| `apps/engine/src/subquery.rs` | cross-table subquery registry: shared nodes, edges, flips, absolute emission |
-| `apps/engine/src/replication.rs` | Postgres logical-replication ingestor (peek, buffer per-txn, stamp commit LSN, append, advance) |
-| `apps/engine/src/pg.rs` | connect/introspect, `REPLICA IDENTITY FULL`, slot create, predicate-pushdown backfill (`seed_lsn`), subset query-back |
+| `apps/engine/src/engine.rs` | tailers (+ (lsn,seq) de-dup), delta computation, key routing + standalone + aggregation fan-out, shape sharing/lifecycle, reliable flush |
+| `apps/engine/src/subquery.rs` | cross-table subquery registry: shared nodes, edges, flips, absolute emission, atomic create/rollback |
+| `apps/engine/src/replication.rs` | Postgres logical-replication ingestor (capped peek, buffer per-txn, stamp commit LSN + xid + seq, append, advance) |
+| `apps/engine/src/pg.rs` | connect/introspect, `REPLICA IDENTITY FULL`, slot create, predicate-pushdown backfill + `SnapshotGate`, subset query-back |
 | `apps/engine/src/predicate.rs` | predicate compile, three-valued `matches`/`matches_ctx`, `equality_template`, subquery signatures |
 | `apps/engine/src/sql.rs` / `where_sql.rs` | predicate → SQL (backfill pushdown); SQL `WHERE` → predicate (Electric path) |
 | `apps/engine/src/schema.rs` | schema, composite PK (`pk_cols`, `\u{1f}` key join), JSON⇄Row |

@@ -61,6 +61,19 @@ importers:
         specifier: ^6.0.0
         version: 6.4.3(@types/node@26.0.1)(tsx@4.22.4)
 
+  docker:
+    dependencies:
+      '@durable-streams/server':
+        specifier: ^0.3.7
+        version: 0.3.7(@tanstack/db@0.6.12(typescript@5.9.3))
+      '@electric-lite/api':
+        specifier: workspace:*
+        version: link:../apps/api
+    devDependencies:
+      tsx:
+        specifier: ^4.19.2
+        version: 4.22.4
+
   examples:
     dependencies:
       '@durable-streams/server':

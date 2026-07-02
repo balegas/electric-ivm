@@ -4,12 +4,14 @@
 // pointed at our adapter, collects the statsd/UDP telemetry the script emits, and reports latency
 // percentiles + throughput. Writes a markdown report.
 //
-//   FLEET_DIR=/path/to/benchmarking-fleet pnpm --filter @electric-lite/bench exec tsx src/electric-bench-runner.ts
+//   pnpm bench:fleet            # from the repo root — clones the fleet repo itself if needed
 //
 // Env: BENCH_SCALE (workload multiplier, default 1), BENCH_ONLY (comma list of benchmark names),
-//      FLEET_DIR (path to a clone of electric-sql/benchmarking-fleet), BENCH_OUT (report path).
+//      FLEET_DIR (path to a clone of electric-sql/benchmarking-fleet; auto-cloned from FLEET_REPO
+//      when absent), FLEET_REPO (default https://github.com/electric-sql/benchmarking-fleet),
+//      BENCH_OUT (report path).
 
-import { type ChildProcess, spawn } from 'node:child_process'
+import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
 import dgram from 'node:dgram'
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -29,10 +31,21 @@ function repoRoot(): string {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const num = (k: string, d: number) => (process.env[k] ? Number(process.env[k]) : d)
 
+const FLEET_REPO = process.env.FLEET_REPO || 'https://github.com/electric-sql/benchmarking-fleet'
 const FLEET_DIR =
   process.env.FLEET_DIR ||
   join(repoRoot(), '..', 'benchmarking-fleet')
 const BENCH_DIR = join(FLEET_DIR, 'predefined_benchmarks', 'benchmarks')
+
+/** Clone electric-sql/benchmarking-fleet on first run (shallow), so `pnpm bench:fleet` is one command. */
+function ensureFleet(): void {
+  if (existsSync(BENCH_DIR)) return
+  if (existsSync(FLEET_DIR)) {
+    throw new Error(`${FLEET_DIR} exists but has no predefined_benchmarks/benchmarks — not a benchmarking-fleet clone?`)
+  }
+  console.log(`cloning ${FLEET_REPO} -> ${FLEET_DIR}`)
+  execFileSync('git', ['clone', '--depth', '1', FLEET_REPO, FLEET_DIR], { stdio: 'inherit' })
+}
 const SCALE = num('BENCH_SCALE', 1)
 const STATSD_PORT = num('BENCH_STATSD_PORT', 8125)
 const OUT = process.env.BENCH_OUT || join(repoRoot(), 'docs', 'bench', 'electric-fleet-results.md')
@@ -88,14 +101,18 @@ function stats(values: number[]) {
 interface Stack {
   pgUrl: string
   proc: ChildProcess
-  stop(): void
+  stop(): Promise<void>
   waitAdapter(): Promise<string>
 }
 async function bootStack(waitTable: string, tables: string): Promise<Stack> {
+  // ADAPTER_LIVE_TIMEOUT_MS=20000: the fleet scripts expect Electric-like ~20s live long-polls (a
+  // live request must outlast the gap before the benchmark's write, not 204 at the ds poll timeout).
+  // detached: the child gets its own process group so stop() can signal bash+pnpm+tsx+engine together
+  // (killing just pnpm orphans the tsx launcher, its Rust engine, and an ephemeral Postgres per bench).
   const proc = spawn(
     'bash',
-    ['-lc', `cd ${repoRoot()} && exec env ADAPTER_WAIT_TABLE=${waitTable} ADAPTER_PG_TABLES=${tables} ADAPTER_LONGPOLL_MS=1000 pnpm --filter @electric-lite/bench exec tsx src/electric-adapter.ts`],
-    { stdio: ['ignore', 'pipe', 'inherit'] },
+    ['-lc', `cd ${repoRoot()} && exec env ADAPTER_WAIT_TABLE=${waitTable} ADAPTER_PG_TABLES=${tables} ADAPTER_LONGPOLL_MS=1000 ADAPTER_LIVE_TIMEOUT_MS=20000 pnpm --filter @electric-lite/bench exec tsx src/electric-adapter.ts`],
+    { stdio: ['ignore', 'pipe', 'inherit'], detached: true },
   )
   // One persistent handler accumulates all output; waiters poll the parsed values (no lost lines).
   let buf = ''
@@ -126,10 +143,26 @@ async function bootStack(waitTable: string, tables: string): Promise<Stack> {
       }, 50)
     })
   const pg = await waitFor(() => pgUrl, 'ADAPTER_PG')
+  // SIGTERM the whole process group (negative pid) so the tsx adapter runs its own shutdown handler
+  // (kills its engine child and hands PG teardown — pg_ctl stop + tmpdir removal — to a detached
+  // helper that survives it), wait for the group to drain, then SIGKILL the group as a backstop.
+  const signalGroup = (sig: NodeJS.Signals | 0) => {
+    try {
+      process.kill(-proc.pid!, sig)
+      return true
+    } catch {
+      return false // group already gone
+    }
+  }
   return {
     pgUrl: pg,
     proc,
-    stop: () => proc.kill('SIGKILL'),
+    stop: async () => {
+      signalGroup('SIGTERM')
+      const deadline = Date.now() + 8000
+      while (signalGroup(0) && Date.now() < deadline) await sleep(100)
+      signalGroup('SIGKILL')
+    },
     waitAdapter: () => waitFor(() => adapterUrl, 'ADAPTER_LISTENING'),
   }
 }
@@ -215,6 +248,18 @@ function specEnvFilter(only?: string) {
 async function runBench(b: Bench, sink: Sink): Promise<{ label: string; specStr: string; durationMs: number; byMetric: Record<string, ReturnType<typeof stats>> }> {
   process.stdout.write(`\n=== ${b.name} (scale ${SCALE}) ===\n`)
   const stack = await bootStack(b.waitTable, b.tables)
+  try {
+    return await runBenchOnStack(b, sink, stack)
+  } finally {
+    await stack.stop() // SIGTERM group + 2s for the adapter's own PG/engine teardown + SIGKILL backstop
+  }
+}
+
+async function runBenchOnStack(
+  b: Bench,
+  sink: Sink,
+  stack: Stack,
+): Promise<{ label: string; specStr: string; durationMs: number; byMetric: Record<string, ReturnType<typeof stats>> }> {
   const client = new pgpkg.Client({ connectionString: stack.pgUrl })
   await client.connect()
   const label = await b.seed(client, SCALE)
@@ -252,19 +297,21 @@ async function runBench(b: Bench, sink: Sink): Promise<{ label: string; specStr:
 
   const byMetric: Record<string, ReturnType<typeof stats>> = {}
   for (const [name, vals] of sink.metrics) byMetric[name] = stats(vals)
-  stack.stop()
-  await sleep(1500) // let the ephemeral PG/engine tear down before the next boot
   return { label, specStr: JSON.stringify(spec), durationMs, byMetric }
 }
 
 async function main() {
+  ensureFleet()
   if (!existsSync(BENCH_DIR)) {
     console.error(`benchmarking-fleet not found at ${FLEET_DIR}. Set FLEET_DIR=/path/to/benchmarking-fleet`)
     process.exit(1)
   }
   if (!existsSync(join(repoRoot(), 'target', 'release', 'electric-lite-engine'))) {
-    console.error('build first: cargo build --release -p electric-lite-engine')
-    process.exit(1)
+    console.log('building the release engine (cargo build --release -p electric-lite-engine)…')
+    execFileSync('cargo', ['build', '--release', '-p', 'electric-lite-engine'], {
+      cwd: repoRoot(),
+      stdio: 'inherit',
+    })
   }
   const sink = await startSink(STATSD_PORT)
   const benches = specEnvFilter(process.env.BENCH_ONLY)

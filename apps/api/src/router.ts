@@ -25,10 +25,11 @@ const schemaSchema = z.object({
   ),
 })
 
-// Recursive predicate AST: leaf | and | or | not | in-subquery.
+// Recursive predicate AST: leaf | is-null | and | or | not | in-subquery.
 const predicateSchema: z.ZodType = z.lazy(() =>
   z.union([
     z.object({ col: z.string(), op: leafOp, value: valueSchema }),
+    z.object({ col: z.string(), isNull: z.boolean() }),
     z.object({ and: z.array(predicateSchema) }),
     z.object({ or: z.array(predicateSchema) }),
     z.object({ not: predicateSchema }),

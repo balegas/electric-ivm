@@ -8,7 +8,7 @@
 //       tsx src/electric-adapter.ts     # prints ADAPTER_LISTENING <url>, stays up until killed
 
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -110,12 +110,20 @@ async function main() {
   // Short long-poll timeout: Electric's oracle harness polls each shape live and only detects "no more
   // changes" when an up-to-date response returns. With the 30s default, unchanged shapes stall a batch;
   // a short timeout returns up-to-date quickly (changed shapes still wake immediately on append).
-  ds = new DurableStreamTestServer({ port: 0, longPollTimeout: Number(process.env.ADAPTER_LONGPOLL_MS || 1000) })
+  const longPollMs = Number(process.env.ADAPTER_LONGPOLL_MS || 1000)
+  ds = new DurableStreamTestServer({ port: 0, longPollTimeout: longPollMs })
   const dsUrl = await ds.start()
+
+  // The adapter's *overall* live deadline (how long a live=true request re-polls before 204) is
+  // decoupled from the ds long-poll timeout above (which just paces the engine's re-poll loop).
+  // Default = ADAPTER_LONGPOLL_MS so the oracle harness keeps its fast up-to-date detection; the
+  // benchmark runner sets ADAPTER_LIVE_TIMEOUT_MS=20000 for Electric-like ~20s live behavior.
+  const liveTimeoutMs = Number(process.env.ADAPTER_LIVE_TIMEOUT_MS || longPollMs)
 
   engineProc = spawn(join(repoRoot(), 'target', 'release', 'electric-lite-engine'), [], {
     env: {
       ...process.env,
+      ELECTRIC_LIVE_TIMEOUT_MS: String(liveTimeoutMs),
       ELECTRIC_LITE_DS_URL: dsUrl,
       ELECTRIC_LITE_BIND: '127.0.0.1:0',
       ELECTRIC_LITE_LOG: process.env.ADAPTER_LOG || 'warn',
@@ -147,19 +155,15 @@ async function main() {
 function shutdown() {
   engineProc?.kill('SIGKILL')
   void ds?.stop().catch(() => {})
-  if (pgData) {
-    try {
-      execFileSync('pg_ctl', ['-D', pgData, '-m', 'immediate', '-w', 'stop'], { stdio: 'ignore' })
-    } catch {
-      /* down */
-    }
-  }
-  if (pgDir) {
-    try {
-      rmSync(pgDir, { recursive: true, force: true })
-    } catch {
-      /* ignore */
-    }
+  if (pgData && pgDir) {
+    // pnpm/tsx can hard-kill this process moments after a SIGTERM reaches the process group — before
+    // a synchronous pg_ctl stop + rmSync would finish (which leaked the ephemeral PG + its tmpdir).
+    // Hand the teardown to a detached helper: it survives us AND a group-wide SIGKILL backstop
+    // (detached = its own process group).
+    spawn('bash', ['-c', `pg_ctl -D '${pgData}' -m immediate -w stop >/dev/null 2>&1; rm -rf '${pgDir}'`], {
+      detached: true,
+      stdio: 'ignore',
+    }).unref()
   }
   process.exit(0)
 }

@@ -3,6 +3,7 @@ import {
   type ColumnType,
   isAnd,
   isInSubquery,
+  isIsNull,
   isLeaf,
   isNot,
   isOr,
@@ -56,6 +57,9 @@ export function predicateToSql(pred: Predicate, startIndex = 1): SqlFragment {
   function build(p: Predicate): string {
     if (isLeaf(p)) {
       return `${q(p.col)} ${OP_SQL[p.op]} ${ph(p.value)}`
+    }
+    if (isIsNull(p)) {
+      return `${q(p.col)} IS ${p.isNull ? '' : 'NOT '}NULL`
     }
     if (isAnd(p)) {
       if (p.and.length === 0) return 'TRUE'

@@ -111,14 +111,20 @@ activeUsers.subscribe((rows) => render(rows))
   retains WAL for it. If you decommission an engine, drop its slot:
   `SELECT pg_drop_replication_slot('<slot>');` Monitor `pg_replication_slots.confirmed_flush_lsn` vs
   `pg_current_wal_lsn()` to watch lag.
-- **Consistency:** on shape registration the engine takes a `REPEATABLE READ` snapshot of the table
-  (the backfill) and records its `pg_current_wal_lsn()` as `seed_lsn`. Each replicated change is
-  stamped with its transaction's **COMMIT LSN**, and the engine skips changes whose commit LSN is
-  strictly **`< seed_lsn`** — those transactions committed before the snapshot, so they are already in
-  the backfill; transactions committing at/after the snapshot (commit LSN `>= seed_lsn`) are taken
-  from the live stream. Comparing the commit LSN (not the per-change record LSN) is what keeps rows of
-  transactions that were in flight during the snapshot from being dropped, so each row is counted
-  exactly once. This assumes a single ingestor per database (the model above). Running multiple
-  ingestors over the same tables is not supported.
+- **Consistency:** on shape registration the engine takes a `REPEATABLE READ` snapshot of the
+  matching rows (the backfill) and, atomically with it, captures the snapshot's
+  `pg_current_snapshot()` — the **snapshot gate**. Each replicated change is stamped with its
+  transaction's **commit LSN, xid, and in-transaction position**, and the engine skips a change iff
+  its xid was **visible to the backfill snapshot** (already in the seed); everything else is taken
+  from the live stream. Visibility — not WAL position — is the fence because a commit's WAL record
+  exists before the transaction becomes snapshot-visible; an LSN-only comparison would drop rows in
+  that window. Ingest delivery is at-least-once (append, then advance the slot), and the engine
+  de-duplicates by `(commit LSN, position)`, so each change takes effect exactly once. This assumes a
+  single ingestor per database (the model above). Running multiple ingestors over the same tables is
+  not supported.
+- **Degraded forms are loud:** if a table's `REPLICA IDENTITY` is reset from `FULL` (e.g. a migration
+  recreated it), updates lose their old image and deletes their tuple — the engine logs errors and
+  tells you to restore identity + recreate shapes. `TRUNCATE` is not propagated (also logged);
+  recreate shapes after one.
 - **Permissions:** the engine's Postgres role needs `SELECT` on the watched tables, ownership (for
   `ALTER TABLE … REPLICA IDENTITY`), and the `REPLICATION` attribute (to create/read the slot).

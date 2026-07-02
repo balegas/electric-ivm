@@ -55,6 +55,12 @@ const CASES: Array<{ label: string; where: ShapeDef['where'] }> = [
   { label: 'OR with null operand', where: { or: [{ col: 'active', op: 'eq', value: true }, { col: 'age', op: 'gt', value: 100 }] } },
   // Deep nesting with NOT over a conjunction that hits nulls.
   { label: 'NOT(and) over nulls', where: { not: { and: [{ col: 'name', op: 'eq', value: 'alpha' }, { col: 'age', op: 'gte', value: 20 }] } } },
+  // The native null-test leaf — the one predicate that is TRUE on a NULL cell.
+  { label: 'IS NULL selects null cells', where: { col: 'name', isNull: true } },
+  { label: 'IS NOT NULL excludes null cells', where: { col: 'name', isNull: false } },
+  { label: 'NOT(IS NULL) = IS NOT NULL', where: { not: { col: 'age', isNull: true } } },
+  { label: 'IS NULL composed under AND', where: { and: [{ col: 'active', op: 'eq', value: true }, { col: 'age', isNull: true }] } },
+  { label: 'IS NULL composed under OR', where: { or: [{ col: 'name', isNull: true }, { col: 'age', op: 'gt', value: 25 }] } },
 ]
 
 describe('conformance: NULL three-valued logic (deterministic fixtures)', () => {

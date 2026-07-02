@@ -23,6 +23,12 @@ export interface StreamEnvelope {
      * `lsn < snapshotLsn`. Absent on backfill rows and in library (no-Postgres) mode.
      */
     lsn?: string
+    /**
+     * Position of the change within its transaction, stamped by the replication ingestor on
+     * table-stream envelopes. `(lsn, seq)` uniquely identifies a change so the engine tailer can
+     * skip duplicates from the ingestor's at-least-once redelivery. Not present on shape streams.
+     */
+    seq?: number
   }
 }
 

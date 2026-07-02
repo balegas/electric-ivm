@@ -143,6 +143,8 @@ async function main() {
   forceExit.unref()
   sampler?.stop()
   await Promise.all(users.map((u) => u.stop()))
+  // Users already closed their own subscriptions; client.close() only tears down what's still open
+  // (every close is one-shot + pruned, so this never double-decrements a shared shape's refcount).
   await client.close().catch(() => {})
   if (sampler) {
     await sampler.sample()

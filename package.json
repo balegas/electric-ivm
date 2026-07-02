@@ -17,7 +17,10 @@
     "demo": "pnpm --filter @electric-lite/examples demo",
     "demo:web": "pnpm --filter @electric-lite/web start",
     "demo:linearlite": "pnpm --filter @electric-lite/linearlite start",
-    "bench": "pnpm --filter @electric-lite/bench bench"
+    "bench": "pnpm --filter @electric-lite/bench bench",
+    "bench:fleet": "pnpm --filter @electric-lite/bench electric-fleet",
+    "docker:build": "docker compose -f docker/compose.yaml build",
+    "docker:up": "docker compose -f docker/compose.yaml up"
   },
   "devDependencies": {
     "typescript": "^5.7.2",

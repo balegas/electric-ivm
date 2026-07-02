@@ -1,6 +1,6 @@
 # ElectricSQL benchmarking-fleet — results vs electric-lite
 
-Generated 2026-06-30 on darwin/arm64. We ran ElectricSQL's **own** `byo_electric` benchmarks
+Generated 2026-07-02 on darwin/arm64. We ran ElectricSQL's **own** `byo_electric` benchmarks
 (unmodified `.exs` scripts from [electric-sql/benchmarking-fleet](https://github.com/electric-sql/benchmarking-fleet))
 against electric-lite's Electric-protocol `/v1/shape` adapter, the same way the fleet benchmarks the real
 Electric sync-service. This is a load/throughput companion to the oracle conformance tests.
@@ -11,16 +11,18 @@ A runner (`packages/bench/src/electric-bench-runner.ts`) does, per benchmark: bo
 (durable-streams + engine + `/v1/shape` adapter on an ephemeral Postgres), seed the benchmark's schema at
 scale, run the unmodified ElectricSQL benchmark script with `ELECTRIC_SERVER` pointed at our adapter, and
 aggregate the per-shape latency the benchmark emits over statsd/UDP. The benchmark scripts are vanilla
-`Mix.install([:req, …])` — no GCP fleet, no Docker. Reproduce:
+`Mix.install([:req, …])` — no GCP fleet, no Docker. Reproduce with one command (it clones the fleet repo
+and builds the release engine itself if needed):
 
 ```
-cargo build --release -p electric-lite-engine
-git clone https://github.com/electric-sql/benchmarking-fleet ../benchmarking-fleet
-BENCH_SCALE=2 pnpm --filter @electric-lite/bench exec tsx src/electric-bench-runner.ts
+pnpm bench:fleet                 # scale 1
+BENCH_SCALE=2 pnpm bench:fleet   # double workload
 ```
 
-`latency` is the per-shape *fetch-complete* duration the benchmark measures (initial shape sync, or — for
-the fanout/latency benchmarks — write-to-visible propagation). `wall` is the whole benchmark's wall-clock.
+`latency` is the per-shape *fetch-complete* duration the benchmark measures: initial shape sync for the
+shape-creation benchmarks, and **write-to-visible propagation through a live long-poll** for the
+fanout/latency benchmarks (each of N concurrent live requests on one handle must receive the fanned-out
+write). `wall` is the whole benchmark's wall-clock.
 
 ## Results
 
@@ -28,48 +30,47 @@ the fanout/latency benchmarks — write-to-visible propagation). `wall` is the w
 
 | benchmark | workload | samples | wall (s) | p50 (ms) | p95 (ms) | p99 (ms) | max (ms) |
 |-----------|----------|--------:|---------:|---------:|---------:|---------:|---------:|
-| concurrent_shape_creation | 500 concurrent shapes, 2k-row table | 500 | 6.4 | 2637 | 5040 | 5264 | 5312 |
-| concurrent_shape_creation_with_subqueries | 300 concurrent **subquery** shapes | 300 | 4.6 | 351 | 561 | 577 | 582 |
-| many_shapes_one_client_latency | write → 500 shapes, 1 client | 1 | 7.3 | 1 | 1 | 1 | 1 |
-| diverse_shape_fanout | write fanout → 200 shapes | 200 | 4.2 | ~0† | ~0† | ~0† | 3 |
-| write_fanout | write fanout → 200 shapes | 200 | 2.2 | 19 | 39 | 41 | 41 |
+| concurrent_shape_creation | 500 concurrent shapes, 2k-row table | 500 | 6.2 | 2581 | 4828 | 5022 | 5072 |
+| concurrent_shape_creation_with_subqueries | 300 concurrent **subquery** shapes | 300 | 4.5 | 213 | 339 | 350 | 353 |
+| many_shapes_one_client_latency | write → visible, 1 live client | 1 | 7.1 | 86 | 86 | 86 | 86 |
+| diverse_shape_fanout | write fanout → 200 live long-polls | 200 | 4.2 | 59 | 68 | 69 | 69 |
+| write_fanout | write fanout → 200 live long-polls | 200 | 2.1 | 37 | 40 | 40 | 40 |
 
 ### Large workload (`BENCH_SCALE=2`)
 
 | benchmark | workload | samples | wall (s) | p50 (ms) | p95 (ms) | p99 (ms) | max (ms) |
 |-----------|----------|--------:|---------:|---------:|---------:|---------:|---------:|
-| concurrent_shape_creation | **1000** concurrent shapes, 2k-row table | 1000 | 11.5 | 5171 | 9813 | 10213 | 10332 |
-| concurrent_shape_creation_with_subqueries | **600** concurrent **subquery** shapes | 600 | 5.1 | 569 | 1031 | 1069 | 1079 |
-| many_shapes_one_client_latency | write → 1000 shapes, 1 client | 1 | 12.2 | 1 | 1 | 1 | 1 |
-| diverse_shape_fanout | write fanout → 400 shapes | 400 | 6.5 | ~0† | ~0† | ~0† | 0 |
-| write_fanout | write fanout → 400 shapes | 400 | 2.2 | 38 | 44 | 44 | 44 |
-
-† `diverse_shape_fanout` measures write-to-visible latency relative to the write-commit timestamp; our
-propagation is fast enough that many samples land at or just before that baseline (the benchmark emits
-small negative values). Read it as "changes are visible ~immediately"; `max` (0–3 ms) is the honest bound.
+| concurrent_shape_creation | **1000** concurrent shapes, 2k-row table | 1000 | 12.0 | 5197 | 10336 | 10733 | 10834 |
+| concurrent_shape_creation_with_subqueries | **600** concurrent **subquery** shapes | 600 | 4.9 | 473 | 822 | 852 | 860 |
+| many_shapes_one_client_latency | write → visible, 1 live client | 1 | 12.6 | 94 | 94 | 94 | 94 |
+| diverse_shape_fanout | write fanout → **400** live long-polls | 400 | 6.6 | 75 | 90 | 91 | 91 |
+| write_fanout | write fanout → **400** live long-polls | 400 | 2.2 | 44 | 50 | 50 | 50 |
 
 ## Findings
 
 1. **Everything completes — no failures, no connection exhaustion.** All shapes returned at every scale,
-   including 1000 concurrent shape creations and 600 concurrent subquery shapes (Postgres
-   `max_connections=1200`).
-2. **Shape creation is backfill-bound.** 500→1000 concurrent shapes ≈ doubles p99 (5.3 s → 10.2 s). The
+   including 1000 concurrent shape creations, 600 concurrent subquery shapes (Postgres
+   `max_connections=1200`), and 400 concurrent live long-polls receiving a fanned-out write.
+2. **Shape creation is backfill-bound.** 500→1000 concurrent shapes ≈ doubles p99 (5.0 s → 10.7 s). The
    engine opens a **fresh Postgres connection per standalone backfill**, so at high concurrency the
    backfills contend on connections + the snapshot read. This is the clear next optimization (pool/limit
    backfill connections — already done for the subquery registry).
 3. **Subquery shapes scale much better than match-all shapes.** 600 concurrent subquery shapes finish at
-   p99 ~1.07 s vs 1000 match-all at p99 ~10 s — a subquery shape returns only the *matching* rows (keyed
-   node lookup) and the subquery registry reuses a single pooled Postgres connection, while the match-all
-   benchmark backfills the whole 2k-row table per shape.
-4. **Write fanout is excellent and nearly flat in shape count.** Writes propagate to 200 *and* 400
-   concurrent shapes at p99 ~41–44 ms — the live replication/tail path scales well; doubling the shape
-   count barely moved the latency.
+   p99 ~0.85 s vs 1000 match-all at p99 ~10.7 s — a subquery shape returns only the *matching* rows
+   (keyed node lookup) and the subquery registry reuses a single pooled Postgres connection, while the
+   match-all benchmark backfills the whole 2k-row table per shape.
+4. **Write fanout is fast and nearly flat in fan-out width.** A committed write is visible to 200
+   concurrent live long-polls at p99 ~40–69 ms and to 400 at p99 ~50–91 ms — the full
+   replication → engine → shape-stream → adapter live path. Concurrent live requests on one handle at
+   the same offset are **coalesced** (one leader reads/applies; every waiter gets the identical
+   response), so doubling the fan-out width barely moves the latency.
 
-## Engine changes the benchmarks required
+## Engine/adapter changes the benchmarks required or validated
 
-Running Electric's benchmarks surfaced two real protocol gaps, now fixed:
-- **Constant `where` comparisons** (`373 = 373`): the benchmarks use a trivial always-true literal
-  comparison as a unique match-all predicate; our SQL `where` parser now evaluates `<lit> <op> <lit>`
-  (`where_sql.rs`).
-- **Schema-qualified table names** (`public.users`): the adapter now strips the schema prefix
-  (`electric.rs`).
+- **Constant `where` comparisons** (`373 = 373`): the SQL `where` parser evaluates `<lit> <op> <lit>`
+  at parse time (`where_sql.rs`).
+- **Schema-qualified table names** (`public.users`): the adapter strips the schema prefix.
+- **Live long-poll semantics**: live requests hold until data or an Electric-like deadline
+  (`ELECTRIC_LIVE_TIMEOUT_MS`, default 20 s; 204 + up-to-date at the deadline), and concurrent live
+  requests per (handle, offset) are coalesced — both were required for the fanout benchmarks, whose
+  N clients long-poll one handle concurrently and treat premature timeouts as fatal.
