@@ -11,13 +11,13 @@ export function Welcome({ onClose }: { onClose: () => void }) {
     <div className="modal-back">
       <div className="modal welcome">
         <div className="welcome-title">
-          X-ray a <em>sync engine</em>
+          How <em>live queries</em> work
         </div>
         <p className="welcome-lead">
           A <b>shape</b> is a database query whose results stay up to date on every screen that
-          subscribes to it — that's how Electric-style sync works. This playground is an x-ray of
-          the engine that makes it happen: change some data in a little food-delivery world and
-          watch, live, how the change reaches exactly the screens that care — and nothing else.
+          subscribes to it — that's how Electric-style sync works. This playground is a live view
+          inside the engine that makes it happen: change some data in a little food-delivery world
+          and watch how the change reaches exactly the screens that care — and nothing else.
         </p>
         <div className="welcome-grid">
           <div>
