@@ -171,6 +171,51 @@ pnpm demo:linearlite    # LinearLite (issue tracker) on electric-ivm — the fla
 scripts/linearlite.sh start large   # same, at a 100k-issue workload + the pipeline explorer
 ```
 
+### The apps in this repo
+
+Each is self-contained with its own README; every demo boots everything it needs (ephemeral
+Postgres, durable-streams, the engine) in one command.
+
+**`apps/engine` — the sync engine (Rust).** The core: ingests Postgres logical replication and
+maintains every shape/subquery/aggregation incrementally; serves the control-plane HTTP API,
+the Electric wire protocol (`/v1/shape`), and the `/trace` SSE feed. You rarely run it by hand —
+the demos and Docker do — but standalone:
+
+```bash
+cargo build -p electric-ivm-engine
+ELECTRIC_IVM_DS_URL=<durable-streams url> ELECTRIC_IVM_PG_URL=<postgres url> \
+ELECTRIC_IVM_PG_TABLES='*' target/debug/electric-ivm-engine   # prints ENGINE_LISTENING <url>
+```
+
+**`apps/api` — the extended API (TS).** The tRPC façade for the extended client surface (schema,
+writes, shapes, subset queries, aggregations). Run via the demos or `docker/api-server.ts`.
+
+**`apps/pipeline-viz` — the pipeline explorer (TS).** A developer/debugging GUI that attaches to
+any running engine and renders the maintained dbsp pipeline (logical + circuit views, node
+details, live shape contents). Auto-launched by `pnpm demo:linearlite`, or standalone:
+
+```bash
+ELECTRIC_IVM_ENGINE_URL=http://127.0.0.1:<engine-port> VIZ_PORT=5180 \
+  pnpm --filter @electric-ivm/pipeline-viz dev
+```
+
+**`apps/playground` — the dbsp playground (TS).** The audience-facing interactive demo: a
+food-delivery world whose writes animate live through the real engine's pipeline to subscriber
+device cards, with a six-scene walkthrough, per-visitor workspaces, and click-to-inspect node
+details. Built for demo videos and public hosting.
+
+```bash
+pnpm demo:playground      # ephemeral PG + engine + server + app (+ HTTPS/2 front if caddy is installed)
+pnpm docker:playground    # the hosted stack (compose overlay), app on :5199
+```
+
+**`examples/linearlite` — the flagship demo app (TS).** A Linear-style issue tracker synced
+entirely through shapes (visibility subqueries, live counts, subset pagination):
+`pnpm demo:linearlite`, or `scripts/linearlite.sh start large` for a 100k-issue workload.
+
+**`examples/web` — the minimal example (TS).** The smallest end-to-end app using the extended
+client: `pnpm demo:web`. (`pnpm demo` runs the even smaller headless todos walkthrough.)
+
 ### Docker
 
 ```bash
@@ -249,7 +294,8 @@ logic, and concurrent writers.
 | `electric-conformance/` | Elixir | Electric's own tests, pointed at our adapter |
 | `examples/linearlite`, `examples/web` | TS | demo apps |
 | `docker/` | — | containerized stack |
-| `apps/pipeline-viz` | TS | live pipeline explorer |
+| `apps/pipeline-viz` | TS | live pipeline explorer (developer tool) |
+| `apps/playground` | TS | interactive dbsp playground (public demo: scenes, workspaces, trace animation) |
 
 Each package has its own README. Agent guidance for working in this repo: **AGENTS.md**.
 
