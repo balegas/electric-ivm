@@ -163,7 +163,9 @@ impl CompiledPredicate {
         Ok(match p {
             PredicateJson::Leaf { col, op, value } => {
                 let idx = ts.column_index(col)?;
-                let v = Value::from_json(value, ts.column_type(idx))?;
+                // Leaf literals (incl. substituted `$N` param values, always strings) coerce to the
+                // column type — Postgres/Electric unknown-literal semantics.
+                let v = Value::literal_from_json(value, ts.column_type(idx))?;
                 CompiledPredicate::Cmp { col: idx, op: *op, value: v }
             }
             PredicateJson::IsNull { col, is_null } => {
@@ -421,6 +423,29 @@ mod tests {
 
     fn row(ts: &TableSchema, j: serde_json::Value) -> Row {
         ts.row_from_json(j.as_object().unwrap()).unwrap()
+    }
+
+    // Substituted `$N` param values arrive as quoted string literals; a leaf literal coerces to the
+    // column type (Postgres/Electric unknown-literal semantics), so `'18'` works against an int column
+    // and `'true'` against a bool column — this is what makes params work for non-text columns.
+    #[test]
+    fn string_literal_coerces_to_column_type() {
+        let ts = users();
+        let compile = |j: serde_json::Value| {
+            CompiledPredicate::compile(&serde_json::from_value::<PredicateJson>(j).unwrap(), &ts).unwrap()
+        };
+        let r = row(&ts, serde_json::json!({"id":1,"name":"a","age":18,"active":true}));
+        assert!(compile(serde_json::json!({"col":"age","op":"gte","value":"18"})).matches(&r)); // '18' -> int
+        assert!(compile(serde_json::json!({"col":"active","op":"eq","value":"true"})).matches(&r)); // 'true' -> bool
+        assert!(compile(serde_json::json!({"col":"name","op":"eq","value":"a"})).matches(&r)); // 'a' -> text
+        // an uncoercible string against an int column is a (400) error, not a silent mismatch
+        assert!(
+            CompiledPredicate::compile(
+                &serde_json::from_value::<PredicateJson>(serde_json::json!({"col":"age","op":"eq","value":"abc"})).unwrap(),
+                &ts,
+            )
+            .is_err()
+        );
     }
 
     #[test]

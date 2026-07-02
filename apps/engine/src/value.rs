@@ -38,6 +38,29 @@ impl Value {
         })
     }
 
+    /// Type a **where-clause literal** (not a data cell) against a column type, leniently: a string
+    /// literal is coerced into the target type (`'5'` → int 5, `'t'` → bool true, …), matching
+    /// Postgres/Electric unknown-literal coercion. This is what lets a substituted `$N` param value
+    /// (always delivered as a string) compare against a non-text column. Typed JSON (number/bool)
+    /// stays strict — same as [`from_json`], so a bare `5` against a text column still errors.
+    pub fn literal_from_json(j: &serde_json::Value, ty: ColumnType) -> Result<Value> {
+        if let serde_json::Value::String(s) = j {
+            return Ok(match ty {
+                ColumnType::Text => Value::Text(s.clone()),
+                ColumnType::Int => Value::Int(s.parse().with_context(|| format!("invalid integer literal '{s}'"))?),
+                ColumnType::Float => {
+                    Value::Float(OrderedFloat(s.parse().with_context(|| format!("invalid float literal '{s}'"))?))
+                }
+                ColumnType::Bool => match s.as_str() {
+                    "t" | "true" | "TRUE" | "True" => Value::Bool(true),
+                    "f" | "false" | "FALSE" | "False" => Value::Bool(false),
+                    _ => bail!("invalid boolean literal '{s}'"),
+                },
+            });
+        }
+        Value::from_json(j, ty)
+    }
+
     /// Parse a stringified primary-key (the durable-stream event `key`) into a typed `Value`.
     pub fn from_key_string(s: &str, ty: ColumnType) -> Result<Value> {
         Ok(match ty {

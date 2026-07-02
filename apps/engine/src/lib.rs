@@ -17,6 +17,7 @@ pub mod fault;
 pub mod http;
 pub mod mem;
 pub mod metrics;
+pub mod params;
 pub mod pg;
 pub mod statsd;
 pub mod predicate;

@@ -638,7 +638,12 @@ fn unauthorized() -> Response {
     resp
 }
 
-pub async fn shape(State(engine): State<Engine>, Query(p): Query<ShapeParams>) -> Response {
+pub async fn shape(
+    State(engine): State<Engine>,
+    Query(p): Query<ShapeParams>,
+    // Raw query pairs (decoded) for `params` — bracket form `params[1]=…` isn't a single serde field.
+    Query(raw_pairs): Query<Vec<(String, String)>>,
+) -> Response {
     ensure_evictor(&engine);
     let start = Instant::now();
     let live = p.live.as_deref() == Some("true");
@@ -652,7 +657,7 @@ pub async fn shape(State(engine): State<Engine>, Query(p): Query<ShapeParams>) -
     ) {
         unauthorized()
     } else {
-        match shape_inner(engine, p).await {
+        match shape_inner(engine, p, &raw_pairs).await {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::warn!("/v1/shape error ({}): {}", e.status, e.message);
@@ -667,7 +672,11 @@ pub async fn shape(State(engine): State<Engine>, Query(p): Query<ShapeParams>) -
     resp
 }
 
-async fn shape_inner(engine: Engine, mut p: ShapeParams) -> Result<Response, ApiError> {
+async fn shape_inner(
+    engine: Engine,
+    mut p: ShapeParams,
+    raw_pairs: &[(String, String)],
+) -> Result<Response, ApiError> {
     // Electric clients send schema-qualified table names (`public.users`); our engine keys by the bare
     // table name. Strip any schema prefix.
     if let Some((_schema, bare)) = p.table.rsplit_once('.') {
@@ -691,7 +700,13 @@ async fn shape_inner(engine: Engine, mut p: ShapeParams) -> Result<Response, Api
 
     // ---- Snapshot: offset=-1 -> create the shape and emit the current rows as inserts.
     if offset == "-1" {
-        let pred = crate::where_sql::parse_where_typed(p.where_.as_deref().unwrap_or(""), Some(&ts))
+        // Resolve + validate `params` (Electric-compatible), then substitute `$N` into the where clause
+        // BEFORE parsing, so the predicate/subquery machinery — and the shape's identity/signature —
+        // are derived from the substituted text (distinct param values never collide onto one shape).
+        let params = crate::params::parse_params(raw_pairs).map_err(ApiError::bad_request)?;
+        let where_raw = p.where_.as_deref().unwrap_or("");
+        let where_sub = crate::params::substitute(where_raw, &params).map_err(ApiError::bad_request)?;
+        let pred = crate::where_sql::parse_where_typed(&where_sub, Some(&ts))
             .map_err(|e| ApiError::bad_request(format!("invalid where clause: {e:#}")))?;
         // Validate the request shape against the schema up front: these are client errors (400). A
         // failure past this point (stream creation, backfill, reads) is internal (500).
