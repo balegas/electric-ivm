@@ -270,10 +270,50 @@ pub fn consumers_ready(tables: u64) {
     s.gauge("electric.connection.consumers_ready.total", tables as f64, &[]);
 }
 
-/// Current durable-streams storage size (file mode; `du` of `ELECTRIC_STORAGE_DIR`).
-pub fn storage_used(bytes: u64) {
+/// Current durable-streams storage size (file mode; `du` of `ELECTRIC_STORAGE_DIR`) plus how long the
+/// `du` took (matches Electric emitting `used.bytes` + `used.measurement_duration` together).
+pub fn storage_used(bytes: u64, measurement: Duration) {
     let Some(s) = statsd() else { return };
     s.gauge("electric.storage.used.bytes", bytes as f64, &[]);
+    s.dist("electric.storage.used.measurement_duration", measurement.as_secs_f64() * 1000.0, &[]);
+}
+
+/// Shape-count gauges (conformance §5 / baseline dashboard headline metrics), emitted every poll tick.
+/// `indexed`/`unindexed` map to our shared-family vs standalone evaluation split — the honest analog of
+/// Electric's indexed-where-clause distinction. Every registered shape is actively maintained in our
+/// engine, so `active_shapes == total_shapes` (a true statement about this engine, not a copy of total).
+pub fn shape_gauges(total: u64, indexed: u64, unindexed: u64) {
+    let Some(s) = statsd() else { return };
+    s.gauge("electric.shapes.total_shapes.count", total as f64, &[]);
+    s.gauge("electric.shapes.active_shapes.count", total as f64, &[]);
+    s.gauge("electric.shapes.total_shapes.count_indexed", indexed as f64, &[]);
+    s.gauge("electric.shapes.total_shapes.count_unindexed", unindexed as f64, &[]);
+}
+
+/// Compute the replication-slot WAL gauges from raw LSN strings (pure, unit-tested). `restart` and
+/// `confirmed` are `Option` because a freshly-created slot can report NULL for them — a missing value
+/// omits its delta metric rather than emitting a fake/stale one. `pg_wal_offset` is always present.
+pub fn slot_gauge_values(wal: &str, restart: Option<&str>, confirmed: Option<&str>) -> Vec<(&'static str, f64)> {
+    let wal_u = crate::pg::lsn_to_u64(wal);
+    let mut out = vec![("electric.postgres.replication.pg_wal_offset", wal_u as f64)];
+    if let Some(r) = restart {
+        let r = crate::pg::lsn_to_u64(r);
+        out.push(("electric.postgres.replication.slot_retained_wal_size", wal_u.saturating_sub(r) as f64));
+    }
+    if let Some(c) = confirmed {
+        let c = crate::pg::lsn_to_u64(c);
+        out.push(("electric.postgres.replication.slot_confirmed_flush_lsn_lag", wal_u.saturating_sub(c) as f64));
+    }
+    out
+}
+
+/// Emit the replication-slot WAL gauges for one sample (`wal` = pg_current_wal_lsn, `restart`/`confirmed`
+/// from `pg_replication_slots` for our slot). No-op when StatsD is off.
+pub fn replication_slot_gauges(wal: &str, restart: Option<&str>, confirmed: Option<&str>) {
+    let Some(s) = statsd() else { return };
+    for (name, v) in slot_gauge_values(wal, restart, confirmed) {
+        s.gauge(name, v, &[]);
+    }
 }
 
 // ---- periodic samplers ------------------------------------------------------------------------
@@ -366,6 +406,10 @@ async fn system_sampler(period: Duration) {
             s.gauge("vm.system_counts.process_count", threads as f64, &[]);
         }
 
+        // Shape-count gauges from the engine's cardinality snapshot (published by the mem sampler).
+        let (total, indexed, unindexed) = crate::mem::published_shape_counts();
+        shape_gauges(total, indexed, unindexed);
+
         tokio::time::sleep(period).await;
     }
 }
@@ -395,11 +439,69 @@ pub fn spawn_storage_sampler(dir: Option<String>) {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            if let Some(bytes) = du_bytes(std::path::Path::new(&dir)) {
-                storage_used(bytes);
+            let t0 = Instant::now();
+            let bytes = du_bytes(std::path::Path::new(&dir));
+            let measurement = t0.elapsed();
+            if let Some(bytes) = bytes {
+                storage_used(bytes, measurement);
             }
         }
     });
+}
+
+/// Spawn the replication-slot WAL sampler on its own ~10s cadence (Electric's cadence for these), pg
+/// mode only. Holds a single PG connection (reconnecting on failure). No-op when StatsD is off.
+pub fn spawn_replication_slot_sampler(pg_url: String, slot: String) {
+    if !enabled() {
+        return;
+    }
+    tokio::spawn(replication_slot_sampler(pg_url, slot));
+}
+
+async fn replication_slot_sampler(pg_url: String, slot: String) {
+    let mut tick = tokio::time::interval(Duration::from_secs(10));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut client: Option<tokio_postgres::Client> = None;
+    let mut logged_err = false;
+    loop {
+        tick.tick().await;
+        if client.is_none() {
+            match crate::pg::connect(&pg_url).await {
+                Ok(c) => {
+                    client = Some(c);
+                    logged_err = false;
+                }
+                Err(e) => {
+                    if !logged_err {
+                        tracing::warn!("statsd slot sampler: connect failed: {e:#}; will retry");
+                        logged_err = true;
+                    }
+                    continue;
+                }
+            }
+        }
+        // pg_current_wal_lsn() (primary) + our slot's restart/confirmed LSNs. NULLs (fresh slot) are
+        // reported as None -> the corresponding delta metric is omitted, never faked.
+        let q = "select pg_current_wal_lsn()::text, restart_lsn::text, confirmed_flush_lsn::text \
+                 from pg_replication_slots where slot_name = $1";
+        match client.as_ref().unwrap().query_opt(q, &[&slot]).await {
+            Ok(Some(row)) => {
+                let wal: String = row.get(0);
+                let restart: Option<String> = row.get(1);
+                let confirmed: Option<String> = row.get(2);
+                replication_slot_gauges(&wal, restart.as_deref(), confirmed.as_deref());
+                logged_err = false;
+            }
+            Ok(None) => { /* slot not present yet — skip this tick */ }
+            Err(e) => {
+                if !logged_err {
+                    tracing::warn!("statsd slot sampler: query failed: {e:#}; reconnecting");
+                    logged_err = true;
+                }
+                client = None; // drop the (possibly dead) connection and reconnect next tick
+            }
+        }
+    }
 }
 
 /// Recursive `du` (sum of regular-file sizes). Skips symlinks. `None` if the path does not exist.
@@ -482,6 +584,26 @@ mod tests {
         for (a, b) in rejoined.iter().zip(lines.iter()) {
             assert_eq!(a, b);
         }
+    }
+
+    #[test]
+    fn slot_gauge_values_compute_deltas() {
+        // wal=0x20, restart=0x10, confirmed=0x18 -> retained=0x10, confirmed_lag=0x8.
+        let v = slot_gauge_values("0/20", Some("0/10"), Some("0/18"));
+        assert_eq!(v[0], ("electric.postgres.replication.pg_wal_offset", 0x20 as f64));
+        assert_eq!(v[1], ("electric.postgres.replication.slot_retained_wal_size", 0x10 as f64));
+        assert_eq!(v[2], ("electric.postgres.replication.slot_confirmed_flush_lsn_lag", 0x8 as f64));
+    }
+
+    #[test]
+    fn slot_gauge_values_omit_missing_lsns() {
+        // A fresh slot with NULL restart/confirmed emits only pg_wal_offset (no faked deltas).
+        let v = slot_gauge_values("0/20", None, None);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].0, "electric.postgres.replication.pg_wal_offset");
+        // confirmed ahead of wal (shouldn't happen, but must not underflow/panic)
+        let v = slot_gauge_values("0/10", Some("0/40"), None);
+        assert_eq!(v[1], ("electric.postgres.replication.slot_retained_wal_size", 0.0));
     }
 
     #[test]

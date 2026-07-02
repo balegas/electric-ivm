@@ -65,6 +65,8 @@ async fn main() -> Result<()> {
             let tables = engine.table_count().await;
             tracing::info!("postgres mode: {tables} table(s), slot '{}', poll {}ms", config.slot, config.poll_ms);
             statsd::consumers_ready(tables as u64);
+            // Replication-slot WAL gauges (own ~10s cadence, single pooled PG connection).
+            statsd::spawn_replication_slot_sampler(url.clone(), config.slot.clone());
             engine
         }
         _ => {

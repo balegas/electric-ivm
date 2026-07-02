@@ -122,6 +122,9 @@ async fn instrumentation_emits_expected_metric_families() {
     statsd::storage_txn(3, 256, 2);
     statsd::snapshot_stored(100, 4096, 12.0);
     statsd::consumers_ready(7);
+    statsd::shape_gauges(5, 3, 2); // total, indexed (family), unindexed (standalone)
+    statsd::storage_used(1_048_576, Duration::from_millis(4));
+    statsd::replication_slot_gauges("0/20", Some("0/10"), Some("0/18"));
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     let datagrams = tokio::task::spawn_blocking(move || collect(sock, Duration::from_millis(800))).await.unwrap();
@@ -149,9 +152,28 @@ async fn instrumentation_emits_expected_metric_families() {
         "electric.storage.make_new_snapshot.stop.duration",
         "electric.connection.consumers_ready.duration",
         "electric.connection.consumers_ready.total",
+        "electric.shapes.total_shapes.count",
+        "electric.shapes.active_shapes.count",
+        "electric.shapes.total_shapes.count_indexed",
+        "electric.shapes.total_shapes.count_unindexed",
+        "electric.storage.used.bytes",
+        "electric.storage.used.measurement_duration",
+        "electric.postgres.replication.pg_wal_offset",
+        "electric.postgres.replication.slot_retained_wal_size",
+        "electric.postgres.replication.slot_confirmed_flush_lsn_lag",
     ] {
         assert!(names.iter().any(|n| n == expected), "missing metric {expected}");
     }
+
+    // active_shapes == total_shapes for our engine (every registered shape is actively maintained).
+    assert!(all.contains("electric.shapes.total_shapes.count:5|g"));
+    assert!(all.contains("electric.shapes.active_shapes.count:5|g"));
+    assert!(all.contains("electric.shapes.total_shapes.count_indexed:3|g"));
+    assert!(all.contains("electric.shapes.total_shapes.count_unindexed:2|g"));
+    // slot deltas: wal 0x20 - restart 0x10 = 0x10 (32); wal 0x20 - confirmed 0x18 = 0x8 (8).
+    assert!(all.contains("electric.postgres.replication.pg_wal_offset:32|g"));
+    assert!(all.contains("electric.postgres.replication.slot_retained_wal_size:16|g"));
+    assert!(all.contains("electric.postgres.replication.slot_confirmed_flush_lsn_lag:8|g"));
 
     // The response-size distribution carries the fleet tags, incl. the configured stack_id.
     assert!(

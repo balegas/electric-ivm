@@ -121,6 +121,18 @@ pub fn snapshot_json() -> serde_json::Value {
     })
 }
 
+/// Shape counts from the last published cardinality snapshot (refreshed by the background sampler):
+/// `(total, family_shapes, standalone)`. Used by the StatsD periodic sampler for the
+/// `electric.shapes.*` gauges without re-locking engine state on the poll path.
+pub fn published_shape_counts() -> (u64, u64, u64) {
+    let g = gauges();
+    (
+        g.shapes.load(Ordering::Relaxed),
+        g.family_shapes.load(Ordering::Relaxed),
+        g.standalone.load(Ordering::Relaxed),
+    )
+}
+
 /// Render the OTel/Prometheus exposition text for `GET /metrics/prometheus`.
 pub fn prometheus_text() -> String {
     let Some(reg) = PROM_REGISTRY.get() else { return String::new() };
