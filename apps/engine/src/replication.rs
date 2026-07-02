@@ -77,6 +77,8 @@ async fn poll_loop(
     let mut cap: i32 = PEEK_CAP;
     loop {
         let rows = client.query(peek, &[&slot, &cap]).await?; // connection error -> reconnect
+        // When this batch was read off the slot — the reference point for `receive_lag` below.
+        let read_at = std::time::Instant::now();
         if !rows.is_empty() {
             let pairs: Vec<(String, String)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
             let batch = decode_batch(&pairs, tables);
@@ -118,6 +120,17 @@ async fn poll_loop(
                     if let Some(n) = batch.max_sync {
                         sync_seq.fetch_max(n, Ordering::Relaxed);
                     }
+                    // Per-txn replication metrics, once per commit (only on the poll where the slot
+                    // advanced, so a re-peeked batch is not double-counted). test_decoding's COMMIT
+                    // carries no commit timestamp (include-timestamp is not enabled on the slot), so
+                    // `receive_lag` measures ingest-side latency: time from when this batch was read
+                    // off the slot to now — NOT source-commit→receipt lag.
+                    if crate::statsd::enabled() {
+                        let lag_ms = read_at.elapsed().as_secs_f64() * 1000.0;
+                        for t in &batch.txns {
+                            crate::statsd::replication_txn(t.ops, t.bytes, lag_ms);
+                        }
+                    }
                 }
             }
         }
@@ -132,6 +145,17 @@ struct Batch {
     max_sync: Option<i64>,
     /// LSN of the last COMMIT we fully processed; the slot is advanced to here.
     advance_to: Option<String>,
+    /// Per committed transaction that carried tracked-table changes: (ops, payload bytes). Drives the
+    /// `electric.postgres.replication.transaction_received.*` StatsD metrics.
+    txns: Vec<TxnStat>,
+}
+
+/// Per-transaction ingest accounting for the replication StatsD metrics.
+struct TxnStat {
+    /// Tracked-table change operations in the transaction.
+    ops: u64,
+    /// Raw `test_decoding` payload bytes of those changes (the bytes received from the slot).
+    bytes: u64,
 }
 
 /// Decode a peeked batch (rows of `(lsn, data)`) into per-table envelopes, buffering each transaction
@@ -141,19 +165,23 @@ fn decode_batch(rows: &[(String, String)], tables: &HashMap<String, TableSchema>
     let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
     let mut max_sync: Option<i64> = None;
     let mut advance_to: Option<String> = None;
+    let mut txns: Vec<TxnStat> = Vec::new();
 
     let mut tx_envs: Vec<Envelope> = Vec::new();
     let mut tx_sync: Option<i64> = None;
+    let mut tx_bytes: u64 = 0;
     for (lsn, data) in rows {
         let data = data.as_str();
         if data.starts_with("BEGIN") {
             tx_envs.clear();
             tx_sync = None;
+            tx_bytes = 0;
         } else if data.starts_with("COMMIT") {
             // The COMMIT row's LSN is the transaction's commit LSN; stamp the buffered changes with
             // it, the transaction's xid (for the backfill snapshot's xid-visibility fence), and each
             // change's position within the transaction (for tailer-side de-duplication by (lsn, seq)).
             let xid = data.split_whitespace().nth(1).map(str::to_string);
+            let ops = tx_envs.len() as u64;
             for (i, mut env) in tx_envs.drain(..).enumerate() {
                 env.headers.lsn = Some(lsn.clone());
                 env.headers.txid = xid.clone();
@@ -163,6 +191,11 @@ fn decode_batch(rows: &[(String, String)], tables: &HashMap<String, TableSchema>
             if let Some(n) = tx_sync.take() {
                 max_sync = Some(max_sync.map_or(n, |m| m.max(n)));
             }
+            // Only real data transactions count; a bookkeeping-only txn (e.g. the `__el_sync` drain
+            // barrier) carries no tracked-table op and is not a "transaction received".
+            if ops > 0 {
+                txns.push(TxnStat { ops, bytes: tx_bytes });
+            }
             advance_to = Some(lsn.clone());
         } else if let Some((table, op, body)) = parse_row(&data) {
             if table == SYNC_TABLE {
@@ -171,12 +204,13 @@ fn decode_batch(rows: &[(String, String)], tables: &HashMap<String, TableSchema>
                 }
             } else if let Some(ts) = tables.get(table) {
                 if let Some(env) = build_envelope(table, ts, op, body) {
+                    tx_bytes += data.len() as u64; // raw payload bytes of this tracked change
                     tx_envs.push(env); // lsn stamped at COMMIT
                 }
             }
         }
     }
-    Batch { pending, max_sync, advance_to }
+    Batch { pending, max_sync, advance_to, txns }
 }
 
 /// Split a `test_decoding` change line into `(table, op, body)`, or `None` for BEGIN/COMMIT/other.

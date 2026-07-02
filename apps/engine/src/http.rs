@@ -1,7 +1,7 @@
 //! Control-plane HTTP API (the swappable interface in front of the engine).
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -13,6 +13,9 @@ use crate::schema::Schema;
 
 pub fn router(engine: Engine) -> Router {
     Router::new()
+        // Fleet surface: root probe + health state machine (CORS preflight is on the /v1/shape route).
+        .route("/", get(|| async { StatusCode::OK }))
+        .route("/v1/health", get(health_v1))
         .route("/health", get(|| async { "ok" }))
         .route("/schema", post(define_schema))
         .route("/shapes", post(create_shape))
@@ -31,8 +34,36 @@ pub fn router(engine: Engine) -> Router {
         .route("/memory", get(get_memory))
         .route("/metrics/prometheus", get(get_prometheus))
         // Electric-protocol adapter: lets Electric's official client + oracle harness read our shapes.
-        .route("/v1/shape", get(crate::electric::shape))
+        // OPTIONS is the CORS preflight the fleet's browser-style clients send.
+        .route("/v1/shape", get(crate::electric::shape).options(shape_options))
         .with_state(engine)
+}
+
+/// Exact `/v1/health` JSON body for a status — no whitespace (the fleet's healthcheck string-compares
+/// the body against `{"status":"active"}`).
+fn health_json(status: &str) -> String {
+    format!("{{\"status\":\"{status}\"}}")
+}
+
+/// `GET /v1/health` — `waiting`/`starting` → 202, `active` → 200. Caches are disabled so the fleet's
+/// 500ms poll always sees the live phase.
+async fn health_v1(State(engine): State<Engine>) -> Response {
+    let status = engine.health_status();
+    let code = if status == "active" { StatusCode::OK } else { StatusCode::ACCEPTED };
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache, no-store, must-revalidate"));
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    (code, headers, health_json(status)).into_response()
+}
+
+/// `OPTIONS /v1/shape` — CORS preflight: 204 advertising the methods the adapter serves.
+async fn shape_options() -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, POST, HEAD, DELETE, OPTIONS"),
+    );
+    (StatusCode::NO_CONTENT, headers).into_response()
 }
 
 #[derive(Deserialize)]
@@ -328,5 +359,19 @@ impl From<anyhow::Error> for AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         (self.status, Json(serde_json::json!({ "error": self.msg }))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::health_json;
+
+    // The fleet's healthcheck does an awk string-compare against the exact body, so byte-for-byte
+    // exactness (no whitespace) matters more than JSON equivalence.
+    #[test]
+    fn health_body_is_exact() {
+        assert_eq!(health_json("waiting"), r#"{"status":"waiting"}"#);
+        assert_eq!(health_json("starting"), r#"{"status":"starting"}"#);
+        assert_eq!(health_json("active"), r#"{"status":"active"}"#);
     }
 }

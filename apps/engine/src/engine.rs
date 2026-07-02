@@ -20,6 +20,11 @@ use crate::schema::{Schema, TableSchema, compile_schema};
 use crate::subquery::{SubqueryRegistry, predicate_has_subquery, referenced_tables};
 use crate::value::{Row, Value};
 
+/// `GET /v1/health` phases (see [`Engine::health`]).
+const HEALTH_WAITING: u8 = 0;
+const HEALTH_STARTING: u8 = 1;
+const HEALTH_ACTIVE: u8 = 2;
+
 #[derive(Clone)]
 pub struct Engine {
     ds: DsClient,
@@ -35,6 +40,10 @@ pub struct Engine {
     repl_sync: Arc<std::sync::atomic::AtomicI64>,
     /// Set once the replication ingestor has been spawned, so `setup_postgres` stays idempotent.
     replicator_started: Arc<std::sync::atomic::AtomicBool>,
+    /// Boot readiness phase driving `GET /v1/health`: 0 = `waiting` (Postgres not connected), 1 =
+    /// `starting` (connected; introspecting / creating slot / spawning ingest), 2 = `active` (ingest
+    /// loop running). Library mode (no Postgres) is `active` from construction.
+    health: Arc<std::sync::atomic::AtomicU8>,
     /// Cross-table subquery registry: maintained inner-set nodes (shared by canonical signature) + the
     /// outer subquery shapes that depend on them. Every tailer routes its deltas here so an inner-table
     /// change moves outer rows. `None`-free; empty until a subquery shape is created.
@@ -294,6 +303,8 @@ impl Engine {
             repl_lsn: Arc::new(std::sync::Mutex::new("0/0".to_string())),
             repl_sync: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             replicator_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            // Library mode: no Postgres to wait on, so report `active` immediately.
+            health: Arc::new(std::sync::atomic::AtomicU8::new(HEALTH_ACTIVE)),
             subqueries,
         }
     }
@@ -304,7 +315,23 @@ impl Engine {
         let mut e = Self::new(ds.clone());
         e.pg_url = Some(pg_url.clone());
         e.subqueries = Arc::new(Mutex::new(SubqueryRegistry::new(ds, Some(pg_url))));
+        // Postgres mode starts `waiting` until the connection + introspection + slot + ingest are up.
+        e.health.store(HEALTH_WAITING, std::sync::atomic::Ordering::Relaxed);
         e
+    }
+
+    /// Number of tables with a known schema (tables being tailed) — for the boot `consumers_ready` metric.
+    pub async fn table_count(&self) -> usize {
+        self.state.lock().await.tables.len()
+    }
+
+    /// The `/v1/health` status string: `waiting` | `starting` | `active` (exact, no whitespace).
+    pub fn health_status(&self) -> &'static str {
+        match self.health.load(std::sync::atomic::Ordering::Relaxed) {
+            HEALTH_WAITING => "waiting",
+            HEALTH_STARTING => "starting",
+            _ => "active",
+        }
     }
 
     /// Introspect the configured tables from Postgres, set `REPLICA IDENTITY FULL`, create the
@@ -313,6 +340,9 @@ impl Engine {
     pub async fn setup_postgres(&self, tables: &[String], slot: &str, poll_ms: u64) -> Result<()> {
         let url = self.pg_url.clone().context("setup_postgres called without a pg_url")?;
         let client = crate::pg::connect(&url).await?;
+        // Postgres connection established: leave `waiting`, enter `starting` (introspection + slot +
+        // ingest spawn still ahead). `/v1/health` reports 202 until the ingest loop is running.
+        self.health.store(HEALTH_STARTING, std::sync::atomic::Ordering::Relaxed);
         // `*` (or empty) => introspect every public table with a PK (set isn't known up front).
         let discovered;
         let tables: &[String] = if tables.is_empty() || tables == ["*".to_string()] {
@@ -336,6 +366,7 @@ impl Engine {
         // Spawn the ingestor at most once, even if setup_postgres is called again.
         if self.replicator_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
             tracing::warn!("setup_postgres called again; ingestor already running, not spawning another");
+            self.health.store(HEALTH_ACTIVE, std::sync::atomic::Ordering::Relaxed);
             return Ok(());
         }
         tokio::spawn(crate::replication::run(
@@ -347,6 +378,8 @@ impl Engine {
             self.repl_lsn.clone(),
             self.repl_sync.clone(),
         ));
+        // Introspection + slot + ingest loop are up: report `active` (200 on `/v1/health`).
+        self.health.store(HEALTH_ACTIVE, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -428,6 +461,9 @@ impl Engine {
         changes_only: bool,
         share: bool,
     ) -> Result<ShapeRecord> {
+        // Whole shape-creation timer (backfill + registration); emitted by the creator on success only
+        // (joiners return early before this fires) as `create_snapshot_task.stop.duration`.
+        let created_at = std::time::Instant::now();
         let mut st = self.state.lock().await;
         let ts = match st.tables.get(table) {
             Some(ts) => ts.clone(),
@@ -517,6 +553,7 @@ impl Engine {
             match res {
                 Ok(()) => {
                     let _ = ready_tx.send(Some(true));
+                    crate::statsd::create_snapshot_task(created_at.elapsed());
                     return Ok(rec);
                 }
                 Err(e) => {
@@ -588,6 +625,7 @@ impl Engine {
         match outcome {
             Ok(()) => {
                 let _ = share_tx.send(Some(true));
+                crate::statsd::create_snapshot_task(created_at.elapsed());
                 Ok(rec)
             }
             Err(e) => {
@@ -1214,27 +1252,70 @@ async fn tailer_loop(
                     // concurrently. Appends (HTTP round-trips) dominate, so coalescing per stream and
                     // parallelizing is the main throughput/latency lever.
                     let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
-                    for env in rr.envelopes {
-                        // Skip redelivered changes (see `highwater` above).
-                        let pos = match (env.headers.lsn.as_deref(), env.headers.seq) {
-                            (Some(l), Some(s)) => Some((crate::pg::lsn_to_u64(l), s)),
-                            _ => None,
-                        };
-                        if let (Some(p), Some(hw)) = (pos, highwater) {
-                            if p <= hw {
-                                tracing::debug!("tailer {}: skipping duplicate change at {p:?}", ts.name);
-                                continue;
+                    if crate::statsd::enabled() {
+                        // Telemetry on: split the batch into runs of one source transaction (envelopes
+                        // are stamped with txid and arrive in commit+seq order) so the storage metrics
+                        // are per-txn. The merged `pending` is byte-for-byte the ungrouped path's.
+                        let envs = rr.envelopes;
+                        let mut i = 0;
+                        while i < envs.len() {
+                            let txid = envs[i].headers.txid.clone();
+                            let mut j = i + 1;
+                            while j < envs.len() && envs[j].headers.txid == txid {
+                                j += 1;
                             }
+                            let mut txn_pending: HashMap<String, Vec<Envelope>> = HashMap::new();
+                            for env in envs[i..j].iter() {
+                                let pos = match (env.headers.lsn.as_deref(), env.headers.seq) {
+                                    (Some(l), Some(s)) => Some((crate::pg::lsn_to_u64(l), s)),
+                                    _ => None,
+                                };
+                                if let (Some(p), Some(hw)) = (pos, highwater) {
+                                    if p <= hw {
+                                        tracing::debug!("tailer {}: skipping duplicate change at {p:?}", ts.name);
+                                        continue;
+                                    }
+                                }
+                                if let Err(e) = process_envelope(
+                                    &ts, &shapes, &families, &mut aggregates, env.clone(), &mut txn_pending, &subqueries,
+                                )
+                                .await
+                                {
+                                    tracing::error!("process_envelope failed: {e:#}");
+                                }
+                                if let Some(p) = pos {
+                                    highwater = Some(p);
+                                }
+                            }
+                            emit_storage_txn_metrics(&txn_pending);
+                            for (k, v) in txn_pending {
+                                pending.entry(k).or_default().extend(v);
+                            }
+                            i = j;
                         }
-                        if let Err(e) = process_envelope(
-                            &ts, &shapes, &families, &mut aggregates, env, &mut pending, &subqueries,
-                        )
-                        .await
-                        {
-                            tracing::error!("process_envelope failed: {e:#}");
-                        }
-                        if let Some(p) = pos {
-                            highwater = Some(p);
+                    } else {
+                        for env in rr.envelopes {
+                            // Skip redelivered changes (see `highwater` above).
+                            let pos = match (env.headers.lsn.as_deref(), env.headers.seq) {
+                                (Some(l), Some(s)) => Some((crate::pg::lsn_to_u64(l), s)),
+                                _ => None,
+                            };
+                            if let (Some(p), Some(hw)) = (pos, highwater) {
+                                if p <= hw {
+                                    tracing::debug!("tailer {}: skipping duplicate change at {p:?}", ts.name);
+                                    continue;
+                                }
+                            }
+                            if let Err(e) = process_envelope(
+                                &ts, &shapes, &families, &mut aggregates, env, &mut pending, &subqueries,
+                            )
+                            .await
+                            {
+                                tracing::error!("process_envelope failed: {e:#}");
+                            }
+                            if let Some(p) = pos {
+                                highwater = Some(p);
+                            }
                         }
                     }
                     flush_pending(&ds, pending).await;
@@ -1319,12 +1400,20 @@ async fn add_shape_routed(
             let gate = if changes_only {
                 crate::pg::SnapshotGate::passthrough()
             } else {
+                let t0 = std::time::Instant::now();
                 let bf = pg_backfill(pg_url, ts, Some(pred.as_ref())).await?;
+                let make_new_ms = t0.elapsed().as_secs_f64() * 1000.0;
                 let out: Vec<(Row, ZWeight)> = bf.rows.iter().map(|r| (r.clone(), 1)).collect();
+                let rows = out.len() as u64;
+                let mut snapshot_bytes = 0u64;
                 if !out.is_empty() {
                     let envs = translate_output(ts, out, None, None, proj);
+                    if crate::statsd::enabled() {
+                        snapshot_bytes = envs_bytes(&envs);
+                    }
                     ds.append(&stream_path, &envs).await?;
                 }
+                crate::statsd::snapshot_stored(rows, snapshot_bytes, make_new_ms);
                 bf.gate
             };
 
@@ -1348,13 +1437,21 @@ async fn add_shape_routed(
             let gate = if changes_only {
                 crate::pg::SnapshotGate::passthrough()
             } else {
+                let t0 = std::time::Instant::now();
                 let bf = pg_backfill(pg_url, ts, Some(pred.as_ref())).await?;
+                let make_new_ms = t0.elapsed().as_secs_f64() * 1000.0;
                 let out: Vec<(Row, ZWeight)> =
                     bf.rows.iter().filter(|r| pred.matches(r)).map(|r| (r.clone(), 1)).collect();
+                let rows = out.len() as u64;
+                let mut snapshot_bytes = 0u64;
                 if !out.is_empty() {
                     let envs = translate_output(ts, out, None, None, proj);
+                    if crate::statsd::enabled() {
+                        snapshot_bytes = envs_bytes(&envs);
+                    }
                     ds.append(&stream_path, &envs).await?;
                 }
+                crate::statsd::snapshot_stored(rows, snapshot_bytes, make_new_ms);
                 bf.gate
             };
             shapes.insert(shape_id, StandaloneShape { pred, stream_path, gate, out_cols });
@@ -1480,6 +1577,28 @@ async fn process_envelope(
         }
     }
     Ok(())
+}
+
+/// Total serialized byte size of a set of output envelopes (for storage/snapshot byte metrics).
+fn envs_bytes(envs: &[Envelope]) -> u64 {
+    envs.iter().map(|e| serde_json::to_string(e).map(|s| s.len() as u64).unwrap_or(0)).sum()
+}
+
+/// Emit the per-source-transaction storage StatsD metrics from one txn's staged appends.
+/// `affected_shape_count` = distinct shape streams the txn touched; `operations`/`bytes` = output
+/// envelopes appended + their serialized size. (Subquery-registry appends go out synchronously inside
+/// `process_envelope` and are not reflected here.) No-op when the txn produced no appends.
+fn emit_storage_txn_metrics(txn_pending: &HashMap<String, Vec<Envelope>>) {
+    let ops: u64 = txn_pending.values().map(|v| v.len() as u64).sum();
+    if ops == 0 {
+        return;
+    }
+    let bytes: u64 = txn_pending
+        .values()
+        .flatten()
+        .map(|e| serde_json::to_string(e).map(|s| s.len() as u64).unwrap_or(0))
+        .sum();
+    crate::statsd::storage_txn(ops, bytes, txn_pending.len() as u64);
 }
 
 /// Flush the batch's staged appends, bounded-concurrently. Each envelope keeps its own txid, so

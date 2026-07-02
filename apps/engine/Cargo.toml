@@ -46,7 +46,13 @@ tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 memory-stats = "1"
+# System-metrics sampler for the StatsD periodic-metrics table (CPU/mem/load/process, conformance §4a).
+sysinfo = "0.33"
 opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["metrics"] }
 opentelemetry-prometheus = "0.27"
 prometheus = "0.13"
+
+[dev-dependencies]
+# Drive the axum router in-process (Service::oneshot) for the /v1/health + endpoint tests.
+tower = { version = "0.5", features = ["util"] }

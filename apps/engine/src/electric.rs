@@ -64,6 +64,11 @@ pub struct ShapeParams {
     cursor: Option<String>,
     #[serde(default)]
     replica: Option<String>,
+    /// `ELECTRIC_SECRET` auth: either query param, when the secret is configured, must equal it.
+    #[serde(default)]
+    secret: Option<String>,
+    #[serde(default)]
+    api_secret: Option<String>,
 }
 
 /// A registered handle. The registry maps handle → `Arc<HandleEntry>`; the mutable cursor state
@@ -264,7 +269,11 @@ fn hv(s: &str) -> HeaderValue {
 
 fn respond(messages: Vec<serde_json::Value>, mut headers: HeaderMap, status: StatusCode) -> Response {
     headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    (status, headers, serde_json::to_string(&messages).unwrap_or_else(|_| "[]".into())).into_response()
+    let body = serde_json::to_string(&messages).unwrap_or_else(|_| "[]".into());
+    let len = body.len() as u64;
+    let mut resp = (status, headers, body).into_response();
+    resp.extensions_mut().insert(BodyLen(len));
+    resp
 }
 
 fn must_refetch() -> Response {
@@ -298,10 +307,13 @@ impl From<anyhow::Error> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = serde_json::json!({ "message": self.message });
+        let body = serde_json::json!({ "message": self.message }).to_string();
+        let len = body.len() as u64;
         let mut headers = HeaderMap::new();
         headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        (self.status, headers, body.to_string()).into_response()
+        let mut resp = (self.status, headers, body).into_response();
+        resp.extensions_mut().insert(BodyLen(len));
+        resp
     }
 }
 
@@ -568,15 +580,48 @@ async fn positioned_read(
     })
 }
 
+/// Response body size in bytes, stamped on every `/v1/shape` response so [`shape`] can emit the byte
+/// metrics without re-reading (and consuming) the response body.
+#[derive(Clone, Copy)]
+struct BodyLen(u64);
+
+/// `401 {"message":"Unauthorized"}` for a request that fails the `ELECTRIC_SECRET` check.
+fn unauthorized() -> Response {
+    let body = r#"{"message":"Unauthorized"}"#;
+    let mut headers = HeaderMap::new();
+    headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    let mut resp = (StatusCode::UNAUTHORIZED, headers, body).into_response();
+    resp.extensions_mut().insert(BodyLen(body.len() as u64));
+    resp
+}
+
 pub async fn shape(State(engine): State<Engine>, Query(p): Query<ShapeParams>) -> Response {
     ensure_evictor(&engine);
-    match shape_inner(engine, p).await {
-        Ok(resp) => resp,
-        Err(e) => {
-            tracing::warn!("/v1/shape error ({}): {}", e.status, e.message);
-            e.into_response()
+    let start = Instant::now();
+    let live = p.live.as_deref() == Some("true");
+    // root_table tag: the bare table name (strip any schema prefix), computed before shape_inner moves p.
+    let root_table = p.table.rsplit_once('.').map(|(_, b)| b.to_string()).unwrap_or_else(|| p.table.clone());
+
+    let resp = if !crate::config::secret_ok(
+        crate::config::secret(),
+        p.secret.as_deref(),
+        p.api_secret.as_deref(),
+    ) {
+        unauthorized()
+    } else {
+        match shape_inner(engine, p).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::warn!("/v1/shape error ({}): {}", e.status, e.message);
+                e.into_response()
+            }
         }
-    }
+    };
+
+    let status = resp.status().as_u16();
+    let bytes = resp.extensions().get::<BodyLen>().map(|b| b.0).unwrap_or(0);
+    crate::statsd::serve_shape(&root_table, live, status, start.elapsed(), bytes);
+    resp
 }
 
 async fn shape_inner(engine: Engine, mut p: ShapeParams) -> Result<Response, ApiError> {
@@ -697,10 +742,17 @@ async fn shape_inner(engine: Engine, mut p: ShapeParams) -> Result<Response, Api
     }
     headers.insert(axum::http::header::CACHE_CONTROL, hv("no-store"));
     match outcome.body {
-        None => Ok((StatusCode::NO_CONTENT, headers).into_response()),
+        None => {
+            let mut resp = (StatusCode::NO_CONTENT, headers).into_response();
+            resp.extensions_mut().insert(BodyLen(0));
+            Ok(resp)
+        }
         Some(body) => {
             headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-            Ok((StatusCode::OK, headers, body).into_response())
+            let len = body.len() as u64;
+            let mut resp = (StatusCode::OK, headers, body).into_response();
+            resp.extensions_mut().insert(BodyLen(len));
+            Ok(resp)
         }
     }
 }
