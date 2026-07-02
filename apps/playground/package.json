@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "dev:server": "tsx watch server/main.ts",
-    "build": "vite build",
+    "demo": "tsx start.ts",
+    "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "start": "tsx server/main.ts",
     "test": "pnpm -w exec vitest run apps/playground/server"

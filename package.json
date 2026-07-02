@@ -17,6 +17,7 @@
     "demo": "pnpm --filter @electric-ivm/examples demo",
     "demo:web": "pnpm --filter @electric-ivm/web start",
     "demo:linearlite": "pnpm --filter @electric-ivm/linearlite start",
+    "demo:playground": "pnpm --filter @electric-ivm/playground demo",
     "bench": "pnpm --filter @electric-ivm/bench bench",
     "bench:fleet": "pnpm --filter @electric-ivm/bench electric-fleet",
     "docker:build": "docker compose -f docker/compose.yaml build",

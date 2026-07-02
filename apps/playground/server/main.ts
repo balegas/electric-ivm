@@ -3,7 +3,7 @@
 // out the engine's /trace with per-workspace tagging. Defenses: per-workspace token-bucket rate
 // limit on writes, shape/order caps, idle-workspace TTL sweep, epoch-based reset recovery.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { readFile, stat } from 'node:fs/promises'
 import { extname, join, normalize } from 'node:path'
 

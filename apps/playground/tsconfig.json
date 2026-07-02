@@ -19,5 +19,6 @@
       "@viz/*": ["../pipeline-viz/src/*"]
     }
   },
-  "include": ["src", "server", "../pipeline-viz/src"]
+  "include": ["src", "server", "shared", "start.ts", "../pipeline-viz/src"],
+  "exclude": ["server/__tests__"]
 }
