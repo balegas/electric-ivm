@@ -76,11 +76,11 @@ export default function App() {
           <span className="ws-chip" title="Your workspace — all your rows and shapes carry this id">
             {wsId ?? '…'}
           </span>
-          <button className="mini" onClick={() => setWelcomeOpen(true)} title="What is this?">
-            ? about
+          <button className="tbtn" onClick={() => setWelcomeOpen(true)} title="What is this?">
+            <span className="tbtn-ico">?</span> about
           </button>
-          <button className="mini" onClick={() => void w.reprovision()} title="Start over in a fresh workspace">
-            new workspace
+          <button className="tbtn" onClick={() => void w.reprovision()} title="Start over in a fresh workspace">
+            <span className="tbtn-ico">↺</span> new workspace
           </button>
         </div>
       </header>
