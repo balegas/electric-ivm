@@ -32,11 +32,14 @@ export function WorldPanel({
   restaurants,
   orders,
   showMoveCity,
+  pending,
   act,
 }: {
   restaurants: Restaurant[]
   orders: Order[]
   showMoveCity: boolean
+  /** Writes in flight — the whole panel shows pending feedback so clicks feel acknowledged. */
+  pending: boolean
   act: (verb: Verb) => void
 }) {
   const byRestaurant = new Map<number, Order[]>()
@@ -46,8 +49,10 @@ export function WorldPanel({
   }
 
   return (
-    <div className="world">
-      <div className="world-h">Food delivery</div>
+    <div className={`world${pending ? ' world-pending' : ''}`}>
+      <div className="world-h">
+        Food delivery {pending ? <span className="world-spin" title="write in flight" /> : null}
+      </div>
       {restaurants.map((r) => {
         const ros = (byRestaurant.get(r.id) ?? []).filter((o) => o.status !== 'cancelled')
         return (

@@ -16,6 +16,8 @@ export interface Workspace {
   error: string | null
   /** Bumped after every successful action — device cards use it to poll immediately. */
   actionTick: number
+  /** Number of writes currently in flight — drives the pressed/pending button feedback. */
+  pending: number
   refresh(): Promise<void>
   reprovision(): Promise<void>
   act(verb: Verb): Promise<void>
@@ -31,6 +33,7 @@ export function useWorkspace(): Workspace {
   const [status, setStatus] = useState<WsStatus>('booting')
   const [error, setError] = useState<string | null>(null)
   const [actionTick, setActionTick] = useState(0)
+  const [pending, setPending] = useState(0)
   const idRef = useRef<string | undefined>(storedWorkspaceId())
 
   const handleError = useCallback((e: unknown) => {
@@ -84,12 +87,15 @@ export function useWorkspace(): Workspace {
   const withWs = useCallback(
     async (fn: (ws: string) => Promise<unknown>) => {
       if (!idRef.current) return
+      setPending((n) => n + 1)
       try {
         await fn(idRef.current)
         setActionTick((n) => n + 1)
         await refresh()
       } catch (e) {
         handleError(e)
+      } finally {
+        setPending((n) => n - 1)
       }
     },
     [refresh, handleError],
@@ -100,6 +106,7 @@ export function useWorkspace(): Workspace {
     status,
     error,
     actionTick,
+    pending,
     refresh,
     reprovision: () => provision(false),
     act: (verb) => withWs((ws) => api.action(ws, verb)),

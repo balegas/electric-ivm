@@ -102,6 +102,7 @@ export default function App() {
               restaurants={w.state.restaurants}
               orders={w.state.orders}
               showMoveCity={scene >= 4}
+              pending={w.pending > 0}
               act={(v) => void w.act(v)}
             />
           ) : (

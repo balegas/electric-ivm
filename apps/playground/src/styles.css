@@ -209,10 +209,41 @@ button {
   border-radius: 6px;
   padding: 2px 7px;
   font-size: 11px;
+  transition: transform 0.06s, background 0.12s;
 }
 .verb:hover {
   background: #ecfdf5;
   border-color: #16a34a;
+}
+/* Instant tactile acknowledgement — the click registers even before the round-trip returns. */
+.verb:active,
+.order-btn:active,
+.add-rest:active {
+  transform: scale(0.94);
+  background: #dcfce7;
+  border-color: #16a34a;
+}
+.world-pending .verb,
+.world-pending .order-btn,
+.world-pending .add-rest {
+  opacity: 0.6;
+  pointer-events: none;
+}
+.world-spin {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-left: 6px;
+  border: 2px solid #cbd5e1;
+  border-top-color: #0ea5e9;
+  border-radius: 999px;
+  animation: world-spin 0.6s linear infinite;
+  vertical-align: -1px;
+}
+@keyframes world-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 .order-delivered {
   opacity: 0.55;
