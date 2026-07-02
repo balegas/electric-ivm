@@ -509,7 +509,7 @@ impl SubqueryRegistry {
         // Work queue of (node sig, flip) pairs to propagate (BFS up the dependency DAG).
         let mut work: VecDeque<(SubquerySig, Flip)> = VecDeque::new();
         // Trace helper: record a hop once per node id (a shape reached via several flips is one hop).
-        let mut hop = |trace: &mut Option<&mut Vec<crate::trace::TraceHop>>, node: String, outcome: &'static str| {
+        let hop = |trace: &mut Option<&mut Vec<crate::trace::TraceHop>>, node: String, outcome: &'static str| {
             if let Some(t) = trace.as_mut() {
                 if let Some(prev) = t.iter_mut().find(|h| h.node == node) {
                     if outcome == "passed" {

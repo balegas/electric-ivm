@@ -99,12 +99,13 @@ export interface TraceHop {
    *  `node:<sig>`, `shape:s7` — so the UI can animate without translation. */
   node: string
   outcome: HopOutcome
-  /** Routing key values for `routed` hops. */
-  key?: unknown[]
+  /** Routing key values for `routed` hops (JSON array). */
+  key?: unknown[] | undefined
 }
 
 export interface TraceEvent {
-  lsn: string
+  lsn?: string
+  txid?: string
   table: string
   /** Weighted delta rows, e.g. an update = [(old,-1),(new,+1)]. Rows may be truncated server-side. */
   delta: { row: Record<string, unknown>; w: 1 | -1 }[]

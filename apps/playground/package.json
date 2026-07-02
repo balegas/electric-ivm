@@ -9,16 +9,19 @@
     "build": "vite build",
     "preview": "vite preview",
     "start": "tsx server/main.ts",
-    "test": "vitest run"
+    "test": "pnpm -w exec vitest run apps/playground/server"
   },
   "dependencies": {
     "@dagrejs/dagre": "^1.1.4",
+    "@electric-ivm/protocol": "workspace:*",
     "@xyflow/react": "^12.3.5",
     "pg": "^8.13.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
+    "@electric-ivm/conformance": "workspace:*",
+    "@durable-streams/server": "^0.3.7",
     "@types/node": "^22.10.2",
     "@types/pg": "^8.11.10",
     "@types/react": "^18.3.12",
