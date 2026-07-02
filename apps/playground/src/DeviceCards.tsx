@@ -36,8 +36,16 @@ function DeviceCard({
   const isAgg = !!shape.spec.aggregate
   const flash = Date.now() - changedAt < 1200
 
-  // An aggregation stream materializes to a single scalar row.
-  const scalar = isAgg ? ((rows[0]?.value as { value?: unknown } | undefined)?.value ?? rows[0]?.value) : null
+  // An aggregation stream materializes to a single `{ value, n }` row; `value` is SQL-null for an
+  // empty SUM/AVG/MIN/MAX (no fallback to the envelope — that renders "[object Object]").
+  const payload = isAgg ? (rows[0]?.value as { value?: unknown } | undefined) : undefined
+  const scalar = payload && 'value' in payload ? payload.value : null
+  const scalarText =
+    scalar === null || scalar === undefined
+      ? '—'
+      : typeof scalar === 'number' && !Number.isInteger(scalar)
+        ? scalar.toFixed(2)
+        : String(scalar)
 
   return (
     <div className={`device ${meta.chrome}${flash ? ' device-flash' : ''}`}>
@@ -59,7 +67,9 @@ function DeviceCard({
       </div>
       {error ? <div className="device-err">{error}</div> : null}
       {isAgg ? (
-        <div className="device-scalar">{scalar === null || scalar === undefined ? '—' : String(scalar)}</div>
+        <div className="device-scalar" title="SQL semantics: an empty SUM/AVG/MIN/MAX is NULL (—)">
+          {scalarText}
+        </div>
       ) : (
         <div className="device-rows">
           {rows.length === 0 ? <div className="device-empty">no rows in this shape</div> : null}
