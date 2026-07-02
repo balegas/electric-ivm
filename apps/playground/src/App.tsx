@@ -48,28 +48,15 @@ export default function App() {
     return () => clearInterval(t)
   }, [loadGraph, w.actionTick])
 
-  const enterScene = useCallback(
+  // Entering a scene only changes the explainer — shapes are created deliberately, via the
+  // scene card's "Create the shape" button, so you SEE the Shape API call take effect.
+  const provisionScene = useCallback(
     (n: number) => {
-      setScene(n)
       void w.enterScene(n).then(loadGraph)
     },
     [w.enterScene, loadGraph], // eslint-disable-line react-hooks/exhaustive-deps
   )
-  // Provision on boot AND whenever the workspace identity changes (new workspace / reset
-  // recovery). Scene 0 is the deliberate empty state; from scene 1 on, scene 1's base shape
-  // always exists, then the stored scene's shapes.
   const ready = w.status === 'ready'
-  useEffect(() => {
-    if (!ready || !wsId) return
-    void (async () => {
-      if (scene >= 1) {
-        await w.enterScene(1)
-        if (scene !== 1) await w.enterScene(scene)
-      }
-      await loadGraph()
-    })()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ready, wsId])
 
   return (
     <div className="app">
@@ -138,7 +125,14 @@ export default function App() {
         </aside>
       </div>
 
-      <SceneStrip scene={scene} view={view} onScene={enterScene} />
+      <SceneStrip
+        scene={scene}
+        view={view}
+        shapes={w.state?.shapes ?? []}
+        provisioning={w.pending > 0}
+        onScene={setScene}
+        onProvision={provisionScene}
+      />
 
       {builderOpen ? (
         <ShapeBuilder onCreate={(spec, label) => void w.createShape(spec, label)} onClose={() => setBuilderOpen(false)} />

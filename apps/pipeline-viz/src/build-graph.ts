@@ -220,6 +220,9 @@ const KIND_SIZE: Partial<Record<NodeKind, { w: number; h: number }>> = {
  *  lets an embedder size nodes to fit full multi-line labels. */
 export interface BuildOpts {
   measure?: (data: VizNodeData) => { w: number; h: number } | null
+  /** Force all replication-source nodes into one rank (one aligned column). Done inside dagre via
+   *  a hidden root, so downstream placement still avoids node/edge overlaps. */
+  alignSources?: boolean
 }
 
 function layout(
@@ -236,6 +239,12 @@ function layout(
     g.setNode(id, { width: s.w, height: s.h })
   }
   for (const e of raw.edges) g.setEdge(e.source, e.target)
+  if (opts?.alignSources) {
+    g.setNode('__align_root', { width: 1, height: 1 })
+    for (const [id, n] of raw.nodes) {
+      if (n.data.kind === 'table' || n.data.kind === 'source') g.setEdge('__align_root', id)
+    }
+  }
   dagre.layout(g)
 
   // Connection highlight: when a node is focused, neighbours stay lit and the rest dims.

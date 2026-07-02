@@ -49,10 +49,10 @@ export const SCENES: SceneDef[] = [
     n: 1,
     title: 'Your first shape',
     body:
-      'A shape is defined by a query. This scene registered one through the Shape API — todo ' +
-      'issues — and the engine answered with a pipeline: it backfilled the current matches, and ' +
-      'from now on it maintains the result incrementally. Expand "API request" on the result ' +
-      'card to see the exact call.' +
+      'A shape is defined by a query. This scene proposes one — todo issues. Press "Create the ' +
+      'shape" and it is registered through the Shape API; the engine answers with a pipeline: it ' +
+      'backfills the current matches, then maintains the result incrementally. Expand "API ' +
+      'request" on the result card to see the exact call.' +
       '\n\n' +
       'On the canvas: the grey TABLE node is the replication source — every committed write to ' +
       'issues becomes a change event. The blue ROUTER dispatches each change by key. The green ' +

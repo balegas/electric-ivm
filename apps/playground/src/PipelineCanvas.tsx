@@ -73,14 +73,8 @@ export function PipelineCanvas({
         return { w, h: 30 + lines * 17 + subLines * 14 + (d.kind === 'shape' ? 8 : 4) }
       },
     }
-    const built = view === 'dbsp' ? buildDbspGraph(graph, sel, f, opts) : buildGraph(graph, sel, f, opts)
-    // Keep the grey source nodes in one aligned column, whatever rank dagre picked for them.
-    const tables = built.nodes.filter((n) => n.id.startsWith('table:') || n.id.startsWith('src:'))
-    if (tables.length > 1) {
-      const minX = Math.min(...tables.map((n) => n.position.x))
-      for (const n of tables) n.position = { ...n.position, x: minX }
-    }
-    return built
+    opts.alignSources = true
+    return view === 'dbsp' ? buildDbspGraph(graph, sel, f, opts) : buildGraph(graph, sel, f, opts)
   }, [graph, mine, view, focus, underHood])
 
   // Refs so the trace callback maps events against the CURRENT render without re-subscribing.
@@ -119,6 +113,19 @@ export function PipelineCanvas({
           sub: d.sub ? scrubText(d.sub) : d.sub,
           shared: undefined,
           index: d.index ? scrubText(d.index) : d.index,
+        }
+        // Router counts would leak other tenants' shape counts — recompute from YOUR shapes.
+        if ((n.id.startsWith('family:') || n.id.startsWith('pa:') || n.id.startsWith('j:')) && graph) {
+          const mineSet = new Set(mine)
+          const key = n.id.replace(/^(family:|pa:|j:)/, '')
+          const members = graph.shapes.filter(
+            (sh) => mineSet.has(sh.id) && sh.familyKey && `${sh.table}:${sh.familyKey.join(',')}` === key,
+          ).length
+          d = {
+            ...d,
+            index: `${members} ${members === 1 ? 'key' : 'keys'}`,
+            sub: members > 1 ? `shared by ${members} shapes` : undefined,
+          }
         }
       }
       if (decor?.nodes.has(n.id)) d = { ...d, flash: decor.nodes.get(n.id) }

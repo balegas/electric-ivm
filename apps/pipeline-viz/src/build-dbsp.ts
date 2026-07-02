@@ -287,6 +287,12 @@ function layout(
     g.setNode(id, { width: s.w, height: s.h })
   }
   for (const e of raw.edges) g.setEdge(e.source, e.target)
+  if (opts?.alignSources) {
+    g.setNode('__align_root', { width: 1, height: 1 })
+    for (const [id, n] of raw.nodes) {
+      if (n.data.kind === 'table' || n.data.kind === 'source') g.setEdge('__align_root', id)
+    }
+  }
   dagre.layout(g)
 
   let lit: Set<string> | null = null
