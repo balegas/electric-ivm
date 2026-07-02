@@ -503,20 +503,36 @@ impl SubqueryRegistry {
         lsn: u64,
         xid: Option<u64>,
         txid: Option<String>,
+        mut trace: Option<&mut Vec<crate::trace::TraceHop>>,
     ) -> Result<()> {
         let table = ts.name.clone();
         // Work queue of (node sig, flip) pairs to propagate (BFS up the dependency DAG).
         let mut work: VecDeque<(SubquerySig, Flip)> = VecDeque::new();
+        // Trace helper: record a hop once per node id (a shape reached via several flips is one hop).
+        let mut hop = |trace: &mut Option<&mut Vec<crate::trace::TraceHop>>, node: String, outcome: &'static str| {
+            if let Some(t) = trace.as_mut() {
+                if let Some(prev) = t.iter_mut().find(|h| h.node == node) {
+                    if outcome == "passed" {
+                        prev.outcome = "passed"; // an earlier dropped hop upgraded by a later emit
+                    }
+                } else {
+                    t.push(crate::trace::TraceHop::new(node, outcome));
+                }
+            }
+        };
 
         // 1. Nodes whose inner table is this table: reconcile from the delta, collect flips.
         let node_sigs: Vec<SubquerySig> =
             self.nodes.iter().filter(|(_, n)| n.inner_table == table).map(|(s, _)| s.clone()).collect();
         for sig in node_sigs {
             if self.nodes.get(&sig).is_some_and(|n| n.gate.should_skip(lsn, xid)) {
+                hop(&mut trace, format!("node:{sig}"), "dropped");
                 continue;
             }
             let evals = self.node_present_values(&sig, ts, delta);
-            for f in self.apply_node_flips(&sig, evals) {
+            let flips = self.apply_node_flips(&sig, evals);
+            hop(&mut trace, format!("node:{sig}"), if flips.is_empty() { "dropped" } else { "passed" });
+            for f in flips {
                 work.push_back((sig.clone(), f));
             }
         }
@@ -532,7 +548,8 @@ impl SubqueryRegistry {
             if self.shapes.get(&id).is_some_and(|s| s.gate.should_skip(lsn, xid)) {
                 continue;
             }
-            self.emit_shape_delta(&id, ts, delta, txid.clone()).await?;
+            let emitted = self.emit_shape_delta(&id, ts, delta, txid.clone()).await?;
+            hop(&mut trace, format!("shape:{id}"), if emitted { "passed" } else { "dropped" });
         }
 
         // 3. Propagate flips up the DAG.
@@ -542,7 +559,8 @@ impl SubqueryRegistry {
                 // `IN` leaf under any `Not{…}` (SQL: a NULL in the set makes the leaf UNKNOWN, which
                 // negation turns into a membership change). It can shift *every* dependent row, so
                 // re-derive the dependent fully; NULL-insensitive dependents can't change (AND/OR are
-                // monotone over FALSE < UNKNOWN < TRUE), so skip.
+                // monotone over FALSE < UNKNOWN < TRUE), so skip. (Not traced: rare path, and it
+                // re-derives whole dependents rather than following this envelope's delta.)
                 if matches!(flip.value, Value::Null) {
                     if edge.null_sensitive {
                         self.rederive_dependent(&edge, txid.clone(), &mut work).await?;
@@ -551,12 +569,21 @@ impl SubqueryRegistry {
                 }
                 match &edge.dependent {
                     Dependent::Shape(id) => {
-                        self.move_shape_for_value(id, edge.connecting_col, &flip.value, txid.clone()).await?;
+                        let moved =
+                            self.move_shape_for_value(id, edge.connecting_col, &flip.value, txid.clone()).await?;
+                        if moved {
+                            hop(&mut trace, format!("shape:{id}"), "passed");
+                        }
                     }
                     Dependent::Node(parent_sig) => {
                         let new_flips = self
                             .reconcile_parent_for_value(parent_sig, edge.connecting_col, &flip.value)
                             .await?;
+                        hop(
+                            &mut trace,
+                            format!("node:{parent_sig}"),
+                            if new_flips.is_empty() { "dropped" } else { "passed" },
+                        );
                         for f in new_flips {
                             work.push_back((parent_sig.clone(), f));
                         }
@@ -657,12 +684,12 @@ impl SubqueryRegistry {
         connecting_col: usize,
         value: &Value,
         txid: Option<String>,
-    ) -> Result<()> {
-        let Some(shape) = self.shapes.get(shape_id) else { return Ok(()) };
+    ) -> Result<bool> {
+        let Some(shape) = self.shapes.get(shape_id) else { return Ok(false) };
         let ts = self.schemas.get(&shape.outer_table).cloned().context("shape: unknown table")?;
         let rows = self.query_candidates(&ts, connecting_col, value).await?;
         if rows.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let pred = shape.pred.clone();
         let out: Vec<(Row, ZWeight)> = rows
@@ -673,11 +700,12 @@ impl SubqueryRegistry {
             })
             .collect();
         let envs = crate::engine::translate_output(&ts, out, txid, None, shape.out_cols.as_deref().map(Vec::as_slice));
-        if !envs.is_empty() {
-            // Reliable: a dropped move envelope is permanent divergence for the shape's subscribers.
-            self.ds.append_reliable(&shape.stream_path, &envs).await;
+        if envs.is_empty() {
+            return Ok(false);
         }
-        Ok(())
+        // Reliable: a dropped move envelope is permanent divergence for the shape's subscribers.
+        self.ds.append_reliable(&shape.stream_path, &envs).await;
+        Ok(true)
     }
 
     /// Evaluate a subquery shape over a delta on its own (outer) table and append the resulting
@@ -694,8 +722,8 @@ impl SubqueryRegistry {
         ts: &TableSchema,
         delta: &[Tup2<Row, ZWeight>],
         txid: Option<String>,
-    ) -> Result<()> {
-        let Some(shape) = self.shapes.get(shape_id) else { return Ok(()) };
+    ) -> Result<bool> {
+        let Some(shape) = self.shapes.get(shape_id) else { return Ok(false) };
         let pred = shape.pred.clone();
         // Per touched pk, take the row's latest state: the `+1` row if present (insert/update), else the
         // `-1` row (delete). `is_new` distinguishes "row still exists" from "row was deleted".
@@ -716,13 +744,14 @@ impl SubqueryRegistry {
             })
             .collect();
         if out.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let envs = crate::engine::translate_output(ts, out, txid, None, shape.out_cols.as_deref().map(Vec::as_slice));
-        if !envs.is_empty() {
-            self.ds.append_reliable(&shape.stream_path, &envs).await;
+        if envs.is_empty() {
+            return Ok(false);
         }
-        Ok(())
+        self.ds.append_reliable(&shape.stream_path, &envs).await;
+        Ok(true)
     }
 
     /// Re-derive a dependent fully (used for NULL flips on negated edges): re-query every candidate row
@@ -926,6 +955,43 @@ mod tests {
 
     fn node() -> SubqueryNode {
         SubqueryNode::new("sig".into(), "t".into(), 0, 1, Arc::new(CompiledPredicate::MatchAll))
+    }
+
+    /// The trace reports an inner-table delta's effect on a subquery node: `passed` when the
+    /// inner set flipped (a value entered/left), `dropped` when it didn't change.
+    #[tokio::test]
+    async fn trace_subquery_node_hops() {
+        use crate::schema::TableDef;
+        let ts = {
+            let def: TableDef = serde_json::from_value(serde_json::json!({
+                "columns": { "id": {"type":"int"} }, "primaryKey": "id"
+            }))
+            .unwrap();
+            crate::schema::TableSchema::from_def("t", &def).unwrap()
+        };
+        let mut reg = SubqueryRegistry::new(crate::ds::DsClient::new("http://127.0.0.1:1"), None);
+        reg.nodes.insert("sig1".into(), node_with_sig("sig1"));
+
+        // A new row projects value 1 into the inner set -> Enter flip -> passed.
+        let delta = vec![Tup2(Row(vec![Value::Int(1)]), 1)];
+        let mut hops = Vec::new();
+        reg.on_table_delta(&ts, &delta, 0, None, None, Some(&mut hops)).await.unwrap();
+        assert!(
+            hops.iter().any(|h| h.node == "node:sig1" && h.outcome == "passed"),
+            "expected passed node hop, got {hops:?}"
+        );
+
+        // The same row again: the value is already present -> no flip -> dropped.
+        let mut hops = Vec::new();
+        reg.on_table_delta(&ts, &delta, 0, None, None, Some(&mut hops)).await.unwrap();
+        assert!(
+            hops.iter().any(|h| h.node == "node:sig1" && h.outcome == "dropped"),
+            "expected dropped node hop, got {hops:?}"
+        );
+    }
+
+    fn node_with_sig(sig: &str) -> SubqueryNode {
+        SubqueryNode::new(sig.into(), "t".into(), 0, 1, Arc::new(CompiledPredicate::MatchAll))
     }
 
     #[test]

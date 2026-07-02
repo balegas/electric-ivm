@@ -1521,7 +1521,19 @@ async fn process_envelope(
     {
         let mut reg = subqueries.lock().await;
         if reg.touches(&ts.name) {
-            reg.on_table_delta(ts, &delta, lsn_u64, xid, txid.clone()).await?;
+            let mut sq_hops: Option<Vec<crate::trace::TraceHop>> = tr.as_ref().map(|_| Vec::new());
+            reg.on_table_delta(ts, &delta, lsn_u64, xid, txid.clone(), sq_hops.as_mut()).await?;
+            if let (Some((hops, ids)), Some(sq)) = (tr.as_mut(), sq_hops) {
+                for h in &sq {
+                    if h.outcome == "passed"
+                        && let Some(sid) = h.node.strip_prefix("shape:")
+                        && !ids.iter().any(|i| i == sid)
+                    {
+                        ids.push(sid.to_string());
+                    }
+                }
+                hops.extend(sq);
+            }
         }
     }
     // Scalar aggregations: fold this delta into each running aggregate; emit the new value when it
