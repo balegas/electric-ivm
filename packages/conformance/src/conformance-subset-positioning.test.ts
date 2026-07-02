@@ -2,7 +2,7 @@
 // stamping). Validates the no-double-count guarantee: a change committing in the overlap window
 // [feed-open, page-snapshot] is reflected in the page AND emitted on the live feed, and the client's
 // LSN positioning drops the feed copy (commit LSN < snapshot LSN) so the row is counted exactly once.
-// See docs/superpowers/specs/2026-07-01-subset-lsn-positioning-design.md.
+// See docs/ARCHITECTURE.md §7 (subset queries and client positioning).
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import pgpkg from 'pg'

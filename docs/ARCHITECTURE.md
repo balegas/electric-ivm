@@ -6,7 +6,6 @@ The as-built system architecture. Companion documents:
   analytical cost model (what grows with shapes/users/rows).
 - **[shapes-and-subqueries-guide.md](shapes-and-subqueries-guide.md)** — the user/integrator guide.
 - **[deployment-postgres.md](deployment-postgres.md)** — running against your Postgres.
-- `docs/superpowers/specs/` — one design record per feature, with the decision history.
 
 ---
 
@@ -179,9 +178,9 @@ Any two **equal** shapes share one maintained stream, ref-counted:
   share entry) so no caller ever sees a stream whose snapshot isn't readable yet — and a *failed*
   creation propagates to every waiting joiner rather than handing them a dead stream.
 - **Drop.** Deletes decrement; the shape, its routing/registry entries, **and its durable stream**
-  are torn down when the last subscriber leaves. (Without the stream deletion every dropped shape
-  leaked its stream on the storage server — found under load-generator churn.) N joiners hold the
-  same id and must each delete exactly once; the client enforces one-shot `close()`.
+  are torn down when the last subscriber leaves (a dropped shape must not leave an orphaned stream
+  on the storage server). N joiners hold the same id and must each delete exactly once; the client
+  enforces one-shot `close()`.
 - The Electric `/v1/shape` adapter opts out (`share=false`) — its protocol needs per-request handles.
 
 ### 5.4 Creation is atomic; failures never leave zombies
@@ -189,9 +188,9 @@ Any two **equal** shapes share one maintained stream, ref-counted:
 `create_shape` returns `Ok` only after registration + backfill actually succeeded. On any failure —
 backfill error, subquery seeding error, append error — the shape record, share entries, tailer
 registration, and (for subqueries) every node refcount/edge/pending-seed added by the attempt are
-rolled back, waiting joiners get the error, and the stream is deleted. A previously-observed failure
-mode — a "zombie" shape that is registered, streams nothing, and pins its signature so all future
-identical creates silently join a dead feed — is structurally excluded.
+rolled back, waiting joiners get the error, and the stream is deleted. This structurally excludes
+the "zombie shape" failure mode: a shape that is registered, streams nothing, and pins its
+signature so all future identical creates silently join a dead feed.
 
 ### 5.5 Reliability: appends never drop silently
 
@@ -205,7 +204,7 @@ dropped mid-flush; discard is correct). Because shape envelopes are absolute per
 
 ## 6. Subqueries: shared inner-set nodes
 
-(Design record: `docs/superpowers/specs/2026-06-29-subqueries-design.md`; cost model: internals §3.3.)
+(Cost model: internals doc §3.3.)
 
 A predicate leaf `col [NOT] IN (SELECT proj FROM inner WHERE …)` routes through a registry shared by
 all tailers:
@@ -296,7 +295,7 @@ stream, and client, including live replication, batched mutations, NULLs, and co
 | replication ingestor | 1 task | peek/decode/append/advance |
 | subquery registry | 0 (a mutex) | every tailer calls into it |
 
-Threads are flat in shapes *and* in templates (the earlier per-template dbsp circuit thread is gone).
+Threads are flat in the number of shapes *and* in the number of equality templates.
 
 ---
 
@@ -334,20 +333,7 @@ is **storage throughput** (the single-process durable-streams test server), not 
 
 ---
 
-## 13. Appendix — dbsp trace storage: a negative result (historical)
-
-An earlier design ran a shared dbsp join circuit per equality template, whose data trace held a full
-table copy; dbsp 0.299's disk-backed trace storage was wired up to bound that memory. Measured
-honestly: on our ephemeral, hand-built circuit it did **not** offload the steady-state working set
-(`MIN_BYTES=0` spilled ~2 MB while ~570 MB stayed resident; `FelderaCache` made RSS *worse*).
-Effective spill appears tied to dbsp's persistent-id/checkpoint machinery we didn't use. The routing
-model then removed the table copies entirely, mooting the problem — there is little resident state
-left to spill. Kept here as the record of why "run dbsp from disk" is not the memory lever, and why
-the engine holds no table data instead. Do not resurrect `MIN_BYTES=0` / `FelderaCache`.
-
----
-
-## 14. Client query layer (two-level querying)
+## 13. Client query layer (two-level querying)
 
 There are **two query layers** with different jobs:
 
@@ -363,9 +349,9 @@ query (`col < lastSeen OR (col = lastSeen AND id < lastId)` folded into the `WHE
 top-N anywhere. The render layer is virtualized, so a 100k-row deployment stays a few dozen DOM nodes.
 For permissioned/faceted lists, prefer **per-facet feeds reused across filter changes** + a client
 merge (identical predicates across users ⇒ shared engine families) over folding UI filters into the
-predicate (which recreates the feed per click) — see AGENTS.md "lessons".
+predicate (which recreates the feed per click) — see AGENTS.md "gotchas".
 
-## 15. File map
+## 14. File map
 
 | path | role |
 |------|------|

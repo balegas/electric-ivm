@@ -26,6 +26,16 @@ The engine introspects the table set at startup (`ELECTRIC_IVM_PG_TABLES=*` = ev
 with a primary key). Create your tables first, or `docker compose -f docker/compose.yaml restart engine`
 after a migration.
 
+## Published images
+
+CI publishes both images to the GitHub Container Registry on every push to `main` and on `v*` tags
+(`.github/workflows/docker.yml`):
+
+```bash
+docker pull ghcr.io/balegas/electric-ivm/engine:main
+docker pull ghcr.io/balegas/electric-ivm/node:main
+```
+
 ## Building images individually
 
 ```bash

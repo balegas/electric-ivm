@@ -5,7 +5,6 @@
   "type": "module",
   "scripts": {
     "bench": "tsx src/run.ts",
-    "memtest": "tsx src/memtest.ts",
     "shape-mem": "tsx src/shape-mem-matrix.ts",
     "electric-adapter": "tsx src/electric-adapter.ts",
     "electric-fleet": "tsx src/electric-bench-runner.ts"

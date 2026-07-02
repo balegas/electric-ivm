@@ -32,8 +32,7 @@ the project is growing toward).
 - `docs/ivm-engine-internals.md` — engine execution strategies + the analytical cost model.
 - `docs/shapes-and-subqueries-guide.md` — user/integrator guide.
 - `docs/deployment-postgres.md` — Postgres-as-source-of-record setup.
-- `docs/superpowers/specs/` — one design record per feature. New designs go in
-  `docs/superpowers/specs/YYYY-MM-DD-<topic>-design.md` and get committed.
+- Each package has its own `README.md` (surface, commands, env knobs).
 
 ## Build & test
 
@@ -95,30 +94,29 @@ storage, not the engine).
   offset captured *before* the page snapshot.
 - **Aggregations follow SQL NULL semantics** (ignore NULLs; `COUNT(col)` = non-NULLs; empty
   SUM/AVG/MIN/MAX = NULL). Extended API only — the Electric surface doesn't cover them.
-- Commit messages end with the harness trailers (`Co-Authored-By:` + `Claude-Session:`). Branch
-  before committing if on the default branch.
+- Branch before committing if on the default branch.
 
-## Lessons learned (hard-won — don't relearn these)
+## Gotchas (know these before touching the respective areas)
 
-- **`pg_current_wal_lsn()` is not a visibility fence.** Commit-record-written ≠ snapshot-visible
-  (the gap includes a WAL fsync). We shipped the LSN fence, reasoned it was "negligible", and it
-  wasn't sound; the xid gate (`pg_current_snapshot()`) decides both the dropped-row and
-  boundary-duplicate cases exactly. See `pg.rs::SnapshotGate`.
-- **The client must delete what it creates — there is no server-side reaper.** The engine-shape leak
-  under open/close churn was `shape().close()` never calling `shapes.delete` (plus swallowed delete
-  errors and an error path that leaked a just-created feed). Every create path needs a guaranteed,
-  retried, one-shot delete; `track()` in `packages/client/src/index.ts` is the pattern.
+- **`pg_current_wal_lsn()` is not a visibility fence.** A commit's WAL record exists (and the LSN
+  moves past it) before the transaction becomes visible to snapshots — the gap includes a WAL fsync.
+  The xid gate (`pg_current_snapshot()`) decides both the dropped-row and boundary-duplicate cases
+  exactly. See `pg.rs::SnapshotGate`.
+- **The client must delete what it creates — there is no server-side reaper.** Every create path
+  needs a guaranteed, retried, one-shot delete; `track()` in `packages/client/src/index.ts` is the
+  pattern. An unpaired create pins a shared feed's refcount forever.
 - **Backfill and replication must produce byte-identical text values.** `to_jsonb(t)` renders
   timestamps ISO-`T`-style; `test_decoding` uses Postgres text output. Same cell, different string →
   broken retractions/routing/MIN-MAX. Backfill casts text-mapped columns with `::text`
   (`pg.rs::row_json_expr`). If you add a read path, match it.
-- **test_decoding array types nest brackets** (`tags[integer[]]:`). A first-`]` scan silently
-  NULLed every later column in the row. Bracket-depth matters; there's a regression test.
+- **test_decoding array types nest brackets** (`tags[integer[]]:`) — the type-name skip in
+  `parse_cols` is bracket-depth aware; keep it that way (a first-`]` scan reads every later column
+  in the row as NULL).
 - **Read raw stream envelopes, not stream-db's reconciled view, when you need every delta.** A
   subset's live feed must apply *move-outs*; stream-db no-ops a delete for a key it never inserted.
   (`packages/client/subset.ts` reads raw `StreamEnvelope`s.)
 - **Deletes must leave tombstones across the page/live seam.** An in-flight `loadMore` whose
-  snapshot predates a delete will resurrect the row (or insert a ghost for a never-seen pk) unless
+  snapshot predates a delete would resurrect the row (or insert a ghost for a never-seen pk) unless
   the per-pk watermark survives the delete. (`subset.ts` keeps LSN tombstones, pruned when no page
   is in flight.)
 - **Shape rows stringify the primary key** (TanStack DB keys are strings); non-pk ints stay numbers.
@@ -127,17 +125,18 @@ storage, not the engine).
   Prefer per-facet feeds reused across filter changes + a client merge (identical predicates across
   users ⇒ shared engine families). LinearLite's browse list does this.
 - **The demo boots an _ephemeral_ Postgres each run** (`mkdtemp`); data does not persist. **Kill
-  stale demos before restarting** — a leftover `tsx start.ts`/`caddy` serves OLD code and reads as a
-  mysterious schema mismatch. `scripts/linearlite.sh stop`, or `pkill -f electric-ivm-engine`,
-  `pkill -f "tsx start.ts"`, `pkill -f caddy`. If two demos run, scope kills by port
-  (`ps -o ppid= -p $(lsof -ti :<httpsPort>)`) — a SIGKILL mid-shutdown leaks the ephemeral Postgres.
+  stale demos before restarting** — a leftover `tsx start.ts`/`caddy` keeps the ports and serves
+  stale code, which reads as a mysterious schema mismatch. `scripts/linearlite.sh stop`, or
+  `pkill -f electric-ivm-engine`, `pkill -f "tsx start.ts"`, `pkill -f caddy`. If two demos run,
+  scope kills by port (`ps -o ppid= -p $(lsof -ti :<httpsPort>)`) — a SIGKILL mid-shutdown leaks
+  the ephemeral Postgres.
 - **Vite binds IPv6 `[::1]` only** — prefer the `https://localhost:8443` Caddy proxy (HTTP/2 also
   dodges the browser's ~6-connection HTTP/1.1 cap that freezes multi-stream apps).
 - **Under load the durable-streams *test server* is the ceiling, not the engine** (fsync per append
-  file-backed; `ECONNRESET` under burst). `DS_MEMORY=1` + staggered ramps; the real fix is a
-  production backend.
+  file-backed; `ECONNRESET` under burst). `DS_MEMORY=1` + staggered ramps; a production
+  durable-streams backend lifts the ceiling.
 - **Docker + pnpm:** scripts that import workspace deps must live in a workspace package
   (`docker/package.json`) — running `tsx docker/x.ts` from the repo root can't resolve them.
 - **Verify against the live stack, not just types.** A headless `tsx` script driving the real client
-  against a running demo catches what the (absent) typechecker can't. **Reverting code ≠ reverting
-  docs** — realign them in the same pass.
+  against a running demo catches what the (absent) typechecker can't. **Changing code means
+  realigning docs in the same pass.**

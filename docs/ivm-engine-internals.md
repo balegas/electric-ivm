@@ -5,9 +5,9 @@ incremental-view-maintenance (IVM) engine — how a shape becomes a live, increm
 maintained result set, how subqueries extend that across tables, and what each construct
 costs as you add shapes, users, and rows.
 
-It is grounded in the code (`apps/engine/src/`) and the design records under
-`docs/superpowers/specs/`. `docs/ARCHITECTURE.md` is the system-level companion (ingest,
-consistency fences, reliability, adapters); this document goes deeper on execution and cost.
+It is grounded in the code (`apps/engine/src/`). `docs/ARCHITECTURE.md` is the system-level
+companion (ingest, consistency fences, reliability, adapters); this document goes deeper on
+execution and cost.
 
 ---
 
@@ -379,18 +379,14 @@ dominate.
 
 ### 4.5 Disk
 
-The engine does **not** currently page state to disk in a way you can rely on for memory
-bounding. dbsp 0.299 has a storage subsystem (on-disk columnar batches), and it is wired in,
-but `ARCHITECTURE.md` §10 records an honest negative result: on our ephemeral, hand-built
-circuit it does **not** offload the steady-state working set, and the `FelderaCache` / forced-
-spill knobs made RSS *worse*. Effective spill appears tied to dbsp's persistent-id/checkpoint
-machinery we don't use. Do **not** ship `MIN_BYTES=0` or `FelderaCache`. The higher-confidence
-"run from disk" path, if needed, is to back the engine's own per-shape/routing metadata with an
-embedded KV (redb/lmdb/sled) — but note that, post routing model, there is little resident state
-left to spill: the table data that used to dominate is gone.
+The engine does **not** page state to disk, and does not need to: there is no table-scale
+resident state to spill. Per-shape routing metadata, subquery contributor sets, and running
+aggregates are the only retained structures, and they are small (§4.2). If a future workload
+ever demands disk-backed metadata, the natural path is an embedded KV (redb/lmdb/sled) under
+the engine's own structures — not a query-engine storage subsystem.
 
-In short: **disk is not a tuning lever today; the memory story is "keep nothing big resident,"
-and the engine already does.**
+In short: **disk is not a tuning lever; the memory story is "keep nothing big resident," and
+the engine does.**
 
 ---
 
@@ -467,14 +463,9 @@ bounded keyset range query folded into the `WHERE`, so the engine never holds a 
 | `apps/engine/src/electric.rs` / `http.rs` | `/v1/shape` Electric adapter + control-plane HTTP |
 | `apps/engine/src/metrics.rs` / `mem.rs` | counters, latency histograms, OTel memory/cardinality gauges |
 
-## 8. Related records
+## 8. Related documents
 
-- `docs/superpowers/specs/2026-06-29-reduce-engine-memory-design.md` — why the table-copy /
-  per-template circuit model was removed (the routing model this doc describes).
-- `docs/superpowers/specs/2026-06-29-subqueries-design.md` — the subquery node/edge/flip design
-  and the absolute-emission correctness argument.
-- `docs/superpowers/specs/2026-06-29-postgres-logical-replication.md` — ingest + commit-LSN
-  reconciliation.
+- `docs/ARCHITECTURE.md` — the system-level architecture (consistency fences, reliability,
+  adapters) and the speedup backlog.
 - `docs/bench/shape-memory-matrix.md` — the measured memory-vs-shapes data used above.
-- `ARCHITECTURE.md` §9–§10 — speedup backlog and the dbsp-storage negative result.
 - `docs/shapes-and-subqueries-guide.md` — the user-facing companion to this document.

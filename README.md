@@ -52,8 +52,8 @@ Full architecture: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**; engine exec
 
 - **Backfill ↔ live is fenced by transaction visibility**, not WAL position: the backfill snapshot
   records `pg_current_snapshot()` and the engine skips a replicated change iff its xid was visible to
-  that snapshot. (An LSN-only fence silently drops rows committed-but-not-yet-visible during the
-  snapshot — a race we hit and closed; see ARCHITECTURE §4.)
+  that snapshot. (A WAL-position fence cannot express snapshot visibility — a commit's WAL record
+  exists before the transaction becomes visible to snapshots; see ARCHITECTURE §4.)
 - **Ingest is at-least-once, effect is exactly-once**: the ingestor appends before advancing the
   slot; tailers de-duplicate by the stamped `(commit LSN, seq)`.
 - **Shape appends never drop silently**: transient storage failures retry with backoff and the
@@ -178,4 +178,8 @@ pnpm loop [N]           # run the fuzz loop until failure; replay with SEED=<n>
 | `docker/` | — | containerized stack |
 | `apps/pipeline-viz` | TS | live pipeline explorer |
 
-Design records live in `docs/superpowers/specs/` (one per feature). Agent guidance: **AGENTS.md**.
+Each package has its own README. Agent guidance for working in this repo: **AGENTS.md**.
+
+## License
+
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option.

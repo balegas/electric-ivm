@@ -1,6 +1,6 @@
 // Unit tests for subset LSN positioning — the no-double-count invariant and the merge decision
 // table. Pure (no stack): drives `mergeFeedDelta` directly. See
-// `docs/superpowers/specs/2026-07-01-subset-lsn-positioning-design.md`.
+// `docs/ARCHITECTURE.md` §7 (subset queries and client positioning).
 // Plus subscription lifecycle (one-shot close, feed cleanup on error) against a fake tRPC.
 
 import { describe, expect, it, vi } from 'vitest'

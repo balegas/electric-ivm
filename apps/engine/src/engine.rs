@@ -1668,8 +1668,7 @@ mod tests {
     }
 
     /// The commit LSN is stamped onto output envelopes (upsert + delete) so a subset client can
-    /// position its live tail at the page snapshot. Regression guard for the LSN-positioning feature
-    /// (`docs/superpowers/specs/2026-07-01-subset-lsn-positioning-design.md`).
+    /// position its live tail at the page snapshot (see `docs/ARCHITECTURE.md` §7).
     #[test]
     fn translate_output_stamps_commit_lsn() {
         let ts = users();

@@ -65,12 +65,12 @@ write). `wall` is the whole benchmark's wall-clock.
    the same offset are **coalesced** (one leader reads/applies; every waiter gets the identical
    response), so doubling the fan-out width barely moves the latency.
 
-## Engine/adapter changes the benchmarks required or validated
+## Adapter behaviors the benchmarks exercise
 
 - **Constant `where` comparisons** (`373 = 373`): the SQL `where` parser evaluates `<lit> <op> <lit>`
   at parse time (`where_sql.rs`).
 - **Schema-qualified table names** (`public.users`): the adapter strips the schema prefix.
 - **Live long-poll semantics**: live requests hold until data or an Electric-like deadline
   (`ELECTRIC_LIVE_TIMEOUT_MS`, default 20 s; 204 + up-to-date at the deadline), and concurrent live
-  requests per (handle, offset) are coalesced — both were required for the fanout benchmarks, whose
-  N clients long-poll one handle concurrently and treat premature timeouts as fatal.
+  requests per (handle, offset) are coalesced — the fanout benchmarks long-poll one handle from N
+  clients concurrently and treat premature timeouts as fatal.

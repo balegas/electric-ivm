@@ -6,8 +6,8 @@
 //! non-shareable shapes (ranges / OR / NOT / inequality) are stateless filters evaluated directly on
 //! each delta. Matching deltas are appended (as State-Protocol envelopes) to per-shape durable
 //! streams. The Z-set element is a dynamically-typed [`value::Row`] (positional `Vec<Value>`); the
-//! schema gives names to the positions. See `docs/superpowers/specs/2026-06-27-electric-ivm-decisions.md`
-//! and `docs/superpowers/specs/2026-06-29-reduce-engine-memory-design.md`.
+//! schema gives names to the positions. See `docs/ARCHITECTURE.md` and
+//! `docs/ivm-engine-internals.md` for the system design.
 
 pub mod ds;
 pub mod electric;

@@ -5,12 +5,16 @@ comparison-against-Postgres logic) against electric-ivm's `GET /v1/shape` adapte
 official Elixir `Electric.Client`. This proves electric-ivm speaks Electric's wire protocol.
 
 ## Run
-1. `cargo build --release -p electric-ivm-engine`
-2. Copy `electric_ivm_oracle_test.exs` and `electric_ivm_oracle_property_test.exs` into
-   `../electric/packages/sync-service/test/integration/`.
-3. In `../electric/packages/sync-service`: `mix deps.get` then
-   - hand-written scenarios: `mix test test/integration/electric_ivm_oracle_test.exs`
-   - **property test** (the real one): `mix test test/integration/electric_ivm_oracle_property_test.exs`
+
+```bash
+electric-conformance/run.sh            # all suites (oracle + property + subqueries)
+electric-conformance/run.sh property   # or: oracle | subqueries
+```
+
+The script locates an ElectricSQL checkout (`ELECTRIC_DIR`, default `../electric`; cloned from
+`ELECTRIC_REPO` when absent, optionally at `ELECTRIC_REF`), builds our release engine, copies the
+test files into `packages/sync-service/test/{integration,support}/`, and runs `mix test`.
+Requirements: elixir/mix, Rust, and PostgreSQL binaries (`initdb`/`pg_ctl`) on `PATH`.
 
 Both boot our stack (durable-streams + engine + adapter) via `packages/bench/src/electric-adapter.ts`,
 point Electric's official `Electric.Client` at it, and run Electric's own `OracleHarness`/`ShapeChecker`.
@@ -52,9 +56,8 @@ Tunables: `ORACLE_RUNS`, `ORACLE_SHAPE_COUNT`, `ORACLE_BATCH_COUNT`, `ORACLE_MUT
 These are Electric's **hand-written** subquery integration tests, run against electric-ivm via a setup
 swap: `el_ivm_setup.ex` (`el_ivm_pg` + `el_ivm_client`) replaces `with_unique_db` + `with_complete_stack`
 + `with_electric_client` with our launcher-booted stack (engine introspects all tables via
-`ELECTRIC_IVM_PG_TABLES=*`); **the test bodies and assertions are unchanged**. Copy all three files into
-`test/integration/` (the two test files) and `test/support/` (`el_ivm_setup.ex`), then
-`mix test test/integration/subquery_move_out_test.exs test/integration/subquery_dependency_update_test.exs`.
+`ELECTRIC_IVM_PG_TABLES=*`); **the test bodies and assertions are unchanged**. Run with
+`electric-conformance/run.sh subqueries`.
 
 **Result: 13 / 15 pass.** The 13 cover the real subquery behaviors — synthetic move-out deletes (parent
 deactivation/deletion), move-in via a different parent, negated move-in/out, dependency tracking (team

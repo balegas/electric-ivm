@@ -272,5 +272,5 @@ ref-counted — always `close()` what you open (close is one-shot and safe to ca
 
 - `docs/ivm-engine-internals.md` — engine internals + full analytical cost model.
 - `docs/deployment-postgres.md` — running with Postgres as system of record.
-- `docs/superpowers/specs/2026-06-29-subqueries-design.md` — subquery model and correctness.
+- `docs/ARCHITECTURE.md` §6 — the subquery node/edge/flip model and its correctness argument.
 - `examples/linearlite/README.md` — the end-to-end visibility example.

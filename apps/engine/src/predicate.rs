@@ -210,7 +210,7 @@ impl CompiledPredicate {
     /// Sharing template: if this predicate is a pure conjunction of **non-null equality** leaves
     /// over **distinct columns**, return the `(column index, literal)` pairs sorted by column
     /// index. Shapes with equal column-index sets share one family circuit (see
-    /// `docs/superpowers/specs/2026-06-27-shape-pipeline-sharing-design.md`).
+    /// `docs/ivm-engine-internals.md` §3.1).
     ///
     /// Returns `None` for everything else — ranges, `neq`, `OR`, `NOT`, `MatchAll`, a `col = NULL`
     /// literal (SQL `= NULL` is UNKNOWN, never a key match), or a duplicate column (`a=1 AND a=2`,
