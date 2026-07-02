@@ -69,7 +69,7 @@ export default function App() {
       <header className="topbar">
         <div className="brand">
           <b>electric-ivm</b> dbsp playground
-          <span className="brand-sub">an interactive visualization of a real sync engine over Postgres</span>
+          <span className="brand-sub">an interactive visualization of a sync engine over Postgres</span>
         </div>
         <div className="topbar-r">
           {w.error ? <span className="toast">{w.error}</span> : null}
