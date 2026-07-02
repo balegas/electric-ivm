@@ -1,6 +1,6 @@
 // Custom edge that can carry a travelling delta dot: the base bezier plus, while a pulse is
-// active, an SVG circle animated along the path (one shot per trace event — keyed by decor id so
-// consecutive events restart the motion).
+// active, an SVG circle animated along the path — one shot per trace event, keyed by the id of
+// the event that created the pulse, so later events never restart dots already in flight.
 
 import { BaseEdge, getBezierPath, type EdgeProps } from '@xyflow/react'
 
