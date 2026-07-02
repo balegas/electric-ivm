@@ -1,9 +1,9 @@
 // The domain verbs — the ONLY way playground visitors write data. Each verb is fixed,
 // parameterized SQL scoped to the caller's workspace; there is no raw SQL surface.
 
-import type { Order, Verb } from '../shared/types.ts'
+import type { Order, Restaurant, Verb } from '../shared/types.ts'
 import { type Db, mintId, num } from './db.ts'
-import { DISHES, TRANSITIONS } from './schema.ts'
+import { DISHES, SEED_RESTAURANTS, TRANSITIONS } from './schema.ts'
 
 export class ActionError extends Error {
   constructor(
@@ -15,9 +15,30 @@ export class ActionError extends Error {
 }
 
 const MAX_OPEN_ORDERS = 30
+const MAX_RESTAURANTS = 8
 
-export async function applyAction(db: Db, ws: string, verb: Verb): Promise<{ ok: true; order?: Order }> {
+export async function applyAction(
+  db: Db,
+  ws: string,
+  verb: Verb,
+): Promise<{ ok: true; order?: Order; restaurant?: Restaurant }> {
   switch (verb.verb) {
+    case 'add_restaurant': {
+      const existing = await db.query('SELECT name FROM restaurants WHERE workspace_id = $1', [ws])
+      if ((existing.rowCount ?? 0) >= MAX_RESTAURANTS) throw new ActionError(413, 'restaurant cap reached')
+      const used = new Set(existing.rows.map((r) => r.name as string))
+      const next = SEED_RESTAURANTS.find((r) => !used.has(r.name)) ?? {
+        name: `Kitchen #${existing.rowCount! + 1}`,
+        emoji: '🍽️',
+        city: Math.random() < 0.5 ? 'Lisbon' : 'Porto',
+      }
+      const ins = await db.query(
+        'INSERT INTO restaurants (id, workspace_id, name, emoji, city) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+        [mintId(), ws, next.name, next.emoji, next.city],
+      )
+      const r = ins.rows[0]
+      return { ok: true, restaurant: { ...r, id: num(r.id) } }
+    }
     case 'place_order': {
       const r = await db.query('SELECT id FROM restaurants WHERE id = $1 AND workspace_id = $2', [
         verb.restaurantId,

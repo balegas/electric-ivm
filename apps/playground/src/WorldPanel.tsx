@@ -93,6 +93,9 @@ export function WorldPanel({
           </div>
         )
       })}
+      <button className="add-rest" onClick={() => act({ verb: 'add_restaurant' })}>
+        ＋ Add restaurant
+      </button>
     </div>
   )
 }

@@ -56,29 +56,21 @@ export async function provisionWorkspace(deps: WorkspaceDeps, existingId?: strin
     now,
     now,
   ])
-  const restaurantIds: number[] = []
-  for (const r of SEED_RESTAURANTS) {
-    const rid = mintId()
-    restaurantIds.push(rid)
-    await deps.db.query('INSERT INTO restaurants (id, workspace_id, name, emoji, city) VALUES ($1,$2,$3,$4,$5)', [
-      rid,
-      id,
-      r.name,
-      r.emoji,
-      r.city,
-    ])
-  }
-  const seedOrders: { status: string; ri: number }[] = [
-    { status: 'new', ri: 0 },
-    { status: 'new', ri: 1 },
-    { status: 'cooking', ri: 0 },
-    { status: 'riding', ri: 2 },
-    { status: 'delivered', ri: 4 },
-  ]
-  for (const [i, o] of seedOrders.entries()) {
+  // One restaurant to start (the world stays quiet); "Add restaurant" grows it on demand.
+  const first = SEED_RESTAURANTS[0]!
+  const rid = mintId()
+  await deps.db.query('INSERT INTO restaurants (id, workspace_id, name, emoji, city) VALUES ($1,$2,$3,$4,$5)', [
+    rid,
+    id,
+    first.name,
+    first.emoji,
+    first.city,
+  ])
+  const seedOrders = ['new', 'cooking', 'riding']
+  for (const [i, status] of seedOrders.entries()) {
     await deps.db.query(
       'INSERT INTO orders (id, workspace_id, restaurant_id, status, dish, total) VALUES ($1,$2,$3,$4,$5,$6)',
-      [mintId(), id, restaurantIds[o.ri], o.status, DISHES[i % DISHES.length], 8 + i * 3.5],
+      [mintId(), id, rid, status, DISHES[i % DISHES.length], 8 + i * 3.5],
     )
   }
   const state = await getWorkspaceState(deps, id)

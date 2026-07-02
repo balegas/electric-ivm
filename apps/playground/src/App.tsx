@@ -9,9 +9,9 @@ import { api } from './api.ts'
 import { DeviceCards } from './DeviceCards.tsx'
 import { PipelineCanvas, type View } from './PipelineCanvas.tsx'
 import { SceneStrip, currentScene } from './SceneStrip.tsx'
-import { ShapeBuilder } from './ShapeBuilder.tsx'
 import { SubsetBoard } from './SubsetBoard.tsx'
 import { useWorkspace } from './useWorkspace.ts'
+import { hasSeenWelcome, markWelcomeSeen, Welcome } from './Welcome.tsx'
 import { WorldPanel } from './WorldPanel.tsx'
 
 const GRAPH_POLL_MS = 2500
@@ -22,7 +22,7 @@ export default function App() {
   const [view, setView] = useState<View>('logical')
   const [graph, setGraph] = useState<EngineGraph | null>(null)
   const [mine, setMine] = useState<string[]>([])
-  const [builderOpen, setBuilderOpen] = useState(false)
+  const [welcomeOpen, setWelcomeOpen] = useState(!hasSeenWelcome())
 
   const wsId = w.state?.workspace.id
 
@@ -76,8 +76,8 @@ export default function App() {
           <span className="ws-chip" title="Your workspace — all your rows and shapes carry this id">
             {wsId ?? '…'}
           </span>
-          <button className="mini" onClick={() => setBuilderOpen(true)} disabled={!ready}>
-            ＋ shape
+          <button className="mini" onClick={() => setWelcomeOpen(true)} title="What is this?">
+            ? about
           </button>
           <button className="mini" onClick={() => void w.reprovision()} title="Start over in a fresh workspace">
             new workspace
@@ -116,8 +116,13 @@ export default function App() {
 
       <SceneStrip scene={scene} onScene={enterScene} />
 
-      {builderOpen ? (
-        <ShapeBuilder onCreate={(spec, label, role) => void w.createShape(spec, label, role)} onClose={() => setBuilderOpen(false)} />
+      {welcomeOpen ? (
+        <Welcome
+          onClose={() => {
+            markWelcomeSeen()
+            setWelcomeOpen(false)
+          }}
+        />
       ) : null}
 
       {w.status === 'reset-needed' ? (

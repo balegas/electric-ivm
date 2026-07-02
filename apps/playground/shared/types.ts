@@ -34,6 +34,7 @@ export type Verb =
   | { verb: 'deliver'; orderId: number }
   | { verb: 'cancel'; orderId: number }
   | { verb: 'move_restaurant'; restaurantId: number; city: string }
+  | { verb: 'add_restaurant' }
 
 // ── Workspaces ────────────────────────────────────────────────────────────────────────────────
 

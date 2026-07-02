@@ -74,7 +74,7 @@ export const SCENES: SceneDef[] = [
       "genuinely shared with other visitors' shapes too: that's the shared ×N badge.",
     try: [
       'Move one order through cooking → riding → delivered and watch it hop between screens',
-      'Build your own status shape — it joins the same router',
+      'Note the shared ×N badge — one route lookup per write, however many shapes listen',
     ],
     shapes: [
       {
@@ -99,7 +99,11 @@ export const SCENES: SceneDef[] = [
       'the inner SELECT as a shared distinct-set node fed by the restaurants table, and the shape ' +
       'becomes a semijoin against it. The cascade is the point: change a restaurant, and its orders ' +
       'enter or leave the shape without any order row being touched.',
-    try: ['Move a restaurant to Porto → watch its orders leave the shape', 'Move it back → they return'],
+    try: [
+      'Move a restaurant to Porto → watch its orders leave the shape',
+      'Move it back → they return',
+      'Add a restaurant (left panel) to grow the inner set',
+    ],
     shapes: [
       {
         key: 'lisbon',

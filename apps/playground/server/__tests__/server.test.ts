@@ -38,10 +38,10 @@ async function newWorkspace(): Promise<WorkspaceState> {
 }
 
 describe('workspaces', () => {
-  it('provisions 6 restaurants + 5 seed orders and is idempotent by id', async () => {
+  it('provisions 1 restaurant + 3 seed orders and is idempotent by id', async () => {
     const ws = await newWorkspace()
-    expect(ws.restaurants).toHaveLength(6)
-    expect(ws.orders).toHaveLength(5)
+    expect(ws.restaurants).toHaveLength(1)
+    expect(ws.orders).toHaveLength(3)
     expect(ws.workspace.epoch).toBe(7)
     const again = await api<WorkspaceState>('/api/workspace', {
       method: 'POST',
@@ -57,7 +57,20 @@ describe('workspaces', () => {
       body: JSON.stringify({ existingId: 'w_gone' }),
     })
     expect(body.workspace.id).not.toBe('w_gone')
-    expect(body.restaurants).toHaveLength(6)
+    expect(body.restaurants).toHaveLength(1)
+  })
+
+  it('add_restaurant grows the world from the seed pool, workspace-scoped', async () => {
+    const ws = await newWorkspace()
+    const r = await api<{ ok: true; restaurant: { id: number; name: string; workspace_id: string } }>('/api/action', {
+      method: 'POST',
+      body: JSON.stringify({ workspace: ws.workspace.id, verb: 'add_restaurant' }),
+    })
+    expect(r.status).toBe(200)
+    expect(r.body.restaurant.workspace_id).toBe(ws.workspace.id)
+    expect(r.body.restaurant.name).not.toBe(ws.restaurants[0]!.name)
+    const state = await api<WorkspaceState>(`/api/workspace/${ws.workspace.id}`)
+    expect(state.body.restaurants).toHaveLength(2)
   })
 
   it('GET of an unknown workspace is a 404 carrying the epoch', async () => {

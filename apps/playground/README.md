@@ -47,14 +47,16 @@ bumping `PLAYGROUND_EPOCH` — clients self-heal.
 ## Layout
 
 - `server/` — the playground server: the ONLY thing browsers talk to. Workspace provisioning +
-  seeds, the action verbs (fixed parameterized SQL — no raw SQL surface), the guided shape builder
-  (spec → engine predicate AST, always workspace-scoped), scene provisioning (idempotent,
+  seeds (one restaurant to start; an `add_restaurant` verb grows the world), the action verbs
+  (fixed parameterized SQL — no raw SQL surface), a shape endpoint (spec → engine predicate AST,
+  always workspace-scoped; scenes are its only UI today), scene provisioning (idempotent,
   self-healing), engine proxies (`/graph`, shape rows, subset queries), and the `/trace` fan-out
   that tags events `yours`/foreign and strips foreign events to shared-node pulses. Defenses:
-  per-workspace rate limiting, shape/order caps, idle-workspace TTL sweep.
+  per-workspace rate limiting, shape/order/restaurant caps, idle-workspace TTL sweep.
 - `src/` — the React app. Reuses pipeline-viz's graph builders + node renderer (`@viz` alias);
-  adds the scene strip, world panel, device cards, shape builder, and the trace-driven animation
-  (travelling delta dots, pass/drop/fold node flashes, red ✕ where a delta dies).
+  adds the first-visit welcome/intro, the scene strip, world panel, device cards, and the
+  trace-driven animation (travelling delta dots, pass/drop/fold node flashes, red ✕ where a delta
+  dies).
 - `shared/` — the client↔server contract (`types.ts`) and the scene definitions (`scenes.ts`,
   copy + shape specs in one module so the story and the provisioning can't drift).
 - `start.ts` — the one-command dev boot (pattern from `examples/linearlite`).
