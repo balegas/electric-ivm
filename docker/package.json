@@ -1,0 +1,17 @@
+{
+  "name": "@electric-ivm/docker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "ds": "tsx ds-server.ts",
+    "api": "tsx api-server.ts"
+  },
+  "dependencies": {
+    "@durable-streams/server": "^0.3.7",
+    "@electric-ivm/api": "workspace:*"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2"
+  }
+}

@@ -1,0 +1,92 @@
+# The whole electric-ivm server stack, containerized:
+#
+#   postgres  — the system of record (wal_level=logical; the engine creates its replication slot)
+#   ds        — durable-streams server (the log: table/<name> in, shape/<id> out)
+#   engine    — the Rust engine: replication ingest, shape/subquery/aggregation maintenance,
+#               control-plane HTTP + the Electric-compatible GET /v1/shape (port 7010)
+#   api       — the extended tRPC API (shapes/subsets/aggregations for @electric-ivm/client, port 8790)
+#
+#   docker compose -f docker/compose.yaml up --build
+#
+# Then point an ElectricSQL client at http://localhost:7010/v1/shape, or @electric-ivm/client at
+# http://localhost:8790 (API) + http://localhost:8791 (streams).
+#
+# Note: the engine introspects the table set at startup (ELECTRIC_IVM_PG_TABLES=* = every public
+# table with a primary key). Create your tables first — or `docker compose restart engine` after a
+# migration — for them to be picked up.
+
+name: electric-ivm
+
+services:
+  postgres:
+    image: postgres:16
+    command: ["postgres", "-c", "wal_level=logical"]
+    environment:
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: electric
+    ports:
+      - "${PG_PORT:-5432}:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d electric"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  ds:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.node
+    command: ["pnpm", "run", "ds"]
+    environment:
+      DS_PORT: 8791
+      DS_DATA_DIR: /data
+    ports:
+      - "${DS_PORT:-8791}:8791"
+    volumes:
+      - ds-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8791').then(()=>process.exit(0),()=>process.exit(1))\""]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  engine:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.engine
+    environment:
+      ELECTRIC_IVM_DS_URL: http://ds:8791
+      ELECTRIC_IVM_PG_URL: postgres://postgres:password@postgres:5432/electric
+      ELECTRIC_IVM_PG_TABLES: "${ELECTRIC_IVM_PG_TABLES:-*}"
+      ELECTRIC_IVM_BIND: 0.0.0.0:7010
+    ports:
+      - "${ENGINE_PORT:-7010}:7010"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ds:
+        condition: service_healthy
+    restart: unless-stopped # e.g. Postgres not ready with tables yet — retry via restart
+
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.node
+    command: ["pnpm", "run", "api"]
+    environment:
+      DS_URL: http://ds:8791
+      ENGINE_URL: http://engine:7010
+      API_PORT: 8790
+    ports:
+      - "${API_PORT:-8790}:8790"
+    depends_on:
+      ds:
+        condition: service_healthy
+      engine:
+        condition: service_started
+
+volumes:
+  pg-data:
+  ds-data:

@@ -1,0 +1,933 @@
+//! Electric-protocol adapter: serves `GET /v1/shape` so Electric's official `Electric.Client` (and its
+//! oracle test harness) can read shapes from our engine. We translate the engine's materialized-shape
+//! durable stream into Electric's change-message log with the headers/control-messages the client
+//! requires (`electric-handle`, `electric-offset`, `electric-schema`, `electric-cursor`,
+//! `electric-up-to-date`; `up-to-date` / `must-refetch` control messages).
+//!
+//! Mapping notes:
+//! - A `GET` with `offset=-1` is the **snapshot**: parse `where` → predicate, create a materialized
+//!   shape, fold its stream to the current row set, emit every row as an `insert`, then an
+//!   `up-to-date` control. The handle is the shape id; the offset is the stream's tail. An
+//!   `offset > -1` without a handle is a 400 (Electric: "handle required").
+//! - A `GET` with `live=true` long-polls the stream from `offset` and emits `insert`/`update`/`delete`.
+//!   Our engine emits absolute `upsert`/`delete`, so we reconstruct insert-vs-update from a per-handle
+//!   key set (Electric's client rejects insert-of-existing / update-of-missing). Requests on one handle
+//!   are serialized by a per-handle mutex; a retry at an older offset rebuilds the key set **as of that
+//!   offset** before replaying. Concurrent **live** requests at the *same* (handle, offset) are
+//!   identical, so they are **coalesced**: one leader does the read+apply and every waiter receives the
+//!   same response (write-fanout: N clients long-poll one handle at one offset — serializing them behind
+//!   the mutex would hand each a full long-poll timeout in turn). A live request keeps re-polling the
+//!   ds stream until data arrives or `ELECTRIC_LIVE_TIMEOUT_MS` (default 20000, Electric-like ~20s)
+//!   elapses, then returns `204` — the deadline is decoupled from the ds server's own long-poll timeout.
+//! - Handles are evicted after sitting idle for `ELECTRIC_HANDLE_TTL` seconds (default 600): the engine
+//!   shape and its durable stream are dropped, and a late request on the evicted handle gets the
+//!   standard `409 must-refetch` (the client re-snapshots). Without this every initial `GET` leaks a
+//!   shape + stream + registry entry forever.
+//! - Errors split by who must act: validation failures (bad `where`, unknown table/column, missing
+//!   handle, table/handle mismatch) are 400 with an Electric-style `{"message": …}` body — the client
+//!   treats 400 as fatal. Everything else (durable-streams hiccups, engine failures) is 500 so the
+//!   client retries.
+//! - Values are encoded as Postgres **text** (`bool`→`"true"`/`"false"`, text as-is); Electric's default
+//!   value-mapper only coerces int/float, leaving these as strings — matching the oracle's stringified
+//!   comparison.
+
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+
+use axum::extract::{Query, State};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use serde::Deserialize;
+use tokio::sync::watch;
+
+use crate::ds::{Envelope, ReadResult};
+use crate::engine::Engine;
+use crate::schema::{ColumnType, TableSchema};
+
+#[derive(Debug, Deserialize)]
+pub struct ShapeParams {
+    table: String,
+    #[serde(default)]
+    offset: Option<String>,
+    #[serde(default)]
+    handle: Option<String>,
+    #[serde(default, rename = "where")]
+    where_: Option<String>,
+    #[serde(default)]
+    columns: Option<String>,
+    #[serde(default)]
+    live: Option<String>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    replica: Option<String>,
+}
+
+/// A registered handle. The registry maps handle → `Arc<HandleEntry>`; the mutable cursor state
+/// (`keys`/`offset`) sits behind a per-handle async mutex held across read+apply so two concurrent
+/// requests on one handle (client abort + retry) cannot interleave and corrupt the key set. The
+/// registry lock itself is only ever held briefly (get/insert/remove), never across I/O.
+struct HandleEntry {
+    stream_path: String,
+    table: String,
+    pk_name: String,
+    /// When this handle was last touched by a request — drives idle-TTL eviction.
+    last_access: std::sync::Mutex<Instant>,
+    state: tokio::sync::Mutex<HandleState>,
+    /// In-flight **live** long-polls keyed by request offset. Concurrent live requests at the same
+    /// (handle, offset) are identical, so the first arrival (the leader) does the read+apply while
+    /// every other one awaits the published [`ReadOutcome`] on the watch channel instead of queueing
+    /// behind the state mutex (which would hand each waiter a full long-poll timeout in turn). Only
+    /// the leader touches [`HandleState`]. Lock order: this lock is only ever held briefly and never
+    /// across I/O or the state mutex.
+    live_inflight: std::sync::Mutex<HashMap<String, watch::Receiver<LiveSlot>>>,
+}
+
+/// `None` until the leader publishes; then the shared result every coalesced waiter clones.
+type LiveSlot = Option<Result<ReadOutcome, ApiError>>;
+
+impl HandleEntry {
+    fn touch(&self) {
+        *self.last_access.lock().unwrap() = Instant::now();
+    }
+}
+
+/// Per-handle live state: which keys the client currently holds (to pick insert vs update) and the last
+/// offset we served it.
+struct HandleState {
+    keys: HashSet<String>,
+    offset: String,
+}
+
+fn handles() -> &'static std::sync::Mutex<HashMap<String, Arc<HandleEntry>>> {
+    static H: OnceLock<std::sync::Mutex<HashMap<String, Arc<HandleEntry>>>> = OnceLock::new();
+    H.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Overall deadline for a `live=true` long-poll, decoupled from the ds server's own long-poll timeout:
+/// the adapter keeps re-polling the ds stream until data arrives or this elapses, then returns `204`.
+/// `ELECTRIC_LIVE_TIMEOUT_MS` env var; default 20000 (Electric's ~20s live long-poll).
+fn live_timeout() -> Duration {
+    static T: OnceLock<Duration> = OnceLock::new();
+    *T.get_or_init(|| {
+        let ms = std::env::var("ELECTRIC_LIVE_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(20_000);
+        Duration::from_millis(ms)
+    })
+}
+
+/// Idle TTL for `/v1/shape` handles: a handle not touched for this long is evicted (its engine shape
+/// and durable stream are dropped). `ELECTRIC_HANDLE_TTL` env var, in seconds; default 600 (10 min).
+fn handle_ttl() -> Duration {
+    static TTL: OnceLock<Duration> = OnceLock::new();
+    *TTL.get_or_init(|| {
+        let secs = std::env::var("ELECTRIC_HANDLE_TTL")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(600);
+        Duration::from_secs(secs)
+    })
+}
+
+/// Spawn (once) the background evictor that drops handles idle longer than [`handle_ttl`]. A request
+/// arriving with an evicted handle gets the standard `409 must-refetch` and re-snapshots.
+fn ensure_evictor(engine: &Engine) {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            let ttl = handle_ttl();
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let idle: Vec<(String, Arc<HandleEntry>)> = handles()
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, e)| e.last_access.lock().unwrap().elapsed() > ttl)
+                    .map(|(id, e)| (id.clone(), e.clone()))
+                    .collect();
+                for (id, entry) in idle {
+                    // Skip a handle mid-request (its state mutex is held). Holding the guard while we
+                    // unregister keeps a racing request from mutating state we are tearing down; a
+                    // request that snatched the Arc just before removal fails its read (stream gone),
+                    // returns a 5xx, and the retry gets 409 must-refetch.
+                    let Ok(guard) = entry.state.try_lock() else { continue };
+                    if entry.last_access.lock().unwrap().elapsed() <= ttl {
+                        continue; // touched between the scan and now
+                    }
+                    handles().lock().unwrap().remove(&id);
+                    drop(guard);
+                    match engine.drop_shape(&id).await {
+                        Ok(()) => tracing::debug!("evicted idle electric handle {id}"),
+                        Err(e) => {
+                            tracing::warn!("evicting idle electric handle {id}: drop_shape failed: {e:#}")
+                        }
+                    }
+                }
+            }
+        });
+    });
+}
+
+fn next_cursor() -> u64 {
+    static C: AtomicU64 = AtomicU64::new(1);
+    C.fetch_add(1, Ordering::Relaxed)
+}
+
+fn col_csv(c: &Option<String>) -> Option<Vec<String>> {
+    c.as_ref().map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+}
+
+/// A Postgres type name for the `electric-schema` header. Only `int*`/`float*` trigger the client's
+/// value coercion; text/bool stay strings (which is what we want for the stringified oracle compare).
+fn pg_type(ty: ColumnType) -> &'static str {
+    match ty {
+        ColumnType::Int => "int8",
+        ColumnType::Float => "float8",
+        ColumnType::Text => "text",
+        ColumnType::Bool => "bool",
+    }
+}
+
+/// Build the `electric-schema` JSON: `{col: {type, pk_index?}}`.
+fn schema_json(ts: &TableSchema, columns: &Option<Vec<String>>) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for (name, ty) in &ts.columns {
+        if let Some(cols) = columns {
+            if !cols.iter().any(|c| c == name) && name != &ts.pk_name {
+                continue;
+            }
+        }
+        let mut entry = serde_json::Map::new();
+        entry.insert("type".into(), serde_json::Value::String(pg_type(*ty).into()));
+        if name == &ts.pk_name {
+            entry.insert("pk_index".into(), serde_json::Value::from(0));
+        }
+        map.insert(name.clone(), serde_json::Value::Object(entry));
+    }
+    serde_json::Value::Object(map)
+}
+
+/// Re-encode a row JSON value (typed: string/bool/number/null) as Electric text values (`{col: "text"}`).
+fn encode_value(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(m) => {
+            serde_json::Value::Object(m.iter().map(|(k, val)| (k.clone(), pg_text(val))).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+fn pg_text(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Null => serde_json::Value::Null,
+        serde_json::Value::Bool(b) => serde_json::Value::String(if *b { "true".into() } else { "false".into() }),
+        serde_json::Value::String(s) => serde_json::Value::String(s.clone()),
+        serde_json::Value::Number(n) => serde_json::Value::String(n.to_string()),
+        other => serde_json::Value::String(other.to_string()),
+    }
+}
+
+fn change_msg(op: &str, key: &str, value: Option<serde_json::Value>) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    let mut headers = serde_json::Map::new();
+    headers.insert("operation".into(), serde_json::Value::String(op.into()));
+    m.insert("headers".into(), serde_json::Value::Object(headers));
+    m.insert("key".into(), serde_json::Value::String(key.into()));
+    if let Some(v) = value {
+        m.insert("value".into(), v);
+    }
+    serde_json::Value::Object(m)
+}
+
+fn control_msg(control: &str) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    let mut headers = serde_json::Map::new();
+    headers.insert("control".into(), serde_json::Value::String(control.into()));
+    if control == "up-to-date" {
+        headers.insert("global_last_seen_lsn".into(), serde_json::Value::String("0".into()));
+    }
+    m.insert("headers".into(), serde_json::Value::Object(headers));
+    serde_json::Value::Object(m)
+}
+
+fn hv(s: &str) -> HeaderValue {
+    HeaderValue::from_str(s).unwrap_or_else(|_| HeaderValue::from_static(""))
+}
+
+fn respond(messages: Vec<serde_json::Value>, mut headers: HeaderMap, status: StatusCode) -> Response {
+    headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    (status, headers, serde_json::to_string(&messages).unwrap_or_else(|_| "[]".into())).into_response()
+}
+
+fn must_refetch() -> Response {
+    // No `electric-handle` header: the evicted/unknown handle has no replacement shape yet — the
+    // client re-requests with offset=-1 and the snapshot response assigns the fresh handle.
+    let mut headers = HeaderMap::new();
+    headers.insert(HeaderName::from_static("electric-offset"), hv("-1"));
+    respond(vec![control_msg("must-refetch")], headers, StatusCode::CONFLICT)
+}
+
+/// Adapter error split by who must act: Electric's client treats **400 as fatal** (it kills the sync
+/// loop), so only request-validation failures may use it; anything transient/internal must be a 500 so
+/// the client retries. The body mirrors Electric's error shape: `{"message": …}`.
+#[derive(Clone, Debug)]
+struct ApiError {
+    status: StatusCode,
+    message: String,
+}
+
+impl ApiError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        ApiError { status: StatusCode::BAD_REQUEST, message: message.into() }
+    }
+}
+
+impl From<anyhow::Error> for ApiError {
+    fn from(e: anyhow::Error) -> Self {
+        ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("{e:#}") }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let body = serde_json::json!({ "message": self.message });
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        (self.status, headers, body.to_string()).into_response()
+    }
+}
+
+/// `true` iff stream offset `a` sorts after `b`. `"-1"` is the beginning; every other offset is the
+/// durable-streams server's fixed-width zero-padded token, whose lexicographic order equals stream
+/// order (`{seq:016}_{byte:016}`).
+fn offset_after(a: &str, b: &str) -> bool {
+    if a == "-1" {
+        false
+    } else if b == "-1" {
+        true
+    } else {
+        a > b
+    }
+}
+
+/// Page-driven fold of a shape stream into its current key→row map (pure, so unit-testable).
+///
+/// `until = Some(off)` rebuilds the state **as of** that offset: envelopes stamped after it are
+/// ignored (used when a client retries an older offset — folding to the tail instead would drop
+/// deletes / mis-classify inserts in the replayed window). `done` is set on `up-to-date`, when the
+/// target offset is passed, or when the next offset stops advancing; an empty page mid-stream does
+/// **not** end the fold (that truncated snapshots).
+struct StreamFold {
+    rows: HashMap<String, serde_json::Value>,
+    offset: String,
+    until: Option<String>,
+    done: bool,
+}
+
+impl StreamFold {
+    fn to_tail() -> Self {
+        StreamFold { rows: HashMap::new(), offset: "-1".into(), until: None, done: false }
+    }
+
+    fn up_to(offset: &str) -> Self {
+        StreamFold { rows: HashMap::new(), offset: "-1".into(), until: Some(offset.to_string()), done: false }
+    }
+
+    fn apply_page(&mut self, r: ReadResult) {
+        for env in r.envelopes {
+            if let (Some(target), Some(stamp)) = (self.until.as_deref(), env.headers.offset.as_deref()) {
+                if offset_after(stamp, target) {
+                    self.done = true;
+                    return;
+                }
+            }
+            match env.headers.operation.as_str() {
+                "delete" => {
+                    self.rows.remove(&env.key);
+                }
+                _ => {
+                    if let Some(v) = env.value {
+                        self.rows.insert(env.key, v);
+                    }
+                }
+            }
+        }
+        let advanced = match r.next_offset {
+            Some(n) if n != self.offset => {
+                self.offset = n;
+                true
+            }
+            _ => false,
+        };
+        if r.up_to_date || !advanced {
+            self.done = true;
+        }
+    }
+}
+
+/// Drive a [`StreamFold`] with catch-up reads until it completes.
+async fn drive_fold(engine: &Engine, path: &str, mut fold: StreamFold) -> anyhow::Result<StreamFold> {
+    while !fold.done {
+        let offset = fold.offset.clone();
+        let r = engine.read_shape_stream(path, &offset, false).await?;
+        fold.apply_page(r);
+    }
+    Ok(fold)
+}
+
+/// Fold a shape's whole stream (catch-up reads from `-1`) into the current key→row-value map and return
+/// it with the stream's tail offset.
+async fn materialize(engine: &Engine, path: &str) -> anyhow::Result<(HashMap<String, serde_json::Value>, String)> {
+    let fold = drive_fold(engine, path, StreamFold::to_tail()).await?;
+    Ok((fold.rows, fold.offset))
+}
+
+/// The key set a client holds when positioned at `offset` (fold `-1..=offset`).
+async fn keys_as_of(engine: &Engine, path: &str, offset: &str) -> anyhow::Result<HashSet<String>> {
+    let fold = drive_fold(engine, path, StreamFold::up_to(offset)).await?;
+    Ok(fold.rows.into_keys().collect())
+}
+
+/// Classify the engine's absolute `upsert`/`delete` envelopes into Electric `insert`/`update`/`delete`
+/// change messages against the client's key set (mutating it as it goes).
+fn apply_changes(keys: &mut HashSet<String>, pk_name: &str, envelopes: Vec<Envelope>) -> Vec<serde_json::Value> {
+    let mut messages = Vec::new();
+    for env in envelopes {
+        match env.headers.operation.as_str() {
+            "delete" => {
+                if keys.remove(&env.key) {
+                    // Electric's client requires a `value` on every change message (its parser matches
+                    // on `"value"`). For a delete we carry the row's old value if present, else the key.
+                    let value = env
+                        .value
+                        .as_ref()
+                        .map(encode_value)
+                        .unwrap_or_else(|| serde_json::json!({ pk_name: env.key }));
+                    messages.push(change_msg("delete", &env.key, Some(value)));
+                }
+            }
+            _ => {
+                let value = env.value.as_ref().map(encode_value);
+                if keys.contains(&env.key) {
+                    messages.push(change_msg("update", &env.key, value));
+                } else {
+                    keys.insert(env.key.clone());
+                    messages.push(change_msg("insert", &env.key, value));
+                }
+            }
+        }
+    }
+    messages
+}
+
+/// Schema-validation collector: lets [`CompiledPredicate::compile_with`] walk `IN (SELECT …)` leaves
+/// (returning their signature) without registering nodes — used to pre-validate a snapshot request's
+/// predicate against the table schema so unknown columns / mistyped literals are a 400, not a 500.
+struct ValidateOnly;
+impl crate::predicate::SubqueryCollector for ValidateOnly {
+    fn collect(
+        &mut self,
+        table: &str,
+        project: &str,
+        where_: Option<&crate::predicate::PredicateJson>,
+    ) -> anyhow::Result<crate::predicate::SubquerySig> {
+        Ok(crate::predicate::subquery_sig(table, project, where_))
+    }
+}
+
+/// The result of one positioned read on a handle, cloneable to every coalesced waiter. `body: None`
+/// is the `204` long-poll-deadline response; `Some` carries the serialized JSON message array.
+#[derive(Clone)]
+struct ReadOutcome {
+    offset: String,
+    up_to_date: bool,
+    cursor: u64,
+    body: Option<String>,
+}
+
+/// Coalesce concurrent live requests at one (handle, offset): the first arrival becomes the leader,
+/// runs `work` (the serialized resync+read+apply path) and publishes its result; every concurrent
+/// caller at the same offset awaits that result instead of re-running `work`. If the leader vanishes
+/// without publishing (client disconnect drops its future mid-poll), the channel closes and waiters
+/// re-elect a leader (`work` is re-buildable via `Fn`).
+async fn coalesce_live<F, Fut>(entry: &HandleEntry, offset: &str, work: F) -> Result<ReadOutcome, ApiError>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<ReadOutcome, ApiError>>,
+{
+    enum Role {
+        Leader(watch::Sender<LiveSlot>),
+        Waiter(watch::Receiver<LiveSlot>),
+    }
+    loop {
+        let role = {
+            let mut map = entry.live_inflight.lock().unwrap();
+            match map.get(offset) {
+                Some(rx) => Role::Waiter(rx.clone()),
+                None => {
+                    let (tx, rx) = watch::channel(None);
+                    map.insert(offset.to_string(), rx);
+                    Role::Leader(tx)
+                }
+            }
+        };
+        match role {
+            Role::Leader(tx) => {
+                // Unregister on scope exit *and* on cancellation (the future being dropped), so an
+                // aborted leader never leaves a dead in-flight slot that waiters would hang on.
+                struct Unregister<'a>(&'a HandleEntry, &'a str);
+                impl Drop for Unregister<'_> {
+                    fn drop(&mut self) {
+                        self.0.live_inflight.lock().unwrap().remove(self.1);
+                    }
+                }
+                let _unregister = Unregister(entry, offset);
+                let result = work().await;
+                // The map still holds a receiver until `_unregister` drops, so send cannot fail; late
+                // arrivals that grabbed a receiver before removal see the value immediately.
+                let _ = tx.send(Some(result.clone()));
+                return result;
+            }
+            Role::Waiter(mut rx) => {
+                loop {
+                    if let Some(result) = rx.borrow_and_update().clone() {
+                        return result;
+                    }
+                    if rx.changed().await.is_err() {
+                        break; // leader cancelled without publishing — re-elect
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The serialized (per-handle state mutex) resync+read+apply path shared by non-live requests and the
+/// live leader. Holds the state mutex across the whole read loop so only one request mutates
+/// [`HandleState`]; for `live`, keeps re-polling the ds stream until data arrives or [`live_timeout`]
+/// elapses (the ds server's own long-poll timeout just paces the loop).
+async fn positioned_read(
+    engine: &Engine,
+    entry: &HandleEntry,
+    offset: &str,
+    live: bool,
+) -> Result<ReadOutcome, ApiError> {
+    let mut st = entry.state.lock().await;
+    if st.offset != offset {
+        // The client resumed at a different (older) offset than we last served: rebuild the key set
+        // **as of that offset** (fold -1..=offset), then replay from there. Folding to the tail instead
+        // would silently drop a delete of a key absent at tail and emit updates for reinserted keys.
+        st.keys = keys_as_of(engine, &entry.stream_path, offset).await?;
+        st.offset = offset.to_string();
+    }
+    let mut from = offset.to_string();
+    let mut r = engine.read_shape_stream(&entry.stream_path, &from, live).await?;
+    if live {
+        let deadline = Instant::now() + live_timeout();
+        while r.envelopes.is_empty() && Instant::now() < deadline {
+            if let Some(n) = &r.next_offset {
+                from = n.clone();
+            }
+            r = engine.read_shape_stream(&entry.stream_path, &from, true).await?;
+        }
+    }
+
+    if let Some(n) = &r.next_offset {
+        st.offset = n.clone();
+    }
+
+    // Live deadline reached with no new data: a 204 with the electric headers (handle, offset
+    // unchanged) like Electric does — a 200 `[]` without `up-to-date` would make the client busy-loop.
+    if live && r.envelopes.is_empty() {
+        let served_offset = st.offset.clone();
+        drop(st);
+        entry.touch();
+        return Ok(ReadOutcome { offset: served_offset, up_to_date: true, cursor: next_cursor(), body: None });
+    }
+
+    let mut messages = apply_changes(&mut st.keys, &entry.pk_name, r.envelopes);
+    if r.up_to_date {
+        messages.push(control_msg("up-to-date"));
+    }
+    let served_offset = st.offset.clone();
+    drop(st);
+    entry.touch();
+    Ok(ReadOutcome {
+        offset: served_offset,
+        up_to_date: r.up_to_date,
+        cursor: next_cursor(),
+        body: Some(serde_json::to_string(&messages).unwrap_or_else(|_| "[]".into())),
+    })
+}
+
+pub async fn shape(State(engine): State<Engine>, Query(p): Query<ShapeParams>) -> Response {
+    ensure_evictor(&engine);
+    match shape_inner(engine, p).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::warn!("/v1/shape error ({}): {}", e.status, e.message);
+            e.into_response()
+        }
+    }
+}
+
+async fn shape_inner(engine: Engine, mut p: ShapeParams) -> Result<Response, ApiError> {
+    // Electric clients send schema-qualified table names (`public.users`); our engine keys by the bare
+    // table name. Strip any schema prefix.
+    if let Some((_schema, bare)) = p.table.rsplit_once('.') {
+        p.table = bare.to_string();
+    }
+    let offset = p.offset.clone().unwrap_or_else(|| "-1".into());
+    let live = p.live.as_deref() == Some("true");
+    let columns = col_csv(&p.columns);
+    let _ = &p.cursor; // accepted (cache-busting hint); we mint our own electric-cursor
+    let _ = &p.replica; // accepted; we always send full rows (replica=full semantics)
+
+    let Some(ts) = engine.table_schema(&p.table).await else {
+        return Err(ApiError::bad_request(format!("unknown table '{}'", p.table)));
+    };
+
+    // A positioned read without a handle is invalid (Electric: "handle required") — silently serving a
+    // fresh snapshot here would hand the client a log that doesn't match its offset.
+    if offset != "-1" && p.handle.is_none() {
+        return Err(ApiError::bad_request("offset was provided without a shape handle"));
+    }
+
+    // ---- Snapshot: offset=-1 -> create the shape and emit the current rows as inserts.
+    if offset == "-1" {
+        let pred = crate::where_sql::parse_where_typed(p.where_.as_deref().unwrap_or(""), Some(&ts))
+            .map_err(|e| ApiError::bad_request(format!("invalid where clause: {e:#}")))?;
+        // Validate the request shape against the schema up front: these are client errors (400). A
+        // failure past this point (stream creation, backfill, reads) is internal (500).
+        if let Some(cols) = &columns {
+            for c in cols {
+                if ts.column_index(c).is_err() {
+                    return Err(ApiError::bad_request(format!("unknown column '{c}'")));
+                }
+            }
+        }
+        if let Some(pr) = &pred {
+            crate::predicate::CompiledPredicate::compile_with(pr, &ts, &mut ValidateOnly)
+                .map_err(|e| ApiError::bad_request(format!("invalid where clause: {e:#}")))?;
+        }
+        // share = false: the Electric handle model keys live cursor state by shape id per request, so
+        // each /v1/shape request needs its own shape (no id sharing).
+        let rec = engine.create_shape(&p.table, pred, columns.clone(), false, false).await?;
+        let (rows, tail) = materialize(&engine, &rec.stream_path).await?;
+
+        let mut messages = Vec::with_capacity(rows.len() + 1);
+        let mut keys = HashSet::with_capacity(rows.len());
+        for (key, value) in &rows {
+            messages.push(change_msg("insert", key, Some(encode_value(value))));
+            keys.insert(key.clone());
+        }
+        messages.push(control_msg("up-to-date"));
+
+        let schema_str = serde_json::to_string(&schema_json(&ts, &columns)).unwrap_or_default();
+        handles().lock().unwrap().insert(
+            rec.id.clone(),
+            Arc::new(HandleEntry {
+                stream_path: rec.stream_path.clone(),
+                table: p.table.clone(),
+                pk_name: ts.pk_name.clone(),
+                last_access: std::sync::Mutex::new(Instant::now()),
+                state: tokio::sync::Mutex::new(HandleState { keys, offset: tail.clone() }),
+                live_inflight: std::sync::Mutex::new(HashMap::new()),
+            }),
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(HeaderName::from_static("electric-handle"), hv(&rec.id));
+        headers.insert(HeaderName::from_static("electric-offset"), hv(&tail));
+        headers.insert(HeaderName::from_static("electric-schema"), hv(&schema_str));
+        headers.insert(HeaderName::from_static("electric-up-to-date"), hv(""));
+        headers.insert(axum::http::header::CACHE_CONTROL, hv("no-store"));
+        return Ok(respond(messages, headers, StatusCode::OK));
+    }
+
+    // ---- Live: long-poll from `offset`, emit insert/update/delete reconstructed against the key set.
+    let handle = p.handle.clone().unwrap();
+    let entry = {
+        // Registry lock held only for the lookup; never across I/O or the per-handle lock.
+        let map = handles().lock().unwrap();
+        match map.get(&handle) {
+            Some(e) => e.clone(),
+            None => return Ok(must_refetch()),
+        }
+    };
+    entry.touch();
+    if entry.table != p.table {
+        return Err(ApiError::bad_request(format!(
+            "table '{}' does not match the shape of handle '{handle}' (table '{}')",
+            p.table, entry.table
+        )));
+    }
+
+    // Live requests at one (handle, offset) coalesce onto a single leader; everything else takes the
+    // serialized (state-mutex) path directly. Only the leader / the serialized caller mutates state.
+    let outcome = if live {
+        let work_engine = engine.clone();
+        let work_entry = entry.clone();
+        let work_offset = offset.clone();
+        coalesce_live(&entry, &offset, move || {
+            let engine = work_engine.clone();
+            let entry = work_entry.clone();
+            let offset = work_offset.clone();
+            async move { positioned_read(&engine, &entry, &offset, true).await }
+        })
+        .await?
+    } else {
+        positioned_read(&engine, &entry, &offset, false).await?
+    };
+
+    let mut headers = HeaderMap::new();
+    headers.insert(HeaderName::from_static("electric-handle"), hv(&handle));
+    headers.insert(HeaderName::from_static("electric-offset"), hv(&outcome.offset));
+    headers.insert(HeaderName::from_static("electric-cursor"), hv(&outcome.cursor.to_string()));
+    if outcome.up_to_date {
+        headers.insert(HeaderName::from_static("electric-up-to-date"), hv(""));
+    }
+    headers.insert(axum::http::header::CACHE_CONTROL, hv("no-store"));
+    match outcome.body {
+        None => Ok((StatusCode::NO_CONTENT, headers).into_response()),
+        Some(body) => {
+            headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            Ok((StatusCode::OK, headers, body).into_response())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ds::EnvelopeHeaders;
+
+    fn env(op: &str, key: &str, offset: &str) -> Envelope {
+        Envelope {
+            type_: "change".into(),
+            key: key.into(),
+            value: if op == "delete" { None } else { Some(serde_json::json!({ "id": key })) },
+            old: None,
+            headers: EnvelopeHeaders {
+                operation: op.into(),
+                txid: None,
+                offset: Some(offset.into()),
+                lsn: None,
+                seq: None,
+            },
+        }
+    }
+
+    fn page(envs: Vec<Envelope>, next: &str, up_to_date: bool) -> ReadResult {
+        ReadResult { envelopes: envs, next_offset: Some(next.into()), up_to_date }
+    }
+
+    fn op_and_key(msg: &serde_json::Value) -> (String, String) {
+        (
+            msg["headers"]["operation"].as_str().unwrap().to_string(),
+            msg["key"].as_str().unwrap().to_string(),
+        )
+    }
+
+    // M9: an empty non-up-to-date page mid-stream must not end the fold (that truncated snapshots);
+    // the fold only stops on up-to-date or when the next offset stops advancing.
+    #[test]
+    fn fold_survives_empty_mid_stream_page() {
+        let mut fold = StreamFold::to_tail();
+        fold.apply_page(page(vec![env("upsert", "k1", "01")], "01", false));
+        assert!(!fold.done, "non-empty non-up-to-date page must not end the fold");
+        fold.apply_page(page(vec![], "02", false)); // empty page, but offset advanced
+        assert!(!fold.done, "empty page with an advancing offset must not end the fold");
+        fold.apply_page(page(vec![env("upsert", "k2", "03")], "03", true));
+        assert!(fold.done);
+        assert_eq!(fold.offset, "03");
+        let mut keys: Vec<_> = fold.rows.keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, vec!["k1", "k2"], "snapshot missed rows past the empty page");
+    }
+
+    #[test]
+    fn fold_stops_when_offset_stalls() {
+        let mut fold = StreamFold::to_tail();
+        fold.apply_page(page(vec![env("upsert", "k1", "01")], "01", false));
+        // Same next offset, no up-to-date: the stream is not advancing — stop (no infinite loop).
+        fold.apply_page(page(vec![], "01", false));
+        assert!(fold.done);
+        assert_eq!(fold.offset, "01");
+    }
+
+    // C2: rebuilding the key set as of the client's *requested* offset (not the tail).
+    #[test]
+    fn fold_up_to_stops_at_the_requested_offset() {
+        // Stream: insert k1 @01, insert k2 @02, delete k2 @03. A client at offset 02 holds {k1, k2}.
+        let mut fold = StreamFold::up_to("02");
+        fold.apply_page(page(
+            vec![env("upsert", "k1", "01"), env("upsert", "k2", "02"), env("delete", "k2", "03")],
+            "03",
+            true,
+        ));
+        assert!(fold.done);
+        let mut keys: Vec<_> = fold.rows.keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, vec!["k1", "k2"], "the delete past the requested offset must not be folded in");
+    }
+
+    // C2: a delete in the replayed window must reach the client. Folding to the TAIL loses k2 (absent
+    // at tail), so the replayed delete was silently dropped and the client kept a deleted row forever.
+    #[test]
+    fn replay_emits_delete_for_row_deleted_in_the_replayed_window() {
+        let all = vec![env("upsert", "k1", "01"), env("upsert", "k2", "02"), env("delete", "k2", "03")];
+
+        // Rebuild as of the client's offset (02)...
+        let mut fold = StreamFold::up_to("02");
+        fold.apply_page(page(all.clone(), "03", true));
+        let mut keys: HashSet<String> = fold.rows.into_keys().collect();
+
+        // ...then replay everything after it.
+        let replay: Vec<Envelope> = all.into_iter().filter(|e| offset_after(e.headers.offset.as_deref().unwrap(), "02")).collect();
+        let msgs = apply_changes(&mut keys, "id", replay);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(op_and_key(&msgs[0]), ("delete".into(), "k2".into()));
+        assert!(!keys.contains("k2"));
+    }
+
+    // C2: an insert in the replayed window whose key exists at TAIL must be emitted as an insert (the
+    // tail-state rebuild classified it as `update`, which Electric's client rejects as update-of-missing).
+    #[test]
+    fn replay_emits_insert_for_row_reinserted_after_the_replayed_offset() {
+        let all = vec![env("upsert", "k1", "01"), env("delete", "k1", "02"), env("upsert", "k1", "03")];
+
+        let mut fold = StreamFold::up_to("02");
+        fold.apply_page(page(all.clone(), "03", true));
+        let mut keys: HashSet<String> = fold.rows.into_keys().collect();
+        assert!(keys.is_empty(), "as of offset 02 the client holds no rows");
+
+        let replay: Vec<Envelope> = all.into_iter().filter(|e| offset_after(e.headers.offset.as_deref().unwrap(), "02")).collect();
+        let msgs = apply_changes(&mut keys, "id", replay);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(op_and_key(&msgs[0]), ("insert".into(), "k1".into()));
+    }
+
+    #[test]
+    fn apply_changes_classifies_against_the_key_set() {
+        let mut keys: HashSet<String> = ["k1".to_string()].into_iter().collect();
+        let msgs = apply_changes(
+            &mut keys,
+            "id",
+            vec![env("upsert", "k1", "01"), env("upsert", "k2", "02"), env("delete", "k9", "03")],
+        );
+        assert_eq!(op_and_key(&msgs[0]), ("update".into(), "k1".into()));
+        assert_eq!(op_and_key(&msgs[1]), ("insert".into(), "k2".into()));
+        // delete of a key the client never had is suppressed
+        assert_eq!(msgs.len(), 2);
+    }
+
+    #[test]
+    fn offset_ordering() {
+        assert!(offset_after("02", "01"));
+        assert!(!offset_after("01", "02"));
+        assert!(!offset_after("-1", "01"));
+        assert!(offset_after("01", "-1"));
+        assert!(!offset_after("01", "01"));
+    }
+
+    // ---- live-request coalescing --------------------------------------------------------------
+
+    use std::sync::atomic::AtomicUsize;
+
+    fn test_entry() -> Arc<HandleEntry> {
+        Arc::new(HandleEntry {
+            stream_path: "s".into(),
+            table: "t".into(),
+            pk_name: "id".into(),
+            last_access: std::sync::Mutex::new(Instant::now()),
+            state: tokio::sync::Mutex::new(HandleState { keys: HashSet::new(), offset: "-1".into() }),
+            live_inflight: std::sync::Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Spawn one coalesced live request whose leader work bumps `calls`, sleeps `work_ms` of (paused)
+    /// time, and publishes a canned outcome tagged with `offset`.
+    fn spawn_live(
+        entry: &Arc<HandleEntry>,
+        offset: &'static str,
+        calls: &Arc<AtomicUsize>,
+        work_ms: u64,
+    ) -> tokio::task::JoinHandle<Result<ReadOutcome, ApiError>> {
+        let entry = entry.clone();
+        let calls = calls.clone();
+        tokio::spawn(async move {
+            coalesce_live(&entry, offset, move || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    // Stands in for the ds long-poll: long enough that every spawned request has
+                    // registered (leader or waiter) before the leader publishes.
+                    tokio::time::sleep(Duration::from_millis(work_ms)).await;
+                    Ok(ReadOutcome {
+                        offset: format!("{offset}-next"),
+                        up_to_date: true,
+                        cursor: 1,
+                        body: Some("[]".into()),
+                    })
+                }
+            })
+            .await
+        })
+    }
+
+    // The write-fanout shape: N concurrent live requests on one handle at one offset must produce ONE
+    // leader read, with every request receiving the same response (not N serialized long-polls).
+    #[tokio::test]
+    async fn concurrent_live_requests_coalesce_to_one_leader() {
+        let entry = test_entry();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tasks: Vec<_> = (0..200).map(|_| spawn_live(&entry, "07", &calls, 500)).collect();
+        for t in tasks {
+            let out = t.await.unwrap().expect("every coalesced request gets the leader's response");
+            assert_eq!(out.offset, "07-next");
+            assert_eq!(out.body.as_deref(), Some("[]"));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one leader must run the read");
+        assert!(entry.live_inflight.lock().unwrap().is_empty(), "in-flight slot must be cleared");
+    }
+
+    // Requests at *different* offsets are not identical — each gets its own leader.
+    #[tokio::test]
+    async fn live_requests_at_different_offsets_do_not_coalesce() {
+        let entry = test_entry();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let a = spawn_live(&entry, "07", &calls, 100);
+        let b = spawn_live(&entry, "08", &calls, 100);
+        assert_eq!(a.await.unwrap().unwrap().offset, "07-next");
+        assert_eq!(b.await.unwrap().unwrap().offset, "08-next");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(entry.live_inflight.lock().unwrap().is_empty());
+    }
+
+    // A leader whose request future is dropped (client disconnect mid-poll) must not strand waiters:
+    // the watch channel closes and a waiter re-elects itself leader.
+    #[tokio::test]
+    async fn waiters_reelect_when_the_leader_is_cancelled() {
+        let entry = test_entry();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let leader = spawn_live(&entry, "07", &calls, 500);
+        tokio::time::sleep(Duration::from_millis(50)).await; // let the leader register
+        let waiter = spawn_live(&entry, "07", &calls, 500);
+        tokio::time::sleep(Duration::from_millis(50)).await; // let the waiter subscribe
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        leader.abort();
+        let out = waiter.await.unwrap().expect("waiter must recover from a cancelled leader");
+        assert_eq!(out.offset, "07-next");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "the waiter re-ran the read as the new leader");
+        assert!(entry.live_inflight.lock().unwrap().is_empty());
+    }
+}

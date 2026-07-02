@@ -1,0 +1,35 @@
+# electric-ivm ENGINE image: the Rust binary that tails Postgres logical replication, maintains
+# shapes/subqueries/aggregations, and serves both the control-plane HTTP API and the
+# Electric-compatible `GET /v1/shape` endpoint.
+#
+# Build context is the repo root:
+#   docker build -f docker/Dockerfile.engine -t electric-ivm-engine .
+#
+# The engine speaks plain HTTP to the durable-streams server (reqwest is built with no TLS
+# backend), so the runtime image needs no OpenSSL — just certs-free debian slim.
+
+FROM rust:1-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends cmake pkg-config && rm -rf /var/lib/apt/lists/*
+WORKDIR /repo
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY apps/engine apps/engine
+RUN cargo build --release -p electric-ivm-engine
+
+FROM debian:bookworm-slim
+COPY --from=build /repo/target/release/electric-ivm-engine /usr/local/bin/electric-ivm-engine
+
+# Required:
+#   ELECTRIC_IVM_DS_URL   durable-streams base URL (e.g. http://ds:8791)
+#   ELECTRIC_IVM_PG_URL   Postgres URL (wal_level=logical; the engine creates its slot)
+# Optional:
+#   ELECTRIC_IVM_PG_TABLES  comma list, or `*` (default here) to introspect every public table
+#   ELECTRIC_IVM_PG_SLOT    slot name (default electric_ivm)
+#   ELECTRIC_IVM_BIND       bind address (default here 0.0.0.0:7010)
+#   ELECTRIC_IVM_LOG        tracing filter (default info)
+ENV ELECTRIC_IVM_BIND=0.0.0.0:7010 \
+    ELECTRIC_IVM_PG_TABLES=*
+
+EXPOSE 7010
+HEALTHCHECK --interval=5s --timeout=3s --retries=12 \
+  CMD ["/bin/sh", "-c", "exec 3<>/dev/tcp/127.0.0.1/7010 && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q 200"]
+CMD ["electric-ivm-engine"]

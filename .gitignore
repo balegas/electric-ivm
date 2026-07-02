@@ -1,0 +1,21 @@
+node_modules/
+dist/
+target/
+.turbo/
+*.log
+.DS_Store
+/tmp-data/
+pnpm-debug.log*
+
+# playwright-mcp output
+.playwright-mcp/
+
+# TS incremental build info
+*.tsbuildinfo
+
+# Ad-hoc run artifacts / scratch (not source)
+/*.png
+erl_crash.dump
+*.dump
+memtest.txt
+/results/

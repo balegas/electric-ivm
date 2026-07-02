@@ -1,0 +1,21 @@
+{
+  "name": "@electric-ivm/client",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@electric-ivm/protocol": "workspace:*",
+    "@electric-ivm/api": "workspace:*",
+    "@trpc/client": "^11.18.0",
+    "@durable-streams/client": "0.2.6",
+    "@durable-streams/state": "^0.3.1",
+    "@tanstack/db": "^0.6.12",
+    "zod": "^4.4.3"
+  }
+}

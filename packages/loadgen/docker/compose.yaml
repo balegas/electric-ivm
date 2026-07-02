@@ -1,0 +1,36 @@
+# Scale load-generator client nodes against a host-run infra.
+#
+#   1. On the host, boot the infra bound to all interfaces with fixed ports:
+#        BIND_HOST=0.0.0.0 API_PORT=8790 DS_PORT=8791 PG_PORT=8792 SEED_ISSUES=20000 \
+#          pnpm --filter @electric-ivm/loadgen loadgen   # LOADGEN_MODE defaults to `all`; use LOADGEN_MODE=infra
+#      (LOADGEN_MODE=infra keeps it up + samples server metrics while clients connect.)
+#
+#   2. Scale client nodes (each its own container/network namespace):
+#        cd packages/loadgen/docker
+#        USERS=50 DURATION_S=120 docker compose up --build --scale client=8
+#      → 8 nodes × 50 users = 400 simulated users, spread across 8 ephemeral-port ranges.
+#
+# The host infra samples engine RSS/CPU + Postgres/durable-streams disk into its results/metrics-infra.csv.
+
+services:
+  client:
+    build:
+      context: ../../.. # repo root
+      dockerfile: packages/loadgen/docker/Dockerfile.client
+    environment:
+      LOADGEN_MODE: client
+      API_URL: http://host.docker.internal:${API_PORT:-8790}
+      DS_URL: http://host.docker.internal:${DS_PORT:-8791}
+      PG_URL: postgres://postgres@host.docker.internal:${PG_PORT:-8792}/postgres
+      USERS: ${USERS:-50}
+      DURATION_S: ${DURATION_S:-120}
+      FEEDS_PER_USER: ${FEEDS_PER_USER:-4}
+      WRITE_RATE: ${WRITE_RATE:-0.25}
+      RAMP_MS: ${RAMP_MS:-25}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Each client node needs FDs for USERS × FEEDS_PER_USER connections + the write pool.
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576

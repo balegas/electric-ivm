@@ -1,0 +1,52 @@
+[package]
+name = "electric-ivm-engine"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+name = "electric_ivm_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "electric-ivm-engine"
+path = "src/main.rs"
+
+[dependencies]
+# Query engine. Version reqs kept at minor-level so cargo unifies our direct deps with
+# dbsp 0.299.0's own tree (so the rkyv/size-of/feldera-macros derive macros match dbsp's
+# expected rkyv 0.7). Pinning exact patches risks selecting a version dbsp didn't use.
+dbsp = "0.299"
+# default-features=false avoids rkyv's default `size_32`, which is mutually exclusive with
+# the `size_64` that dbsp selects (cargo unions features across dependents).
+rkyv = { version = "0.7", default-features = false, features = ["std", "size_64", "validation"] }
+# dbsp uses Feldera's fork of size-of (upstream size-of 0.1.5 fails on modern Rust/arm64
+# with E0570 on fn-pointer ABIs). The `SizeOf` derive emits hardcoded `size_of::` paths, so
+# the crate must be in scope under the name `size_of` (dbsp renames it the same way).
+# `ordered-float` feature pulls the SizeOf impl for OrderedFloat (used by our Float cell).
+size_of = { package = "feldera-size-of", version = "0.1.7", features = ["ordered-float"] }
+feldera-macros = "0.299"
+# Pin to 3.x to match feldera-size-of's ordered-float (its SizeOf impl targets v3's
+# OrderedFloat). rkyv_64 matches rkyv's size_64; rkyv_ck adds the validation/CheckBytes impl.
+ordered-float = { version = "3", features = ["rkyv_64", "rkyv_ck"] }
+anyhow = "1"
+
+# Service layer: control-plane HTTP + durable-streams client + async runtime.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+# http to a localhost durable-streams server only -> no TLS backend needed.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+# Postgres source: logical-replication slot polling (test_decoding) + backfill queries.
+# with-serde_json-1 lets us read `to_jsonb(row)` straight into serde_json::Value.
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+memory-stats = "1"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["metrics"] }
+opentelemetry-prometheus = "0.27"
+prometheus = "0.13"
