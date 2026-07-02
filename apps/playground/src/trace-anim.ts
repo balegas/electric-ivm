@@ -13,11 +13,14 @@ export interface Decor {
   nodes: Map<string, FlashKind>
   /** edge id -> pulse (color + weight label) */
   edges: Map<string, EdgePulse>
-  /** monotonically increasing — keys the SVG animation restarts */
+  /** monotonically increasing (diagnostics; pulses carry their own id) */
   id: number
 }
 
 export interface EdgePulse {
+  /** Id of the EVENT that created this pulse — keys the SVG animation, so merging a later event
+   *  into the decor never restarts other events' running dots (that read as a double render). */
+  id: number
   color: string
   label: string
   foreign: boolean
@@ -73,13 +76,14 @@ export function eventDecor(ev: TraceEvent, view: 'logical' | 'dbsp', edges: Edge
   const label = ev.delta.length === 0 ? '' : ev.delta.length > 1 && w === 0 ? '±1' : w > 0 ? '+1' : '−1'
   const color = ev.yours ? (w > 0 ? '#16a34a' : w < 0 ? '#dc2626' : '#0ea5e9') : '#94a3b8'
 
+  const id = decorSeq++
   const pulses = new Map<string, EdgePulse>()
   for (const e of edges) {
     if (nodes.has(e.source) && nodes.has(e.target)) {
-      pulses.set(e.id, { color, label, foreign: !ev.yours })
+      pulses.set(e.id, { id, color, label, foreign: !ev.yours })
     }
   }
-  return { nodes, edges: pulses, id: decorSeq++ }
+  return { nodes, edges: pulses, id }
 }
 
 /** Merge b over a (later events win per node/edge). */

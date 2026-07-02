@@ -7,7 +7,7 @@ import { BaseEdge, getBezierPath, type EdgeProps } from '@xyflow/react'
 import type { EdgePulse } from './trace-anim.ts'
 
 export interface PulseEdgeData extends Record<string, unknown> {
-  pulse?: (EdgePulse & { id: number }) | undefined
+  pulse?: EdgePulse | undefined
   baseStyle?: React.CSSProperties
 }
 

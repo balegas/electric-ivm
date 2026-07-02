@@ -83,9 +83,10 @@ export function PipelineCanvas({
       decor?.nodes.has(n.id) ? { ...n, data: { ...n.data, flash: decor.nodes.get(n.id) } } : n,
     )
     const de = edges.map((e) => {
-      const pulse = decor?.edges.get(e.id)
-      const data: PulseEdgeData = { pulse: pulse ? { ...pulse, id: decor!.id } : undefined, baseStyle: e.style }
-      return { ...e, type: 'pulse', data, style: pulse ? undefined : e.style }
+      // The pulse keeps the id of the event that created it — re-rendering after a merge must not
+      // restart dots already in flight on other edges.
+      const data: PulseEdgeData = { pulse: decor?.edges.get(e.id), baseStyle: e.style }
+      return { ...e, type: 'pulse', data, style: data.pulse ? undefined : e.style }
     })
     return { nodes: dn, edges: de }
   }, [nodes, edges, decor])
