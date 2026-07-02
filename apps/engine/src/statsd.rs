@@ -376,10 +376,11 @@ async fn system_sampler(period: Duration) {
             s.gauge("system.memory_percent.used_memory", pct(sys.used_memory()), &[]);
         }
 
-        // vm.memory.total = process RSS bytes (memory-stats, matching mem.rs).
-        let (rss, _virt) = crate::mem::process_memory();
-        if rss > 0 {
-            s.gauge("vm.memory.total", rss as f64, &[]);
+        // vm.memory.total = container-total memory when in a cgroup (engine + node ds server +
+        // everything) — the honest analog of Electric's whole-BEAM figure; else the engine RSS.
+        let mem_total = vm_memory_total_bytes();
+        if mem_total > 0 {
+            s.gauge("vm.memory.total", mem_total as f64, &[]);
         }
 
         s.gauge("vm.uptime.total", since_start().as_secs_f64(), &[]);
@@ -412,6 +413,29 @@ async fn system_sampler(period: Duration) {
 
         tokio::time::sleep(period).await;
     }
+}
+
+/// Parse a cgroup memory file (a byte count, or `max` for "unlimited"). `None` for `max`/unparseable
+/// → the caller falls back to process RSS.
+fn parse_cgroup_mem(contents: &str) -> Option<u64> {
+    let t = contents.trim();
+    if t == "max" {
+        return None;
+    }
+    t.parse::<u64>().ok()
+}
+
+/// `vm.memory.total` in bytes: the cgroup-v2 container total (`/sys/fs/cgroup/memory.current`, which
+/// counts every process in the container — our engine AND the node durable-streams server) when
+/// running in a cgroup; otherwise the engine process RSS (e.g. macOS dev, no cgroup). Reporting only
+/// the engine RSS would under-report vs Electric's whole-BEAM figure and read as unfairly favorable.
+fn vm_memory_total_bytes() -> u64 {
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory.current") {
+        if let Some(b) = parse_cgroup_mem(&s) {
+            return b;
+        }
+    }
+    crate::mem::process_memory().0
 }
 
 /// OS thread count of this process. Linux: entries in `/proc/self/task`. Elsewhere unmeasured → `None`
@@ -584,6 +608,16 @@ mod tests {
         for (a, b) in rejoined.iter().zip(lines.iter()) {
             assert_eq!(a, b);
         }
+    }
+
+    #[test]
+    fn cgroup_mem_parsing() {
+        assert_eq!(parse_cgroup_mem("171966464\n"), Some(171_966_464)); // real memory.current form
+        assert_eq!(parse_cgroup_mem("  42 "), Some(42));
+        assert_eq!(parse_cgroup_mem("max"), None); // unlimited -> fall back to RSS
+        assert_eq!(parse_cgroup_mem("max\n"), None);
+        assert_eq!(parse_cgroup_mem(""), None);
+        assert_eq!(parse_cgroup_mem("garbage"), None);
     }
 
     #[test]
