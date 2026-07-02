@@ -491,7 +491,7 @@ impl Engine {
                         .cloned()
                         .ok_or_else(|| anyhow::anyhow!("unknown table '{t}' referenced by subquery"))?;
                     let handle =
-                        spawn_tailer(self.ds.clone(), tts, self.pg_url.clone(), self.subqueries.clone());
+                        spawn_tailer(self.ds.clone(), tts, self.pg_url.clone(), self.subqueries.clone(), self.trace_tx.clone());
                     st.tailers.insert(t.clone(), handle);
                 }
             }
@@ -554,7 +554,7 @@ impl Engine {
             .map(|pairs| pairs.iter().map(|(i, _)| ts.columns[*i].0.clone()).collect::<Vec<_>>());
 
         if !st.tailers.contains_key(table) {
-            let handle = spawn_tailer(self.ds.clone(), ts.clone(), self.pg_url.clone(), self.subqueries.clone());
+            let handle = spawn_tailer(self.ds.clone(), ts.clone(), self.pg_url.clone(), self.subqueries.clone(), self.trace_tx.clone());
             st.tailers.insert(table.to_string(), handle);
         }
         let tailer = st.tailers.get(table).expect("tailer just inserted");
@@ -666,7 +666,7 @@ impl Engine {
         self.ds.ensure_stream(&stream_path).await?;
 
         if !st.tailers.contains_key(table) {
-            let handle = spawn_tailer(self.ds.clone(), ts.clone(), self.pg_url.clone(), self.subqueries.clone());
+            let handle = spawn_tailer(self.ds.clone(), ts.clone(), self.pg_url.clone(), self.subqueries.clone(), self.trace_tx.clone());
             st.tailers.insert(table.to_string(), handle);
         }
         let tailer = st.tailers.get(table).expect("tailer just inserted");
@@ -1119,11 +1119,12 @@ fn spawn_tailer(
     ts: TableSchema,
     pg_url: Option<String>,
     subqueries: Arc<Mutex<SubqueryRegistry>>,
+    trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
 ) -> TailerHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let processed = Arc::new(std::sync::Mutex::new("-1".to_string()));
     let stats = Arc::new(std::sync::Mutex::new(TableStats::default()));
-    tokio::spawn(tailer_loop(ds, ts, pg_url, cmd_rx, processed.clone(), stats.clone(), subqueries));
+    tokio::spawn(tailer_loop(ds, ts, pg_url, cmd_rx, processed.clone(), stats.clone(), subqueries, trace_tx));
     TailerHandle { cmd_tx, processed, stats }
 }
 
@@ -1140,6 +1141,7 @@ fn publish_stats(
     *stats.lock().unwrap() = TableStats { families: fams, standalone: shapes.len() };
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn tailer_loop(
     ds: DsClient,
     ts: TableSchema,
@@ -1148,6 +1150,7 @@ async fn tailer_loop(
     processed: Arc<std::sync::Mutex<String>>,
     stats: Arc<std::sync::Mutex<TableStats>>,
     subqueries: Arc<Mutex<SubqueryRegistry>>,
+    trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
 ) {
     let table_path = format!("table/{}", ts.name);
     let mut offset = "-1".to_string();
@@ -1237,7 +1240,7 @@ async fn tailer_loop(
                             }
                         }
                         if let Err(e) = process_envelope(
-                            &ts, &shapes, &families, &mut aggregates, env, &mut pending, &subqueries,
+                            &ts, &shapes, &families, &mut aggregates, env, &mut pending, &subqueries, &trace_tx,
                         )
                         .await
                         {
@@ -1395,6 +1398,7 @@ async fn pg_backfill(
 }
 
 
+#[allow(clippy::too_many_arguments)]
 async fn process_envelope(
     ts: &TableSchema,
     shapes: &HashMap<String, StandaloneShape>,
@@ -1403,11 +1407,19 @@ async fn process_envelope(
     env: Envelope,
     pending: &mut HashMap<String, Vec<Envelope>>,
     subqueries: &Arc<Mutex<SubqueryRegistry>>,
+    trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
 ) -> Result<()> {
     let (delta, txid, lsn) = apply_envelope(ts, &env)?;
     if delta.is_empty() {
         return Ok(());
     }
+    // Per-envelope trace collection (hops, reached shape ids). `None` when nobody is subscribed,
+    // so the untraced hot path pays only this one atomic load — see `crate::trace`.
+    let mut tr: Option<(Vec<crate::trace::TraceHop>, Vec<String>)> = if trace_tx.receiver_count() > 0 {
+        Some((vec![crate::trace::TraceHop::new(format!("table:{}", ts.name), "passed")], Vec::new()))
+    } else {
+        None
+    };
     // `lsn` (the commit-LSN string) is stamped onto output envelopes so a subset client can position
     // its live tail at the page snapshot (drop deltas with `lsn < snapshot_lsn`); `lsn_u64` is the
     // numeric fallback for the per-shape backfill-skip compare, and `xid` (the transaction id the
@@ -1420,13 +1432,24 @@ async fn process_envelope(
     // Standalone shapes: evaluate each stateless filter directly on the delta (no thread, no clone).
     // Skip changes already visible to the shape's backfill snapshot (xid-visibility gate, LSN
     // fallback for changes without a parseable xid).
-    for shape in shapes.values() {
+    for (sid, shape) in shapes {
         if shape.gate.should_skip(lsn_u64, xid) {
+            if let Some((hops, _)) = tr.as_mut() {
+                hops.push(crate::trace::TraceHop::new(format!("filter:{sid}"), "dropped"));
+            }
             continue;
         }
         let out = eval_standalone(&shape.pred, &delta);
         if out.is_empty() {
+            if let Some((hops, _)) = tr.as_mut() {
+                hops.push(crate::trace::TraceHop::new(format!("filter:{sid}"), "dropped"));
+            }
             continue;
+        }
+        if let Some((hops, ids)) = tr.as_mut() {
+            hops.push(crate::trace::TraceHop::new(format!("filter:{sid}"), "passed"));
+            hops.push(crate::trace::TraceHop::new(format!("shape:{sid}"), "passed"));
+            ids.push(sid.clone());
         }
         let envs =
             translate_output(ts, out, txid.clone(), lsn.clone(), shape.out_cols.as_deref().map(Vec::as_slice));
@@ -1440,9 +1463,13 @@ async fn process_envelope(
     for router in families.values() {
         type ShapeOut<'a> = (&'a str, Option<&'a [usize]>, Vec<(Row, ZWeight)>);
         let mut by_shape: HashMap<u64, ShapeOut> = HashMap::new();
+        let mut routed_keys: Vec<Row> = Vec::new();
         for Tup2(row, w) in &delta {
             let key = key_of(row, &router.key_cols);
             let Some(routed) = router.index.get(&key) else { continue };
+            if tr.is_some() && !routed_keys.contains(&key) {
+                routed_keys.push(key);
+            }
             for rs in routed {
                 if rs.gate.should_skip(lsn_u64, xid) {
                     continue;
@@ -1452,6 +1479,29 @@ async fn process_envelope(
                     .or_insert_with(|| (rs.stream_path.as_str(), rs.out_cols.as_deref().map(Vec::as_slice), Vec::new()))
                     .2
                     .push((row.clone(), *w));
+            }
+        }
+        if let Some((hops, ids)) = tr.as_mut() {
+            // Node id matches the visualizer's logical graph: family:<table>:<key cols by name>.
+            let cols = router
+                .key_cols
+                .iter()
+                .map(|i| ts.columns.get(*i).map(|(n, _)| n.clone()).unwrap_or_else(|| format!("col{i}")))
+                .collect::<Vec<_>>()
+                .join(",");
+            let node = format!("family:{}:{cols}", ts.name);
+            if by_shape.is_empty() {
+                hops.push(crate::trace::TraceHop::new(node, "dropped"));
+            } else {
+                for key in &routed_keys {
+                    let key_json = serde_json::Value::Array(key.0.iter().map(crate::value::Value::to_json).collect());
+                    hops.push(crate::trace::TraceHop::routed(node.clone(), key_json));
+                }
+                for num_id in by_shape.keys() {
+                    let sid = format!("s{num_id}");
+                    hops.push(crate::trace::TraceHop::new(format!("shape:{sid}"), "passed"));
+                    ids.push(sid);
+                }
             }
         }
         if by_shape.is_empty() {
@@ -1476,17 +1526,46 @@ async fn process_envelope(
     }
     // Scalar aggregations: fold this delta into each running aggregate; emit the new value when it
     // changes. Skips changes already counted in the seed (the aggregate's snapshot gate).
-    for agg in aggregates.values_mut() {
+    for (sid, agg) in aggregates.iter_mut() {
         if agg.gate.should_skip(lsn_u64, xid) {
+            if let Some((hops, _)) = tr.as_mut() {
+                hops.push(crate::trace::TraceHop::new(format!("shape:{sid}"), "dropped"));
+            }
             continue;
         }
+        let mut folded = false;
         if agg.apply(&delta) {
             let val = agg.value();
             if agg.last.as_ref() != Some(&val) {
                 agg.last = Some(val.clone());
                 let env = agg.envelope(ts, txid.clone(), lsn.clone());
                 pending.entry(agg.stream_path.clone()).or_default().push(env);
+                folded = true;
             }
+        }
+        if let Some((hops, ids)) = tr.as_mut() {
+            hops.push(crate::trace::TraceHop::new(format!("shape:{sid}"), if folded { "folded" } else { "dropped" }));
+            if folded {
+                ids.push(sid.clone());
+            }
+        }
+    }
+    // Publish the trace event (serialize once; lossy send — see `crate::trace`).
+    if let Some((hops, shape_ids)) = tr {
+        let ev = crate::trace::TraceEvent {
+            lsn: lsn.clone(),
+            txid: txid.clone(),
+            table: ts.name.clone(),
+            delta: delta
+                .iter()
+                .take(crate::trace::DELTA_CAP)
+                .map(|Tup2(row, w)| crate::trace::TraceDelta { row: ts.row_to_json(row), w: *w })
+                .collect(),
+            hops,
+            shapes: shape_ids,
+        };
+        if let Ok(json) = serde_json::to_string(&ev) {
+            let _ = trace_tx.send(Arc::new(json));
         }
     }
     Ok(())
@@ -1700,6 +1779,137 @@ mod tests {
         let out = vec![(Row(vec![crate::value::Value::Int(3), crate::value::Value::Text("c".into()), crate::value::Value::Bool(true)]), 1)];
         let envs = translate_output(&ts, out, None, None, None);
         assert_eq!(envs[0].headers.lsn, None);
+    }
+
+    /// The per-envelope trace reports the actual route: a family router hop (with the key) + the
+    /// reached shape for a key match, a `dropped` family hop when no key matches, and a `dropped`
+    /// filter hop for a standalone predicate that matches nothing.
+    #[tokio::test]
+    async fn trace_family_route_and_filter_drop() {
+        let ts = users();
+        // Columns are stored sorted: active(0), id(1), name(2).
+        let name_idx = 2usize;
+
+        // One family router on (name) with a single shape s7 registered on key 'a'.
+        let mut families: HashMap<Vec<usize>, KeyRouter> = HashMap::new();
+        let mut index: HashMap<Row, Vec<RoutedShape>> = HashMap::new();
+        index.insert(
+            Row(vec![Value::Text("a".into())]),
+            vec![RoutedShape {
+                num_id: 7,
+                stream_path: "shape/s7".into(),
+                gate: crate::pg::SnapshotGate::passthrough(),
+                out_cols: None,
+            }],
+        );
+        families.insert(vec![name_idx], KeyRouter { key_cols: vec![name_idx], index });
+
+        // One standalone filter shape s9 whose predicate (active = false) won't match the inserts.
+        let mut shapes: HashMap<String, StandaloneShape> = HashMap::new();
+        shapes.insert(
+            "s9".into(),
+            StandaloneShape {
+                pred: Arc::new(
+                    CompiledPredicate::compile_opt(
+                        Some(&serde_json::from_value(serde_json::json!({"col":"active","op":"eq","value":false})).unwrap()),
+                        &ts,
+                    )
+                    .unwrap(),
+                ),
+                stream_path: "shape/s9".into(),
+                gate: crate::pg::SnapshotGate::passthrough(),
+                out_cols: None,
+            },
+        );
+
+        let mut aggregates: HashMap<String, AggShape> = HashMap::new();
+        let subqueries = Arc::new(Mutex::new(SubqueryRegistry::new(DsClient::new("http://127.0.0.1:1"), None)));
+        let (trace_tx, mut trace_rx) = tokio::sync::broadcast::channel::<Arc<String>>(16);
+        let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
+
+        // Insert routed to key 'a' -> family hop routed with the key, shape s7 reached, filter s9 drops.
+        process_envelope(
+            &ts, &shapes, &families, &mut aggregates,
+            env("insert", "1", Some(serde_json::json!({"id":1,"name":"a","active":true})), None),
+            &mut pending, &subqueries, &trace_tx,
+        )
+        .await
+        .unwrap();
+        let ev: serde_json::Value = serde_json::from_str(&trace_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(ev["table"], "users");
+        let hops = ev["hops"].as_array().unwrap();
+        let hop = |node: &str| hops.iter().find(|h| h["node"] == node).unwrap_or_else(|| panic!("missing hop {node}: {hops:?}"));
+        assert_eq!(hop("table:users")["outcome"], "passed");
+        assert_eq!(hop("family:users:name")["outcome"], "routed");
+        assert_eq!(hop("family:users:name")["key"][0], "a");
+        assert_eq!(hop("shape:s7")["outcome"], "passed");
+        assert_eq!(hop("filter:s9")["outcome"], "dropped");
+        assert_eq!(ev["shapes"].as_array().unwrap(), &vec![serde_json::json!("s7")]);
+        assert_eq!(ev["delta"][0]["w"], 1);
+        assert_eq!(ev["delta"][0]["row"]["name"], "a");
+
+        // Insert whose key matches no routed shape -> family hop dropped, no shapes reached.
+        process_envelope(
+            &ts, &shapes, &families, &mut aggregates,
+            env("insert", "2", Some(serde_json::json!({"id":2,"name":"zzz","active":true})), None),
+            &mut pending, &subqueries, &trace_tx,
+        )
+        .await
+        .unwrap();
+        let ev: serde_json::Value = serde_json::from_str(&trace_rx.try_recv().unwrap()).unwrap();
+        let hops = ev["hops"].as_array().unwrap();
+        let hop = |node: &str| hops.iter().find(|h| h["node"] == node).unwrap_or_else(|| panic!("missing hop {node}: {hops:?}"));
+        assert_eq!(hop("family:users:name")["outcome"], "dropped");
+        assert_eq!(hop("filter:s9")["outcome"], "dropped");
+        assert!(ev["shapes"].as_array().unwrap().is_empty());
+
+        // Nobody subscribed -> nothing is built or sent (receiver dropped).
+        drop(trace_rx);
+        process_envelope(
+            &ts, &shapes, &families, &mut aggregates,
+            env("insert", "3", Some(serde_json::json!({"id":3,"name":"a","active":true})), None),
+            &mut pending, &subqueries, &trace_tx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(trace_tx.receiver_count(), 0);
+    }
+
+    /// An aggregation shape appears in the trace as a `folded` hop when the delta moves its value,
+    /// and `dropped` when the delta doesn't match its predicate.
+    #[tokio::test]
+    async fn trace_aggregate_fold() {
+        let ts = users();
+        let shapes: HashMap<String, StandaloneShape> = HashMap::new();
+        let families: HashMap<Vec<usize>, KeyRouter> = HashMap::new();
+        let mut aggregates: HashMap<String, AggShape> = HashMap::new();
+        aggregates.insert("s4".into(), agg(AggFn::Count, None)); // COUNT(*) WHERE active = true
+        let subqueries = Arc::new(Mutex::new(SubqueryRegistry::new(DsClient::new("http://127.0.0.1:1"), None)));
+        let (trace_tx, mut trace_rx) = tokio::sync::broadcast::channel::<Arc<String>>(16);
+        let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
+
+        process_envelope(
+            &ts, &shapes, &families, &mut aggregates,
+            env("insert", "1", Some(serde_json::json!({"id":1,"name":"a","active":true})), None),
+            &mut pending, &subqueries, &trace_tx,
+        )
+        .await
+        .unwrap();
+        let ev: serde_json::Value = serde_json::from_str(&trace_rx.try_recv().unwrap()).unwrap();
+        let hops = ev["hops"].as_array().unwrap();
+        assert!(hops.iter().any(|h| h["node"] == "shape:s4" && h["outcome"] == "folded"), "{hops:?}");
+        assert_eq!(ev["shapes"].as_array().unwrap(), &vec![serde_json::json!("s4")]);
+
+        process_envelope(
+            &ts, &shapes, &families, &mut aggregates,
+            env("insert", "2", Some(serde_json::json!({"id":2,"name":"b","active":false})), None),
+            &mut pending, &subqueries, &trace_tx,
+        )
+        .await
+        .unwrap();
+        let ev: serde_json::Value = serde_json::from_str(&trace_rx.try_recv().unwrap()).unwrap();
+        let hops = ev["hops"].as_array().unwrap();
+        assert!(hops.iter().any(|h| h["node"] == "shape:s4" && h["outcome"] == "dropped"), "{hops:?}");
     }
 
     fn agg(func: AggFn, col: Option<usize>) -> AggShape {
