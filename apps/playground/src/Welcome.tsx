@@ -22,8 +22,8 @@ export function Welcome({ onClose }: { onClose: () => void }) {
         <div className="welcome-grid">
           <div>
             <span className="welcome-ico">🍕</span>
-            <b>Left — the world.</b> Every button changes real data in Postgres: place an order,
-            start cooking, deliver…
+            <b>Left — food delivery.</b> Every button changes real data in Postgres: place an
+            order, start cooking, deliver…
           </div>
           <div>
             <span className="welcome-ico">🔀</span>

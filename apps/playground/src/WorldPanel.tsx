@@ -47,9 +47,7 @@ export function WorldPanel({
 
   return (
     <div className="world">
-      <div className="world-h">
-        The world <span className="world-sub">writes go straight to Postgres</span>
-      </div>
+      <div className="world-h">Food delivery</div>
       {restaurants.map((r) => {
         const ros = (byRestaurant.get(r.id) ?? []).filter((o) => o.status !== 'cancelled')
         return (
