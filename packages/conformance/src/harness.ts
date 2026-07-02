@@ -50,7 +50,7 @@ async function spawnEngine(
   tables: string[],
   slot: string,
   fault?: string,
-): Promise<{ url: string; proc: ChildProcess }> {
+): Promise<{ url: string; proc: ChildProcess; stderr: () => string }> {
   const proc = spawn(engineBin(), [], {
     env: {
       ...process.env,
@@ -63,7 +63,15 @@ async function spawnEngine(
       ELECTRIC_IVM_PG_POLL_MS: '25',
       ...(fault ? { ELECTRIC_IVM_FAULT: fault } : {}),
     },
-    stdio: ['ignore', 'pipe', 'inherit'],
+    // Pipe stderr so tests can assert on engine logs (e.g. no silent `process_envelope failed`); teed
+    // back to our stderr below so it stays visible.
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  let stderrBuf = ''
+  proc.stderr!.on('data', (d: Buffer) => {
+    const s = d.toString()
+    stderrBuf += s
+    process.stderr.write(s)
   })
   const url = await new Promise<string>((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -87,7 +95,7 @@ async function spawnEngine(
     proc.kill('SIGKILL')
     throw e
   })
-  return { url, proc }
+  return { url, proc, stderr: () => stderrBuf }
 }
 
 export interface Harness {
@@ -100,6 +108,8 @@ export interface Harness {
   schema: Schema
   /** Postgres connection string for this harness's database (the system of record). */
   pgUrl: string
+  /** Everything the engine has written to stderr so far — for asserting on/absence of engine log lines. */
+  engineStderr(): string
   shutdown(): Promise<void>
 }
 
@@ -224,6 +234,7 @@ export async function bootHarness(schema: Schema, opts: BootOptions = {}): Promi
       oracle,
       schema,
       pgUrl,
+      engineStderr: spawned.stderr,
       shutdown: teardown,
     }
   } catch (e) {

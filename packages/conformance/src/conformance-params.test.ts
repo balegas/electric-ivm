@@ -142,3 +142,73 @@ describe('conformance: /v1/shape params over uuid columns', () => {
     }
   })
 })
+
+// A LIVE inner change that re-derives outer membership via a Postgres query-back over uuid columns —
+// the path that failed SILENTLY (process_envelope: "backfill select comments: cannot convert String ->
+// uuid"), dropping move-in rows while the client stream stayed clean. Own harness so the mutation is
+// isolated from the read-only snapshot tests above.
+describe('conformance: /v1/shape params LIVE move-in over uuid columns', () => {
+  let h: Harness
+  const uOwner = uuid()
+  const uOther = uuid()
+  const pl = uuid()
+  const il = uuid()
+  const cl = uuid()
+
+  beforeAll(async () => {
+    h = await bootHarness(schema, { ddl })
+    // Pre-shape: project pl owned by uOther (NOT uOwner), issue il on pl, comment cl on il.
+    await applyOp(h, 'projects', { op: 'insert', pk: pl, row: { id: pl, owner_id: uOther } })
+    await applyOp(h, 'issues', { op: 'insert', pk: il, row: { id: il, project_id: pl } })
+    await applyOp(h, 'comments', { op: 'insert', pk: cl, row: { id: cl, issue_id: il } })
+    await drainEngine(h)
+  }, 60000)
+  afterAll(async () => {
+    await h?.shutdown()
+  })
+
+  it('re-derives a uuid move-in on a live inner change (no silent drop, no engine error)', async () => {
+    // Snapshot the depth-2 comments shape for uOwner: empty (pl is owned by uOther).
+    const q = new URLSearchParams({ table: 'comments', offset: '-1', where: NESTED, 'params[1]': uOwner })
+    const snap = await fetch(`${h.engineUrl}/v1/shape?${q.toString()}`)
+    expect(snap.status).toBe(200)
+    const handle = snap.headers.get('electric-handle') as string
+    const snapMsgs = (await snap.json()) as Array<{ headers: { operation?: string }; key?: string }>
+    expect(snapMsgs.filter((m) => m.headers.operation === 'insert').map((m) => m.key)).toEqual([])
+
+    const errBefore = h.engineStderr().length
+
+    // LIVE inner change: pl's owner becomes uOwner -> pl enters -> il enters -> the engine re-derives
+    // `comments WHERE issue_id = il` (uuid query-back, the previously-failing path) -> cl must move in.
+    await applyOp(h, 'projects', { op: 'update', pk: pl, row: { id: pl, owner_id: uOwner } })
+    await drainEngine(h)
+
+    // (a) the move-in row actually arrives on the shape stream (silently dropped before the fix).
+    const arrived = await waitShapeContains(h.engineUrl, handle, cl)
+    expect(arrived, 'comment did not move in — the live uuid subquery re-derive dropped it').toBe(true)
+
+    // (b) no engine-side process_envelope failure during the re-derive.
+    const errNew = h.engineStderr().slice(errBefore)
+    expect(errNew).not.toContain('process_envelope failed')
+    expect(errNew).not.toContain('cannot convert')
+  }, 60000)
+})
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+/** Fold a shape's current contents (via /shapes/{id}/rows) and report whether `key` is present. */
+async function shapeContains(engineUrl: string, handle: string, key: string): Promise<boolean> {
+  const res = await fetch(`${engineUrl}/shapes/${handle}/rows`)
+  if (res.status !== 200) return false
+  const body = (await res.json()) as { rows: Array<{ key: string }> }
+  return body.rows.some((r) => r.key === key)
+}
+
+async function waitShapeContains(engineUrl: string, handle: string, key: string, ms = 8000): Promise<boolean> {
+  const end = Date.now() + ms
+  while (Date.now() < end) {
+    if (await shapeContains(engineUrl, handle, key)) return true
+    await sleep(150)
+  }
+  return false
+}

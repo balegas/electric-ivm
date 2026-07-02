@@ -19,7 +19,9 @@ use crate::value::Value;
 /// type is known, cast the (text) param to it — `name = $n::text::uuid` — so the comparison stays
 /// index-eligible (a plain `name::text = $n` defeats the btree index). `None` (library mode / unknown
 /// column) falls back to the text-vs-text form, which is always correct for our coarse-Text columns.
-fn text_param_cmp(name: &str, op: &str, n: usize, pg_type: Option<&str>) -> String {
+/// Shared with the subquery live move query-back (`subquery::value_eq_sql`) so every text/uuid param
+/// bind uses the identical form.
+pub(crate) fn text_param_cmp(name: &str, op: &str, n: usize, pg_type: Option<&str>) -> String {
     match pg_type {
         Some(ty) => format!("{name} {op} ${n}::text::{}", quote_ident(ty)),
         None => format!("{name}::text {op} ${n}"),
