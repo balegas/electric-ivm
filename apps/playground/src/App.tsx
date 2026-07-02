@@ -51,18 +51,18 @@ export default function App() {
     },
     [w.enterScene, loadGraph], // eslint-disable-line react-hooks/exhaustive-deps
   )
-  // Provision on boot: scene 1's base shape always exists (so a wiped-and-reminted workspace is
-  // never empty), then the stored scene's shapes.
+  // Provision on boot AND whenever the workspace identity changes (new workspace / reset
+  // recovery): scene 1's base shape always exists, then the stored scene's shapes.
   const ready = w.status === 'ready'
   useEffect(() => {
-    if (!ready) return
+    if (!ready || !wsId) return
     void (async () => {
       await w.enterScene(1)
       if (scene !== 1) await w.enterScene(scene)
       await loadGraph()
     })()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ready])
+  }, [ready, wsId])
 
   return (
     <div className="app">
@@ -79,7 +79,14 @@ export default function App() {
           <button className="tbtn" onClick={() => setWelcomeOpen(true)} title="What is this?">
             <span className="tbtn-ico">?</span> about
           </button>
-          <button className="tbtn" onClick={() => void w.reprovision()} title="Start over in a fresh workspace">
+          <button
+            className="tbtn"
+            onClick={() => {
+              setWelcomeOpen(true)
+              void w.reprovision()
+            }}
+            title="Start over in a fresh workspace"
+          >
             <span className="tbtn-ico">↺</span> new workspace
           </button>
         </div>
