@@ -15,14 +15,15 @@ export function Welcome({ onClose }: { onClose: () => void }) {
         </div>
         <p className="welcome-lead">
           Electric-style sync streams subsets of your Postgres data — <b>shapes</b> — into apps,
-          and keeps them up to date as the data changes. This playground shows the engine doing
-          it. Change some data. Watch it reach every screen that subscribes — and nothing else.
+          and keeps them up to date as the data changes. This playground drives the Shape API
+          directly against a tiny issue tracker. Create a shape. Change some data. Watch the
+          change reach every shape that subscribes — and nothing else.
         </p>
         <div className="welcome-grid">
           <div>
-            <span className="welcome-ico">🍕</span>
-            <b>Left — food delivery.</b> Every button changes real data in Postgres: place an
-            order, start cooking, deliver…
+            <span className="welcome-ico">📝</span>
+            <b>Left — the data.</b> Two plain tables (issues, projects). Every cell you edit is
+            one real write to Postgres.
           </div>
           <div>
             <span className="welcome-ico">🔀</span>
@@ -31,8 +32,8 @@ export function Welcome({ onClose }: { onClose: () => void }) {
           </div>
           <div>
             <span className="welcome-ico">📱</span>
-            <b>Right — the screens.</b> Each card is a subscriber — a kitchen display, a rider's
-            phone, a dashboard. They update the instant a change concerns them.
+            <b>Right — live results.</b> One card per shape: its query, its API request, and its
+            result set — maintained incrementally, never re-queried.
           </div>
           <div>
             <span className="welcome-ico">🎬</span>
@@ -42,8 +43,8 @@ export function Welcome({ onClose }: { onClose: () => void }) {
         </div>
         <div className="modal-actions welcome-actions">
           <span className="welcome-note">
-            You're in a private workspace on a shared server — every predicate carries your
-            workspace id, honestly displayed.
+            Your data is private to you on a shared server. Curious how? Flip "under the hood" in
+            the top bar.
           </span>
           <button className="primary" onClick={onClose}>
             Let's go →

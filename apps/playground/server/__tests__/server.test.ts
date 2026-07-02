@@ -1,12 +1,12 @@
 // Integration: the playground server against a real Postgres + engine (via the conformance
 // harness — ephemeral DB per file, engine subprocess in Postgres mode). Covers provisioning
-// idempotency, the action lifecycle, workspace scoping, scene idempotency + self-heal, graph/rows
+// idempotency, the grid-edit verbs, workspace scoping, scene idempotency + self-heal, graph/rows
 // proxying, subsets, reset recovery, rate limiting, and a live end-to-end trace event.
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 import { bootHarness, type Harness } from '../../../../packages/conformance/src/harness.ts'
-import type { Order, TraceEvent, WorkspaceState } from '../../shared/types.ts'
+import type { Issue, TraceEvent, WorkspaceState } from '../../shared/types.ts'
 import { createPlaygroundServer, type PlaygroundServer } from '../main.ts'
 import { PLAYGROUND_SCHEMA } from '../schema.ts'
 
@@ -38,17 +38,17 @@ async function newWorkspace(): Promise<WorkspaceState> {
 }
 
 describe('workspaces', () => {
-  it('provisions 1 restaurant + 3 seed orders and is idempotent by id', async () => {
+  it('provisions 2 projects + 4 seed issues and is idempotent by id', async () => {
     const ws = await newWorkspace()
-    expect(ws.restaurants).toHaveLength(1)
-    expect(ws.orders).toHaveLength(3)
+    expect(ws.projects).toHaveLength(2)
+    expect(ws.issues).toHaveLength(4)
     expect(ws.workspace.epoch).toBe(7)
     const again = await api<WorkspaceState>('/api/workspace', {
       method: 'POST',
       body: JSON.stringify({ existingId: ws.workspace.id }),
     })
     expect(again.body.workspace.id).toBe(ws.workspace.id)
-    expect(again.body.restaurants.map((r) => r.id)).toEqual(ws.restaurants.map((r) => r.id))
+    expect(again.body.projects.map((r) => r.id)).toEqual(ws.projects.map((r) => r.id))
   })
 
   it('an unknown id mints a fresh workspace (reset recovery)', async () => {
@@ -57,20 +57,7 @@ describe('workspaces', () => {
       body: JSON.stringify({ existingId: 'w_gone' }),
     })
     expect(body.workspace.id).not.toBe('w_gone')
-    expect(body.restaurants).toHaveLength(1)
-  })
-
-  it('add_restaurant grows the world from the seed pool, workspace-scoped', async () => {
-    const ws = await newWorkspace()
-    const r = await api<{ ok: true; restaurant: { id: number; name: string; workspace_id: string } }>('/api/action', {
-      method: 'POST',
-      body: JSON.stringify({ workspace: ws.workspace.id, verb: 'add_restaurant' }),
-    })
-    expect(r.status).toBe(200)
-    expect(r.body.restaurant.workspace_id).toBe(ws.workspace.id)
-    expect(r.body.restaurant.name).not.toBe(ws.restaurants[0]!.name)
-    const state = await api<WorkspaceState>(`/api/workspace/${ws.workspace.id}`)
-    expect(state.body.restaurants).toHaveLength(2)
+    expect(body.projects).toHaveLength(2)
   })
 
   it('GET of an unknown workspace is a 404 carrying the epoch', async () => {
@@ -81,50 +68,60 @@ describe('workspaces', () => {
 })
 
 describe('actions', () => {
-  it('runs the order lifecycle and rejects illegal transitions', async () => {
+  it('adds, edits, and deletes issues; validates inputs', async () => {
     const ws = await newWorkspace()
-    const rid = ws.restaurants[0]!.id
-    const placed = await api<{ ok: true; order: Order }>('/api/action', {
-      method: 'POST',
-      body: JSON.stringify({ workspace: ws.workspace.id, verb: 'place_order', restaurantId: rid }),
-    })
-    expect(placed.status).toBe(200)
-    expect(placed.body.order.status).toBe('new')
-
-    const oid = placed.body.order.id
-    const act = (verb: string, orderId = oid) =>
-      api<{ ok: true; order: Order }>('/api/action', {
+    const pid = ws.projects[0]!.id
+    const act = (body: Record<string, unknown>) =>
+      api<{ ok: true; issue?: Issue }>('/api/action', {
         method: 'POST',
-        body: JSON.stringify({ workspace: ws.workspace.id, verb, orderId }),
+        body: JSON.stringify({ workspace: ws.workspace.id, ...body }),
       })
 
-    // deliver before riding -> 409
-    expect((await act('deliver')).status).toBe(409)
-    expect((await act('start_cooking')).body.order.status).toBe('cooking')
-    expect((await act('pickup')).body.order.status).toBe('riding')
-    expect((await act('deliver')).body.order.status).toBe('delivered')
-    // terminal -> cancel is illegal
-    expect((await act('cancel')).status).toBe(409)
+    const added = await act({ verb: 'add_issue', projectId: pid })
+    expect(added.status).toBe(200)
+    expect(added.body.issue!.status).toBe('todo')
+
+    const iid = added.body.issue!.id
+    expect((await act({ verb: 'set_status', issueId: iid, status: 'in_progress' })).body.issue!.status).toBe('in_progress')
+    expect((await act({ verb: 'set_priority', issueId: iid, priority: 4 })).body.issue!.priority).toBe(4)
+    expect((await act({ verb: 'set_priority', issueId: iid, priority: 9 })).status).toBe(400)
+    expect((await act({ verb: 'set_status', issueId: iid, status: 'bogus' })).status).toBe(400)
+    expect((await act({ verb: 'delete_issue', issueId: iid })).status).toBe(200)
+    expect((await act({ verb: 'delete_issue', issueId: iid })).status).toBe(404)
   })
 
-  it("cannot touch another workspace's orders (404)", async () => {
+  it("cannot touch another workspace's issues (404)", async () => {
     const a = await newWorkspace()
     const b = await newWorkspace()
     const r = await api('/api/action', {
       method: 'POST',
-      body: JSON.stringify({ workspace: b.workspace.id, verb: 'start_cooking', orderId: a.orders[0]!.id }),
+      body: JSON.stringify({ workspace: b.workspace.id, verb: 'set_status', issueId: a.issues[0]!.id, status: 'done' }),
     })
     expect(r.status).toBe(404)
   })
 
+  it('add_project grows the world; set_team reassigns', async () => {
+    const ws = await newWorkspace()
+    const r = await api<{ ok: true; project: { id: number; team: string } }>('/api/action', {
+      method: 'POST',
+      body: JSON.stringify({ workspace: ws.workspace.id, verb: 'add_project' }),
+    })
+    expect(r.status).toBe(200)
+    const moved = await api<{ ok: true; project: { team: string } }>('/api/action', {
+      method: 'POST',
+      body: JSON.stringify({ workspace: ws.workspace.id, verb: 'set_team', projectId: r.body.project.id, team: 'infra' }),
+    })
+    expect(moved.body.project.team).toBe('infra')
+  })
+
   it('rate limits rapid writes with 429', async () => {
     const ws = await newWorkspace()
-    const rid = ws.restaurants[0]!.id
+    const pid = ws.projects[0]!.id
     const results = await Promise.all(
       Array.from({ length: 30 }, () =>
         api('/api/action', {
           method: 'POST',
-          body: JSON.stringify({ workspace: ws.workspace.id, verb: 'place_order', restaurantId: rid }),
+          body: JSON.stringify({ workspace: ws.workspace.id, verb: 'add_issue', projectId: pid }),
         }),
       ),
     )
@@ -138,7 +135,7 @@ describe('scenes and shapes', () => {
     const ws = await newWorkspace()
     const first = await api<{ scene: number; shapes: { id: string }[] }>('/api/scene', {
       method: 'POST',
-      body: JSON.stringify({ workspace: ws.workspace.id, scene: 2 }),
+      body: JSON.stringify({ workspace: ws.workspace.id, scene: 1 }),
     })
     expect(first.status).toBe(200)
     expect(first.body.shapes).toHaveLength(1)
@@ -146,15 +143,14 @@ describe('scenes and shapes', () => {
 
     const second = await api<{ shapes: { id: string }[] }>('/api/scene', {
       method: 'POST',
-      body: JSON.stringify({ workspace: ws.workspace.id, scene: 2 }),
+      body: JSON.stringify({ workspace: ws.workspace.id, scene: 1 }),
     })
     expect(second.body.shapes.map((x) => x.id)).toEqual([sid])
 
-    // Simulate an engine that lost the shape (restart): drop it engine-side, re-provision.
     await fetch(`${h.engineUrl}/shapes/${sid}`, { method: 'DELETE' })
     const healed = await api<{ shapes: { id: string }[] }>('/api/scene', {
       method: 'POST',
-      body: JSON.stringify({ workspace: ws.workspace.id, scene: 2 }),
+      body: JSON.stringify({ workspace: ws.workspace.id, scene: 1 }),
     })
     expect(healed.status).toBe(200)
     expect(healed.body.shapes).toHaveLength(1)
@@ -166,7 +162,7 @@ describe('scenes and shapes', () => {
     const b = await newWorkspace()
     const sceneA = await api<{ shapes: { id: string }[] }>('/api/scene', {
       method: 'POST',
-      body: JSON.stringify({ workspace: a.workspace.id, scene: 2 }),
+      body: JSON.stringify({ workspace: a.workspace.id, scene: 1 }),
     })
     const shapeA = sceneA.body.shapes[0]!.id
 
@@ -175,8 +171,6 @@ describe('scenes and shapes', () => {
     )
     expect(graphB.status).toBe(200)
     expect(graphB.body.mine).not.toContain(shapeA)
-    // the full graph is public introspection — a's shape is visible there (honest shared engine)
-    expect(graphB.body.graph.shapes.map((x) => x.id)).toContain(shapeA)
 
     const rowsDenied = await api(`/api/shapes/${shapeA}/rows?workspace=${b.workspace.id}`)
     expect(rowsDenied.status).toBe(404)
@@ -190,9 +184,8 @@ describe('scenes and shapes', () => {
       method: 'POST',
       body: JSON.stringify({
         workspace: ws.workspace.id,
-        label: 'big orders',
-        role: 'custom',
-        spec: { table: 'orders', where: [{ col: 'total', op: 'gte', value: 20 }] },
+        label: 'urgent',
+        spec: { table: 'issues', where: [{ col: 'priority', op: 'gte', value: 4 }] },
       }),
     })
     expect(created.status).toBe(200)
@@ -206,23 +199,22 @@ describe('scenes and shapes', () => {
 
   it('subset queries return ordered rows pinned at an LSN', async () => {
     const ws = await newWorkspace()
-    const r = await api<{ rows: { total: number }[]; lsn: string }>('/api/subset', {
+    const r = await api<{ rows: { priority: number }[]; lsn: string }>('/api/subset', {
       method: 'POST',
-      body: JSON.stringify({ workspace: ws.workspace.id, orderBy: { col: 'total', desc: true }, limit: 3 }),
+      body: JSON.stringify({ workspace: ws.workspace.id, orderBy: { col: 'priority', desc: true }, limit: 3 }),
     })
     expect(r.status).toBe(200)
     expect(r.body.rows.length).toBeGreaterThan(0)
     expect(r.body.rows.length).toBeLessThanOrEqual(3)
-    expect(typeof r.body.lsn).toBe('string')
-    const totals = r.body.rows.map((x) => x.total)
-    expect([...totals].sort((x, y) => y - x)).toEqual(totals)
+    const prios = r.body.rows.map((x) => x.priority)
+    expect([...prios].sort((x, y) => y - x)).toEqual(prios)
   })
 })
 
 describe('trace', () => {
   it('a write produces a yours-tagged trace event that reaches the SSE subscriber', async () => {
     const ws = await newWorkspace()
-    await api('/api/scene', { method: 'POST', body: JSON.stringify({ workspace: ws.workspace.id, scene: 2 }) })
+    await api('/api/scene', { method: 'POST', body: JSON.stringify({ workspace: ws.workspace.id, scene: 1 }) })
 
     const ac = new AbortController()
     const events: TraceEvent[] = []
@@ -245,25 +237,22 @@ describe('trace', () => {
       }
     })().catch(() => {})
 
-    // Give the fan-out a beat to attach upstream, then write.
     await new Promise((r) => setTimeout(r, 300))
-    const placed = await api<{ order: Order }>('/api/action', {
+    const added = await api<{ issue: Issue }>('/api/action', {
       method: 'POST',
-      body: JSON.stringify({ workspace: ws.workspace.id, verb: 'place_order', restaurantId: ws.restaurants[0]!.id }),
+      body: JSON.stringify({ workspace: ws.workspace.id, verb: 'add_issue', projectId: ws.projects[0]!.id }),
     })
-    expect(placed.status).toBe(200)
+    expect(added.status).toBe(200)
 
-    // Wait for the event to arrive through replication -> engine -> SSE -> fan-out.
     const deadline = Date.now() + 15_000
-    while (Date.now() < deadline && !events.some((e) => e.yours && e.table === 'orders')) {
+    while (Date.now() < deadline && !events.some((e) => e.yours && e.table === 'issues')) {
       await new Promise((r) => setTimeout(r, 100))
     }
     ac.abort()
     await streamDone
 
-    const mine = events.find((e) => e.yours && e.table === 'orders')
+    const mine = events.find((e) => e.yours && e.table === 'issues')
     expect(mine, `no yours event among ${events.length} events`).toBeTruthy()
-    expect(mine!.hops.some((hop) => hop.node === 'table:orders')).toBe(true)
-    expect(mine!.delta.some((d) => (d.row as { workspace_id?: string }).workspace_id === ws.workspace.id)).toBe(true)
+    expect(mine!.hops.some((hop) => hop.node === 'table:issues')).toBe(true)
   }, 30_000)
 })

@@ -23,7 +23,7 @@ export async function provisionScene(deps: ShapeDeps, ws: string, n: number): Pr
       // Engine lost it (restart/wipe) — drop the stale meta row and re-create.
       await deps.db.query('DELETE FROM playground_shapes WHERE shape_id = $1', [found.id])
     }
-    out.push(await createShape(deps, ws, def.spec, def.label, def.role, n, def.key))
+    out.push(await createShape(deps, ws, def.spec, def.label, n, def.key))
   }
   return { scene: n, shapes: out }
 }

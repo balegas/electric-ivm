@@ -8,7 +8,7 @@ import { tagAndStrip, type EngineTraceEvent } from '../trace.ts'
 
 describe('specToWhere', () => {
   it('empty spec is just the workspace conjunct', () => {
-    expect(specToWhere({ table: 'orders', where: [] }, 'w_a')).toEqual({
+    expect(specToWhere({ table: 'issues', where: [] }, 'w_a')).toEqual({
       col: 'workspace_id',
       op: 'eq',
       value: 'w_a',
@@ -16,9 +16,9 @@ describe('specToWhere', () => {
   })
 
   it('conjuncts AND the workspace conjunct last (honest display order: user predicate first)', () => {
-    expect(specToWhere({ table: 'orders', where: [{ col: 'status', op: 'eq', value: 'cooking' }] }, 'w_a')).toEqual({
+    expect(specToWhere({ table: 'issues', where: [{ col: 'status', op: 'eq', value: 'todo' }] }, 'w_a')).toEqual({
       and: [
-        { col: 'status', op: 'eq', value: 'cooking' },
+        { col: 'status', op: 'eq', value: 'todo' },
         { col: 'workspace_id', op: 'eq', value: 'w_a' },
       ],
     })
@@ -27,11 +27,11 @@ describe('specToWhere', () => {
   it('subquery inner where is workspace-scoped too', () => {
     const p = specToWhere(
       {
-        table: 'orders',
+        table: 'issues',
         where: [],
         subquery: {
-          col: 'restaurant_id',
-          inner: { table: 'restaurants', project: 'id', where: [{ col: 'city', op: 'eq', value: 'Lisbon' }] },
+          col: 'project_id',
+          inner: { table: 'projects', project: 'id', where: [{ col: 'team', op: 'eq', value: 'web' }] },
         },
       },
       'w_a',
@@ -39,13 +39,13 @@ describe('specToWhere', () => {
     expect(p).toEqual({
       and: [
         {
-          col: 'restaurant_id',
+          col: 'project_id',
           in: {
-            table: 'restaurants',
+            table: 'projects',
             project: 'id',
             where: {
               and: [
-                { col: 'city', op: 'eq', value: 'Lisbon' },
+                { col: 'team', op: 'eq', value: 'web' },
                 { col: 'workspace_id', op: 'eq', value: 'w_a' },
               ],
             },
@@ -64,11 +64,11 @@ describe('tagAndStrip', () => {
   ])
   const ev: EngineTraceEvent = {
     lsn: '0/1',
-    table: 'orders',
+    table: 'issues',
     delta: [{ row: { id: 1, workspace_id: 'w_me', total: 12 }, w: 1 }],
     hops: [
-      { node: 'table:orders', outcome: 'passed' },
-      { node: 'family:orders:status,workspace_id', outcome: 'routed', key: ['cooking', 'w_me'] },
+      { node: 'table:issues', outcome: 'passed' },
+      { node: 'family:issues:status,workspace_id', outcome: 'routed', key: ['cooking', 'w_me'] },
       { node: 'shape:s1', outcome: 'passed' },
       { node: 'filter:s2', outcome: 'dropped' },
     ],
@@ -81,8 +81,8 @@ describe('tagAndStrip', () => {
     expect(out.delta[0]!.row).toHaveProperty('total', 12)
     expect(out.shapes).toEqual(['s1'])
     expect(out.hops.map((h) => h.node)).toEqual([
-      'table:orders',
-      'family:orders:status,workspace_id',
+      'table:issues',
+      'family:issues:status,workspace_id',
       'shape:s1',
     ])
   })

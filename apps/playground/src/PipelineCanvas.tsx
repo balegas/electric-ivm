@@ -14,6 +14,7 @@ import { PipelineNode } from './nodes.tsx'
 import type { TraceEvent } from '../shared/types.ts'
 import { DetailPanel } from './DetailPanel.tsx'
 import { edgeTypes, type PulseEdgeData } from './edges.tsx'
+import { scrubText } from './scrub.ts'
 import { eventDecor, mergeDecor, type Decor, type FlashKind } from './trace-anim.ts'
 import { useTrace } from './useTrace.ts'
 
@@ -38,12 +39,15 @@ export function PipelineCanvas({
   graph,
   mine,
   view,
+  underHood,
   onViewChange,
 }: {
   workspaceId: string | undefined
   graph: EngineGraph | null
   mine: string[]
   view: View
+  /** Reveal the multi-tenancy plumbing (full predicates, shared badges, foreign pulses). */
+  underHood: boolean
   onViewChange: (v: View) => void
 }) {
   const [decor, setDecor] = useState<Decor | null>(null)
@@ -65,8 +69,12 @@ export function PipelineCanvas({
   presentRef.current = useMemo(() => new Set(nodes.map((n) => n.id)), [nodes])
   const viewRef = useRef(view)
   viewRef.current = view
+  const hoodRef = useRef(underHood)
+  hoodRef.current = underHood
 
   const onTrace = useCallback((ev: TraceEvent) => {
+    // Foreign pulses are an "under the hood" lesson — hidden while scoping is silent.
+    if (!ev.yours && !hoodRef.current) return
     const d = eventDecor(ev, viewRef.current, edgesRef.current, presentRef.current)
     if (d.nodes.size === 0 && d.edges.size === 0) return
     setDecor((prev) => mergeDecor(prev, d))
@@ -79,9 +87,22 @@ export function PipelineCanvas({
   }, [])
 
   const decorated = useMemo(() => {
-    const dn = nodes.map((n) =>
-      decor?.nodes.has(n.id) ? { ...n, data: { ...n.data, flash: decor.nodes.get(n.id) } } : n,
-    )
+    const dn = nodes.map((n) => {
+      let d = n.data as VizNodeData & { flash?: FlashKind }
+      // Display-only scrub: node ids stay real (trace animation matches); labels hide the
+      // workspace conjunct and the cross-tenant shared badge unless under-the-hood is on.
+      if (!underHood) {
+        d = {
+          ...d,
+          label: scrubText(d.label),
+          sub: d.sub ? scrubText(d.sub) : d.sub,
+          shared: undefined,
+          index: d.index ? scrubText(d.index) : d.index,
+        }
+      }
+      if (decor?.nodes.has(n.id)) d = { ...d, flash: decor.nodes.get(n.id) }
+      return d === n.data ? n : { ...n, data: d }
+    })
     const de = edges.map((e) => {
       // The pulse keeps the id of the event that created it — re-rendering after a merge must not
       // restart dots already in flight on other edges.
@@ -89,7 +110,7 @@ export function PipelineCanvas({
       return { ...e, type: 'pulse', data, style: data.pulse ? undefined : e.style }
     })
     return { nodes: dn, edges: de }
-  }, [nodes, edges, decor])
+  }, [nodes, edges, decor, underHood])
 
   return (
     <div className="canvas">

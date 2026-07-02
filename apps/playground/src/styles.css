@@ -1026,3 +1026,89 @@ button {
   color: #94a3b8;
   max-width: 380px;
 }
+
+/* ── v2: data grids, API blocks, under-the-hood toggle ───────────────────── */
+.grid {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11.5px;
+  margin-bottom: 8px;
+}
+.grid th {
+  text-align: left;
+  color: #94a3b8;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 4px;
+  border-bottom: 1px solid #e2e8f0;
+}
+.grid td {
+  padding: 3px 4px;
+  border-bottom: 1px solid #f1f5f9;
+}
+.grid select {
+  font: inherit;
+  font-size: 11px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: #f8fafc;
+  padding: 1px 2px;
+  max-width: 100px;
+}
+.grid select:hover {
+  border-color: #cbd5e1;
+}
+.grid-title {
+  max-width: 120px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.grid-proj {
+  color: #64748b;
+  font-size: 10.5px;
+}
+.grid-del {
+  border: 0;
+  background: transparent;
+  color: #cbd5e1;
+  padding: 0 3px;
+}
+.grid-del:hover {
+  color: #dc2626;
+}
+.api-block {
+  margin: 4px 0 0;
+  font-family: ui-monospace, monospace;
+  font-size: 10.5px;
+  line-height: 1.5;
+  background: #0f172a;
+  color: #a5f3fc;
+  border-radius: 7px;
+  padding: 8px 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 220px;
+  overflow: auto;
+}
+.api-block-flat {
+  background: #f8fafc;
+  color: #0f172a;
+  border: 1px solid #e2e8f0;
+}
+.hood {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: #94a3b8;
+  cursor: pointer;
+}
+.hood input {
+  accent-color: #7dd3fc;
+}
+.conjunct-value,
+.fld-label {
+  flex: 1;
+}

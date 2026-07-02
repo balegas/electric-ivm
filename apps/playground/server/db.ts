@@ -14,22 +14,21 @@ export function createDb(connectionString: string): Db {
 /** Create the playground's tables if missing. Data tables get REPLICA IDENTITY FULL (the engine
  *  needs old+new tuples); meta tables don't need it. Idempotent — safe on every boot. */
 export async function ensureTables(db: Db): Promise<void> {
-  await db.query(`CREATE TABLE IF NOT EXISTS restaurants (
+  await db.query(`CREATE TABLE IF NOT EXISTS projects (
     id BIGINT PRIMARY KEY,
     workspace_id TEXT NOT NULL,
     name TEXT NOT NULL,
-    emoji TEXT NOT NULL,
-    city TEXT NOT NULL
+    team TEXT NOT NULL
   )`)
-  await db.query(`CREATE TABLE IF NOT EXISTS orders (
+  await db.query(`CREATE TABLE IF NOT EXISTS issues (
     id BIGINT PRIMARY KEY,
     workspace_id TEXT NOT NULL,
-    restaurant_id BIGINT NOT NULL,
+    project_id BIGINT NOT NULL,
+    title TEXT NOT NULL,
     status TEXT NOT NULL,
-    dish TEXT NOT NULL,
-    total DOUBLE PRECISION NOT NULL
+    priority BIGINT NOT NULL
   )`)
-  for (const t of ['restaurants', 'orders']) {
+  for (const t of ['projects', 'issues']) {
     await db.query(`ALTER TABLE "${t}" REPLICA IDENTITY FULL`)
   }
   await db.query(`CREATE TABLE IF NOT EXISTS playground_workspaces (
@@ -61,7 +60,7 @@ export function mintId(): number {
 /** Seed the id counter past anything already in the data tables. Called from ensureTables. */
 export async function seedIds(db: Db): Promise<void> {
   const r = await db.query(
-    'SELECT GREATEST((SELECT COALESCE(MAX(id),0) FROM restaurants), (SELECT COALESCE(MAX(id),0) FROM orders)) AS m',
+    'SELECT GREATEST((SELECT COALESCE(MAX(id),0) FROM projects), (SELECT COALESCE(MAX(id),0) FROM issues)) AS m',
   )
   nextId = Number(r.rows[0].m) + 1
 }

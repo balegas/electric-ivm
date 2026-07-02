@@ -3,13 +3,13 @@
 An interactive playground that shows **how Electric shapes are implemented as DBSP pipelines** —
 built for sharing (demo videos, a hosted live demo), on a real engine and a real Postgres.
 
-The domain is food delivery: `restaurants` and `orders`. You click verbs on the left (place order,
-start cooking, rider picks up, delivered…), each verb is one SQL write to Postgres, and you watch
-the resulting **delta** replicate into the engine and travel the maintained pipeline in the middle —
-through family routers, filters, subquery nodes, and aggregation folds — down to the **subscriber
-device cards** on the right, which are live shapes. Six scenes walk you through the ideas
-(workspaces, filters, shared machinery, subqueries, live aggregations, subset queries); free play
-is available in every scene.
+It drives the **Shape API** directly against a tiny issue tracker: `issues` and `projects`. Every
+cell you edit in the data grids is one SQL write to Postgres, and you watch the resulting **delta**
+replicate into the engine and travel the maintained pipeline in the middle — through routers,
+filters, subquery nodes, and aggregation folds — down to the per-shape **live result cards** on the
+right (each shows its query, its exact API request, and its maintained result set). Scenes walk you
+through the ideas (shapes, deltas and drops, shared machinery, subqueries, live aggregations,
+subset queries); the shape composer and grids work in every scene.
 
 ## What's real
 
@@ -20,12 +20,12 @@ processed envelope, with the actual hops taken — including drops). Nothing is 
 
 ## Workspaces
 
-Every visitor gets a **workspace**: rows in the shared `restaurants`/`orders` tables stamped with
-their `workspace_id`, and every shape predicate carries `AND workspace_id = <yours>` — displayed
-honestly, because shared machinery across workspaces (the `shared ×N` family router badge) is part
-of the lesson. The workspace id lives in localStorage. The concept is identical locally and hosted;
-localhost is just a one-visitor instance. If the operator wipes the server, clients notice
-(epoch/404) and offer a fresh workspace in one click.
+Every visitor gets a **workspace**: rows in the shared `issues`/`projects` tables stamped with
+their `workspace_id`, and every shape predicate carries `AND workspace_id = <yours>` server-side.
+The UI keeps this **silent** (predicates and router keys render scrubbed) — the "under the hood"
+toggle reveals the real predicates, the `shared ×N` badges, and other visitors' pulses. The
+workspace id lives in localStorage; if the operator wipes the server, clients notice (epoch/404)
+and offer fresh data in one click.
 
 ## Run it
 

@@ -220,7 +220,7 @@ export async function createPlaygroundServer(opts: PlaygroundServerOptions): Pro
       const ws = await guard(res, body.workspace, true)
       if (!ws) return
       const spec = body.spec as Parameters<typeof createShape>[2]
-      if (!spec || (spec.table !== 'orders' && spec.table !== 'restaurants')) {
+      if (!spec || (spec.table !== 'issues' && spec.table !== 'projects')) {
         return json(res, 400, { error: 'invalid shape spec' })
       }
       const shape = await createShape(
@@ -228,7 +228,6 @@ export async function createPlaygroundServer(opts: PlaygroundServerOptions): Pro
         ws,
         spec,
         typeof body.label === 'string' ? body.label : 'Custom shape',
-        (body.role as Parameters<typeof createShape>[4]) ?? 'custom',
       )
       fanout.invalidateOwners()
       return json(res, 200, shape)
@@ -274,7 +273,7 @@ export async function createPlaygroundServer(opts: PlaygroundServerOptions): Pro
       const orderBy = body.orderBy as { col: string; desc?: boolean } | undefined
       const limit = Math.min(50, Number(body.limit ?? 5))
       const result = await engine.query({
-        table: 'orders',
+        table: 'issues',
         where: { col: 'workspace_id', op: 'eq', value: ws },
         orderBy,
         limit,

@@ -9,7 +9,6 @@ import type {
   ShapeSpec,
   Verb,
   WorkspaceState,
-  DeviceRole,
 } from '../shared/types.ts'
 
 export class ApiError extends Error {
@@ -39,8 +38,8 @@ export const api = {
     req<{ ok: true }>('/api/action', { method: 'POST', body: JSON.stringify({ workspace, ...verb }) }),
   scene: (workspace: string, scene: number) =>
     req<SceneShapeResult>('/api/scene', { method: 'POST', body: JSON.stringify({ workspace, scene }) }),
-  createShape: (workspace: string, spec: ShapeSpec, label: string, role: DeviceRole) =>
-    req<PlaygroundShape>('/api/shape', { method: 'POST', body: JSON.stringify({ workspace, spec, label, role }) }),
+  createShape: (workspace: string, spec: ShapeSpec, label: string) =>
+    req<PlaygroundShape>('/api/shape', { method: 'POST', body: JSON.stringify({ workspace, spec, label }) }),
   deleteShape: (workspace: string, id: string) =>
     req<{ ok: true }>(`/api/shape/${encodeURIComponent(id)}?workspace=${encodeURIComponent(workspace)}`, {
       method: 'DELETE',

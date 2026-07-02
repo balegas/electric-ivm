@@ -6,48 +6,44 @@ import type { Schema } from '@electric-ivm/protocol'
 
 export const PLAYGROUND_SCHEMA: Schema = {
   tables: {
-    restaurants: {
+    projects: {
       columns: {
         id: { type: 'int' },
         workspace_id: { type: 'text' },
         name: { type: 'text' },
-        emoji: { type: 'text' },
-        city: { type: 'text' },
+        team: { type: 'text' },
       },
       primaryKey: 'id',
     },
-    orders: {
+    issues: {
       columns: {
         id: { type: 'int' },
         workspace_id: { type: 'text' },
-        restaurant_id: { type: 'int' },
+        project_id: { type: 'int' },
+        title: { type: 'text' },
         status: { type: 'text' },
-        dish: { type: 'text' },
-        total: { type: 'float' },
+        priority: { type: 'int' },
       },
       primaryKey: 'id',
     },
   },
 }
 
-export const SEED_RESTAURANTS: { name: string; emoji: string; city: string }[] = [
-  { name: "Nono's Pizza", emoji: '🍕', city: 'Lisbon' },
-  { name: 'Bifana Bros', emoji: '🥪', city: 'Lisbon' },
-  { name: 'Peixe & Co', emoji: '🐟', city: 'Lisbon' },
-  { name: 'Casa do Caril', emoji: '🍛', city: 'Lisbon' },
-  { name: 'Francesinha 24', emoji: '🥩', city: 'Porto' },
-  { name: 'Tripas Douro', emoji: '🍲', city: 'Porto' },
+export const SEED_PROJECTS: { name: string; team: string }[] = [
+  { name: 'Web App', team: 'web' },
+  { name: 'Mobile', team: 'mobile' },
 ]
 
-export const DISHES = [
-  'Margherita', 'Bifana', 'Bacalhau', 'Tikka Masala', 'Francesinha', 'Caldo Verde',
-  'Piri-piri Chicken', 'Pastel de Nata x6', 'Arroz de Marisco', 'Prego no Pão',
+export const SEED_ISSUES: { title: string; status: string; priority: number; pi: number }[] = [
+  { title: 'Fix login redirect', status: 'todo', priority: 3, pi: 0 },
+  { title: 'Dark mode', status: 'todo', priority: 1, pi: 0 },
+  { title: 'Sync conflict banner', status: 'in_progress', priority: 4, pi: 1 },
+  { title: 'Upgrade Postgres 17', status: 'done', priority: 2, pi: 0 },
+]
+
+export const ISSUE_TITLES = [
+  'Flaky e2e test', 'Rate-limit uploads', 'Empty-state copy', 'Retry on 502', 'Offline banner',
+  'Split vendor bundle', 'Audit log export', 'Keyboard shortcuts', 'Migrate icons', 'Cache avatars',
 ] as const
 
-/** Legal status transitions for the action verbs. */
-export const TRANSITIONS: Record<string, { from: string[]; to: string }> = {
-  start_cooking: { from: ['new'], to: 'cooking' },
-  pickup: { from: ['cooking'], to: 'riding' },
-  deliver: { from: ['riding'], to: 'delivered' },
-  cancel: { from: ['new', 'cooking', 'riding'], to: 'cancelled' },
-}
+export const PROJECT_NAMES = ['Infra', 'Design System', 'Billing', 'Search', 'Notifications'] as const

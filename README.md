@@ -199,10 +199,10 @@ ELECTRIC_IVM_ENGINE_URL=http://127.0.0.1:<engine-port> VIZ_PORT=5180 \
   pnpm --filter @electric-ivm/pipeline-viz dev
 ```
 
-**`apps/playground` — the dbsp playground (TS).** The audience-facing interactive demo: a
-food-delivery world whose writes animate live through the real engine's pipeline to subscriber
-device cards, with a six-scene walkthrough, per-visitor workspaces, and click-to-inspect node
-details. Built for demo videos and public hosting.
+**`apps/playground` — the dbsp playground (TS).** The audience-facing interactive demo: drive
+the Shape API against a tiny issue tracker and watch each write animate live through the real
+engine's pipeline to per-shape result cards — with a scene walkthrough, a shape composer, and
+click-to-inspect node details. Built for demo videos and public hosting.
 
 ```bash
 pnpm demo:playground      # ephemeral PG + engine + server + app (+ HTTPS/2 front if caddy is installed)

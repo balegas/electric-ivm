@@ -5,7 +5,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 
-import type { DeviceRole, ShapeSpec, Verb, WorkspaceState } from '../shared/types.ts'
+import type { ShapeSpec, Verb, WorkspaceState } from '../shared/types.ts'
 import { api, ApiError, storedWorkspaceId, storeWorkspaceId } from './api.ts'
 
 export type WsStatus = 'booting' | 'ready' | 'reset-needed' | 'error'
@@ -21,7 +21,7 @@ export interface Workspace {
   refresh(): Promise<void>
   reprovision(): Promise<void>
   act(verb: Verb): Promise<void>
-  createShape(spec: ShapeSpec, label: string, role: DeviceRole): Promise<void>
+  createShape(spec: ShapeSpec, label: string): Promise<void>
   deleteShape(id: string): Promise<void>
   enterScene(n: number): Promise<void>
 }
@@ -110,7 +110,7 @@ export function useWorkspace(): Workspace {
     refresh,
     reprovision: () => provision(false),
     act: (verb) => withWs((ws) => api.action(ws, verb)),
-    createShape: (spec, label, role) => withWs((ws) => api.createShape(ws, spec, label, role)),
+    createShape: (spec, label) => withWs((ws) => api.createShape(ws, spec, label)),
     deleteShape: (id) => withWs((ws) => api.deleteShape(ws, id)),
     enterScene: (n) => withWs((ws) => api.scene(ws, n)),
   }

@@ -14,7 +14,7 @@ export function SubsetBoard({ workspaceId }: { workspaceId: string | undefined }
   const load = useCallback(async () => {
     if (!workspaceId) return
     try {
-      const r = await api.subset(workspaceId, { col: 'total', desc: true }, 5)
+      const r = await api.subset(workspaceId, { col: 'priority', desc: true }, 5)
       setRows(r.rows)
       setLsn(r.lsn)
       setErr(null)
@@ -30,23 +30,23 @@ export function SubsetBoard({ workspaceId }: { workspaceId: string | undefined }
   return (
     <div className="device device-tile subset">
       <div className="device-h">
-        <span className="device-title">🏆 Top 5 orders by total</span>
+        <span className="device-title">🏆 Top 5 issues by priority</span>
         <button className="mini" onClick={() => void load()}>
           ↻ re-pin
         </button>
       </div>
-      <div className="device-pred">subset query · ORDER BY total DESC LIMIT 5 · pinned at LSN {lsn ?? '…'}</div>
+      <div className="device-pred">subset query · ORDER BY priority DESC LIMIT 5 · pinned at LSN {lsn ?? '…'}</div>
       {err ? <div className="device-err">{err}</div> : null}
       <div className="device-rows">
         {rows.map((r, i) => (
           <div key={String(r.id ?? i)} className="device-row">
             <span>
-              {i + 1}. {String(r.dish ?? '')}
+              {i + 1}. {String(r.title ?? '')}
             </span>
-            <span className="device-row-r">€{Number(r.total ?? 0).toFixed(2)}</span>
+            <span className="device-row-r">P{Number(r.priority ?? 0)}</span>
           </div>
         ))}
-        {rows.length === 0 && !err ? <div className="device-empty">no orders yet</div> : null}
+        {rows.length === 0 && !err ? <div className="device-empty">no issues yet</div> : null}
       </div>
     </div>
   )

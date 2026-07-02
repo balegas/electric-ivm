@@ -4,7 +4,7 @@
 // Honest display: the stored where_json is exactly what the engine maintains, workspace_id and all.
 
 import type { Predicate } from '@electric-ivm/protocol'
-import type { DeviceRole, PlaygroundShape, ShapeSpec } from '../shared/types.ts'
+import type { PlaygroundShape, ShapeSpec } from '../shared/types.ts'
 import { type Db } from './db.ts'
 import { EngineClient } from './engine-client.ts'
 
@@ -56,7 +56,6 @@ function rowToShape(r: Record<string, unknown>): StoredShape {
     workspaceId: r.workspace_id as string,
     scene: (r.scene as number | null) ?? null,
     skey: (r.skey as string | null) ?? null,
-    role: r.role as DeviceRole,
     label: r.label as string,
     spec: r.spec as ShapeSpec,
     where: r.where_json as PlaygroundShape['where'],
@@ -84,7 +83,6 @@ export async function createShape(
   ws: string,
   spec: ShapeSpec,
   label: string,
-  role: DeviceRole,
   scene: number | null = null,
   skey: string | null = null,
 ): Promise<PlaygroundShape> {
@@ -103,7 +101,7 @@ export async function createShape(
     `INSERT INTO playground_shapes (shape_id, workspace_id, scene, skey, role, label, spec, where_json)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
      ON CONFLICT (shape_id) DO NOTHING`,
-    [resp.shapeId, ws, scene, skey, role, label, JSON.stringify(spec), JSON.stringify(where)],
+    [resp.shapeId, ws, scene, skey, 'custom', label, JSON.stringify(spec), JSON.stringify(where)],
   )
   if (ins.rowCount === 0) {
     // Shared with an existing shape: the engine bumped its refcount — undo that so meta stays 1:1
@@ -112,7 +110,7 @@ export async function createShape(
     const existing = await deps.db.query('SELECT * FROM playground_shapes WHERE shape_id = $1', [resp.shapeId])
     return rowToShape(existing.rows[0])
   }
-  return { id: resp.shapeId, workspaceId: ws, scene, role, label, spec, where: where as PlaygroundShape['where'] }
+  return { id: resp.shapeId, workspaceId: ws, scene, label, spec, where: where as PlaygroundShape['where'] }
 }
 
 export async function deleteShape(deps: ShapeDeps, ws: string, shapeId: string): Promise<void> {
