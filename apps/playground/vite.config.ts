@@ -19,6 +19,9 @@ export default defineConfig({
   server: {
     port: Number(process.env.PLAYGROUND_PORT ?? 5190),
     fs: { allow: ['..'] },
+    // Set PLAYGROUND_ALLOW_TUNNEL=1 to serve through a public tunnel (cloudflared/ngrok) — dev
+    // only; it disables Vite's Host-header check for this server.
+    ...(process.env.PLAYGROUND_ALLOW_TUNNEL ? { allowedHosts: true as const } : {}),
     proxy: {
       '/api': {
         target: SERVER,
