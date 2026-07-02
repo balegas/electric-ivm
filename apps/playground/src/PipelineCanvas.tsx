@@ -6,7 +6,7 @@ import { Background, Controls, ReactFlow, type Edge, type Node, type NodeProps }
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { buildDbspGraph } from '@viz/build-dbsp'
-import { buildGraph, type NodeRef, type VizNodeData } from '@viz/build-graph'
+import { buildGraph, type BuildOpts, type NodeRef, type VizNodeData } from '@viz/build-graph'
 import type { EngineGraph } from '@viz/types'
 
 import { PipelineNode } from './nodes.tsx'
@@ -59,8 +59,29 @@ export function PipelineCanvas({
     if (!graph || mine.length === 0) return { nodes: [], edges: [] }
     const sel = new Set(mine)
     const f = focus?.id ?? null
-    return view === 'dbsp' ? buildDbspGraph(graph, sel, f) : buildGraph(graph, sel, f)
-  }, [graph, mine, view, focus])
+    // Uniform node widths + heights sized to the FULL (wrapped) query text, measured on what will
+    // actually be displayed (scrubbed unless under-the-hood).
+    const opts: BuildOpts = {
+      measure: (d) => {
+        const label = underHood ? d.label : scrubText(d.label)
+        const sub = d.sub ? (underHood ? d.sub : scrubText(d.sub)) : ''
+        if (d.kind === 'table' || d.kind === 'source') return { w: 160, h: 52 }
+        const w = 260
+        const charsPerLine = Math.floor((w - 26) / 7.3) // 12px ui-monospace ≈ 7.3px/char
+        const lines = Math.max(1, Math.ceil(label.length / charsPerLine))
+        const subLines = sub ? Math.max(1, Math.ceil(sub.length / charsPerLine)) : 0
+        return { w, h: 30 + lines * 17 + subLines * 14 + (d.kind === 'shape' ? 8 : 4) }
+      },
+    }
+    const built = view === 'dbsp' ? buildDbspGraph(graph, sel, f, opts) : buildGraph(graph, sel, f, opts)
+    // Keep the grey source nodes in one aligned column, whatever rank dagre picked for them.
+    const tables = built.nodes.filter((n) => n.id.startsWith('table:') || n.id.startsWith('src:'))
+    if (tables.length > 1) {
+      const minX = Math.min(...tables.map((n) => n.position.x))
+      for (const n of tables) n.position = { ...n.position, x: minX }
+    }
+    return built
+  }, [graph, mine, view, focus, underHood])
 
   // Refs so the trace callback maps events against the CURRENT render without re-subscribing.
   const edgesRef = useRef(edges)

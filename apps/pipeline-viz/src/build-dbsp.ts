@@ -1,7 +1,7 @@
 import dagre from '@dagrejs/dagre'
 import type { Edge, Node } from '@xyflow/react'
 
-import type { NodeKind, NodeRef, VizNodeData } from './build-graph'
+import type { BuildOpts, NodeKind, NodeRef, VizNodeData } from './build-graph'
 import { predicateLabel } from './predicate-label'
 import type { EngineGraph } from './types'
 
@@ -271,14 +271,19 @@ const OP_SIZE: Partial<Record<NodeKind, { w: number; h: number }>> = {
   'op-agg': { w: 200, h: 60 },
   sink: { w: 160, h: 54 },
 }
-const sizeOf = (k: NodeKind) => OP_SIZE[k] ?? { w: 190, h: 54 }
+const defaultSize = (k: NodeKind) => OP_SIZE[k] ?? { w: 190, h: 54 }
 
-function layout(raw: { nodes: Map<string, RawNode>; edges: RawEdge[] }, focus: string | null): { nodes: Node[]; edges: Edge[] } {
+function layout(
+  raw: { nodes: Map<string, RawNode>; edges: RawEdge[] },
+  focus: string | null,
+  opts?: BuildOpts,
+): { nodes: Node[]; edges: Edge[] } {
+  const sizeOfNode = (n: RawNode) => opts?.measure?.(n.data) ?? defaultSize(n.data.kind)
   const g = new dagre.graphlib.Graph()
   g.setGraph({ rankdir: 'LR', nodesep: 18, ranksep: 70, marginx: 24, marginy: 24 })
   g.setDefaultEdgeLabel(() => ({}))
   for (const [id, n] of raw.nodes) {
-    const s = sizeOf(n.data.kind)
+    const s = sizeOfNode(n)
     g.setNode(id, { width: s.w, height: s.h })
   }
   for (const e of raw.edges) g.setEdge(e.source, e.target)
@@ -295,7 +300,7 @@ function layout(raw: { nodes: Map<string, RawNode>; edges: RawEdge[] }, focus: s
 
   const nodes: Node[] = [...raw.nodes.values()].map((n) => {
     const p = g.node(n.id)
-    const s = sizeOf(n.data.kind)
+    const s = sizeOfNode(n)
     return {
       id: n.id,
       type: 'pipeline',
@@ -328,8 +333,9 @@ export function buildDbspGraph(
   g: EngineGraph,
   selection: 'all' | Set<string>,
   focus: string | null = null,
+  opts?: BuildOpts,
 ): { nodes: Node[]; edges: Edge[] } {
   const full = buildFull(g)
   const restricted = selection === 'all' ? full : restrictToSelection(full, selection)
-  return layout(restricted, focus)
+  return layout(restricted, focus, opts)
 }

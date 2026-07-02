@@ -216,15 +216,23 @@ const KIND_SIZE: Partial<Record<NodeKind, { w: number; h: number }>> = {
   agg: { w: 210, h: 64 },
 }
 
+/** Optional layout hooks: `measure` overrides a node's box (return null to keep the default) —
+ *  lets an embedder size nodes to fit full multi-line labels. */
+export interface BuildOpts {
+  measure?: (data: VizNodeData) => { w: number; h: number } | null
+}
+
 function layout(
   raw: { nodes: Map<string, RawNode>; edges: RawEdge[] },
   focus: string | null,
+  opts?: BuildOpts,
 ): { nodes: Node[]; edges: Edge[] } {
+  const sizeOf = (n: RawNode) => opts?.measure?.(n.data) ?? KIND_SIZE[n.data.kind] ?? { w: 200, h: 60 }
   const g = new dagre.graphlib.Graph()
   g.setGraph({ rankdir: 'LR', nodesep: 24, ranksep: 90, marginx: 24, marginy: 24 })
   g.setDefaultEdgeLabel(() => ({}))
   for (const [id, n] of raw.nodes) {
-    const s = KIND_SIZE[n.data.kind] ?? { w: 200, h: 60 }
+    const s = sizeOf(n)
     g.setNode(id, { width: s.w, height: s.h })
   }
   for (const e of raw.edges) g.setEdge(e.source, e.target)
@@ -242,7 +250,7 @@ function layout(
 
   const nodes: Node[] = [...raw.nodes.values()].map((n) => {
     const p = g.node(n.id)
-    const s = KIND_SIZE[n.data.kind] ?? { w: 200, h: 60 }
+    const s = sizeOf(n)
     return {
       id: n.id,
       type: 'pipeline',
@@ -275,8 +283,9 @@ export function buildGraph(
   g: EngineGraph,
   selection: 'all' | Set<string>,
   focus: string | null = null,
+  opts?: BuildOpts,
 ): { nodes: Node[]; edges: Edge[] } {
   const full = buildFull(g)
   const restricted = selection === 'all' ? full : restrictToSelection(full, selection)
-  return layout(restricted, focus)
+  return layout(restricted, focus, opts)
 }

@@ -393,9 +393,10 @@ button {
   font-size: 12px;
   font-weight: 600;
   margin-top: 2px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  /* Full queries, always: wrap instead of truncating. Node heights are measured to fit. */
+  white-space: normal;
+  word-break: break-word;
+  line-height: 1.35;
   font-family: ui-monospace, monospace;
 }
 .pnode-sub {
