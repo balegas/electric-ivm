@@ -1,89 +1,161 @@
 # electric-ivm
 
-A reactive sync engine in the style of [Electric](https://electric-sql.com/), built on incremental
-view maintenance. Your app writes to **Postgres**; a Rust engine turns logical-replication changes
-into **live shapes** (incrementally-maintained query results); [durable streams](https://durablestreams.com)
-is the log that carries everything in between. It speaks **two client protocols**:
+A reactive sync engine in the style of [Electric](https://electric-sql.com/), built on **incremental
+view maintenance**. Your app writes to Postgres with ordinary SQL; clients subscribe to **shapes** —
+queries whose result sets stay live — and receive every change that affects them, incrementally. A
+Rust engine sits between the two, turning the Postgres logical-replication stream into per-shape
+change feeds. It speaks the Electric wire protocol (`GET /v1/shape`, works with the unmodified
+ElectricSQL client) plus an extended API that adds subset queries and live aggregations.
 
-- **The Electric protocol** — `GET /v1/shape` on the engine, compatible with the ElectricSQL TS
-  client and validated against Electric's own oracle/property/integration tests
-  ([`electric-conformance/`](electric-conformance/README.md)).
-- **The extended API** (`@electric-ivm/client`) — shapes plus the pieces the Electric API doesn't
-  cover today: **subset queries** (ordered, windowed pages with a shared live tail) and **live
-  aggregations** (COUNT/SUM/AVG/MIN/MAX maintained incrementally). This surface is where the API is
-  headed; the Electric endpoint is the compatibility layer.
+## What is a shape?
 
-## The design in three moves
+A shape is a query over one table whose **result set is maintained for you as the database
+changes**:
+
+```sql
+SELECT * FROM issues
+WHERE status = 'todo' AND priority >= 3
+```
+
+Subscribe to that shape and you first receive its current rows (the *snapshot*), then a live feed of
+exactly three kinds of message, forever:
+
+- `upsert` — a row entered the result set, or changed while inside it;
+- `delete` — a row left the result set (deleted, **or updated so it no longer matches**);
+- nothing — the change didn't affect this shape.
+
+That last bullet is the point. A shape is a **sync boundary**: only matching rows (and only the
+columns you project) ever cross the network, and the client's local copy is always exactly the
+query's result — never a cache to invalidate, never an approximation to refresh.
+
+Shape predicates are comparisons (`= <> < <= > >=`, `LIKE`), null tests (`IS [NOT] NULL`),
+`AND/OR/NOT`, and one cross-table form: single-column subqueries,
+`col [NOT] IN (SELECT proj FROM other WHERE …)`, recursively. Ordering and windowing are
+deliberately *not* shape features — they live in **subset queries** (below), so a shape's
+maintenance never involves range state.
+
+## What is DBSP?
+
+[DBSP](https://docs.rs/dbsp) is a theory (and Rust library) of incremental computation from the
+Feldera project. Its core idea:
+
+1. Represent data as **Z-sets** — collections where every row carries a signed weight
+   (multiplicity). A table is a Z-set where present rows have weight `+1`.
+2. Represent *change* as a **delta** — a tiny Z-set: an insert is `(row, +1)`, a delete is
+   `(row, −1)`, an update is both — `(old, −1), (new, +1)`.
+3. Build queries as **operator pipelines** over Z-sets (filter, map, join, aggregate…), where each
+   operator has an *incremental* form: feed it a delta and it emits the delta of its output.
+
+The consequence: to keep a query result up to date you never re-run the query — you push each
+change's delta through the pipeline and apply the (usually tiny) output delta to the result. Cost
+scales with the size of the *change*, not the size of the *data*.
+
+electric-ivm is built on this model. Every replicated change becomes a Z-set delta (Postgres's
+`REPLICA IDENTITY FULL` supplies the old row, so updates retract precisely), and every shape,
+subquery, and aggregation is an incremental operator over those deltas. The engine implements the
+operators directly in Rust — stateless filters, key routers, shared inner-set nodes, running
+folds — rather than running a general dbsp circuit, so it keeps **no copy of any table**: engine
+RSS is ~19 MiB whether the database has 1k or 100k rows, +~0.8 KiB per shape
+([measurements](docs/bench/shape-memory-matrix.md)).
+
+## A shape as a DBSP pipeline
+
+Take the shape above and one write:
+
+```sql
+UPDATE issues SET status = 'done' WHERE id = 42;   -- was: status = 'todo', priority = 4
+```
+
+```
+                    Postgres logical replication (old + new tuple)
+                                      │
+                                      ▼
+              Z-set delta:   (id=42, status='todo', prio=4)  → −1
+                             (id=42, status='done', prio=4)  → +1
+                                      │
+                                      ▼
+              σ  status='todo' AND priority>=3        (incremental filter:
+                                      │                keep matching weighted rows)
+                                      ▼
+                             (id=42, status='todo', prio=4)  → −1
+                                      │                       (new row filtered out)
+                                      ▼
+              group by pk → net weight negative → emit
+                                      │
+                                      ▼
+              shape feed:   delete id=42          ← the row leaves every subscriber, live
+```
+
+No table scan, no diffing, no re-query — the update's own delta carried everything needed to know
+that row 42 must *leave* the shape.
+
+The one cross-table operator works the same way. A per-user visibility shape:
+
+```sql
+SELECT * FROM issues
+WHERE project_id IN (SELECT project_id FROM project_members WHERE user_id = 42)
+```
+
+compiles to a two-input pipeline with a small piece of shared state — the maintained **inner set**
+(user 42's project ids, a handful of values, not any issues):
+
+```
+project_members deltas ──▶ [ inner-set node: {project_id | user_id = 42} ]
+                                      │  value enters/leaves the set ("flip")
+                                      ▼
+                           re-evaluate the affected outer rows (issues WHERE project_id = P)
+                                      │
+issues deltas ────────────▶ [ membership test against the node ]
+                                      │
+                                      ▼
+                           shape feed: upserts / deletes
+```
+
+Add user 42 to a project and every issue of that project upserts into their shape; remove them and
+the issues delete — driven entirely by the membership table's delta. The pipeline for any running
+engine is inspectable live in the **pipeline explorer** (`apps/pipeline-viz`).
+
+**Everything equal is de-duplicated.** Two identical shapes (same table, canonical predicate,
+projection) share one maintained pipeline and one output stream, ref-counted — as do identical
+subquery inner sets and identical aggregations. A thousand clients opening the same shape cost the
+engine one maintenance path and one append per change.
+
+## The system
 
 ```
   app ──SQL writes──▶ POSTGRES (system of record; wal_level=logical)
-                         │  logical replication (commit LSN + xid + seq stamped)
+                         │  logical replication
                          ▼
                       DURABLE STREAMS   table/<name>       (the change log)
-                         │  one tailer per table, (lsn,seq) de-duplicated
+                         │  one tailer per table
                          ▼
-                      ENGINE   Z-set delta → shared routing/filters/subqueries/aggregations
-                         │  reliable append
+                      ENGINE   Z-set deltas → shared filters/routers/subqueries/aggregations
+                         │
                          ▼
-                      DURABLE STREAMS   shape/<id>         (ONE feed per DISTINCT shape)
+                      DURABLE STREAMS   shape/<id>         (one feed per DISTINCT shape)
                          │  read / long-poll
                          ▼
                       CLIENTS   Electric client (/v1/shape)  or  @electric-ivm/client
 ```
 
-1. **The engine holds no copy of any table.** Row-count-scale state lives in Postgres; shapes
-   backfill just their matching rows in a `REPEATABLE READ` snapshot. Engine RSS is ~19 MiB whether
-   the database has 1k or 100k rows, +~0.8 KiB per shape
-   ([measurements](docs/bench/shape-memory-matrix.md)).
-2. **Every change is a Z-set delta** (rows with ±1 weights, from the replication old+new tuples), and
-   the *shape of the predicate* picks a shared execution strategy: equality templates route by key
-   through one shared router per template; ranges/OR/NOT run as stateless filters; subqueries flow
-   through shared inner-set nodes; aggregations fold the delta into a running scalar. No per-shape
-   circuit, no per-shape thread.
-3. **Everything equal is de-duplicated.** Two identical shapes (same table, canonical predicate,
-   projection, kind) share one maintained stream, ref-counted — as do identical subquery inner-sets
-   and identical aggregations. A thousand clients opening the same shape cost the engine one
-   maintenance path and one append per change.
-
-Full architecture: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**; engine execution + cost model:
+Postgres owns durability and transactions; [durable streams](https://durablestreams.com) is the log
+that decouples every layer (the engine is a restartable consumer in the middle); the engine holds
+only per-shape routing metadata and the shared inner sets. Backfills read just a shape's matching
+rows in a `REPEATABLE READ` snapshot, fenced against the live stream by transaction visibility.
+Full design: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**; execution strategies + cost model:
 **[docs/ivm-engine-internals.md](docs/ivm-engine-internals.md)**.
 
-## Consistency model (the short version)
+## Two client surfaces
 
-- **Backfill ↔ live is fenced by transaction visibility**, not WAL position: the backfill snapshot
-  records `pg_current_snapshot()` and the engine skips a replicated change iff its xid was visible to
-  that snapshot. (A WAL-position fence cannot express snapshot visibility — a commit's WAL record
-  exists before the transaction becomes visible to snapshots; see ARCHITECTURE §4.)
-- **Ingest is at-least-once, effect is exactly-once**: the ingestor appends before advancing the
-  slot; tailers de-duplicate by the stamped `(commit LSN, seq)`.
-- **Shape appends never drop silently**: transient storage failures retry with backoff and the
-  convergence barrier only advances once every subscriber stream reflects the batch.
-- **Subquery membership is emitted absolutely** (current membership per touched pk, never a
-  history-dependent delta), so cross-table tailer interleaving cannot miss move-outs — no
-  LSN-buffering protocol needed.
-- **Shape creation is atomic**: a failed backfill/registration rolls everything back and surfaces the
-  error — never a zombie shape that pins its signature and streams nothing.
-
-The conformance invariant, asserted end-to-end through the real API/streams/client: *for any shape
-and any op stream, the client-materialized set equals the oracle's `SELECT … WHERE <predicate>`* —
-including live replication, batched mutations, NULL three-valued logic, and concurrent writers.
-
-## What a shape is
-
-One table + a `WHERE` over its columns — comparisons (`eq neq lt lte gt gte`, `LIKE`), null tests
-(`col IS [NOT] NULL`), combined with `and/or/not`, **plus single-column subqueries**
-`col [NOT] IN (SELECT proj FROM other WHERE …)` (recursive) as the one cross-table form. An optional **`columns`** projection bounds what is synced
-(never what is matched). Ordered windows (`orderBy`+`limit`) are deliberately **not** a shape knob —
-they live in subset queries, so ranges are never live-tailed and a change never fans out across
-pages.
-
-On top of shapes, the extended API adds:
-
-- **Subset queries** — one-shot `SELECT … ORDER BY … LIMIT/OFFSET` pages + a shared changes-only live
-  feed, merged client-side by per-pk LSN watermarks (with delete tombstones, so a stale page can
-  never resurrect a deleted row). The basis for infinite scroll / keyset pagination.
-- **Aggregations** — live scalar COUNT/SUM/AVG/MIN/MAX over a predicate, SQL NULL semantics,
-  retraction-correct MIN/MAX. One maintained fold feeds every subscriber of the same aggregate.
+- **The Electric protocol** — `GET /v1/shape` on the engine, compatible with the ElectricSQL TS
+  client and validated against Electric's own oracle/property/integration tests
+  ([`electric-conformance/`](electric-conformance/README.md)).
+- **The extended API** (`@electric-ivm/client`) — shapes plus the pieces the Electric API doesn't
+  cover today; this surface is where the API is headed:
+  - **Subset queries** — one-shot `SELECT … ORDER BY … LIMIT` pages + a shared live tail, merged
+    client-side; the basis for infinite scroll / keyset pagination.
+  - **Aggregations** — live scalar COUNT/SUM/AVG/MIN/MAX over a predicate, maintained as an
+    incremental fold with SQL NULL semantics and retraction-correct MIN/MAX.
 
 ## Try it
 
@@ -99,9 +171,6 @@ pnpm demo:linearlite    # LinearLite (issue tracker) on electric-ivm — the fla
 scripts/linearlite.sh start large   # same, at a 100k-issue workload + the pipeline explorer
 ```
 
-The **pipeline explorer** (`apps/pipeline-viz`, printed URL on demo start) shows the live maintained
-pipeline — shapes, shared families, shared subquery nodes, per-node indexes, live shape contents.
-
 ### Docker
 
 ```bash
@@ -109,7 +178,7 @@ pnpm docker:up    # Postgres + durable-streams + engine (+ extended API) — see
 ```
 
 Point an ElectricSQL client at `http://localhost:7010/v1/shape`, or `@electric-ivm/client` at
-`http://localhost:8790`.
+`http://localhost:8790`. Prebuilt images: `ghcr.io/balegas/electric-ivm/{engine,node}`.
 
 ### Using the extended client
 
@@ -138,10 +207,9 @@ Without Postgres (library mode), writes can go through `client.tables.<t>.insert
 ## Electric protocol conformance
 
 `electric-conformance/` runs **Electric's own tests** against our `/v1/shape`: the oracle harness
-(levels 1–4), the PROPERTY test over the full schema+grammar, and the subquery integration tests.
-Known scope gaps are documented in its README (e.g. row `tags` are not emitted — absolute membership
-emission makes them unnecessary for convergence). The adapter parses Electric's SQL `where` grammar,
-serves snapshot + live long-poll with handles/offsets, and evicts idle handles after a TTL.
+(levels 1–4), the PROPERTY test over the full schema+grammar, and the subquery integration tests —
+one command via `electric-conformance/run.sh`. Known scope gaps are documented in its README (e.g.
+row `tags` are not emitted — absolute membership emission makes them unnecessary for convergence).
 
 ## Benchmarks
 
@@ -162,6 +230,11 @@ pnpm test               # full TS suite incl. conformance (boots its own Postgre
 pnpm test:fuzz          # random-predicate fuzz vs the oracle
 pnpm loop [N]           # run the fuzz loop until failure; replay with SEED=<n>
 ```
+
+The conformance invariant, asserted end-to-end through the real API/streams/client: *for any shape
+and any op stream, the client-materialized set equals a Postgres oracle's
+`SELECT … WHERE <predicate>`* — including live replication, batched mutations, NULL three-valued
+logic, and concurrent writers.
 
 ## Layout
 
