@@ -24,6 +24,18 @@ export interface SceneDef {
 
 export const SCENES: SceneDef[] = [
   {
+    n: 0,
+    title: 'Start here',
+    body:
+      'electric-ivm is a sync engine for Postgres. Apps subscribe to shapes — subsets of your ' +
+      'data, defined by a query — and the engine streams every relevant change to them as it ' +
+      'happens. This playground shows the machinery doing it: the left panel writes to Postgres, ' +
+      'the middle shows the pipeline inside the engine, and the right shows the subscribed ' +
+      'screens. Nothing is syncing yet — open scene 1 to create your first live query.',
+    try: ['Open scene 1 →'],
+    shapes: [],
+  },
+  {
     n: 1,
     title: 'Your workspace',
     body:

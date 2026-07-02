@@ -14,10 +14,9 @@ export function Welcome({ onClose }: { onClose: () => void }) {
           How <em>live queries</em> work
         </div>
         <p className="welcome-lead">
-          A <b>shape</b> is a database query whose results stay up to date on every screen that
-          subscribes to it — that's how Electric-style sync works. This playground is a live view
-          inside the engine that makes it happen: change some data in a little food-delivery world
-          and watch how the change reaches exactly the screens that care — and nothing else.
+          Electric-style sync streams subsets of your Postgres data — <b>shapes</b> — into apps,
+          and keeps them up to date as the data changes. This playground shows the engine doing
+          it. Change some data. Watch it reach every screen that subscribes — and nothing else.
         </p>
         <div className="welcome-grid">
           <div>

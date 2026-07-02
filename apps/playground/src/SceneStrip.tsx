@@ -9,7 +9,7 @@ import { SCENES } from '../shared/scenes.ts'
 const SCENE_KEY = 'playground-scene'
 
 export function currentScene(): number {
-  return Number(localStorage.getItem(SCENE_KEY) ?? 1)
+  return Number(localStorage.getItem(SCENE_KEY) ?? 0)
 }
 
 export function SceneStrip({ scene, onScene }: { scene: number; onScene: (n: number) => void }) {

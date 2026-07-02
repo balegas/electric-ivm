@@ -52,13 +52,16 @@ export default function App() {
     [w.enterScene, loadGraph], // eslint-disable-line react-hooks/exhaustive-deps
   )
   // Provision on boot AND whenever the workspace identity changes (new workspace / reset
-  // recovery): scene 1's base shape always exists, then the stored scene's shapes.
+  // recovery). Scene 0 is the deliberate empty state (nothing synced yet); from scene 1 on,
+  // scene 1's base shape always exists, then the stored scene's shapes.
   const ready = w.status === 'ready'
   useEffect(() => {
     if (!ready || !wsId) return
     void (async () => {
-      await w.enterScene(1)
-      if (scene !== 1) await w.enterScene(scene)
+      if (scene >= 1) {
+        await w.enterScene(1)
+        if (scene !== 1) await w.enterScene(scene)
+      }
       await loadGraph()
     })()
     // eslint-disable-next-line react-hooks/exhaustive-deps

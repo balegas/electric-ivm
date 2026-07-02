@@ -127,7 +127,9 @@ export function DeviceCards({
       <div className="devices-h">
         Subscribers <span className="devices-sub">each card is a live shape</span>
       </div>
-      {shapes.length === 0 ? <div className="device-empty">No shapes yet — enter a scene below.</div> : null}
+      {shapes.length === 0 ? (
+        <div className="device-empty">No live queries yet — open scene 1 below to sync your first one.</div>
+      ) : null}
       {shapes.map((s) => (
         <DeviceCard
           key={s.id}

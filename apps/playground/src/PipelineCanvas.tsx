@@ -113,7 +113,10 @@ export function PipelineCanvas({
         </button>
       </div>
       {decorated.nodes.length === 0 ? (
-        <div className="canvas-empty">Your pipeline appears here once the scene creates its shapes.</div>
+        <div className="canvas-empty">
+          <div className="canvas-empty-t">Nothing is syncing yet</div>
+          <div>This pane will show the engine's pipeline. Open scene 1 below to create your first live query.</div>
+        </div>
       ) : (
         <ReactFlow
           nodes={decorated.nodes}
