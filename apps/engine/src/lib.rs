@@ -22,6 +22,7 @@ pub mod replication;
 pub mod schema;
 pub mod sql;
 pub mod subquery;
+pub mod trace;
 pub mod value;
 pub mod where_sql;
 

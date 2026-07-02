@@ -30,9 +30,27 @@ pub fn router(engine: Engine) -> Router {
         .route("/metrics/reset", post(reset_metrics))
         .route("/memory", get(get_memory))
         .route("/metrics/prometheus", get(get_prometheus))
+        // Per-envelope pipeline trace (SSE) — best-effort, for visualization/debugging.
+        .route("/trace", get(get_trace))
         // Electric-protocol adapter: lets Electric's official client + oracle harness read our shapes.
         .route("/v1/shape", get(crate::electric::shape))
         .with_state(engine)
+}
+
+/// SSE stream of per-envelope [`crate::trace::TraceEvent`]s (one JSON object per `data:` line).
+/// Lossy by design: a lagging subscriber silently skips the events it missed rather than slowing
+/// envelope processing.
+async fn get_trace(State(engine): State<Engine>) -> impl IntoResponse {
+    use tokio_stream::StreamExt;
+    let rx = engine.trace_sender().subscribe();
+    let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|item| match item {
+        Ok(json) => Some(Ok::<_, std::convert::Infallible>(
+            axum::response::sse::Event::default().data(json.as_str()),
+        )),
+        // Lagged: drop the gap marker; the consumer treats trace as best-effort animation.
+        Err(_) => None,
+    });
+    axum::response::sse::Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
 #[derive(Deserialize)]

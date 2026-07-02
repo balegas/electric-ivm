@@ -39,6 +39,9 @@ pub struct Engine {
     /// outer subquery shapes that depend on them. Every tailer routes its deltas here so an inner-table
     /// change moves outer rows. `None`-free; empty until a subquery shape is created.
     subqueries: Arc<Mutex<SubqueryRegistry>>,
+    /// Best-effort per-envelope trace broadcast (see [`crate::trace`]). Events are serialized once
+    /// and only when someone is subscribed; slow subscribers lag and drop.
+    trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
 }
 
 struct EngineState {
@@ -295,7 +298,14 @@ impl Engine {
             repl_sync: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             replicator_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             subqueries,
+            trace_tx: tokio::sync::broadcast::channel(crate::trace::CHANNEL_CAP).0,
         }
+    }
+
+    /// Sender for the per-envelope trace broadcast — subscribe via `.subscribe()` (used by the
+    /// `/trace` SSE endpoint); tailers publish through a clone.
+    pub fn trace_sender(&self) -> tokio::sync::broadcast::Sender<Arc<String>> {
+        self.trace_tx.clone()
     }
 
     /// Engine in Postgres mode: data lives in Postgres, ingested via logical replication and read
