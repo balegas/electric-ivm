@@ -34,11 +34,13 @@ let ds: DurableStreamTestServer | undefined
 let engineProc: ChildProcess | undefined
 let server: PlaygroundServer | undefined
 let vite: ViteDevServer | undefined
+let caddyProc: ChildProcess | undefined
 let shuttingDown = false
 
 async function shutdown(code = 0): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
+  caddyProc?.kill('SIGKILL')
   engineProc?.kill('SIGKILL')
   await vite?.close().catch(() => {})
   await server?.close().catch(() => {})
@@ -140,6 +142,42 @@ try {
   await vite.listen()
   console.log('')
   vite.printUrls()
+
+  // HTTPS / HTTP-2 front (Caddy), same as the linearlite demo: browsers cap HTTP/1.1 at ~6
+  // connections per origin, and the playground holds several at once (the /trace SSE stream + a
+  // rows poll per device card + graph/workspace polling + HMR). Fronting Vite with an HTTP/2 TLS
+  // proxy multiplexes everything over one connection. Auto-enabled when `caddy` is on PATH; set
+  // DEMO_HTTPS=0 to skip, DEMO_HTTPS_PORT to change the port (default 8444).
+  if (process.env.DEMO_HTTPS !== '0') {
+    let hasCaddy = true
+    try {
+      execFileSync('caddy', ['version'], { stdio: 'ignore' })
+    } catch {
+      hasCaddy = false
+    }
+    if (hasCaddy) {
+      // Dial the exact address Vite bound (it listens on IPv6 ::1 by default; a 127.0.0.1
+      // upstream would 502). Bracket IPv6 hosts for the host:port form.
+      const a = vite.httpServer?.address()
+      const vitePort = a && typeof a === 'object' ? a.port : 5190
+      const host = a && typeof a === 'object' && a.family === 'IPv6' && a.address !== '::' ? `[${a.address}]` : '127.0.0.1'
+      const httpsPort = process.env.DEMO_HTTPS_PORT ?? '8444'
+      caddyProc = spawn(
+        'caddy',
+        ['reverse-proxy', '--from', `https://localhost:${httpsPort}`, '--to', `${host}:${vitePort}`],
+        { stdio: 'ignore' },
+      )
+      caddyProc.on('exit', (c) => {
+        if (!shuttingDown) console.warn(`caddy proxy exited (${c}); continuing over HTTP only`)
+      })
+      console.log(`\n🔒 HTTPS (HTTP/2) →  https://localhost:${httpsPort}/   ← use this one`)
+      console.log('   Multiplexes the trace stream + device-card polls over one connection (past the ~6-per-origin HTTP/1.1 cap).')
+      console.log("   The cert is from Caddy's local CA: run `caddy trust` once to remove the browser warning, or click through it.")
+    } else {
+      console.log('\n(Install `caddy` to serve over HTTPS/HTTP-2 — the many live streams can exhaust the browser’s ~6-connection HTTP/1.1 cap.)')
+    }
+  }
+
   console.log('\n🍕 dbsp playground — every write is a delta; watch it travel.\n')
 } catch (e) {
   console.error('playground: startup failed:', e)
