@@ -47,6 +47,7 @@ export function App(): JSX.Element {
   const hash = useHashRoute()
   const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS)
   const [createOpen, setCreateOpen] = useState(false)
+  const [sidebarOpen, setSidebarOpen] = useState(true)
 
   const issueMatch = hash.match(/^#\/issue\/(\d+)/)
   const route = issueMatch ? 'issue' : hash.startsWith('#/board') ? 'board' : 'list'
@@ -54,9 +55,20 @@ export function App(): JSX.Element {
 
   return (
     <CurrentUserProvider>
-      <div className="layout">
-        <Sidebar onNewIssue={() => setCreateOpen(true)} filters={filters} setFilters={setFilters} activeHash={hash} />
+      <div className={`layout ${sidebarOpen ? '' : 'sidebar-collapsed'}`}>
+        <Sidebar
+          onNewIssue={() => setCreateOpen(true)}
+          filters={filters}
+          setFilters={setFilters}
+          activeHash={hash}
+          onCollapse={() => setSidebarOpen(false)}
+        />
         <main className="main">
+          {!sidebarOpen && (
+            <button type="button" className="sidebar-reopen" title="Open sidebar" onClick={() => setSidebarOpen(true)}>
+              ☰
+            </button>
+          )}
           {route === 'list' && (
             <IssueList filters={filters} setFilters={setFilters} showSearch={showSearch} onNewIssue={() => setCreateOpen(true)} />
           )}

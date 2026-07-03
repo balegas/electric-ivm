@@ -26,11 +26,13 @@ export function Sidebar({
   filters,
   setFilters,
   activeHash,
+  onCollapse,
 }: {
   onNewIssue: () => void
   filters: Filters
   setFilters: (f: Filters) => void
   activeHash: string
+  onCollapse: () => void
 }): JSX.Element {
   const { users, projects, myProjectIds, myMemberships, currentUserId, setCurrentUserId } = useCurrentUser()
 
@@ -135,12 +137,9 @@ export function Sidebar({
         })}
       </div>
 
-      <div className="sidebar-footer">
-        <a href="https://github.com/electric-sql/electric/tree/main/examples/linearlite" target="_blank" rel="noreferrer">
-          Ported from ElectricSQL LinearLite
-        </a>
-        <span className="muted">Postgres → logical replication → live shapes</span>
-      </div>
+      <button type="button" className="sidebar-collapse" title="Collapse sidebar" onClick={onCollapse}>
+        ☰
+      </button>
     </aside>
   )
 }

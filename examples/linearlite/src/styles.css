@@ -25,8 +25,15 @@ body {
 .spacer { flex: 1; }
 
 /* ---- layout ---- */
-.layout { display: grid; grid-template-columns: 240px 1fr; height: 100vh; }
+.layout { display: grid; grid-template-columns: 240px 1fr; height: 100vh; transition: grid-template-columns 0.2s ease; }
+.layout.sidebar-collapsed { grid-template-columns: 0 1fr; }
 .main { overflow-y: auto; }
+.sidebar-reopen {
+  position: fixed; bottom: 16px; left: 16px; z-index: 10;
+  background: var(--panel-2); border: 1px solid var(--line); color: var(--muted);
+  padding: 10px 14px; border-radius: 10px; cursor: pointer; font-size: 18px;
+}
+.sidebar-reopen:hover { color: var(--text); border-color: #3a3d47; }
 
 /* List view: fixed header + an internal scroll viewport the virtualizer drives (so only visible
    rows mount). The viewport owns the scroll; .main no longer scrolls for this route. */
@@ -41,8 +48,21 @@ body {
   display: flex;
   flex-direction: column;
   gap: 18px;
+  overflow: hidden;
+  min-width: 0;
+  transition: padding 0.2s ease;
 }
+/* Padding would hold the collapsed sidebar ~24px open (grid column 0 can't shrink it). */
+.layout.sidebar-collapsed .sidebar { padding-left: 0; padding-right: 0; border-right: none; }
+/* Pin children to the expanded content width (240 - 2*12 padding) so the collapse animation
+   clips them instead of reflowing/wrapping. The collapse button keeps its intrinsic size. */
+.sidebar > :not(.sidebar-collapse) { width: 216px; }
 .brand { display: flex; align-items: center; gap: 10px; padding: 4px 6px; }
+.sidebar-collapse {
+  margin-top: auto; align-self: flex-start; background: var(--panel-2); border: 1px solid var(--line);
+  color: var(--muted); cursor: pointer; font-size: 18px; padding: 10px 14px; border-radius: 10px;
+}
+.sidebar-collapse:hover { color: var(--text); border-color: #3a3d47; }
 .brand-mark { color: var(--accent); font-size: 20px; }
 .brand-name { font-weight: 700; letter-spacing: -0.01em; }
 .brand-sub { font-size: 11px; color: var(--muted); }
@@ -81,9 +101,6 @@ body {
 .project-dot {
   display: inline-block; width: 8px; height: 8px; border-radius: 999px; flex: none; margin-right: 2px;
 }
-.sidebar-footer { margin-top: auto; display: flex; flex-direction: column; gap: 4px; font-size: 11px; padding: 8px; }
-.sidebar-footer a { color: var(--muted); text-decoration: none; }
-.sidebar-footer a:hover { color: var(--accent); }
 
 /* ---- buttons ---- */
 .btn {
