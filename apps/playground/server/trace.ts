@@ -149,6 +149,10 @@ export class TraceFanout {
     } catch {
       return
     }
+    // The engine's /trace also carries graph-lifecycle events (`{"type":"shapeAdded",...}`), which
+    // lack the data-event fields tagAndStrip dereferences — a crash here would silently drop every
+    // SSE client. The playground UI doesn't consume lifecycle events; skip them.
+    if ('type' in ev) return
     const owners = await this.ownersIndex()
     for (const c of this.clients) {
       try {
