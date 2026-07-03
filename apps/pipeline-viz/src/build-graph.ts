@@ -156,8 +156,9 @@ function buildFull(g: EngineGraph): { nodes: Map<string, RawNode>; edges: RawEdg
   for (const n of g.subqueryNodes) {
     add(`node:${n.sig}`, {
       kind: 'sqnode',
-      label: `SELECT ${n.projCol} FROM ${n.innerTable}`,
-      sub: `${n.distinctValues} values · refcount ${n.refcount}`,
+      // No query expression on the canvas — the detail panel carries the full SQL.
+      label: n.innerTable,
+      sub: `distinct ${n.projCol} · refcount ${n.refcount}`,
       shared: n.refcount,
       index: `${n.distinctValues} ${n.distinctValues === 1 ? 'value' : 'values'}`,
       ref: { kind: 'sqnode', sig: n.sig, innerTable: n.innerTable, projCol: n.projCol },
@@ -247,7 +248,9 @@ function layout(
   if (opts?.alignSources) {
     g.setNode('__align_root', { width: 1, height: 1 })
     for (const [id, n] of raw.nodes) {
-      if (n.data.kind === 'table' || n.data.kind === 'source') g.setEdge('__align_root', id)
+      // High weight: the ranker otherwise trades a longer align edge for a shorter flow edge and
+      // lets a source drift into a deeper rank (e.g. a table whose only consumer sits far right).
+      if (n.data.kind === 'table' || n.data.kind === 'source') g.setEdge('__align_root', id, { weight: 100 })
     }
   }
   dagre.layout(g)

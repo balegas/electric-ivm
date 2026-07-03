@@ -48,27 +48,9 @@ const LOG_OPS: Record<string, { sym: string; cls: string }> = {
  *  delete envelopes on the live tail, newest first — a feed has no materialized set to show. */
 function ShapeLogView({ shapeId }: { shapeId: string }) {
   const { entries, total, live, loading, error } = useShapeLog(true, shapeId, CONTENTS_LIMIT)
-  // The wire carries State-Protocol ops (upsert/delete): derive insert vs update from whether the
-  // key was already live earlier in the log, and give deletes (which carry no row) the key's
-  // last-seen value so the log shows WHAT left the shape.
-  const shown = useMemo(() => {
-    const lastRow = new Map<string, Record<string, unknown> | undefined>()
-    const present = new Set<string>()
-    const derived = entries.map((e) => {
-      let op = e.op
-      let row = e.value ?? e.old
-      if (e.op === 'delete') {
-        present.delete(e.key)
-        if (!row) row = lastRow.get(e.key)
-      } else {
-        op = present.has(e.key) ? 'update' : 'insert'
-        present.add(e.key)
-        if (row) lastRow.set(e.key, row)
-      }
-      return { ...e, op, row }
-    })
-    return derived.reverse()
-  }, [entries])
+  // The endpoint walks the whole stream, so ops arrive as exact insert/update/delete and a delete
+  // entry's `old` carries the row it removed — newest first for display.
+  const shown = useMemo(() => entries.map((e) => ({ ...e, row: e.value ?? e.old })).reverse(), [entries])
   return (
     <div className="dp-contents">
       <div className="dp-sec dp-contents-h">

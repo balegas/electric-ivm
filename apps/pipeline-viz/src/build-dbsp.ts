@@ -296,7 +296,8 @@ function layout(
   if (opts?.alignSources) {
     g.setNode('__align_root', { width: 1, height: 1 })
     for (const [id, n] of raw.nodes) {
-      if (n.data.kind === 'table' || n.data.kind === 'source') g.setEdge('__align_root', id)
+      // High weight: see build-graph — without it the ranker lets a source drift right.
+      if (n.data.kind === 'table' || n.data.kind === 'source') g.setEdge('__align_root', id, { weight: 100 })
     }
   }
   dagre.layout(g)

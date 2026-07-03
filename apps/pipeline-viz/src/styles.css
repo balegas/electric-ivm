@@ -149,12 +149,17 @@ body,
   opacity: 0.4;
   cursor: default;
 }
-.auto {
-  font-size: 12px;
-  color: #475569;
-  display: flex;
-  gap: 4px;
+/* Square icon buttons (↻, 🗑): emoji and text glyphs render at different natural
+   sizes — a fixed box + font-size/line-height keeps them visually identical. */
+.btn-icon {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
+  display: inline-flex;
   align-items: center;
+  justify-content: center;
 }
 .counts {
   padding: 10px 16px 2px;

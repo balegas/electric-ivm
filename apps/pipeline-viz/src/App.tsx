@@ -72,7 +72,6 @@ export default function App() {
   const [err, setErr] = useState<string | null>(null)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [mode, setMode] = useState<Mode>('all')
-  const [auto, setAuto] = useState(true)
   const [loadedAt, setLoadedAt] = useState<number>(0)
   const [search, setSearch] = useState('')
   const [focus, setFocus] = useState<{ id: string; ref: NodeRef } | null>(null)
@@ -96,7 +95,9 @@ export default function App() {
   }
 
   const lastGraphJson = useRef<string>('')
+  const lastLoadAt = useRef(0)
   const load = useCallback(async () => {
+    lastLoadAt.current = Date.now()
     try {
       const gr = await fetch('/engine/graph')
       if (!gr.ok) throw new Error(`engine /graph → ${gr.status}`)
@@ -118,21 +119,25 @@ export default function App() {
     void load()
   }, [load])
   useEffect(() => {
-    if (!auto) return
     // Hold the poll while a lifecycle settle is pending — it must not publish the intermediate
-    // state (e.g. a transient subset-feed shape) that the settle exists to skip.
+    // state (e.g. a transient subset-feed shape) that the settle exists to skip. But sustained
+    // shape churn re-arms the settle forever, so force a refresh anyway once we've gone STARVED_MS
+    // without one — a slightly noisy canvas beats a frozen stale one.
+    const STARVED_MS = 6000
     const t = setInterval(() => {
-      if (!lifecycleTimer.current) void load()
+      if (!lifecycleTimer.current || Date.now() - lastLoadAt.current > STARVED_MS) void load()
     }, 2500)
     return () => clearInterval(t)
-  }, [auto, load])
+  }, [load])
 
   const { nodes, edges } = useMemo<{ nodes: Node[]; edges: Edge[] }>(() => {
     if (!graph) return { nodes: [], edges: [] }
     if (mode === 'select' && selected.size === 0) return { nodes: [], edges: [] }
     const sel = mode === 'all' ? 'all' : selected
     const f = focus?.id ?? null
-    return view === 'dbsp' ? buildDbspGraph(graph, sel, f) : buildGraph(graph, sel, f)
+    // alignSources pins every replication-source (table) node into the leftmost rank.
+    const opts = { alignSources: true }
+    return view === 'dbsp' ? buildDbspGraph(graph, sel, f, opts) : buildGraph(graph, sel, f, opts)
   }, [graph, mode, selected, focus, view])
 
   // Live trace decoration: flashes on nodes, travelling delta dots on edges. Refs let the trace
@@ -170,7 +175,7 @@ export default function App() {
     },
     [load],
   )
-  useTrace(auto, onTrace)
+  useTrace(true, onTrace)
   useEffect(
     () => () => {
       if (decorTimer.current) clearTimeout(decorTimer.current)
@@ -380,14 +385,11 @@ export default function App() {
           </button>
         </div>
         <div className="toolbar">
-          <button className="btn" title="Refresh" onClick={() => void load()}>
+          <button className="btn btn-icon" title="Refresh" onClick={() => void load()}>
             ↻
           </button>
-          <label className="auto" title="Live updates (poll + trace subscription)">
-            <input type="checkbox" checked={auto} onChange={(e) => setAuto(e.target.checked)} /> ●
-          </label>
           <button
-            className="btn btn-danger"
+            className="btn btn-icon btn-danger"
             disabled={!graph || graph.shapes.length === 0}
             title="Delete all shapes (shared feeds are swept until their refcounts drain)"
             onClick={() => void deleteAll()}
