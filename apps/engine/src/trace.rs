@@ -42,6 +42,19 @@ pub struct TraceDelta {
     pub w: i64,
 }
 
+/// Graph-lifecycle event, broadcast on the same channel as [`TraceEvent`]: creating or dropping a
+/// shape changes the pipeline's *structure* (new filters/routers/nodes and the paths between
+/// them), which a UI highlights differently from data flow. Distinguished on the wire by the
+/// `type` field, which data events don't carry.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum GraphLifecycle {
+    #[serde(rename_all = "camelCase")]
+    ShapeAdded { shape: String, table: String },
+    #[serde(rename_all = "camelCase")]
+    ShapeDropped { shape: String },
+}
+
 /// Outcome of one node visit. `passed` = the delta (or part of it) continued downstream;
 /// `dropped` = it terminated here (filter mismatch, no routing key, snapshot-gate skip, no
 /// inner-set change); `routed` = a family router dispatched it (with the key values); `folded` =

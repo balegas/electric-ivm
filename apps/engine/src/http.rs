@@ -19,6 +19,7 @@ pub fn router(engine: Engine) -> Router {
         .route("/aggregate", post(create_aggregate))
         .route("/shapes/{id}", get(get_shape).delete(drop_shape))
         .route("/shapes/{id}/rows", get(get_shape_rows))
+        .route("/shapes/{id}/log", get(get_shape_log))
         .route("/query", post(query_subset))
         .route("/tables/{name}/offset", get(table_offset))
         .route("/tables/{name}/families", get(table_families))
@@ -196,6 +197,79 @@ struct ShapeRowsResp {
     count: usize,
     truncated: bool,
     rows: Vec<ShapeRowEntry>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ShapeLogEntry {
+    op: String,
+    key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<serde_json::Value>,
+    /// Prior row on update/delete (REPLICA IDENTITY FULL) — lets a UI show what a delete removed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    old: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lsn: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ShapeLogResp {
+    id: String,
+    table: String,
+    changes_only: bool,
+    /// Total envelopes on the stream (before the tail cap).
+    total: usize,
+    /// Oldest → newest; capped to the tail (`limit`).
+    entries: Vec<ShapeLogEntry>,
+}
+
+/// The change log of an **existing** shape: the tail of its stream as-is (insert/update/delete
+/// envelopes, oldest → newest). Drives the visualizer's feed-shape "live log" view, which polls
+/// this. Read-only — creates no shape.
+async fn get_shape_log(
+    State(engine): State<Engine>,
+    Path(id): Path<String>,
+    Query(q): Query<ShapeRowsQuery>,
+) -> Result<Json<ShapeLogResp>, AppError> {
+    let Some(rec) = engine.get_shape(&id).await else {
+        return Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("shape {id} not found") });
+    };
+    let limit = q.limit.unwrap_or(50).min(500);
+    let mut entries: std::collections::VecDeque<ShapeLogEntry> = std::collections::VecDeque::new();
+    let mut total = 0usize;
+    let mut offset = "-1".to_string();
+    loop {
+        let r = engine.read_shape_stream(&rec.stream_path, &offset, false).await?;
+        let empty = r.envelopes.is_empty();
+        for env in r.envelopes {
+            total += 1;
+            entries.push_back(ShapeLogEntry {
+                op: env.headers.operation,
+                key: env.key,
+                value: env.value,
+                old: env.old,
+                lsn: env.headers.lsn,
+            });
+            if entries.len() > limit {
+                entries.pop_front();
+            }
+        }
+        if let Some(n) = r.next_offset {
+            offset = n;
+        }
+        if r.up_to_date || empty {
+            break;
+        }
+    }
+    Ok(Json(ShapeLogResp {
+        id: rec.id,
+        table: rec.table,
+        changes_only: rec.changes_only,
+        total,
+        entries: entries.into_iter().collect(),
+    }))
 }
 
 /// The current contents of an **existing** shape, materialized by folding its stream — creates no new

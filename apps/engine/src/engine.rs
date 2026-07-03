@@ -527,6 +527,10 @@ impl Engine {
             match res {
                 Ok(()) => {
                     let _ = ready_tx.send(Some(true));
+                    trace_lifecycle(
+                        &self.trace_tx,
+                        crate::trace::GraphLifecycle::ShapeAdded { shape: id, table: table.to_string() },
+                    );
                     return Ok(rec);
                 }
                 Err(e) => {
@@ -598,6 +602,10 @@ impl Engine {
         match outcome {
             Ok(()) => {
                 let _ = share_tx.send(Some(true));
+                trace_lifecycle(
+                    &self.trace_tx,
+                    crate::trace::GraphLifecycle::ShapeAdded { shape: rec.id.clone(), table: rec.table.clone() },
+                );
                 Ok(rec)
             }
             Err(e) => {
@@ -704,6 +712,10 @@ impl Engine {
         match outcome {
             Ok(()) => {
                 let _ = share_tx.send(Some(true));
+                trace_lifecycle(
+                    &self.trace_tx,
+                    crate::trace::GraphLifecycle::ShapeAdded { shape: rec.id.clone(), table: rec.table.clone() },
+                );
                 Ok(rec)
             }
             Err(e) => {
@@ -837,6 +849,7 @@ impl Engine {
             if let Err(e) = self.ds.delete_stream(&rec.stream_path).await {
                 tracing::warn!("failed to delete stream {} for dropped shape {id}: {e:#}", rec.stream_path);
             }
+            trace_lifecycle(&self.trace_tx, crate::trace::GraphLifecycle::ShapeDropped { shape: id.to_string() });
         }
         Ok(())
     }
@@ -1111,6 +1124,16 @@ fn resolve_columns(ts: &TableSchema, columns: Option<Vec<String>>) -> Result<Opt
             idxs.dedup();
             Ok(Some(Arc::new(idxs)))
         }
+    }
+}
+
+/// Broadcast a graph-lifecycle event on the trace channel (zero cost with no subscribers).
+fn trace_lifecycle(tx: &tokio::sync::broadcast::Sender<Arc<String>>, ev: crate::trace::GraphLifecycle) {
+    if tx.receiver_count() == 0 {
+        return;
+    }
+    if let Ok(json) = serde_json::to_string(&ev) {
+        let _ = tx.send(Arc::new(json));
     }
 }
 
