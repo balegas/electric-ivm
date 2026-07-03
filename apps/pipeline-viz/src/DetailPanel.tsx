@@ -1,10 +1,12 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
 
 import type { NodeRef } from './build-graph'
 import { predicateLabel } from './predicate-label'
 import { nodeInnerSql, shapeSql } from './shape-sql'
 import type { EngineGraph, GraphShape, NodeIndex } from './types'
+import { fmtScalar } from './useAggValues'
 import { useShapeContents } from './useShapeContents'
+import { useShapeLog } from './useShapeLog'
 
 const CONTENTS_LIMIT = 50
 
@@ -26,6 +28,96 @@ function fmtCell(v: unknown): string {
   if (v === null || v === undefined) return '∅'
   const s = String(v)
   return s.length > 48 ? `${s.slice(0, 48)}…` : s
+}
+
+function fmtLogRow(row?: Record<string, unknown>): string {
+  if (!row) return '∅'
+  const s = Object.entries(row)
+    .map(([k, v]) => `${k}: ${fmtCell(v)}`)
+    .join(' · ')
+  return s.length > 160 ? `${s.slice(0, 160)}…` : s
+}
+
+const LOG_OPS: Record<string, { sym: string; cls: string }> = {
+  insert: { sym: '+', cls: 'dp-op-ins' },
+  update: { sym: '~', cls: 'dp-op-upd' },
+  delete: { sym: '−', cls: 'dp-op-del' },
+}
+
+/** Live change log of a feed shape (polls `GET /shapes/{id}/log`): the flow of insert/update/
+ *  delete envelopes on the live tail, newest first — a feed has no materialized set to show. */
+function ShapeLogView({ shapeId }: { shapeId: string }) {
+  const { entries, total, live, loading, error } = useShapeLog(true, shapeId, CONTENTS_LIMIT)
+  // The wire carries State-Protocol ops (upsert/delete): derive insert vs update from whether the
+  // key was already live earlier in the log, and give deletes (which carry no row) the key's
+  // last-seen value so the log shows WHAT left the shape.
+  const shown = useMemo(() => {
+    const lastRow = new Map<string, Record<string, unknown> | undefined>()
+    const present = new Set<string>()
+    const derived = entries.map((e) => {
+      let op = e.op
+      let row = e.value ?? e.old
+      if (e.op === 'delete') {
+        present.delete(e.key)
+        if (!row) row = lastRow.get(e.key)
+      } else {
+        op = present.has(e.key) ? 'update' : 'insert'
+        present.add(e.key)
+        if (row) lastRow.set(e.key, row)
+      }
+      return { ...e, op, row }
+    })
+    return derived.reverse()
+  }, [entries])
+  return (
+    <div className="dp-contents">
+      <div className="dp-sec dp-contents-h">
+        <span>
+          live change log {live ? <span className="dp-live-dot" title="polling every 2s" /> : null}
+        </span>
+        <span className="dp-contents-n">
+          {loading ? 'loading…' : `${total.toLocaleString()} change${total === 1 ? '' : 's'}`}
+        </span>
+      </div>
+      <div className="dp-note">
+        changes-only feed — every insert / update / delete seen on the live tail, newest first.
+      </div>
+      {error ? <div className="dp-err">{error}</div> : null}
+      {!error && !loading && total === 0 ? <div className="dp-empty-idx">no changes seen yet</div> : null}
+      {shown.length > 0 ? (
+        <div className="dp-table-wrap">
+          <table className="dp-table dp-log">
+            <tbody>
+              {shown.map((e, i) => {
+                const op = LOG_OPS[e.op] ?? { sym: e.op, cls: '' }
+                return (
+                  <tr key={total - i} className={op.cls}>
+                    <td className="dp-log-op" title={e.op}>
+                      {op.sym}
+                    </td>
+                    <td className="dp-log-key">{e.key}</td>
+                    <td className="dp-log-row" title={e.row ? JSON.stringify(e.row) : undefined}>
+                      {fmtLogRow(e.row)}
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      ) : null}
+      {total > shown.length ? (
+        <div className="dp-note">
+          showing latest {shown.length} of {total.toLocaleString()} — updates live
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+/** A shape's live view: materialized shapes show their current set, feeds show the change log. */
+function ShapeLiveView({ shape }: { shape: GraphShape }) {
+  return shape.changesOnly ? <ShapeLogView shapeId={shape.id} /> : <ShapeContentsView shapeId={shape.id} />
 }
 
 /** Live-preview a shape's rows (polls `GET /shapes/{id}/rows`) as a compact, updating table. */
@@ -68,6 +160,24 @@ function ShapeContentsView({ shapeId }: { shapeId: string }) {
         </div>
       ) : null}
       {count > shown.length ? <div className="dp-note">showing first {shown.length} of {count.toLocaleString()} — updates live</div> : null}
+    </div>
+  )
+}
+
+/** Prominent live scalar for an aggregation shape. Polls the same `GET /shapes/{id}/rows`
+ *  endpoint as row previews — for an aggregation the single "agg" row's `value` field IS the
+ *  running aggregate. Only mounted while an aggshape is focused, so nothing double-polls. */
+function AggValueView({ shapeId, expr }: { shapeId: string; expr: string }) {
+  const { rows, live, loading, error } = useShapeContents(true, shapeId, 1)
+  const v = rows[0]?.value['value']
+  return (
+    <div className="dp-agg">
+      <div className="dp-agg-l">
+        current value {live ? <span className="dp-live-dot" title="polling every 2s" /> : null}
+      </div>
+      <div className="dp-agg-n">{v === undefined || v === null ? (loading ? '…' : '—') : fmtScalar(v)}</div>
+      <div className="dp-agg-e">{expr}</div>
+      {error ? <div className="dp-err">{error}</div> : null}
     </div>
   )
 }
@@ -219,7 +329,7 @@ export function DetailPanel({
         <Row k="columns" v={<ColumnList columns={s?.columns ?? null} />} />
         <Row k="type" v="standalone — stateless (no index)" />
         {s ? <SqlBlock sql={shapeSql(s)} /> : null}
-        {s ? <ShapeContentsView shapeId={s.id} /> : null}
+        {s ? <ShapeLiveView shape={s} /> : null}
         <div className="dp-note">
           Non-equality predicate: evaluated directly on each change delta. It holds no state, so there is
           no index to maintain — the cost is O(1) predicate evals per change.
@@ -276,6 +386,7 @@ export function DetailPanel({
     title = `Aggregation · ${node.shapeId}`
     body = (
       <>
+        <AggValueView shapeId={node.shapeId} expr={`${fn}(${s?.aggregate?.col ?? '*'})`} />
         <Row k="function" v={<code>{`${fn}(${s?.aggregate?.col ?? '*'})`}</code>} />
         <Row k="table" v={s?.table} />
         <Row k="output" v="a single live scalar (streamed)" />
@@ -315,7 +426,7 @@ export function DetailPanel({
         <Row k="changes-only feed" v={s?.changesOnly ? 'yes (no backfill)' : 'no (materialized)'} />
         <Row k="stream" v={<code>{s?.streamPath}</code>} />
         {s ? <SqlBlock sql={shapeSql(s)} /> : null}
-        {s ? <ShapeContentsView shapeId={s.id} /> : null}
+        {s ? <ShapeLiveView shape={s} /> : null}
         <div className="dp-note">
           {s?.isSubquery
             ? 'Membership is driven by the shared subquery node(s) upstream plus the outer-row filter.'

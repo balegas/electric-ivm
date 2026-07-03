@@ -59,3 +59,31 @@ export interface NodeIndex {
   values: { value: unknown; contributors: number }[]
   truncated: boolean
 }
+
+/** `GET /trace` (SSE) — one event per processed change envelope (crate::trace::TraceEvent).
+ *  Hop node ids use the logical graph's namespace (`table:`, `family:`, `filter:`, `node:`,
+ *  `shape:`), matching build-graph ids directly. */
+export type HopOutcome = 'passed' | 'dropped' | 'routed' | 'folded'
+
+export interface TraceHop {
+  node: string
+  outcome: HopOutcome
+  key?: unknown[]
+}
+
+export interface TraceEvent {
+  lsn?: string
+  txid?: string
+  table: string
+  delta: { row: Record<string, unknown>; w: number }[]
+  hops: TraceHop[]
+  shapes: string[]
+}
+
+/** Graph-lifecycle event on the same `/trace` feed (crate::trace::GraphLifecycle): the pipeline's
+ *  structure changed. Distinguished from data TraceEvents by the `type` field. */
+export interface TraceLifecycle {
+  type: 'shapeAdded' | 'shapeDropped'
+  shape: string
+  table?: string
+}
