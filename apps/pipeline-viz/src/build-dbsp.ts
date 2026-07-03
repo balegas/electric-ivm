@@ -260,18 +260,24 @@ function restrictToSelection(
   return { nodes, edges }
 }
 
+// Boxes handed to dagre — these are also the boxes the nodes RENDER at (the node fills its
+// laid-out box), so each height must cover the kind's full content (tag row + label + optional
+// sub line) or it clips. Dagre center-aligns a chain of these boxes on a common midline.
+/* One default height for every operator — a chained row of ops reads as a single centered line.
+   Must fit the tallest content (arrange renders tag + label + sub). */
+const OP_H = 72
 const OP_SIZE: Partial<Record<NodeKind, { w: number; h: number }>> = {
-  source: { w: 150, h: 54 },
-  delta: { w: 170, h: 56 },
-  'op-filter': { w: 220, h: 54 },
-  'op-index': { w: 200, h: 54 },
-  'op-arrange': { w: 210, h: 60 },
-  'op-join': { w: 180, h: 56 },
-  'op-map': { w: 180, h: 54 },
-  'op-agg': { w: 200, h: 60 },
-  sink: { w: 160, h: 54 },
+  source: { w: 150, h: OP_H },
+  delta: { w: 170, h: OP_H },
+  'op-filter': { w: 220, h: OP_H },
+  'op-index': { w: 200, h: OP_H },
+  'op-arrange': { w: 210, h: OP_H },
+  'op-join': { w: 180, h: OP_H },
+  'op-map': { w: 180, h: OP_H },
+  'op-agg': { w: 200, h: OP_H },
+  sink: { w: 160, h: OP_H },
 }
-const defaultSize = (k: NodeKind) => OP_SIZE[k] ?? { w: 190, h: 54 }
+const defaultSize = (k: NodeKind) => OP_SIZE[k] ?? { w: 190, h: OP_H }
 
 function layout(
   raw: { nodes: Map<string, RawNode>; edges: RawEdge[] },

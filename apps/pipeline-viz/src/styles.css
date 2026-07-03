@@ -21,6 +21,7 @@ body,
 
 /* Sidebar */
 .sidebar {
+  position: relative;
   border-right: 1px solid #e2e8f0;
   display: flex;
   flex-direction: column;
@@ -32,15 +33,38 @@ body,
 .app.sidebar-collapsed .sidebar {
   border-right: none;
 }
-/* Fixed-width children: content clips during the collapse animation instead of wrapping. */
-.sidebar > * {
-  width: 340px;
+/* Fixed-width children (following the drag-resized --sidebar-w): content clips during the
+   collapse animation instead of wrapping. The exceptions below MUST keep the same specificity
+   (0-2-0) so document order resolves them — a :not() chain here once out-ranked them. */
+.sidebar > *:not(.sidebar-resize) {
+  width: var(--sidebar-w, 340px);
 }
-/* These carry 12px horizontal margins, so their expanded layout width is 340 - 24. */
+/* These carry 12px horizontal margins, so their layout width is the sidebar - 24. */
 .sidebar > .viewtabs,
 .sidebar > .search,
 .sidebar > .err {
-  width: 316px;
+  width: calc(var(--sidebar-w, 340px) - 24px);
+}
+/* The collapse button keeps its small intrinsic size. */
+.sidebar > .sidebar-collapse {
+  width: auto;
+}
+/* Drag handle on the sidebar's right edge. */
+.sidebar-resize {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 6px;
+  height: 100%;
+  cursor: col-resize;
+}
+.sidebar-resize:hover {
+  background: #cbd5e180;
+}
+.app.resizing {
+  transition: none;
+  user-select: none;
+  cursor: col-resize;
 }
 .sidebar-collapse {
   margin: auto 12px 12px;
@@ -76,18 +100,10 @@ body,
   background: #f1f5f9;
   color: #0f172a;
 }
-/* The floating reopen button sits where the ReactFlow controls land once the canvas
-   spans the full viewport — shove the controls right so neither covers the other. */
-.app.sidebar-collapsed .react-flow__controls {
-  margin-left: 64px;
-}
-/* MiniMap lives bottom-left too — BESIDE the controls stack (never stacked above it),
-   shifted further when the sidebar is collapsed to also clear the floating ☰ button. */
+/* Controls + MiniMap live bottom-RIGHT, side by side (never stacked): the minimap sits to the
+   left of the controls strip. Bottom-left stays free for the floating ☰ reopen button. */
 .react-flow__minimap {
-  margin-left: 60px;
-}
-.app.sidebar-collapsed .react-flow__minimap {
-  margin-left: 124px;
+  margin-right: 56px;
 }
 .brand {
   padding: 14px 16px;
@@ -298,6 +314,14 @@ body,
 }
 
 /* Nodes */
+/* Custom node renderers may interpose a wrapper div (e.g. the trace-flash overlay) between React
+   Flow's sized node wrapper and .pnode. It must span the full laid-out box, otherwise .pnode's
+   height:100% resolves against an auto-height parent and collapses to content height: every node
+   then top-anchors inside its (center-aligned) dagre box, so a row of connected nodes reads
+   top-aligned and edge handles sit off the row's midline. */
+.react-flow__node > div:not(.pnode) {
+  height: 100%;
+}
 .pnode {
   border: 2px solid;
   border-radius: 9px;
@@ -867,4 +891,32 @@ body,
   font-family: ui-monospace, monospace;
   font-size: 11px;
   color: #334155;
+}
+
+/* table data browser (detail panel) */
+.dp-browse-nav {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.dp-page-btn {
+  font-size: 11px;
+  padding: 2px 8px;
+  border: 1px solid #cbd5e1;
+  background: #fff;
+  border-radius: 5px;
+  cursor: pointer;
+  color: #334155;
+}
+.dp-page-btn:hover:not(:disabled) {
+  background: #f1f5f9;
+}
+.dp-page-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.dp-page-n {
+  font-size: 11px;
+  color: #64748b;
+  white-space: nowrap;
 }

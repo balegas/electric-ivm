@@ -120,6 +120,126 @@ function ShapeLiveView({ shape }: { shape: GraphShape }) {
   return shape.changesOnly ? <ShapeLogView shapeId={shape.id} /> : <ShapeContentsView shapeId={shape.id} />
 }
 
+const BROWSE_PAGE = 25
+
+/** Paginated browser over a table's rows via the engine's one-shot subset query
+ *  (`POST /query` with limit/offset) — each page is fetched on demand, no shape is
+ *  created and nothing is materialized, so large tables never load upfront. */
+function TableBrowser({ table }: { table: string }) {
+  const [page, setPage] = useState(0)
+  const [rows, setRows] = useState<Record<string, unknown>[]>([])
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [nonce, setNonce] = useState(0)
+
+  useEffect(() => {
+    setPage(0)
+  }, [table])
+
+  useEffect(() => {
+    let stopped = false
+    const ac = new AbortController()
+    setLoading(true)
+    const run = async () => {
+      // Keyset-stable paging needs an order; try `id` first (the common case), fall back to
+      // the table's natural order for tables without an id column.
+      const body = (withOrder: boolean) =>
+        JSON.stringify({
+          table,
+          limit: BROWSE_PAGE,
+          offset: page * BROWSE_PAGE,
+          ...(withOrder ? { orderBy: { col: 'id', desc: false } } : {}),
+        })
+      try {
+        let r = await fetch('/engine/query', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: body(true),
+          signal: ac.signal,
+        })
+        if (!r.ok) {
+          r = await fetch('/engine/query', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: body(false),
+            signal: ac.signal,
+          })
+        }
+        if (!r.ok) throw new Error(`query → ${r.status}`)
+        const data = (await r.json()) as { rows: Record<string, unknown>[] }
+        if (stopped) return
+        setRows(data.rows)
+        setError(null)
+      } catch (e) {
+        if (!ac.signal.aborted && !stopped) setError(String(e))
+      } finally {
+        if (!stopped) setLoading(false)
+      }
+    }
+    void run()
+    return () => {
+      stopped = true
+      ac.abort()
+    }
+  }, [table, page, nonce])
+
+  const columns = rows.length ? Object.keys(rows[0]!) : []
+  return (
+    <div className="dp-contents">
+      <div className="dp-sec dp-contents-h">
+        <span>browse data</span>
+        <span className="dp-browse-nav">
+          <button className="dp-page-btn" disabled={page === 0 || loading} onClick={() => setPage((p) => p - 1)}>
+            ‹ prev
+          </button>
+          <span className="dp-page-n">page {page + 1}</span>
+          <button
+            className="dp-page-btn"
+            disabled={rows.length < BROWSE_PAGE || loading}
+            onClick={() => setPage((p) => p + 1)}
+          >
+            next ›
+          </button>
+          <button className="dp-page-btn" disabled={loading} title="reload this page" onClick={() => setNonce((n) => n + 1)}>
+            ↻
+          </button>
+        </span>
+      </div>
+      <div className="dp-note">
+        one-shot subset query, {BROWSE_PAGE} rows per page — pages load on demand, nothing is materialized.
+      </div>
+      {error ? <div className="dp-err">{error}</div> : null}
+      {!error && !loading && rows.length === 0 ? (
+        <div className="dp-empty-idx">{page === 0 ? 'table is empty' : 'no more rows'}</div>
+      ) : null}
+      {rows.length > 0 ? (
+        <div className="dp-table-wrap">
+          <table className="dp-table">
+            <thead>
+              <tr>
+                {columns.map((c) => (
+                  <th key={c}>{c}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r, i) => (
+                <tr key={`${page}:${i}`}>
+                  {columns.map((c) => (
+                    <td key={c} title={String(r[c] ?? '')}>
+                      {fmtCell(r[c])}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
 /** Live-preview a shape's rows (polls `GET /shapes/{id}/rows`) as a compact, updating table. */
 function ShapeContentsView({ shapeId }: { shapeId: string }) {
   const { rows, columns, count, changesOnly, live, loading, error } = useShapeContents(true, shapeId, CONTENTS_LIMIT)
@@ -290,6 +410,7 @@ export function DetailPanel({
             </div>
           ))}
         </div>
+        <TableBrowser table={node.name} />
       </>
     )
   } else if (node.kind === 'family') {

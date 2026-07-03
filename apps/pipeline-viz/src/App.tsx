@@ -16,11 +16,6 @@ import { useTrace } from './useTrace'
 type Mode = 'all' | 'select'
 type View = 'logical' | 'dbsp'
 
-interface Metrics {
-  counters: { envelopes_processed: number; shape_appends: number; family_steps: number }
-  append_us: { p99_us: number }
-}
-
 /** How long a trace decoration (flash + pulse) stays on screen after the last event. */
 const DECOR_TTL_MS = 1100
 /** How long newly created nodes/paths stay highlighted after a graph change. */
@@ -74,7 +69,6 @@ function kindOf(s: GraphShape): { label: string; cls: string } {
 
 export default function App() {
   const [graph, setGraph] = useState<EngineGraph | null>(null)
-  const [metrics, setMetrics] = useState<Metrics | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [mode, setMode] = useState<Mode>('all')
@@ -84,11 +78,27 @@ export default function App() {
   const [focus, setFocus] = useState<{ id: string; ref: NodeRef } | null>(null)
   const [view, setView] = useState<View>('logical')
   const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [sidebarW, setSidebarW] = useState(340)
+  const [resizing, setResizing] = useState(false)
+  // Drag the sidebar's right edge to resize; the width feeds both the grid column and (via a CSS
+  // variable) the fixed child width that keeps content from rewrapping during the collapse.
+  const startResize = (e: React.MouseEvent) => {
+    e.preventDefault()
+    setResizing(true)
+    const move = (ev: MouseEvent) => setSidebarW(Math.min(640, Math.max(240, ev.clientX)))
+    const up = () => {
+      setResizing(false)
+      window.removeEventListener('mousemove', move)
+      window.removeEventListener('mouseup', up)
+    }
+    window.addEventListener('mousemove', move)
+    window.addEventListener('mouseup', up)
+  }
 
   const lastGraphJson = useRef<string>('')
   const load = useCallback(async () => {
     try {
-      const [gr, mr] = await Promise.all([fetch('/engine/graph'), fetch('/engine/metrics')])
+      const gr = await fetch('/engine/graph')
       if (!gr.ok) throw new Error(`engine /graph → ${gr.status}`)
       const text = await gr.text()
       // Only publish a new graph when the CONTENT changed: a fresh object identity per poll makes
@@ -97,7 +107,6 @@ export default function App() {
         lastGraphJson.current = text
         setGraph(JSON.parse(text) as EngineGraph)
       }
-      if (mr.ok) setMetrics((await mr.json()) as Metrics)
       setErr(null)
       setLoadedAt(Date.now())
     } catch (e) {
@@ -313,7 +322,15 @@ export default function App() {
   }, [graph, search])
 
   return (
-    <div className={sidebarOpen ? 'app' : 'app sidebar-collapsed'}>
+    <div
+      className={`app${sidebarOpen ? '' : ' sidebar-collapsed'}${resizing ? ' resizing' : ''}`}
+      style={
+        {
+          gridTemplateColumns: sidebarOpen ? `${sidebarW}px 1fr` : '0 1fr',
+          '--sidebar-w': `${sidebarW}px`,
+        } as React.CSSProperties
+      }
+    >
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-title">electric-ivm</div>
@@ -341,23 +358,6 @@ export default function App() {
           </button>
         </div>
 
-        {metrics ? (
-          <div className="metrics">
-            <div className="metric">
-              <span className="metric-n">{metrics.counters.envelopes_processed.toLocaleString()}</span>
-              <span className="metric-l">changes</span>
-            </div>
-            <div className="metric">
-              <span className="metric-n">{metrics.counters.shape_appends.toLocaleString()}</span>
-              <span className="metric-l">appends</span>
-            </div>
-            <div className="metric">
-              <span className="metric-n">{(metrics.append_us.p99_us / 1000).toFixed(1)}ms</span>
-              <span className="metric-l">append p99</span>
-            </div>
-          </div>
-        ) : null}
-
         <div className="toolbar">
           <button
             className={mode === 'all' ? 'btn btn-on' : 'btn'}
@@ -380,19 +380,19 @@ export default function App() {
           </button>
         </div>
         <div className="toolbar">
-          <button className="btn" onClick={() => void load()}>
-            ↻ Refresh
+          <button className="btn" title="Refresh" onClick={() => void load()}>
+            ↻
           </button>
-          <label className="auto">
-            <input type="checkbox" checked={auto} onChange={(e) => setAuto(e.target.checked)} /> live
+          <label className="auto" title="Live updates (poll + trace subscription)">
+            <input type="checkbox" checked={auto} onChange={(e) => setAuto(e.target.checked)} /> ●
           </label>
           <button
             className="btn btn-danger"
             disabled={!graph || graph.shapes.length === 0}
-            title="Drop every shape from the engine (shared feeds are swept until their refcounts drain)"
+            title="Delete all shapes (shared feeds are swept until their refcounts drain)"
             onClick={() => void deleteAll()}
           >
-            🗑 Delete all
+            🗑
           </button>
         </div>
 
@@ -485,6 +485,7 @@ export default function App() {
         <button className="sidebar-collapse" title="Collapse sidebar" onClick={() => setSidebarOpen(false)}>
           ☰
         </button>
+        <div className="sidebar-resize" title="drag to resize" onMouseDown={startResize} />
       </aside>
 
       {!sidebarOpen ? (
@@ -509,8 +510,8 @@ export default function App() {
             proOptions={{ hideAttribution: true }}
           >
             <Background gap={20} color="#eef2f7" />
-            <MiniMap position="bottom-left" pannable zoomable nodeStrokeWidth={2} />
-            <Controls />
+            <MiniMap position="bottom-right" pannable zoomable nodeStrokeWidth={2} />
+            <Controls position="bottom-right" />
           </ReactFlow>
         )}
         <div className="stamp">

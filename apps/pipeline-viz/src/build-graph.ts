@@ -207,13 +207,18 @@ function restrictToSelection(
   return { nodes, edges }
 }
 
+// Boxes handed to dagre — these are also the boxes the nodes RENDER at (the node fills its
+// laid-out box), so the height must cover the tallest kind's content (tag row + label + optional
+// sub line) or it clips. ONE default height for every kind: a connected row of mixed kinds reads
+// as a single centered line with level edges.
+const KIND_H = 72
 const KIND_SIZE: Partial<Record<NodeKind, { w: number; h: number }>> = {
-  table: { w: 150, h: 52 },
-  family: { w: 220, h: 64 },
-  filter: { w: 240, h: 64 },
-  sqnode: { w: 250, h: 66 },
-  shape: { w: 200, h: 64 },
-  agg: { w: 210, h: 64 },
+  table: { w: 150, h: KIND_H },
+  family: { w: 220, h: KIND_H },
+  filter: { w: 240, h: KIND_H },
+  sqnode: { w: 250, h: KIND_H },
+  shape: { w: 200, h: KIND_H },
+  agg: { w: 210, h: KIND_H },
 }
 
 /** Optional layout hooks: `measure` overrides a node's box (return null to keep the default) —
@@ -230,7 +235,7 @@ function layout(
   focus: string | null,
   opts?: BuildOpts,
 ): { nodes: Node[]; edges: Edge[] } {
-  const sizeOf = (n: RawNode) => opts?.measure?.(n.data) ?? KIND_SIZE[n.data.kind] ?? { w: 200, h: 60 }
+  const sizeOf = (n: RawNode) => opts?.measure?.(n.data) ?? KIND_SIZE[n.data.kind] ?? { w: 200, h: KIND_H }
   const g = new dagre.graphlib.Graph()
   g.setGraph({ rankdir: 'LR', nodesep: 24, ranksep: 90, marginx: 24, marginy: 24 })
   g.setDefaultEdgeLabel(() => ({}))
