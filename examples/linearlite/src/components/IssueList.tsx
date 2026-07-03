@@ -5,7 +5,16 @@ import type { AggregateDef, Predicate } from '@electric-ivm/protocol'
 
 import type { Filters } from '../App'
 import { navigate } from '../App'
-import { type Issue, type IssueQuery, issuesShapeDef, moveIssue, projectIssuesSubsetDef, updateIssue } from '../electric'
+import {
+  type Issue,
+  type IssueQuery,
+  issuesShapeDef,
+  issuesSubsetDef,
+  LIST_COLUMNS,
+  moveIssue,
+  projectIssuesSubsetDef,
+  updateIssue,
+} from '../electric'
 import { PRIORITY_RANK } from '../schema'
 import { useCurrentUser } from '../lib/CurrentUser'
 import { useAggregate, useShapeRows, useSubset } from '../lib/useShape'
@@ -156,15 +165,58 @@ function ProjectSubsetFeed({
   return null
 }
 
+/** Feed-map key for the all-visible-issues subquery feed. */
+const VISIBLE_FEED = -1
+
 /**
- * Browse the visible issues by **merging one per-project subset feed per project the user belongs to**.
- * Each feed is a paginated query-back (never materialized — scales to 100k+ issues), reused across users
- * and filter changes. Project/status/priority/my-tasks selection and ordering happen on the client over
- * the merged loaded window, so switching filters is instant with no new engine request. Scrolling pages
- * every active feed forward together.
+ * The all-issues browse feed as **one subquery-backed subset**: `project_id IN (SELECT project_id
+ * FROM project_members WHERE user_id = me)`. Visibility is evaluated by the engine's shared
+ * subquery node — membership changes re-scope the feed server-side — instead of the client merging
+ * one per-project feed. Paginated + live-tailed like any subset.
+ */
+function VisibleIssuesFeed({
+  userId,
+  userName,
+  orderCol,
+  desc,
+  register,
+}: {
+  userId: number
+  userName: string
+  orderCol: 'created' | 'modified'
+  desc: boolean
+  register: (feedKey: number, state: FeedState | null) => void
+}): JSX.Element | null {
+  const { rows, loadMore, hasMore } = useSubset<Issue>(
+    issuesSubsetDef(
+      { userId, userName, statuses: [], priorities: [], projectId: null, myTasksOnly: false },
+      { col: orderCol, desc },
+      LIST_COLUMNS,
+    ),
+    (b) =>
+      b
+        .orderBy(({ t }: { t: Issue }) => t[orderCol], desc ? 'desc' : 'asc')
+        .orderBy(({ t }: { t: Issue }) => t.id, 'asc')
+        .select(({ t }: { t: Issue }) => t),
+    [userId, orderCol, desc],
+  )
+  useEffect(() => {
+    register(VISIBLE_FEED, { rows, loadMore, hasMore })
+    return () => register(VISIBLE_FEED, null)
+  }, [rows, loadMore, hasMore, register])
+  return null
+}
+
+/**
+ * Browse the visible issues. The all-projects view is **one subquery-backed subset** — the engine
+ * evaluates `project_id IN (SELECT project_id FROM project_members WHERE user_id = me)` through its
+ * shared subquery node, so visibility lives server-side and membership changes re-scope the feed.
+ * Selecting a single project uses that project's plain `project_id = P` subset (shared across users).
+ * Status/priority/my-tasks selection and ordering happen on the client over the loaded window, so
+ * switching filters is instant with no new engine request.
  */
 function BrowseList({ filters, setFilters }: { filters: Filters; setFilters: (f: Filters) => void }): JSX.Element {
-  const { myProjectIds, currentUserName } = useCurrentUser()
+  const { myProjectIds, currentUserId, currentUserName } = useCurrentUser()
   const memberIds = useMemo(() => [...myProjectIds].sort((a, b) => a - b), [myProjectIds])
   const orderCol: 'created' | 'modified' = filters.orderBy === 'modified' ? 'modified' : 'created'
   const desc = filters.dir === 'desc'
@@ -179,8 +231,8 @@ function BrowseList({ filters, setFilters }: { filters: Filters; setFilters: (f:
     })
   }, [])
 
-  // Which projects feed the current view: one when a project is selected, else all member projects.
-  const activeIds = filters.projectId ? [filters.projectId] : memberIds
+  // Which feed drives the current view: the selected project's subset, else the visibility subquery.
+  const activeIds = filters.projectId ? [filters.projectId] : [VISIBLE_FEED]
 
   const rendered = useMemo(() => {
     let all: Issue[] = []
@@ -208,22 +260,39 @@ function BrowseList({ filters, setFilters }: { filters: Filters; setFilters: (f:
 
   // The header count is a real **server-maintained COUNT aggregation** over the visible+filtered set —
   // the true total, updating live on writes — not the length of the client-loaded (paginated) window.
-  const aggDef: AggregateDef | null = activeIds.length
-    ? { table: 'issues', where: buildBrowseWhere(activeIds, filters, currentUserName), fn: 'count' }
+  // Aggregations don't take subquery predicates, so the count keeps the expanded member-project list.
+  const aggProjects = filters.projectId ? [filters.projectId] : memberIds
+  const aggDef: AggregateDef | null = aggProjects.length
+    ? { table: 'issues', where: buildBrowseWhere(aggProjects, filters, currentUserName), fn: 'count' }
     : null
   const agg = useAggregate(aggDef)
 
   return (
     <>
-      {memberIds.map((pid) => (
-        <ProjectSubsetFeed key={pid} projectId={pid} orderCol={orderCol} desc={desc} register={register} />
-      ))}
+      {filters.projectId ? (
+        <ProjectSubsetFeed
+          key={filters.projectId}
+          projectId={filters.projectId}
+          orderCol={orderCol}
+          desc={desc}
+          register={register}
+        />
+      ) : (
+        <VisibleIssuesFeed
+          key={currentUserId}
+          userId={currentUserId}
+          userName={currentUserName}
+          orderCol={orderCol}
+          desc={desc}
+          register={register}
+        />
+      )}
       <ListChrome
         filters={filters}
         setFilters={setFilters}
         rows={rendered}
-        count={activeIds.length ? agg.value : 0}
-        loading={feeds.size === 0 && memberIds.length > 0}
+        count={aggDef ? agg.value : 0}
+        loading={feeds.size === 0}
         onEndReached={() => {
           if (hasMore) loadMore()
         }}
