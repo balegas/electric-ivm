@@ -239,27 +239,35 @@ async fn get_shape_log(
     let limit = q.limit.unwrap_or(50).min(500);
     let mut entries: std::collections::VecDeque<ShapeLogEntry> = std::collections::VecDeque::new();
     let mut total = 0usize;
+    // Walked over the WHOLE stream (not just the returned tail): which keys are live and their
+    // last value. Lets the wire ops (upsert/delete) be reported as insert vs update exactly, and
+    // gives a delete entry the row it removed.
+    let mut live: std::collections::HashMap<String, Option<serde_json::Value>> = std::collections::HashMap::new();
     let mut offset = "-1".to_string();
     loop {
         let r = engine.read_shape_stream(&rec.stream_path, &offset, false).await?;
         let empty = r.envelopes.is_empty();
         for env in r.envelopes {
             total += 1;
-            entries.push_back(ShapeLogEntry {
-                op: env.headers.operation,
-                key: env.key,
-                value: env.value,
-                old: env.old,
-                lsn: env.headers.lsn,
-            });
+            let (op, old) = if env.headers.operation == "delete" {
+                let last = live.remove(&env.key).flatten();
+                ("delete".to_string(), env.old.or(last))
+            } else {
+                let existed = live.insert(env.key.clone(), env.value.clone()).is_some();
+                (if existed { "update".to_string() } else { "insert".to_string() }, env.old)
+            };
+            entries.push_back(ShapeLogEntry { op, key: env.key, value: env.value, old, lsn: env.headers.lsn });
             if entries.len() > limit {
                 entries.pop_front();
             }
         }
+        // Break when caught up, the page was empty, or the offset failed to advance (a defensive
+        // guard against a non-empty page with a missing/unchanged next offset looping forever).
+        let advanced = r.next_offset.as_deref().is_some_and(|n| n != offset);
         if let Some(n) = r.next_offset {
             offset = n;
         }
-        if r.up_to_date || empty {
+        if r.up_to_date || empty || !advanced {
             break;
         }
     }
@@ -295,10 +303,12 @@ async fn get_shape_rows(
                 rows.insert(env.key, v);
             }
         }
+        // Same defensive break as get_shape_log: never spin on a non-advancing offset.
+        let advanced = r.next_offset.as_deref().is_some_and(|n| n != offset);
         if let Some(n) = r.next_offset {
             offset = n;
         }
-        if r.up_to_date || empty {
+        if r.up_to_date || empty || !advanced {
             break;
         }
     }
