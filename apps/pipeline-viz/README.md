@@ -35,8 +35,34 @@ dataflow graph:
 - **⌘/Ctrl-click** to select several → they render together, and anything they **share underneath**
   (a family router, a subquery node) appears **once**, with edges to each shape.
 - **Entire graph** → the whole maintained pipeline at once.
-- **live** toggle re-polls `/graph` every ~2.5s, so you watch the pipeline grow/shrink as shapes come
-  and go.
+- **live** toggle re-polls `/graph` every ~2.5s and subscribes to the engine's `/trace` SSE feed, so
+  you watch the pipeline grow/shrink as shapes come and go.
+
+## Live trace animation
+
+With **live** on, every replicated change animates through the canvas as it flows through the real
+pipeline: a delta dot travels the edges (green `+1` insert, red `−1` delete, blue `±1` update) and
+each visited node flashes with its outcome — passed, routed, **dropped** (filter mismatch), or
+**folded** (absorbed into an aggregation). Shape creations light up too: new nodes and the paths
+into them flash purple with a `★ new` badge (`shapeAdded`/`shapeDropped` lifecycle events trigger an
+immediate, settled graph refresh instead of waiting for the next poll).
+
+## Inspecting data
+
+- **Materialized shapes** show their live contents (a folding of the shape's stream, polled).
+- **Feed shapes** (`changesOnly`) show a **live change log** instead — every insert / update /
+  delete seen on the tail, newest first, with deletes carrying the departed row.
+- **Aggregations** show their running scalar on the node chip and as a stat card in the panel.
+- **Tables** get a paginated **browse data** view (one-shot subset queries, a page at a time —
+  nothing is materialized and no shape is created).
+
+## Shape tools
+
+- **✕ on a shape row** force-drops that shape from the engine.
+- **🗑 Delete all** sweeps every shape (shared shapes are ref-counted, so the sweep repeats until
+  the graph drains). Both are force-drops: live clients holding those shapes will need to
+  resubscribe.
+- The sidebar collapses (bottom-left ☰) and is drag-resizable at its right edge.
 
 ## Run it
 
@@ -58,6 +84,12 @@ The Vite dev server proxies `/engine/*` to that engine (no CORS needed).
 
 ## Backed by
 
-`GET /graph` on the engine (`apps/engine/src/http.rs` → `Engine::graph`) returns tables, every shape
-with its routing placement (`familyKey` / standalone / `isSubquery`) and predicate, plus the shared
-subquery node + edge DAG. It reads in-memory topology only — no cost to the hot path.
+- `GET /graph` (`apps/engine/src/http.rs` → `Engine::graph`) returns tables, every shape with its
+  routing placement (`familyKey` / standalone / `isSubquery`) and predicate, plus the shared
+  subquery node + edge DAG. It reads in-memory topology only — no cost to the hot path.
+- `GET /trace` (SSE, `apps/engine/src/trace.rs`) streams per-envelope pipeline traces — the hops a
+  change took with per-node outcomes — and `shapeAdded`/`shapeDropped` lifecycle events. Hop node
+  ids use the same namespace as the logical view, so events animate onto the graph without
+  translation. Lossy by design; zero cost when nobody subscribes.
+- `GET /shapes/{id}/rows` (fold to current set), `GET /shapes/{id}/log` (stream tail as-is), and
+  `POST /query` (one-shot paginated subset) drive the detail panel's data views.

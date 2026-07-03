@@ -51,7 +51,9 @@ discover the bound port.
 | `POST /aggregate` | create a live scalar aggregation (`table`, `where`, `fn`, `col`) |
 | `GET /shapes/{id}` / `DELETE /shapes/{id}` | look up / drop (decrement) a shape |
 | `GET /shapes/{id}/rows` | current contents of an existing shape (folds its stream; visualizer preview) |
+| `GET /shapes/{id}/log` | tail of a shape's stream as-is (op/key/value/lsn) — the visualizer's feed change log |
 | `POST /query` | one-shot subset query: `SELECT … ORDER BY … LIMIT/OFFSET` + snapshot LSN |
+| `GET /trace` | SSE: per-envelope pipeline traces (hops + outcomes) and `shapeAdded`/`shapeDropped` lifecycle events; lossy by design, zero cost with no subscribers |
 | `GET /tables/{name}/offset` · `GET /tables/{name}/families` | tailer position / routing-family stats |
 | `GET /subqueries` · `GET /graph` · `GET /graph/node?sig=…` | shared-node stats, pipeline graph, one node's live index |
 | `GET /replication/lsn` | ingestor LSN + sync status |

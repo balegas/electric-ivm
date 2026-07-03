@@ -192,7 +192,10 @@ writes, shapes, subset queries, aggregations). Run via the demos or `docker/api-
 
 **`apps/pipeline-viz` — the pipeline explorer (TS).** A developer/debugging GUI that attaches to
 any running engine and renders the maintained dbsp pipeline (logical + circuit views, node
-details, live shape contents). Auto-launched by `pnpm demo:linearlite`, or standalone:
+details, live shape contents / change logs, paginated table browsing) with live trace animation —
+every replicated change pulses through the graph, and shape creation/removal highlights the new
+paths. Includes shape management (drop one / sweep all). Auto-launched by `pnpm demo:linearlite`,
+or standalone:
 
 ```bash
 ELECTRIC_IVM_ENGINE_URL=http://127.0.0.1:<engine-port> VIZ_PORT=5180 \
