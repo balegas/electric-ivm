@@ -1,22 +1,52 @@
-//! electric-ivm engine binary: a durable-streams client that runs dbsp filter circuits per
-//! shape. Reads the durable-streams base URL from `ELECTRIC_IVM_DS_URL`, binds the control
-//! plane (default `127.0.0.1:0`), and prints `ENGINE_LISTENING <url>` to stdout so a harness
-//! can discover the chosen port.
+//! electric-ivm engine binary: a durable-streams client that runs dbsp filter circuits per shape.
+//!
+//! Boot configuration is resolved from the environment by [`electric_ivm_engine::config`], which maps
+//! the benchmarking-fleet's `ELECTRIC_*` / `DATABASE_URL` surface onto the engine's `ELECTRIC_IVM_*`
+//! internals (the latter still win, preserving the dev/test workflow). The durable-streams base URL
+//! comes from `ELECTRIC_IVM_DS_URL`; the engine binds `0.0.0.0:$ELECTRIC_PORT` (default 3000 under the
+//! fleet, `127.0.0.1:0` in dev) and prints `ENGINE_LISTENING <url>` to stdout for harness discovery.
 
 use std::io::Write;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use electric_ivm_engine::config::{self, Config};
 use electric_ivm_engine::ds::DsClient;
 use electric_ivm_engine::engine::Engine;
 use electric_ivm_engine::http::router;
+use electric_ivm_engine::statsd;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing();
+    // Anchor process-uptime / boot-to-ready timing before anything else runs.
+    statsd::mark_start();
 
-    let ds_url = std::env::var("ELECTRIC_IVM_DS_URL")
+    let config = Config::from_env();
+    init_tracing(&config.log_filter);
+
+    // Unknown ELECTRIC_* vars are accepted, never fatal — surface them once so operators can see the
+    // image tolerated (and ignored) them.
+    if !config.noop_vars.is_empty() {
+        tracing::info!("accepted (no-op) ELECTRIC_* vars: {}", config.noop_vars.join(", "));
+    }
+    tracing::info!("resolved config: {}", config.redacted());
+
+    // Publish request-path globals (instance id, stack id, /v1/shape secret) and wire up StatsD.
+    config::set_globals(&config.instance_id, &config.stack_id, config.secret.as_deref());
+    if let Some(target) = &config.statsd {
+        statsd::init(target, &config.instance_id);
+    }
+    if config.prometheus_port.is_some() {
+        tracing::info!(
+            "ELECTRIC_PROMETHEUS_PORT is set, but the dedicated Prometheus listener is not implemented; \
+             /metrics/prometheus stays on the main port"
+        );
+    }
+
+    let ds_url = config
+        .ds_url
+        .clone()
         .context("ELECTRIC_IVM_DS_URL must be set to the durable-streams server base URL")?;
-    let bind = std::env::var("ELECTRIC_IVM_BIND").unwrap_or_else(|_| "127.0.0.1:0".to_string());
 
     // TEST-ONLY: surface an injected fault so a faulted run is never silent (no-op when unset).
     if electric_ivm_engine::fault::active() != electric_ivm_engine::fault::Fault::None {
@@ -24,27 +54,27 @@ async fn main() -> Result<()> {
     }
 
     // Postgres mode: data lives in Postgres, ingested via logical replication and read back for
-    // backfill (no in-memory table_state). Enabled by ELECTRIC_IVM_PG_URL.
-    let engine = match std::env::var("ELECTRIC_IVM_PG_URL") {
-        Ok(url) if !url.is_empty() => {
-            let engine = Engine::new_pg(DsClient::new(ds_url.clone()), url);
-            let tables: Vec<String> = std::env::var("ELECTRIC_IVM_PG_TABLES")
-                .unwrap_or_default()
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            let slot = std::env::var("ELECTRIC_IVM_PG_SLOT").unwrap_or_else(|_| "electric_ivm".to_string());
-            let poll_ms: u64 =
-                std::env::var("ELECTRIC_IVM_PG_POLL_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(50);
+    // backfill. Enabled by a resolved pg_url (ELECTRIC_IVM_PG_URL or DATABASE_URL).
+    let engine = match &config.pg_url {
+        Some(url) if !url.is_empty() => {
+            let engine = Engine::new_pg(DsClient::new(ds_url.clone()), url.clone());
             engine
-                .setup_postgres(&tables, &slot, poll_ms)
+                .setup_postgres(&config.tables, &config.slot, config.poll_ms)
                 .await
                 .context("postgres setup (introspect, REPLICA IDENTITY FULL, create slot)")?;
-            tracing::info!("postgres mode: {} table(s), slot '{slot}', poll {poll_ms}ms", tables.len());
+            let tables = engine.table_count().await;
+            tracing::info!("postgres mode: {tables} table(s), slot '{}', poll {}ms", config.slot, config.poll_ms);
+            statsd::consumers_ready(tables as u64);
+            // Replication-slot WAL gauges (own ~10s cadence, single pooled PG connection).
+            statsd::spawn_replication_slot_sampler(url.clone(), config.slot.clone());
             engine
         }
-        _ => Engine::new(DsClient::new(ds_url.clone())),
+        _ => {
+            // Library mode: no Postgres source; the engine is `active` from construction.
+            let engine = Engine::new(DsClient::new(ds_url.clone()));
+            statsd::consumers_ready(engine.table_count().await as u64);
+            engine
+        }
     };
 
     // Memory probes via OpenTelemetry: register the meter provider + Prometheus exporter, publish an
@@ -52,11 +82,16 @@ async fn main() -> Result<()> {
     // provider (and its exporter) stays alive. Exposed at GET /metrics/prometheus and GET /memory.
     let _otel = electric_ivm_engine::mem::init_otel();
     electric_ivm_engine::mem::publish(&engine.mem_cardinalities().await);
-    electric_ivm_engine::mem::spawn_sampler(engine.clone(), std::time::Duration::from_millis(500));
+    electric_ivm_engine::mem::spawn_sampler(engine.clone(), Duration::from_millis(500));
+
+    // StatsD periodic samplers (no-ops when StatsD is off): system metrics + storage size.
+    statsd::spawn_system_sampler(config.metrics_period);
+    statsd::spawn_storage_sampler(config.storage_dir.clone());
 
     let app = router(engine);
 
-    let listener = tokio::net::TcpListener::bind(&bind).await.with_context(|| format!("binding {bind}"))?;
+    let listener =
+        tokio::net::TcpListener::bind(&config.bind).await.with_context(|| format!("binding {}", config.bind))?;
     let addr = listener.local_addr()?;
 
     // stdout is the discovery channel (logs go to stderr).
@@ -68,8 +103,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn init_tracing() {
+fn init_tracing(filter: &str) {
     use tracing_subscriber::{EnvFilter, fmt};
-    let filter = EnvFilter::try_from_env("ELECTRIC_IVM_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
+    // `filter` already reflects ELECTRIC_IVM_LOG / ELECTRIC_LOG_LEVEL precedence (see config.rs).
+    let env_filter = EnvFilter::try_new(filter).unwrap_or_else(|_| EnvFilter::new("info"));
+    fmt().with_env_filter(env_filter).with_writer(std::io::stderr).init();
 }

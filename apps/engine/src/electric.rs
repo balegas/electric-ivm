@@ -18,7 +18,9 @@
 //!   same response (write-fanout: N clients long-poll one handle at one offset — serializing them behind
 //!   the mutex would hand each a full long-poll timeout in turn). A live request keeps re-polling the
 //!   ds stream until data arrives or `ELECTRIC_LIVE_TIMEOUT_MS` (default 20000, Electric-like ~20s)
-//!   elapses, then returns `204` — the deadline is decoupled from the ds server's own long-poll timeout.
+//!   elapses, then returns `204`. Every individual ds poll is bounded by the *remaining* deadline
+//!   (`poll_live_until`): the ds server's own long-poll window can exceed ours, and an idle stream
+//!   must still produce the 204 on time.
 //! - Handles are evicted after sitting idle for `ELECTRIC_HANDLE_TTL` seconds (default 600): the engine
 //!   shape and its durable stream are dropped, and a late request on the evicted handle gets the
 //!   standard `409 must-refetch` (the client re-snapshots). Without this every initial `GET` leaks a
@@ -64,6 +66,11 @@ pub struct ShapeParams {
     cursor: Option<String>,
     #[serde(default)]
     replica: Option<String>,
+    /// `ELECTRIC_SECRET` auth: either query param, when the secret is configured, must equal it.
+    #[serde(default)]
+    secret: Option<String>,
+    #[serde(default)]
+    api_secret: Option<String>,
 }
 
 /// A registered handle. The registry maps handle → `Arc<HandleEntry>`; the mutable cursor state
@@ -264,7 +271,11 @@ fn hv(s: &str) -> HeaderValue {
 
 fn respond(messages: Vec<serde_json::Value>, mut headers: HeaderMap, status: StatusCode) -> Response {
     headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    (status, headers, serde_json::to_string(&messages).unwrap_or_else(|_| "[]".into())).into_response()
+    let body = serde_json::to_string(&messages).unwrap_or_else(|_| "[]".into());
+    let len = body.len() as u64;
+    let mut resp = (status, headers, body).into_response();
+    resp.extensions_mut().insert(BodyLen(len));
+    resp
 }
 
 fn must_refetch() -> Response {
@@ -298,10 +309,13 @@ impl From<anyhow::Error> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = serde_json::json!({ "message": self.message });
+        let body = serde_json::json!({ "message": self.message }).to_string();
+        let len = body.len() as u64;
         let mut headers = HeaderMap::new();
         headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        (self.status, headers, body.to_string()).into_response()
+        let mut resp = (self.status, headers, body).into_response();
+        resp.extensions_mut().insert(BodyLen(len));
+        resp
     }
 }
 
@@ -510,10 +524,48 @@ where
     }
 }
 
+/// The live polling loop: repeatedly `read(from)` until a page carries envelopes or `deadline`
+/// elapses. Each poll is bounded by the **remaining** deadline — the ds server holds an idle
+/// long-poll far longer than our window, so an unbounded read would blow straight through the
+/// deadline (observed: idle `live=true` requests hanging >60s instead of 204 at ~20s). On expiry
+/// the last empty page is returned so a `next_offset` advanced past empty pages is preserved;
+/// expiry mid-poll (no page yet) yields an offset-less empty result, leaving the handle offset
+/// unchanged.
+async fn poll_live_until<F, Fut, E>(
+    mut from: String,
+    deadline: Instant,
+    mut read: F,
+) -> Result<ReadResult, E>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<ReadResult, E>>,
+{
+    let mut last = ReadResult { envelopes: Vec::new(), next_offset: None, up_to_date: false };
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(last);
+        }
+        match tokio::time::timeout(remaining, read(from.clone())).await {
+            Err(_elapsed) => return Ok(last),
+            Ok(page) => {
+                let page = page?;
+                if !page.envelopes.is_empty() {
+                    return Ok(page);
+                }
+                if let Some(n) = &page.next_offset {
+                    from = n.clone();
+                }
+                last = page;
+            }
+        }
+    }
+}
+
 /// The serialized (per-handle state mutex) resync+read+apply path shared by non-live requests and the
 /// live leader. Holds the state mutex across the whole read loop so only one request mutates
-/// [`HandleState`]; for `live`, keeps re-polling the ds stream until data arrives or [`live_timeout`]
-/// elapses (the ds server's own long-poll timeout just paces the loop).
+/// [`HandleState`]; for `live`, keeps re-polling the ds stream via [`poll_live_until`] until data
+/// arrives or [`live_timeout`] elapses, every poll bounded by the remaining deadline.
 async fn positioned_read(
     engine: &Engine,
     entry: &HandleEntry,
@@ -528,17 +580,20 @@ async fn positioned_read(
         st.keys = keys_as_of(engine, &entry.stream_path, offset).await?;
         st.offset = offset.to_string();
     }
-    let mut from = offset.to_string();
-    let mut r = engine.read_shape_stream(&entry.stream_path, &from, live).await?;
-    if live {
+    let from = offset.to_string();
+    let r = if live {
         let deadline = Instant::now() + live_timeout();
-        while r.envelopes.is_empty() && Instant::now() < deadline {
-            if let Some(n) = &r.next_offset {
-                from = n.clone();
-            }
-            r = engine.read_shape_stream(&entry.stream_path, &from, true).await?;
-        }
-    }
+        let read_engine = engine.clone();
+        let path = entry.stream_path.clone();
+        poll_live_until(from, deadline, move |f| {
+            let engine = read_engine.clone();
+            let path = path.clone();
+            async move { engine.read_shape_stream(&path, &f, true).await }
+        })
+        .await?
+    } else {
+        engine.read_shape_stream(&entry.stream_path, &from, false).await?
+    };
 
     if let Some(n) = &r.next_offset {
         st.offset = n.clone();
@@ -568,18 +623,60 @@ async fn positioned_read(
     })
 }
 
-pub async fn shape(State(engine): State<Engine>, Query(p): Query<ShapeParams>) -> Response {
-    ensure_evictor(&engine);
-    match shape_inner(engine, p).await {
-        Ok(resp) => resp,
-        Err(e) => {
-            tracing::warn!("/v1/shape error ({}): {}", e.status, e.message);
-            e.into_response()
-        }
-    }
+/// Response body size in bytes, stamped on every `/v1/shape` response so [`shape`] can emit the byte
+/// metrics without re-reading (and consuming) the response body.
+#[derive(Clone, Copy)]
+struct BodyLen(u64);
+
+/// `401 {"message":"Unauthorized"}` for a request that fails the `ELECTRIC_SECRET` check.
+fn unauthorized() -> Response {
+    let body = r#"{"message":"Unauthorized"}"#;
+    let mut headers = HeaderMap::new();
+    headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    let mut resp = (StatusCode::UNAUTHORIZED, headers, body).into_response();
+    resp.extensions_mut().insert(BodyLen(body.len() as u64));
+    resp
 }
 
-async fn shape_inner(engine: Engine, mut p: ShapeParams) -> Result<Response, ApiError> {
+pub async fn shape(
+    State(engine): State<Engine>,
+    Query(p): Query<ShapeParams>,
+    // Raw query pairs (decoded) for `params` — bracket form `params[1]=…` isn't a single serde field.
+    Query(raw_pairs): Query<Vec<(String, String)>>,
+) -> Response {
+    ensure_evictor(&engine);
+    let start = Instant::now();
+    let live = p.live.as_deref() == Some("true");
+    // root_table tag: the bare table name (strip any schema prefix), computed before shape_inner moves p.
+    let root_table = p.table.rsplit_once('.').map(|(_, b)| b.to_string()).unwrap_or_else(|| p.table.clone());
+
+    let resp = if !crate::config::secret_ok(
+        crate::config::secret(),
+        p.secret.as_deref(),
+        p.api_secret.as_deref(),
+    ) {
+        unauthorized()
+    } else {
+        match shape_inner(engine, p, &raw_pairs).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::warn!("/v1/shape error ({}): {}", e.status, e.message);
+                e.into_response()
+            }
+        }
+    };
+
+    let status = resp.status().as_u16();
+    let bytes = resp.extensions().get::<BodyLen>().map(|b| b.0).unwrap_or(0);
+    crate::statsd::serve_shape(&root_table, live, status, start.elapsed(), bytes);
+    resp
+}
+
+async fn shape_inner(
+    engine: Engine,
+    mut p: ShapeParams,
+    raw_pairs: &[(String, String)],
+) -> Result<Response, ApiError> {
     // Electric clients send schema-qualified table names (`public.users`); our engine keys by the bare
     // table name. Strip any schema prefix.
     if let Some((_schema, bare)) = p.table.rsplit_once('.') {
@@ -603,7 +700,13 @@ async fn shape_inner(engine: Engine, mut p: ShapeParams) -> Result<Response, Api
 
     // ---- Snapshot: offset=-1 -> create the shape and emit the current rows as inserts.
     if offset == "-1" {
-        let pred = crate::where_sql::parse_where_typed(p.where_.as_deref().unwrap_or(""), Some(&ts))
+        // Resolve + validate `params` (Electric-compatible), then substitute `$N` into the where clause
+        // BEFORE parsing, so the predicate/subquery machinery — and the shape's identity/signature —
+        // are derived from the substituted text (distinct param values never collide onto one shape).
+        let params = crate::params::parse_params(raw_pairs).map_err(ApiError::bad_request)?;
+        let where_raw = p.where_.as_deref().unwrap_or("");
+        let where_sub = crate::params::substitute(where_raw, &params).map_err(ApiError::bad_request)?;
+        let pred = crate::where_sql::parse_where_typed(&where_sub, Some(&ts))
             .map_err(|e| ApiError::bad_request(format!("invalid where clause: {e:#}")))?;
         // Validate the request shape against the schema up front: these are client errors (400). A
         // failure past this point (stream creation, backfill, reads) is internal (500).
@@ -697,10 +800,17 @@ async fn shape_inner(engine: Engine, mut p: ShapeParams) -> Result<Response, Api
     }
     headers.insert(axum::http::header::CACHE_CONTROL, hv("no-store"));
     match outcome.body {
-        None => Ok((StatusCode::NO_CONTENT, headers).into_response()),
+        None => {
+            let mut resp = (StatusCode::NO_CONTENT, headers).into_response();
+            resp.extensions_mut().insert(BodyLen(0));
+            Ok(resp)
+        }
         Some(body) => {
             headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-            Ok((StatusCode::OK, headers, body).into_response())
+            let len = body.len() as u64;
+            let mut resp = (StatusCode::OK, headers, body).into_response();
+            resp.extensions_mut().insert(BodyLen(len));
+            Ok(resp)
         }
     }
 }
@@ -762,6 +872,65 @@ mod tests {
         fold.apply_page(page(vec![], "01", false));
         assert!(fold.done);
         assert_eq!(fold.offset, "01");
+    }
+
+    // The idle-live-poll bug: the ds server holds an idle long-poll far longer than our live
+    // deadline, so each poll must be bounded by the *remaining* deadline or the 204 never fires
+    // (observed in-container: idle live requests hung >60s instead of 204 at ~20s).
+    #[tokio::test(start_paused = true)]
+    async fn live_poll_deadline_fires_through_hanging_read() {
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let r = poll_live_until("00".into(), deadline, |_from| async {
+            // Simulates the ds server parking an idle long-poll indefinitely.
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            Ok::<ReadResult, ()>(page(vec![], "01", false))
+        })
+        .await
+        .unwrap();
+        assert!(r.envelopes.is_empty());
+        assert_eq!(r.next_offset, None, "mid-poll expiry must not advance the offset");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_poll_returns_data_before_deadline() {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let r = poll_live_until("00".into(), deadline, |_from| async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok::<ReadResult, ()>(page(vec![env("upsert", "k1", "01")], "01", false))
+        })
+        .await
+        .unwrap();
+        assert_eq!(r.envelopes.len(), 1, "data arriving before the deadline must be served");
+        assert_eq!(r.next_offset.as_deref(), Some("01"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_poll_deadline_after_empty_pages_keeps_advanced_offset() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let c = calls.clone();
+        let r = poll_live_until("00".into(), deadline, move |from| {
+            let c = c.clone();
+            async move {
+                if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                    assert_eq!(from, "00");
+                    // Empty page but the offset advanced (e.g. skipped envelopes) — not data.
+                    Ok::<ReadResult, ()>(page(vec![], "05", false))
+                } else {
+                    assert_eq!(from, "05", "later polls must resume from the advanced offset");
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    Ok(page(vec![], "06", false))
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(r.envelopes.is_empty());
+        assert_eq!(
+            r.next_offset.as_deref(),
+            Some("05"),
+            "the last empty page's offset must survive to the 204 so the client resumes past it"
+        );
     }
 
     // C2: rebuilding the key set as of the client's *requested* offset (not the tail).
