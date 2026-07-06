@@ -270,6 +270,8 @@ ref-counted — always `close()` what you open (close is one-shot and safe to ca
 
 ## 8. See also
 
+- `docs/getting-started.md` — from-zero setup against a new database, with bare-HTTP examples
+  for every request in this guide (shapes, subqueries, aggregations).
 - `docs/ivm-engine-internals.md` — engine internals + full analytical cost model.
 - `docs/deployment-postgres.md` — running with Postgres as system of record.
 - `docs/ARCHITECTURE.md` §6 — the subquery node/edge/flip model and its correctness argument.
