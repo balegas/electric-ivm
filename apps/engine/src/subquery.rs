@@ -179,6 +179,9 @@ pub struct SubqueryShape {
     pub out_cols: Option<Arc<Vec<usize>>>,
     /// The shape's backfill-snapshot fence; outer deltas already visible to the backfill are skipped.
     pub gate: crate::pg::SnapshotGate,
+    /// Envelopes appended to this shape's stream (backfill + live), for the visualizer's per-node
+    /// state. Atomic because the append paths hold `&self`.
+    pub emitted: std::sync::atomic::AtomicU64,
 }
 
 /// A `TableSchema` lookup shared with the engine's compiled schema.
@@ -317,6 +320,31 @@ impl SubqueryRegistry {
         out
     }
 
+    /// Live state summaries for every registry-owned graph node (`node:<sig>` inner sets and
+    /// subquery `shape:<sid>` sinks), keyed by graph node id — merged into `GET /state` snapshots
+    /// and the tailers' SSE `state` events.
+    pub fn state_summaries(&self) -> Vec<(String, crate::engine::NodeStateSummary)> {
+        let mut out = Vec::with_capacity(self.nodes.len() + self.shapes.len());
+        for (sig, n) in &self.nodes {
+            out.push((
+                format!("node:{sig}"),
+                crate::engine::NodeStateSummary::SubqueryNode {
+                    distinct_values: n.distinct_values(),
+                    refcount: n.refcount,
+                },
+            ));
+        }
+        for (sid, s) in &self.shapes {
+            out.push((
+                format!("shape:{sid}"),
+                crate::engine::NodeStateSummary::Shape {
+                    emitted: s.emitted.load(std::sync::atomic::Ordering::Relaxed),
+                },
+            ));
+        }
+        out
+    }
+
     /// Outgoing edges for a node signature.
     fn edges_of(&self, sig: &SubquerySig) -> Vec<Edge> {
         self.edges.iter().filter(|e| &e.node_sig == sig).cloned().collect()
@@ -399,6 +427,7 @@ impl SubqueryRegistry {
         self.seed_pending_nodes().await?;
         // 4. Backfill the outer shape and append its initial members — UNLESS this is a `changes_only`
         //    feed (a subset's live tail), which forwards only future membership deltas (passthrough).
+        let mut seeded: u64 = 0;
         let gate = if changes_only {
             crate::pg::SnapshotGate::passthrough()
         } else {
@@ -417,6 +446,7 @@ impl SubqueryRegistry {
                     out_cols.as_deref().map(Vec::as_slice),
                 );
                 self.ds.append(stream_path, &envs).await?;
+                seeded = envs.len() as u64;
             }
             bf.gate
         };
@@ -430,6 +460,7 @@ impl SubqueryRegistry {
                 pred,
                 out_cols,
                 gate,
+                emitted: std::sync::atomic::AtomicU64::new(seeded),
             },
         );
         Ok(())
@@ -706,6 +737,7 @@ impl SubqueryRegistry {
         }
         // Reliable: a dropped move envelope is permanent divergence for the shape's subscribers.
         self.ds.append_reliable(&shape.stream_path, &envs).await;
+        shape.emitted.fetch_add(envs.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(true)
     }
 
@@ -752,6 +784,7 @@ impl SubqueryRegistry {
             return Ok(false);
         }
         self.ds.append_reliable(&shape.stream_path, &envs).await;
+        shape.emitted.fetch_add(envs.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(true)
     }
 
@@ -778,6 +811,9 @@ impl SubqueryRegistry {
                 let envs = crate::engine::translate_output(&ts, out, txid, None, out_cols.as_deref().map(Vec::as_slice));
                 if !envs.is_empty() {
                     self.ds.append_reliable(&stream_path, &envs).await;
+                    if let Some(s) = self.shapes.get(id) {
+                        s.emitted.fetch_add(envs.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }
             Dependent::Node(parent_sig) => {

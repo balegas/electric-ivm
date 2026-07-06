@@ -205,8 +205,39 @@ pub struct GraphEdge {
     pub negated: bool,
 }
 
-/// The whole maintained dbsp pipeline at an instant: tables, shapes (with their routing placement), and
-/// the shared subquery node/edge DAG. The visualizer derives family + subquery sharing from this.
+/// One operator of the exploded dbsp-circuit view: the engine's own decomposition of what it
+/// executes per node, so the visualizer renders operators the engine declares instead of guessing.
+/// `hop` binds the operator to the trace-hop id whose outcomes animate it; `state` (when present)
+/// binds it to the state-summary id whose live chips it shows — the operator that actually holds
+/// the state, and only that one.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpNode {
+    pub id: String,
+    /// `source | delta | filter | key | arrange | join | distinct | fold | project | sink`
+    pub kind: String,
+    /// Trace-hop / graph node id (`table:`, `filter:`, `family:`, `node:`, `shape:`).
+    pub hop: String,
+    /// State-summary id (`GET /state` key) when this operator is the state-bearing one.
+    pub state: Option<String>,
+    pub label: String,
+}
+
+/// A stream between two operators of the exploded circuit view.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpEdge {
+    pub source: String,
+    pub target: String,
+    /// `flow` (a Z-set stream) | `state` (an arrangement feeding a join) | `subquery` (an
+    /// inner-set membership dependency).
+    pub kind: String,
+    pub label: Option<String>,
+}
+
+/// The whole maintained dbsp pipeline at an instant: tables, shapes (with their routing placement),
+/// the shared subquery node/edge DAG, and the exploded operator decomposition (`operators` /
+/// `opEdges`) the circuit view renders. The visualizer derives family + subquery sharing from this.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineGraph {
@@ -214,6 +245,8 @@ pub struct EngineGraph {
     pub shapes: Vec<GraphShape>,
     pub subquery_nodes: Vec<GraphNode>,
     pub subquery_edges: Vec<GraphEdge>,
+    pub operators: Vec<OpNode>,
+    pub op_edges: Vec<OpEdge>,
 }
 
 /// One entry of a subquery node's live inner-set index.
@@ -234,6 +267,41 @@ pub struct NodeIndex {
     pub truncated: bool,
 }
 
+/// Live state summary of one pipeline node, keyed by the node's graph/trace id (`table:<t>`,
+/// `filter:<sid>`, `family:<t>:<cols>`, `node:<sig>`, `shape:<sid>`). Served in bulk at
+/// `GET /state`, pushed as `{"type":"state", "nodes":{…}}` events on the `/trace` channel after
+/// each processed batch, and rendered by the visualizer as per-node state chips.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum NodeStateSummary {
+    /// A table source: the tailer's convergence offset + envelopes processed since start.
+    #[serde(rename_all = "camelCase")]
+    Table { processed_offset: String, envelopes: u64 },
+    /// A standalone stateless filter (σ + π): envelopes it has emitted downstream.
+    #[serde(rename_all = "camelCase")]
+    Filter { emitted: u64 },
+    /// A shared equality router: cardinality of its routing index (distinct key tuples) and the
+    /// number of shapes registered across those keys.
+    #[serde(rename_all = "camelCase")]
+    Family { keys: usize, shapes: usize },
+    /// A shape output stream: envelopes appended to it (backfill + live).
+    #[serde(rename_all = "camelCase")]
+    Shape { emitted: u64 },
+    /// A scalar aggregation fold: its current value and internal fold state.
+    #[serde(rename_all = "camelCase")]
+    Aggregate { value: serde_json::Value, count: i64, nn_count: i64, multiset_len: usize },
+    /// A shared subquery inner-set arrangement: distinct values maintained + dependent refcount.
+    #[serde(rename_all = "camelCase")]
+    SubqueryNode { distinct_values: usize, refcount: usize },
+}
+
+/// Full per-node state snapshot (`GET /state`) — the seed the visualizer loads before applying
+/// incremental `state` events from `/trace`.
+#[derive(serde::Serialize)]
+pub struct StateSnapshot {
+    pub nodes: HashMap<String, NodeStateSummary>,
+}
+
 struct TailerHandle {
     cmd_tx: mpsc::UnboundedSender<TailerCmd>,
     /// Offset up to which all table-stream envelopes have been processed AND fanned to every
@@ -242,6 +310,10 @@ struct TailerHandle {
     processed: Arc<std::sync::Mutex<String>>,
     /// Current circuit topology (shared families + standalone count), for tests/observability.
     stats: Arc<std::sync::Mutex<TableStats>>,
+    /// Live per-node state summaries for every node this tailer owns (its table, standalone
+    /// filters, family routers, shape sinks, aggregates), keyed by graph node id. Republished
+    /// after every processed batch and on shape add/remove; read by `GET /state`.
+    node_states: Arc<std::sync::Mutex<HashMap<String, NodeStateSummary>>>,
 }
 
 /// Per-table circuit topology: the shared family circuits (one per equality template) and the
@@ -287,6 +359,10 @@ enum TailerCmd {
         ready: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     },
     RemoveShape { shape_id: String },
+    /// Dump the full internal state of one node this tailer owns (`family:<t>:<cols>` → the
+    /// routing index contents; an aggregate `shape:<sid>` → the fold internals incl. the MIN/MAX
+    /// multiset). `None` if the node id is unknown to this tailer. Serves `GET /state/node`.
+    DumpNode { node_id: String, resp: tokio::sync::oneshot::Sender<Option<serde_json::Value>> },
 }
 
 impl Engine {
@@ -779,7 +855,8 @@ impl Engine {
     }
 
     /// Snapshot the whole maintained pipeline for the visualizer: tables, every registered shape with
-    /// its routing placement (family key / standalone / subquery), and the shared subquery node+edge DAG.
+    /// its routing placement (family key / standalone / subquery), the shared subquery node+edge DAG,
+    /// and the exploded per-operator decomposition for the circuit view.
     pub async fn graph(&self) -> EngineGraph {
         let (tables, shapes, schemas) = {
             let st = self.state.lock().await;
@@ -846,7 +923,8 @@ impl Engine {
                 }
             })
             .collect();
-        EngineGraph { tables, shapes, subquery_nodes, subquery_edges }
+        let (operators, op_edges) = circuit_ops(&tables, &shapes, &subquery_nodes, &subquery_edges);
+        EngineGraph { tables, shapes, subquery_nodes, subquery_edges, operators, op_edges }
     }
 
     /// The live inner-set index of one subquery node (values + contributor counts), for the visualizer's
@@ -972,6 +1050,206 @@ impl Engine {
         let st = self.state.lock().await;
         st.tailers.get(table).map(|t| t.stats.lock().unwrap().clone())
     }
+
+    /// Full per-node state snapshot (`GET /state`): every tailer's published node map merged with
+    /// the subquery registry's node/shape summaries. Tables with no tailer yet (no shape registered)
+    /// report a default source state so the visualizer can render a chip for every graph node.
+    pub async fn state_snapshot(&self) -> StateSnapshot {
+        let mut nodes: HashMap<String, NodeStateSummary> = HashMap::new();
+        {
+            let st = self.state.lock().await;
+            for name in st.tables.keys() {
+                nodes.insert(
+                    format!("table:{name}"),
+                    NodeStateSummary::Table { processed_offset: "-1".to_string(), envelopes: 0 },
+                );
+            }
+            for h in st.tailers.values() {
+                if let Ok(m) = h.node_states.lock() {
+                    for (k, v) in m.iter() {
+                        nodes.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        for (id, s) in self.subqueries.lock().await.state_summaries() {
+            nodes.insert(id, s);
+        }
+        StateSnapshot { nodes }
+    }
+
+    /// Deep state dump of one node (`GET /state/node?id=`): a family router's routing-index
+    /// contents, an aggregate's fold internals (incl. the MIN/MAX multiset), a subquery node's
+    /// inner-set index, or the summary counters for stateless nodes. `None` = unknown node id.
+    pub async fn dump_node(&self, id: &str) -> Option<serde_json::Value> {
+        if let Some(sig) = id.strip_prefix("node:") {
+            let idx = self.node_index(sig, 500).await?;
+            return Some(serde_json::json!({
+                "kind": "subqueryNode",
+                "node": id,
+                "distinctValues": idx.distinct_values,
+                "refcount": idx.refcount,
+                "values": idx.values,
+                "truncated": idx.truncated,
+            }));
+        }
+        // Subquery shapes live in the registry, not in a table tailer.
+        if let Some(sid) = id.strip_prefix("shape:") {
+            let reg = self.subqueries.lock().await;
+            if let Some(s) = reg.shapes.get(sid) {
+                return Some(serde_json::json!({
+                    "kind": "shape",
+                    "node": id,
+                    "emitted": s.emitted.load(std::sync::atomic::Ordering::Relaxed),
+                }));
+            }
+        }
+        // Everything else is owned by a table tailer; resolve the table and round-trip a dump.
+        let table = if let Some(rest) = id.strip_prefix("family:") {
+            rest.split(':').next().map(str::to_string)
+        } else if let Some(rest) = id.strip_prefix("table:") {
+            Some(rest.to_string())
+        } else if let Some(sid) = id.strip_prefix("shape:").or_else(|| id.strip_prefix("filter:")) {
+            self.state.lock().await.shapes.get(sid).map(|r| r.table.clone())
+        } else {
+            None
+        }?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let st = self.state.lock().await;
+            st.tailers
+                .get(&table)?
+                .cmd_tx
+                .send(TailerCmd::DumpNode { node_id: id.to_string(), resp: tx })
+                .ok()?;
+        }
+        rx.await.ok().flatten()
+    }
+}
+
+/// The exploded operator decomposition of the maintained pipeline — what the engine ACTUALLY
+/// executes per node, one operator box per real step, generated from the same registered
+/// structures `/graph` reports. Pure over the graph pieces so it is unit-testable and provably
+/// consistent with the topology: every operator's `hop` is a trace-hop id and every `state` is a
+/// `GET /state` key, so the circuit view animates and shows live state with zero client guessing.
+fn circuit_ops(
+    tables: &[String],
+    shapes: &[GraphShape],
+    subquery_nodes: &[GraphNode],
+    subquery_edges: &[GraphEdge],
+) -> (Vec<OpNode>, Vec<OpEdge>) {
+    let mut ops: Vec<OpNode> = Vec::new();
+    let mut edges: Vec<OpEdge> = Vec::new();
+    let op = |id: &str, kind: &str, hop: &str, state: Option<String>, label: &str| OpNode {
+        id: id.to_string(),
+        kind: kind.to_string(),
+        hop: hop.to_string(),
+        state,
+        label: label.to_string(),
+    };
+    let flow = |s: &str, t: &str| OpEdge { source: s.into(), target: t.into(), kind: "flow".into(), label: None };
+
+    // Every table: the stream tailer (source) and the envelope → Z-set delta step it runs.
+    for t in tables {
+        let hop = format!("table:{t}");
+        ops.push(op(&format!("src:{t}"), "source", &hop, Some(hop.clone()), t));
+        ops.push(op(&format!("d:{t}"), "delta", &hop, None, "Δ change"));
+        edges.push(flow(&format!("src:{t}"), &format!("d:{t}")));
+    }
+
+    // Shared family operators are emitted once per (table, key-cols), like the router itself.
+    let mut fams_done: HashSet<(String, String)> = HashSet::new();
+
+    for s in shapes {
+        let sid = &s.id;
+        let t = &s.table;
+        let d = format!("d:{t}");
+        let shape_hop = format!("shape:{sid}");
+        let snk_id = format!("snk:{sid}");
+
+        if let Some(agg) = &s.aggregate {
+            // apply(): σ over the delta, then the incremental fold; the sink appends on change.
+            let fn_label = format!("Σ {}({})", format!("{:?}", agg.func).to_uppercase(), agg.col.as_deref().unwrap_or("*"));
+            ops.push(op(&format!("sigma:{sid}"), "filter", &shape_hop, None, "σ where"));
+            ops.push(op(&format!("fold:{sid}"), "fold", &shape_hop, Some(shape_hop.clone()), &fn_label));
+            ops.push(op(&snk_id, "sink", &shape_hop, None, &s.stream_path));
+            edges.push(flow(&d, &format!("sigma:{sid}")));
+            edges.push(flow(&format!("sigma:{sid}"), &format!("fold:{sid}")));
+            edges.push(flow(&format!("fold:{sid}"), &snk_id));
+            continue;
+        }
+
+        if s.is_subquery {
+            // The outer predicate evaluates with IN-membership against node arrangements — a
+            // semijoin/antijoin; flips arrive on the subquery edges added below.
+            ops.push(op(&format!("sj:{sid}"), "join", &shape_hop, None, "⋈ membership"));
+            ops.push(op(&format!("pi:{sid}"), "project", &shape_hop, None, "π pk → envelope"));
+            ops.push(op(&snk_id, "sink", &shape_hop, Some(shape_hop.clone()), &s.stream_path));
+            edges.push(flow(&d, &format!("sj:{sid}")));
+            edges.push(flow(&format!("sj:{sid}"), &format!("pi:{sid}")));
+            edges.push(flow(&format!("pi:{sid}"), &snk_id));
+            continue;
+        }
+
+        if let Some(key) = &s.family_key {
+            let cols = key.join(",");
+            let fam_hop = format!("family:{t}:{cols}");
+            let (key_id, arr_id, join_id) =
+                (format!("key:{t}:{cols}"), format!("arr:{t}:{cols}"), format!("rjoin:{t}:{cols}"));
+            if fams_done.insert((t.clone(), cols.clone())) {
+                ops.push(op(&key_id, "key", &fam_hop, None, &format!("↦ key({cols})")));
+                ops.push(op(&arr_id, "arrange", &fam_hop, Some(fam_hop.clone()), "params: key → shapes"));
+                ops.push(op(&join_id, "join", &fam_hop, None, "⋈ route"));
+                edges.push(flow(&d, &key_id));
+                edges.push(flow(&key_id, &join_id));
+                edges.push(OpEdge { source: arr_id, target: join_id.clone(), kind: "state".into(), label: None });
+            }
+            ops.push(op(&format!("pi:{sid}"), "project", &shape_hop, None, "π pk → envelope"));
+            ops.push(op(&snk_id, "sink", &shape_hop, Some(shape_hop.clone()), &s.stream_path));
+            edges.push(OpEdge {
+                source: join_id,
+                target: format!("pi:{sid}"),
+                kind: "flow".into(),
+                label: Some(sid.clone()),
+            });
+            edges.push(flow(&format!("pi:{sid}"), &snk_id));
+            continue;
+        }
+
+        // Standalone: stateless σ directly on the delta, then group-by-pk into envelopes.
+        let filter_hop = format!("filter:{sid}");
+        ops.push(op(&format!("sigma:{sid}"), "filter", &filter_hop, Some(filter_hop.clone()), "σ where"));
+        ops.push(op(&format!("pi:{sid}"), "project", &shape_hop, None, "π pk → envelope"));
+        ops.push(op(&snk_id, "sink", &shape_hop, Some(shape_hop.clone()), &s.stream_path));
+        edges.push(flow(&d, &format!("sigma:{sid}")));
+        edges.push(flow(&format!("sigma:{sid}"), &format!("pi:{sid}")));
+        edges.push(flow(&format!("pi:{sid}"), &snk_id));
+    }
+
+    // Shared subquery inner sets: σ inner where → π projected column → distinct arrangement.
+    for n in subquery_nodes {
+        let sig = &n.sig;
+        let hop = format!("node:{sig}");
+        ops.push(op(&format!("sqf:{sig}"), "filter", &hop, None, "σ inner where"));
+        ops.push(op(&format!("sqp:{sig}"), "project", &hop, None, &format!("π {}", n.proj_col)));
+        ops.push(op(&format!("dist:{sig}"), "distinct", &hop, Some(hop.clone()), &format!("distinct {}", n.proj_col)));
+        edges.push(flow(&format!("d:{}", n.inner_table), &format!("sqf:{sig}")));
+        edges.push(flow(&format!("sqf:{sig}"), &format!("sqp:{sig}")));
+        edges.push(flow(&format!("sqp:{sig}"), &format!("dist:{sig}")));
+    }
+    // Membership dependencies: a node's arrangement feeds each dependent's semijoin (or a parent
+    // node's inner filter, for nested IN).
+    for e in subquery_edges {
+        let src = format!("dist:{}", e.node_sig);
+        let (target, label) = if e.dependent_kind == "shape" {
+            (format!("sj:{}", e.dependent_id), format!("{} · {}", if e.negated { "NOT IN" } else { "IN" }, e.connecting_col))
+        } else {
+            (format!("sqf:{}", e.dependent_id), format!("{} · {}", if e.negated { "NOT IN" } else { "IN" }, e.connecting_col))
+        };
+        edges.push(OpEdge { source: src, target, kind: "subquery".into(), label: Some(label) });
+    }
+
+    (ops, edges)
 }
 
 /// A non-shareable shape (range / OR / NOT / inequality / match-all). Its predicate is a stateless
@@ -1190,8 +1468,136 @@ fn spawn_tailer(
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let processed = Arc::new(std::sync::Mutex::new("-1".to_string()));
     let stats = Arc::new(std::sync::Mutex::new(TableStats::default()));
-    tokio::spawn(tailer_loop(ds, ts, pg_url, cmd_rx, processed.clone(), stats.clone(), subqueries, trace_tx));
-    TailerHandle { cmd_tx, processed, stats }
+    let node_states = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    tokio::spawn(tailer_loop(
+        ds,
+        ts,
+        pg_url,
+        cmd_rx,
+        processed.clone(),
+        stats.clone(),
+        node_states.clone(),
+        subqueries,
+        trace_tx,
+    ));
+    TailerHandle { cmd_tx, processed, stats, node_states }
+}
+
+/// The graph/trace node id of a family router: `family:<table>:<col,col>` (column NAMES, matching
+/// the hop ids `process_envelope` emits and the ids the visualizer renders).
+fn family_node_id(ts: &TableSchema, key_cols: &[usize]) -> String {
+    let cols = key_cols
+        .iter()
+        .map(|i| ts.columns.get(*i).map(|(n, _)| n.clone()).unwrap_or_else(|| format!("col{i}")))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("family:{}:{cols}", ts.name)
+}
+
+/// Shape id (`s<N>`) from its stream path (`shape/s<N>`) — the key `emitted` counters are kept by.
+fn sid_of_path(stream_path: &str) -> &str {
+    stream_path.strip_prefix("shape/").unwrap_or(stream_path)
+}
+
+/// Rebuild the tailer's full per-node state map from its live structures. Pure so it's unit-testable;
+/// cost is O(shapes on this table) small clones, the same order as the fan-out work per batch.
+#[allow(clippy::too_many_arguments)]
+fn build_node_states(
+    ts: &TableSchema,
+    offset: &str,
+    envelopes: u64,
+    shapes: &HashMap<String, StandaloneShape>,
+    families: &HashMap<Vec<usize>, KeyRouter>,
+    family_of: &HashMap<String, (Vec<usize>, u64, Row)>,
+    aggregates: &HashMap<String, AggShape>,
+    emitted: &HashMap<String, u64>,
+) -> HashMap<String, NodeStateSummary> {
+    let mut out = HashMap::new();
+    out.insert(
+        format!("table:{}", ts.name),
+        NodeStateSummary::Table { processed_offset: offset.to_string(), envelopes },
+    );
+    let emitted_of = |path: &str| emitted.get(sid_of_path(path)).copied().unwrap_or(0);
+    for (sid, s) in shapes {
+        let n = emitted_of(&s.stream_path);
+        out.insert(format!("filter:{sid}"), NodeStateSummary::Filter { emitted: n });
+        out.insert(format!("shape:{sid}"), NodeStateSummary::Shape { emitted: n });
+    }
+    for (key_cols, router) in families {
+        out.insert(
+            family_node_id(ts, key_cols),
+            NodeStateSummary::Family { keys: router.index.len(), shapes: router.member_count() },
+        );
+    }
+    for sid in family_of.keys() {
+        out.insert(
+            format!("shape:{sid}"),
+            NodeStateSummary::Shape { emitted: emitted.get(sid.as_str()).copied().unwrap_or(0) },
+        );
+    }
+    for (sid, agg) in aggregates {
+        out.insert(
+            format!("shape:{sid}"),
+            NodeStateSummary::Aggregate {
+                value: agg.value(),
+                count: agg.count,
+                nn_count: agg.nn_count,
+                multiset_len: agg.multiset.len(),
+            },
+        );
+    }
+    out
+}
+
+/// Cap on entries returned by a `DumpNode` state dump (routing keys / multiset values).
+const DUMP_CAP: usize = 500;
+
+/// Full state dump of a family router: the routing index contents (`key tuple -> shape ids`).
+fn dump_family_json(ts: &TableSchema, router: &KeyRouter) -> serde_json::Value {
+    let mut entries: Vec<serde_json::Value> = router
+        .index
+        .iter()
+        .take(DUMP_CAP)
+        .map(|(key, routed)| {
+            serde_json::json!({
+                "key": key.0.iter().map(Value::to_json).collect::<Vec<_>>(),
+                "shapes": routed.iter().map(|rs| format!("s{}", rs.num_id)).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    entries.sort_by_key(|e| e["key"].to_string());
+    serde_json::json!({
+        "kind": "family",
+        "node": family_node_id(ts, &router.key_cols),
+        "keyCols": router.key_cols.iter()
+            .map(|i| ts.columns.get(*i).map(|(n, _)| n.clone()).unwrap_or_else(|| format!("col{i}")))
+            .collect::<Vec<_>>(),
+        "keys": router.index.len(),
+        "shapes": router.member_count(),
+        "entries": entries,
+        "truncated": router.index.len() > DUMP_CAP,
+    })
+}
+
+/// Full state dump of an aggregation fold: running counters + the MIN/MAX multiset contents.
+fn dump_aggregate_json(sid: &str, agg: &AggShape) -> serde_json::Value {
+    let multiset: Vec<serde_json::Value> = agg
+        .multiset
+        .iter()
+        .take(DUMP_CAP)
+        .map(|(v, w)| serde_json::json!({ "value": v.to_json(), "weight": w }))
+        .collect();
+    serde_json::json!({
+        "kind": "aggregate",
+        "node": format!("shape:{sid}"),
+        "func": agg.func,
+        "value": agg.value(),
+        "count": agg.count,
+        "nnCount": agg.nn_count,
+        "multisetLen": agg.multiset.len(),
+        "multiset": multiset,
+        "truncated": agg.multiset.len() > DUMP_CAP,
+    })
 }
 
 fn publish_stats(
@@ -1207,6 +1613,43 @@ fn publish_stats(
     *stats.lock().unwrap() = TableStats { families: fams, standalone: shapes.len() };
 }
 
+/// Publish the tailer's rebuilt node-state map to its shared handle and, when anyone is
+/// subscribed to `/trace`, broadcast it as a `{"type":"state"}` event — merged with the subquery
+/// registry's summaries when this table participates in subqueries (their state changes on the
+/// same batch).
+#[allow(clippy::too_many_arguments)]
+async fn publish_node_states(
+    ts: &TableSchema,
+    offset: &str,
+    envelopes: u64,
+    shapes: &HashMap<String, StandaloneShape>,
+    families: &HashMap<Vec<usize>, KeyRouter>,
+    family_of: &HashMap<String, (Vec<usize>, u64, Row)>,
+    aggregates: &HashMap<String, AggShape>,
+    emitted: &HashMap<String, u64>,
+    node_states: &std::sync::Mutex<HashMap<String, NodeStateSummary>>,
+    subqueries: &Arc<Mutex<SubqueryRegistry>>,
+    trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
+) {
+    let map = build_node_states(ts, offset, envelopes, shapes, families, family_of, aggregates, emitted);
+    *node_states.lock().unwrap() = map.clone();
+    if trace_tx.receiver_count() == 0 {
+        return;
+    }
+    let mut ev_nodes = map;
+    {
+        let reg = subqueries.lock().await;
+        if reg.touches(&ts.name) {
+            for (id, s) in reg.state_summaries() {
+                ev_nodes.insert(id, s);
+            }
+        }
+    }
+    if let Ok(json) = serde_json::to_string(&crate::trace::StateEvent::new(ev_nodes)) {
+        let _ = trace_tx.send(Arc::new(json));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn tailer_loop(
     ds: DsClient,
@@ -1215,11 +1658,16 @@ async fn tailer_loop(
     mut cmd_rx: mpsc::UnboundedReceiver<TailerCmd>,
     processed: Arc<std::sync::Mutex<String>>,
     stats: Arc<std::sync::Mutex<TableStats>>,
+    node_states: Arc<std::sync::Mutex<HashMap<String, NodeStateSummary>>>,
     subqueries: Arc<Mutex<SubqueryRegistry>>,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
 ) {
     let table_path = format!("table/{}", ts.name);
     let mut offset = "-1".to_string();
+    // Envelopes this tailer has processed since start + envelopes emitted per shape id — the
+    // counters behind the per-node state summaries (`GET /state` / SSE `state` events).
+    let mut envelopes_total: u64 = 0;
+    let mut emitted: HashMap<String, u64> = HashMap::new();
     // Standalone per-shape filter circuits (non-equality predicates), keyed by shape id.
     let mut shapes: HashMap<String, StandaloneShape> = HashMap::new();
     // Shared family circuits, keyed by the equality template's (sorted) column indices.
@@ -1242,7 +1690,7 @@ async fn tailer_loop(
             cmd = cmd_rx.recv() => match cmd {
                 Some(TailerCmd::AddShape { shape_id, num_id, stream_path, pred, out_cols, changes_only, ready }) => {
                     let res = add_shape_routed(
-                        &ds, &ts, &pg_url, &mut shapes, &mut families, &mut family_of,
+                        &ds, &ts, &pg_url, &mut shapes, &mut families, &mut family_of, &mut emitted,
                         shape_id, num_id, stream_path, pred, out_cols, changes_only,
                     ).await;
                     if let Err(e) = &res {
@@ -1252,6 +1700,10 @@ async fn tailer_loop(
                     // remove the shape record instead of leaving a zombie.
                     let _ = ready.send(res.map_err(|e| format!("{e:#}")));
                     publish_stats(&stats, &shapes, &families);
+                    publish_node_states(
+                        &ts, &offset, envelopes_total, &shapes, &families, &family_of, &aggregates,
+                        &emitted, &node_states, &subqueries, &trace_tx,
+                    ).await;
                 }
                 Some(TailerCmd::AddAggregate { shape_id, stream_path, pred, func, col, ready }) => {
                     let res = add_aggregate(
@@ -1261,6 +1713,42 @@ async fn tailer_loop(
                         tracing::error!("add_aggregate failed: {e:#}");
                     }
                     let _ = ready.send(res.map_err(|e| format!("{e:#}")));
+                    publish_node_states(
+                        &ts, &offset, envelopes_total, &shapes, &families, &family_of, &aggregates,
+                        &emitted, &node_states, &subqueries, &trace_tx,
+                    ).await;
+                }
+                Some(TailerCmd::DumpNode { node_id, resp }) => {
+                    let val = if node_id.starts_with("family:") {
+                        families
+                            .values()
+                            .find(|r| family_node_id(&ts, &r.key_cols) == node_id)
+                            .map(|r| dump_family_json(&ts, r))
+                    } else if let Some(sid) =
+                        node_id.strip_prefix("shape:").or_else(|| node_id.strip_prefix("filter:"))
+                    {
+                        if let Some(agg) = aggregates.get(sid) {
+                            Some(dump_aggregate_json(sid, agg))
+                        } else if shapes.contains_key(sid) || family_of.contains_key(sid) {
+                            Some(serde_json::json!({
+                                "kind": if node_id.starts_with("filter:") { "filter" } else { "shape" },
+                                "node": node_id,
+                                "emitted": emitted.get(sid).copied().unwrap_or(0),
+                            }))
+                        } else {
+                            None
+                        }
+                    } else if node_id == format!("table:{}", ts.name) {
+                        Some(serde_json::json!({
+                            "kind": "table",
+                            "node": node_id,
+                            "processedOffset": offset.as_str(),
+                            "envelopes": envelopes_total,
+                        }))
+                    } else {
+                        None
+                    };
+                    let _ = resp.send(val);
                 }
                 Some(TailerCmd::RemoveShape { shape_id }) => {
                     if aggregates.remove(&shape_id).is_some() {
@@ -1281,7 +1769,12 @@ async fn tailer_loop(
                             families.remove(&key_cols);
                         }
                     }
+                    emitted.remove(&shape_id);
                     publish_stats(&stats, &shapes, &families);
+                    publish_node_states(
+                        &ts, &offset, envelopes_total, &shapes, &families, &family_of, &aggregates,
+                        &emitted, &node_states, &subqueries, &trace_tx,
+                    ).await;
                 }
                 None => break,
             },
@@ -1293,6 +1786,7 @@ async fn tailer_loop(
                     // concurrently. Appends (HTTP round-trips) dominate, so coalescing per stream and
                     // parallelizing is the main throughput/latency lever.
                     let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
+                    let mut batch_processed: u64 = 0;
                     if crate::statsd::enabled() {
                         // Telemetry on: split the batch into runs of one source transaction (envelopes
                         // are stamped with txid and arrive in commit+seq order) so the storage metrics
@@ -1324,6 +1818,8 @@ async fn tailer_loop(
                                 {
                                     tracing::error!("process_envelope failed: {e:#}");
                                 }
+                                envelopes_total += 1;
+                                batch_processed += 1;
                                 if let Some(p) = pos {
                                     highwater = Some(p);
                                 }
@@ -1354,15 +1850,27 @@ async fn tailer_loop(
                             {
                                 tracing::error!("process_envelope failed: {e:#}");
                             }
+                            envelopes_total += 1;
+                            batch_processed += 1;
                             if let Some(p) = pos {
                                 highwater = Some(p);
                             }
                         }
                     }
+                    let had_work = batch_processed > 0;
+                    for (path, envs) in &pending {
+                        *emitted.entry(sid_of_path(path).to_string()).or_insert(0) += envs.len() as u64;
+                    }
                     flush_pending(&ds, pending).await;
                     // Publish the processed offset only after the whole batch is fanned out + flushed.
                     if let Some(n) = next {
                         *processed.lock().unwrap() = n;
+                    }
+                    if had_work {
+                        publish_node_states(
+                            &ts, &offset, envelopes_total, &shapes, &families, &family_of, &aggregates,
+                            &emitted, &node_states, &subqueries, &trace_tx,
+                        ).await;
                     }
                 }
                 Err(e) => {
@@ -1421,6 +1929,7 @@ async fn add_shape_routed(
     shapes: &mut HashMap<String, StandaloneShape>,
     families: &mut HashMap<Vec<usize>, KeyRouter>,
     family_of: &mut HashMap<String, (Vec<usize>, u64, Row)>,
+    emitted: &mut HashMap<String, u64>,
     shape_id: String,
     num_id: u64,
     stream_path: String,
@@ -1453,6 +1962,7 @@ async fn add_shape_routed(
                         snapshot_bytes = envs_bytes(&envs);
                     }
                     ds.append(&stream_path, &envs).await?;
+                    emitted.insert(shape_id.clone(), envs.len() as u64);
                 }
                 crate::statsd::snapshot_stored(rows, snapshot_bytes, make_new_ms);
                 bf.gate
@@ -1491,6 +2001,7 @@ async fn add_shape_routed(
                         snapshot_bytes = envs_bytes(&envs);
                     }
                     ds.append(&stream_path, &envs).await?;
+                    emitted.insert(shape_id.clone(), envs.len() as u64);
                 }
                 crate::statsd::snapshot_stored(rows, snapshot_bytes, make_new_ms);
                 bf.gate
@@ -1858,6 +2369,228 @@ pub(crate) fn translate_output(
 mod tests {
     use super::*;
     use crate::schema::{TableDef, TableSchema};
+
+    fn agg_shape(func: AggFn, col: Option<usize>, ts: &TableSchema) -> AggShape {
+        let pred = Arc::new(CompiledPredicate::compile_opt(None, ts).unwrap());
+        AggShape {
+            pred,
+            func,
+            col,
+            stream_path: "shape/s9".into(),
+            gate: crate::pg::SnapshotGate::passthrough(),
+            count: 0,
+            nn_count: 0,
+            sum: 0.0,
+            multiset: std::collections::BTreeMap::new(),
+            last: None,
+        }
+    }
+
+    /// `build_node_states` yields one summary per node in the trace/graph id namespace: the table
+    /// source, filter+shape per standalone, the family router under its column-NAME id, family
+    /// member shapes, and aggregate folds with their live value.
+    #[test]
+    fn node_states_cover_every_node_kind() {
+        let ts = users();
+        let pred = Arc::new(
+            CompiledPredicate::compile_opt(
+                Some(&serde_json::from_value(serde_json::json!({"col":"active","op":"eq","value":true})).unwrap()),
+                &ts,
+            )
+            .unwrap(),
+        );
+
+        let mut shapes = HashMap::new();
+        shapes.insert(
+            "s1".to_string(),
+            StandaloneShape {
+                pred: pred.clone(),
+                stream_path: "shape/s1".into(),
+                gate: crate::pg::SnapshotGate::passthrough(),
+                out_cols: None,
+            },
+        );
+        let mut families = HashMap::new();
+        let key_cols = vec![ts.column_index("active").unwrap()];
+        let mut index = HashMap::new();
+        index.insert(
+            Row(vec![Value::Bool(true)]),
+            vec![RoutedShape {
+                num_id: 2,
+                stream_path: "shape/s2".into(),
+                gate: crate::pg::SnapshotGate::passthrough(),
+                out_cols: None,
+            }],
+        );
+        families.insert(key_cols.clone(), KeyRouter { key_cols: key_cols.clone(), index });
+        let mut family_of = HashMap::new();
+        family_of.insert("s2".to_string(), (key_cols, 2u64, Row(vec![Value::Bool(true)])));
+
+        let mut aggregates = HashMap::new();
+        let mut agg = agg_shape(AggFn::Count, None, &ts);
+        agg.apply(&[Tup2(Row(vec![Value::Int(1), Value::Text("a".into()), Value::Bool(true)]), 1)]);
+        aggregates.insert("s3".to_string(), agg);
+
+        let mut emitted = HashMap::new();
+        emitted.insert("s1".to_string(), 4u64);
+        emitted.insert("s2".to_string(), 7u64);
+
+        let m = build_node_states(&ts, "12", 42, &shapes, &families, &family_of, &aggregates, &emitted);
+
+        assert_eq!(
+            m["table:users"],
+            NodeStateSummary::Table { processed_offset: "12".into(), envelopes: 42 }
+        );
+        assert_eq!(m["filter:s1"], NodeStateSummary::Filter { emitted: 4 });
+        assert_eq!(m["shape:s1"], NodeStateSummary::Shape { emitted: 4 });
+        assert_eq!(m["family:users:active"], NodeStateSummary::Family { keys: 1, shapes: 1 });
+        assert_eq!(m["shape:s2"], NodeStateSummary::Shape { emitted: 7 });
+        match &m["shape:s3"] {
+            NodeStateSummary::Aggregate { value, count, .. } => {
+                assert_eq!(value, &serde_json::json!(1));
+                assert_eq!(*count, 1);
+            }
+            other => panic!("expected aggregate summary, got {other:?}"),
+        }
+    }
+
+    /// The exploded circuit decomposition is internally consistent: every edge endpoint is an
+    /// emitted operator, every hop is a trace-hop id, every `state` is a `GET /state` key, shared
+    /// structures (family, subquery node) are emitted once, and each strategy decomposes into its
+    /// real steps.
+    #[test]
+    fn circuit_ops_decompose_every_strategy() {
+        let gs = |id: &str, table: &str, fam: Option<Vec<&str>>, sq: bool, agg: Option<AggFn>| GraphShape {
+            id: id.into(),
+            table: table.into(),
+            stream_path: format!("shape/{id}"),
+            changes_only: false,
+            where_: None,
+            columns: None,
+            family_key: fam.map(|v| v.iter().map(|s| s.to_string()).collect()),
+            is_subquery: sq,
+            aggregate: agg.map(|func| AggInfo { func, col: None }),
+        };
+        let tables = vec!["users".to_string(), "orders".to_string()];
+        let shapes = vec![
+            gs("s1", "users", None, false, None),                    // standalone
+            gs("s2", "users", Some(vec!["active"]), false, None),    // family member 1
+            gs("s3", "users", Some(vec!["active"]), false, None),    // family member 2 (shared ops)
+            gs("s4", "users", None, true, None),                     // subquery shape
+            gs("s5", "users", None, false, Some(AggFn::Count)),      // aggregate
+        ];
+        let nodes = vec![GraphNode {
+            sig: "orders|user_id|".into(),
+            inner_table: "orders".into(),
+            proj_col: "user_id".into(),
+            distinct_values: 0,
+            refcount: 1,
+        }];
+        let sq_edges = vec![GraphEdge {
+            node_sig: "orders|user_id|".into(),
+            dependent_kind: "shape".into(),
+            dependent_id: "s4".into(),
+            connecting_col: "id".into(),
+            negated: false,
+        }];
+        let (ops, edges) = circuit_ops(&tables, &shapes, &nodes, &sq_edges);
+
+        let ids: HashSet<&str> = ops.iter().map(|o| o.id.as_str()).collect();
+        // Every edge endpoint exists.
+        for e in &edges {
+            assert!(ids.contains(e.source.as_str()), "dangling source {}", e.source);
+            assert!(ids.contains(e.target.as_str()), "dangling target {}", e.target);
+        }
+        // Strategy decompositions.
+        for want in [
+            "src:users", "d:users", // table
+            "sigma:s1", "pi:s1", "snk:s1", // standalone
+            "key:users:active", "arr:users:active", "rjoin:users:active", "snk:s2", "snk:s3", // family
+            "sj:s4", "snk:s4", // subquery shape
+            "sigma:s5", "fold:s5", "snk:s5", // aggregate
+            "sqf:orders|user_id|", "dist:orders|user_id|", // inner set
+        ] {
+            assert!(ids.contains(want), "missing operator {want}");
+        }
+        // Shared family ops emitted once despite two members.
+        assert_eq!(ops.iter().filter(|o| o.id == "arr:users:active").count(), 1);
+        // Hop ids use the trace namespace; state ids point at real summaries.
+        let arr = ops.iter().find(|o| o.id == "arr:users:active").unwrap();
+        assert_eq!(arr.hop, "family:users:active");
+        assert_eq!(arr.state.as_deref(), Some("family:users:active"));
+        let fold = ops.iter().find(|o| o.id == "fold:s5").unwrap();
+        assert_eq!(fold.hop, "shape:s5");
+        assert_eq!(fold.state.as_deref(), Some("shape:s5"));
+        let sigma1 = ops.iter().find(|o| o.id == "sigma:s1").unwrap();
+        assert_eq!(sigma1.hop, "filter:s1");
+        // The membership edge lands on the dependent's semijoin, dashed as a subquery stream.
+        let dep = edges.iter().find(|e| e.source == "dist:orders|user_id|").unwrap();
+        assert_eq!(dep.target, "sj:s4");
+        assert_eq!(dep.kind, "subquery");
+        // The params arrangement feeds the route join as a state edge.
+        assert!(edges.iter().any(|e| e.source == "arr:users:active" && e.target == "rjoin:users:active" && e.kind == "state"));
+    }
+
+    /// Wire format: summaries are kind-tagged camelCase objects, and a `StateEvent` wraps them
+    /// under `{"type":"state","nodes":{…}}` (the tag the visualizer switches on).
+    #[test]
+    fn state_summary_and_event_serialize_kind_tagged() {
+        let s = NodeStateSummary::Aggregate {
+            value: serde_json::json!(3.5),
+            count: 4,
+            nn_count: 2,
+            multiset_len: 2,
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["kind"], "aggregate");
+        assert_eq!(v["nnCount"], 2);
+        assert_eq!(v["multisetLen"], 2);
+
+        let mut nodes = HashMap::new();
+        nodes.insert("shape:s1".to_string(), NodeStateSummary::Shape { emitted: 9 });
+        let ev = serde_json::to_value(crate::trace::StateEvent::new(nodes)).unwrap();
+        assert_eq!(ev["type"], "state");
+        assert_eq!(ev["nodes"]["shape:s1"]["kind"], "shape");
+        assert_eq!(ev["nodes"]["shape:s1"]["emitted"], 9);
+    }
+
+    /// Deep dumps: a family router dumps its routing index (key tuple -> shape ids); a MIN/MAX
+    /// aggregate dumps its fold internals including the retraction multiset.
+    #[test]
+    fn dump_node_family_and_aggregate() {
+        let ts = users();
+        let mut index = HashMap::new();
+        index.insert(
+            Row(vec![Value::Bool(true)]),
+            vec![RoutedShape {
+                num_id: 5,
+                stream_path: "shape/s5".into(),
+                gate: crate::pg::SnapshotGate::passthrough(),
+                out_cols: None,
+            }],
+        );
+        let router = KeyRouter { key_cols: vec![ts.column_index("active").unwrap()], index };
+        let v = dump_family_json(&ts, &router);
+        assert_eq!(v["kind"], "family");
+        assert_eq!(v["node"], "family:users:active");
+        assert_eq!(v["keyCols"][0], "active");
+        assert_eq!(v["entries"][0]["key"][0], true);
+        assert_eq!(v["entries"][0]["shapes"][0], "s5");
+        assert_eq!(v["truncated"], false);
+
+        let mut agg = agg_shape(AggFn::Max, Some(0), &ts);
+        agg.apply(&[
+            Tup2(Row(vec![Value::Int(7), Value::Text("a".into()), Value::Bool(true)]), 1),
+            Tup2(Row(vec![Value::Int(3), Value::Text("b".into()), Value::Bool(true)]), 1),
+        ]);
+        let v = dump_aggregate_json("s9", &agg);
+        assert_eq!(v["kind"], "aggregate");
+        assert_eq!(v["value"], 7);
+        assert_eq!(v["count"], 2);
+        assert_eq!(v["multisetLen"], 2);
+        assert_eq!(v["multiset"][0]["value"], 3);
+        assert_eq!(v["multiset"][0]["weight"], 1);
+    }
 
     fn users() -> TableSchema {
         let def: TableDef = serde_json::from_value(serde_json::json!({

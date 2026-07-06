@@ -925,3 +925,59 @@ body,
   color: #64748b;
   white-space: nowrap;
 }
+
+/* Live per-node state chips (fed by GET /state + SSE state events) */
+.pnode-state {
+  display: flex;
+  gap: 4px;
+  margin-top: 4px;
+  align-items: center;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.pnode-state-empty {
+  color: #94a3b8;
+  font-size: 10px;
+}
+.chip {
+  font-size: 9.5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: #0f172a;
+  background: rgba(255, 255, 255, 0.75);
+  border: 1px solid rgba(15, 23, 42, 0.14);
+  border-radius: 999px;
+  padding: 0.5px 7px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chip-dim {
+  color: #64748b;
+  font-weight: 600;
+}
+.chip-state {
+  color: #7e22ce;
+  border-color: rgba(126, 34, 206, 0.35);
+  background: rgba(243, 232, 255, 0.85);
+}
+.chip-value {
+  color: #0d9488;
+  border-color: rgba(13, 148, 136, 0.4);
+  background: rgba(204, 251, 241, 0.9);
+  font-size: 10.5px;
+}
+
+/* "Inside this operator" explainer in the detail panel */
+.dp-inside {
+  border-left: 3px solid #cbd5e1;
+  padding-left: 9px;
+}
+.dp-inside-h {
+  display: block;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #64748b;
+  margin-bottom: 2px;
+}

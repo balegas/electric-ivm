@@ -44,11 +44,34 @@ export interface GraphEdge {
   negated: boolean
 }
 
+/** One operator of the engine-emitted circuit decomposition (crate::engine::OpNode). `hop` is the
+ *  trace-hop id whose outcomes animate this operator; `state` (when set) is the `GET /state` key
+ *  whose live chips it shows — only the operator that actually holds the state carries one. */
+export interface OpNode {
+  id: string
+  kind: 'source' | 'delta' | 'filter' | 'key' | 'arrange' | 'join' | 'distinct' | 'fold' | 'project' | 'sink'
+  hop: string
+  state: string | null
+  label: string
+}
+
+/** A stream between two operators (crate::engine::OpEdge). */
+export interface OpEdge {
+  source: string
+  target: string
+  kind: 'flow' | 'state' | 'subquery'
+  label: string | null
+}
+
 export interface EngineGraph {
   tables: string[]
   shapes: GraphShape[]
   subqueryNodes: GraphNode[]
   subqueryEdges: GraphEdge[]
+  /** The exploded operator decomposition (engine-emitted) the circuit view renders. Absent on
+   *  engines older than the decomposition — consumers must treat missing as empty. */
+  operators?: OpNode[]
+  opEdges?: OpEdge[]
 }
 
 /** `GET /graph/node?sig=…` — the live inner-set index of a subquery node. */
@@ -86,4 +109,53 @@ export interface TraceLifecycle {
   type: 'shapeAdded' | 'shapeDropped'
   shape: string
   table?: string
+}
+
+/** Live state summary of one pipeline node (crate::engine::NodeStateSummary), keyed by the same
+ *  node-id namespace as the graph and trace hops. Rendered as the state chips on every node. */
+export type NodeStateSummary =
+  | { kind: 'table'; processedOffset: string; envelopes: number }
+  | { kind: 'filter'; emitted: number }
+  | { kind: 'family'; keys: number; shapes: number }
+  | { kind: 'shape'; emitted: number }
+  | { kind: 'aggregate'; value: unknown; count: number; nnCount: number; multisetLen: number }
+  | { kind: 'subqueryNode'; distinctValues: number; refcount: number }
+
+/** `GET /state` — the full per-node state snapshot the store seeds from. */
+export interface StateSnapshot {
+  nodes: Record<string, NodeStateSummary>
+}
+
+/** Per-node state push on the `/trace` feed (crate::trace::StateEvent): the current summaries of
+ *  every node the last batch touched. Applied incrementally over the `GET /state` seed. */
+export interface TraceState {
+  type: 'state'
+  nodes: Record<string, NodeStateSummary>
+}
+
+/** Any message on the `/trace` SSE feed. Data events carry no `type` field. */
+export type TraceMessage = TraceEvent | TraceLifecycle | TraceState
+
+/** `GET /state/node?id=family:…` — a family router's full routing-index contents. */
+export interface FamilyDump {
+  kind: 'family'
+  node: string
+  keyCols: string[]
+  keys: number
+  shapes: number
+  entries: { key: unknown[]; shapes: string[] }[]
+  truncated: boolean
+}
+
+/** `GET /state/node?id=shape:…` for an aggregation — the fold internals. */
+export interface AggregateDump {
+  kind: 'aggregate'
+  node: string
+  func: string
+  value: unknown
+  count: number
+  nnCount: number
+  multisetLen: number
+  multiset: { value: unknown; weight: number }[]
+  truncated: boolean
 }

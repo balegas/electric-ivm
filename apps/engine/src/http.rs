@@ -29,6 +29,8 @@ pub fn router(engine: Engine) -> Router {
         .route("/subqueries", get(subquery_stats))
         .route("/graph", get(get_graph))
         .route("/graph/node", get(get_node_index))
+        .route("/state", get(get_state))
+        .route("/state/node", get(get_state_node))
         .route("/replication/lsn", get(replication_lsn))
         .route("/metrics", get(get_metrics))
         .route("/metrics/reset", post(reset_metrics))
@@ -407,6 +409,30 @@ async fn get_node_index(
     match engine.node_index(&q.sig, q.cap.unwrap_or(500)).await {
         Some(idx) => Ok(Json(idx)),
         None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("node {} not found", q.sig) }),
+    }
+}
+
+/// Full per-node state snapshot (`GET /state`): the live summary of every pipeline node, keyed by
+/// graph node id. The visualizer seeds from this, then applies the incremental `{"type":"state"}`
+/// events pushed on `/trace`.
+async fn get_state(State(engine): State<Engine>) -> Json<crate::engine::StateSnapshot> {
+    Json(engine.state_snapshot().await)
+}
+
+#[derive(Deserialize)]
+struct StateNodeQuery {
+    id: String,
+}
+
+/// Deep state dump of one node (`GET /state/node?id=<node-id>`): a family router's routing-index
+/// contents, an aggregate's fold internals, or a subquery node's inner-set index.
+async fn get_state_node(
+    State(engine): State<Engine>,
+    Query(q): Query<StateNodeQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    match engine.dump_node(&q.id).await {
+        Some(v) => Ok(Json(v)),
+        None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("node {} not found", q.id) }),
     }
 }
 

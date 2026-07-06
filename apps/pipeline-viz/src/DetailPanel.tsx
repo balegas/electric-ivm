@@ -1,14 +1,58 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 
-import type { NodeRef } from './build-graph'
+import type { NodeKind, NodeRef } from './build-graph'
+import { KIND_META, fmtScalar } from './node-meta'
 import { predicateLabel } from './predicate-label'
 import { nodeInnerSql, shapeSql } from './shape-sql'
-import type { EngineGraph, GraphShape, NodeIndex } from './types'
-import { fmtScalar } from './useAggValues'
+import { useNodeState } from './state-store'
+import type { AggregateDump, EngineGraph, FamilyDump, GraphShape, NodeIndex } from './types'
 import { useShapeContents } from './useShapeContents'
 import { useShapeLog } from './useShapeLog'
 
 const CONTENTS_LIMIT = 50
+const DUMP_POLL_MS = 2500
+
+/** Poll the engine's deep state dump for one node (`GET /state/node?id=`) while the panel shows
+ *  it. Deep contents (routing keys, multisets) are on-demand — only summaries stream over SSE. */
+function useNodeDump<T>(id: string | null): { dump: T | null; error: string | null } {
+  const [dump, setDump] = useState<T | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  useEffect(() => {
+    setDump(null)
+    setError(null)
+    if (!id) return
+    let alive = true
+    const fetchDump = async () => {
+      try {
+        const r = await fetch(`/engine/state/node?id=${encodeURIComponent(id)}`)
+        if (!r.ok) throw new Error(`state/node → ${r.status}`)
+        if (alive) {
+          setDump((await r.json()) as T)
+          setError(null)
+        }
+      } catch (e) {
+        if (alive) setError(String(e))
+      }
+    }
+    void fetchDump()
+    const t = setInterval(fetchDump, DUMP_POLL_MS)
+    return () => {
+      alive = false
+      clearInterval(t)
+    }
+  }, [id])
+  return { dump, error }
+}
+
+/** The per-kind "inside this operator" explainer — what the engine actually executes here. */
+function InsideNote({ kind }: { kind: NodeKind }) {
+  return (
+    <div className="dp-note dp-inside">
+      <span className="dp-inside-h">inside this operator</span>
+      {KIND_META[kind].inside}
+    </div>
+  )
+}
 
 /** Render a shape's projected columns as chips, or note that it syncs the full row. */
 function ColumnList({ columns }: { columns: string[] | null }) {
@@ -266,24 +310,6 @@ function ShapeContentsView({ shapeId }: { shapeId: string }) {
   )
 }
 
-/** Prominent live scalar for an aggregation shape. Polls the same `GET /shapes/{id}/rows`
- *  endpoint as row previews — for an aggregation the single "agg" row's `value` field IS the
- *  running aggregate. Only mounted while an aggshape is focused, so nothing double-polls. */
-function AggValueView({ shapeId, expr }: { shapeId: string; expr: string }) {
-  const { rows, live, loading, error } = useShapeContents(true, shapeId, 1)
-  const v = rows[0]?.value['value']
-  return (
-    <div className="dp-agg">
-      <div className="dp-agg-l">
-        current value {live ? <span className="dp-live-dot" title="polling every 2s" /> : null}
-      </div>
-      <div className="dp-agg-n">{v === undefined || v === null ? (loading ? '…' : '—') : fmtScalar(v)}</div>
-      <div className="dp-agg-e">{expr}</div>
-      {error ? <div className="dp-err">{error}</div> : null}
-    </div>
-  )
-}
-
 function Row({ k, v }: { k: string; v: ReactNode }) {
   return (
     <div className="dp-row">
@@ -330,6 +356,71 @@ function ShapeLink({ id, onSelect }: { id: string; onSelect: (id: string) => voi
   )
 }
 
+/** The live routing index of a family router (`GET /state/node?id=family:…`) — the actual key
+ *  tuples the engine holds, not a client-side reconstruction. */
+function FamilyIndexView({ nodeId, onSelectShape }: { nodeId: string; onSelectShape: (id: string) => void }) {
+  const { dump, error } = useNodeDump<FamilyDump>(nodeId)
+  return (
+    <>
+      <div className="dp-sec">
+        routing index · key tuple → shapes{dump?.truncated ? ' (top 500)' : ''}
+        <span className="dp-live-dot" title={`live dump, every ${DUMP_POLL_MS / 1000}s`} />
+      </div>
+      {error ? <div className="dp-err">{error}</div> : null}
+      <div className="dp-list dp-index">
+        {dump?.entries.map((e, i) => (
+          <div key={i} className="dp-item">
+            <code className="dp-key">({e.key.map(fmtValue).join(', ')})</code>
+            <span className="dp-arrow">→</span>
+            <span>
+              {e.shapes.map((sid) => (
+                <ShapeLink key={sid} id={sid} onSelect={onSelectShape} />
+              ))}
+            </span>
+          </div>
+        ))}
+        {dump && dump.entries.length === 0 ? <div className="dp-empty-idx">index is empty</div> : null}
+      </div>
+    </>
+  )
+}
+
+/** An aggregate's fold internals (`GET /state/node?id=shape:…`): running counters and, for
+ *  MIN/MAX, the value → net-weight retraction multiset the engine actually keeps. */
+function AggInternalsView({ nodeId }: { nodeId: string }) {
+  const { dump, error } = useNodeDump<AggregateDump>(nodeId)
+  return (
+    <>
+      <div className="dp-sec">
+        fold state <span className="dp-live-dot" title={`live dump, every ${DUMP_POLL_MS / 1000}s`} />
+      </div>
+      {error ? <div className="dp-err">{error}</div> : null}
+      {dump ? (
+        <>
+          <Row k="matching rows (Σ weights)" v={dump.count.toLocaleString()} />
+          <Row k="non-NULL values" v={dump.nnCount.toLocaleString()} />
+          {dump.multisetLen > 0 || dump.multiset.length > 0 ? (
+            <>
+              <div className="dp-sec">
+                retraction multiset · value → net weight{dump.truncated ? ' (top 500)' : ''}
+              </div>
+              <div className="dp-list dp-index">
+                {dump.multiset.map((m, i) => (
+                  <div key={i} className="dp-item">
+                    <code className="dp-key">{fmtValue(m.value)}</code>
+                    <span className="dp-badge-n">×{m.weight}</span>
+                  </div>
+                ))}
+                {dump.multiset.length === 0 ? <div className="dp-empty-idx">multiset is empty</div> : null}
+              </div>
+            </>
+          ) : null}
+        </>
+      ) : null}
+    </>
+  )
+}
+
 export function DetailPanel({
   node,
   graph,
@@ -364,12 +455,29 @@ export function DetailPanel({
       }
     }
     void fetchIdx()
-    const t = setInterval(fetchIdx, 2500)
+    const t = setInterval(fetchIdx, DUMP_POLL_MS)
     return () => {
       alive = false
       clearInterval(t)
     }
   }, [node])
+
+  // Live summary of the focused node (fed by the SSE state stream; same data as the canvas chips).
+  // Operator refs carry their trace-hop id, which is also the state-summary id of the underlying
+  // structure — so an operator's panel shows its owner's live state.
+  const stateId =
+    node.kind === 'op'
+      ? node.hop
+      : node.kind === 'table'
+        ? `table:${node.name}`
+        : node.kind === 'family'
+          ? `family:${node.table}:${node.keyCols.join(',')}`
+          : node.kind === 'filter'
+            ? `filter:${node.shapeId}`
+            : node.kind === 'sqnode'
+              ? `node:${node.sig}`
+              : `shape:${node.shapeId}`
+  const live = useNodeState(stateId)
 
   let title = ''
   let body: ReactNode = null
@@ -381,8 +489,15 @@ export function DetailPanel({
     body = (
       <>
         <Row k="role" v="replication source (table/<name> stream → tailer)" />
+        {live?.kind === 'table' ? (
+          <>
+            <Row k="envelopes processed" v={live.envelopes.toLocaleString()} />
+            <Row k="processed offset" v={<code>{live.processedOffset}</code>} />
+          </>
+        ) : null}
         <Row k="shapes on it" v={onTable.length} />
         {innerFor.length > 0 ? <Row k="feeds subquery nodes" v={innerFor.length} /> : null}
+        <InsideNote kind="table" />
         <div className="dp-sec">shapes reading this table</div>
         <div className="dp-list">
           {onTable.map((s) => (
@@ -396,7 +511,7 @@ export function DetailPanel({
       </>
     )
   } else if (node.kind === 'family') {
-    title = `Family router · (${node.keyCols.join(', ')})`
+    title = `Route join · (${node.keyCols.join(', ')})`
     const members = graph.shapes.filter(
       (s) => s.table === node.table && s.familyKey && s.familyKey.join(',') === node.keyCols.join(','),
     )
@@ -404,9 +519,16 @@ export function DetailPanel({
       <>
         <Row k="table" v={node.table} />
         <Row k="key columns" v={node.keyCols.join(', ')} />
-        <Row k="routing" v="key tuple → shapes (O(log N), no table copy)" />
-        <Row k="member shapes" v={members.length} />
-        <div className="dp-sec">routing index · key → shape</div>
+        {live?.kind === 'family' ? (
+          <>
+            <Row k="index keys (live)" v={live.keys.toLocaleString()} />
+            <Row k="routed shapes (live)" v={live.shapes.toLocaleString()} />
+          </>
+        ) : null}
+        <Row k="member shapes (graph)" v={members.length} />
+        <InsideNote kind="family" />
+        <FamilyIndexView nodeId={stateId} onSelectShape={onSelectShape} />
+        <div className="dp-sec">registered predicates</div>
         <div className="dp-list">
           {members.map((s) => (
             <div key={s.id} className="dp-item">
@@ -415,10 +537,6 @@ export function DetailPanel({
               <ShapeLink id={s.id} onSelect={onSelectShape} />
             </div>
           ))}
-        </div>
-        <div className="dp-note">
-          All {members.length} shapes above share this one router — a change is routed by its key to
-          exactly the matching shape(s).
         </div>
       </>
     )
@@ -430,13 +548,10 @@ export function DetailPanel({
         <Row k="table" v={s?.table} />
         <Row k="predicate" v={<code>{predicateLabel(s?.where ?? null)}</code>} />
         <Row k="columns" v={<ColumnList columns={s?.columns ?? null} />} />
-        <Row k="type" v="standalone — stateless (no index)" />
+        {live?.kind === 'filter' ? <Row k="envelopes emitted (live)" v={live.emitted.toLocaleString()} /> : null}
+        <InsideNote kind="filter" />
         {s ? <SqlBlock sql={shapeSql(s)} /> : null}
         {s ? <ShapeLiveView shape={s} /> : null}
-        <div className="dp-note">
-          Non-equality predicate: evaluated directly on each change delta. It holds no state, so there is
-          no index to maintain — the cost is O(1) predicate evals per change.
-        </div>
       </>
     )
   } else if (node.kind === 'sqnode') {
@@ -448,9 +563,11 @@ export function DetailPanel({
         <Row k="inner table" v={node.innerTable} />
         <Row k="distinct values" v={index ? index.distinctValues : '…'} />
         <Row k="refcount (dependents)" v={index ? index.refcount : '…'} />
+        <InsideNote kind="sqnode" />
         <div className="dp-sec">
           inner-set index · value → contributors
           {index?.truncated ? ' (top 500)' : ''}
+          <span className="dp-live-dot" title={`live index, every ${DUMP_POLL_MS / 1000}s`} />
         </div>
         {indexErr ? <div className="dp-err">{indexErr}</div> : null}
         <div className="dp-list dp-index">
@@ -477,9 +594,50 @@ export function DetailPanel({
             </div>
           ))}
         </div>
+      </>
+    )
+  } else if (node.kind === 'op') {
+    const meta = KIND_META[node.opKind]
+    title = `Operator · ${node.label}`
+    body = (
+      <>
+        <Row k="operator" v={<code>{meta.tag}</code>} />
+        <Row k="computes" v={<code>{meta.formula}</code>} />
+        <Row k="part of" v={<code>{node.hop}</code>} />
+        {live?.kind === 'table' ? (
+          <>
+            <Row k="envelopes processed" v={live.envelopes.toLocaleString()} />
+            <Row k="processed offset" v={<code>{live.processedOffset}</code>} />
+          </>
+        ) : null}
+        {live?.kind === 'filter' ? <Row k="envelopes emitted (live)" v={live.emitted.toLocaleString()} /> : null}
+        {live?.kind === 'shape' ? <Row k="envelopes emitted (live)" v={live.emitted.toLocaleString()} /> : null}
+        {live?.kind === 'family' ? (
+          <>
+            <Row k="index keys (live)" v={live.keys.toLocaleString()} />
+            <Row k="routed shapes (live)" v={live.shapes.toLocaleString()} />
+          </>
+        ) : null}
+        {live?.kind === 'subqueryNode' ? (
+          <>
+            <Row k="distinct values (live)" v={live.distinctValues.toLocaleString()} />
+            <Row k="refcount" v={live.refcount} />
+          </>
+        ) : null}
+        {live?.kind === 'aggregate' ? (
+          <>
+            <Row k="current value (live)" v={<code>{fmtScalar(live.value)}</code>} />
+            <Row k="matching rows" v={live.count.toLocaleString()} />
+          </>
+        ) : null}
+        <InsideNote kind={node.opKind} />
         <div className="dp-note">
-          This one maintained set is shared by every dependent above (the sharing the engine gives you for
-          free) — when a value enters/leaves it, the affected outer rows move in/out live.
+          In the <b>dbsp circuit</b> view every box is one operator the engine declares it executes
+          (from <code>/graph</code>'s operator decomposition), every arrow a Z-set stream — dashed =
+          a stateful arrangement feeding a join. Operators shared underneath (a table's Δ, a
+          family's params arrangement, a subquery's distinct node) appear once, exactly as the
+          engine shares them. Click the same structure in the <b>Logical</b> view for full state
+          dumps.
         </div>
       </>
     )
@@ -489,31 +647,19 @@ export function DetailPanel({
     title = `Aggregation · ${node.shapeId}`
     body = (
       <>
-        <AggValueView shapeId={node.shapeId} expr={`${fn}(${s?.aggregate?.col ?? '*'})`} />
+        <div className="dp-agg">
+          <div className="dp-agg-l">
+            current value <span className="dp-live-dot" title="pushed on the state stream" />
+          </div>
+          <div className="dp-agg-n">{live?.kind === 'aggregate' ? fmtScalar(live.value) : '…'}</div>
+          <div className="dp-agg-e">{`${fn}(${s?.aggregate?.col ?? '*'})`}</div>
+        </div>
         <Row k="function" v={<code>{`${fn}(${s?.aggregate?.col ?? '*'})`}</code>} />
         <Row k="table" v={s?.table} />
         <Row k="output" v="a single live scalar (streamed)" />
+        <InsideNote kind="agg" />
+        <AggInternalsView nodeId={stateId} />
         {s ? <SqlBlock sql={shapeSql(s)} /> : null}
-        <div className="dp-note">
-          Maintained incrementally as a dbsp <b>fold</b>: each change that enters/leaves the filter
-          adjusts the running aggregate — no rows are stored. COUNT is Σ of the Z-set weights. This drives
-          the app's top-of-list counter (the true total, live) rather than a client-side length of the
-          loaded window.
-        </div>
-      </>
-    )
-  } else if (node.kind === 'op') {
-    title = `Operator · ${node.op}`
-    body = (
-      <>
-        <Row k="operator" v={node.op} />
-        <Row k="computes" v={<code>{node.formula}</code>} />
-        <div className="dp-note">{node.note}</div>
-        <div className="dp-note">
-          In the <b>dbsp circuit</b> view every box is one incremental operator and every arrow is a
-          Z-set stream (dashed = a stateful arrangement feeding a join). Operators shared underneath —
-          a table's Δ, a family's params, a subquery's distinct — appear once.
-        </div>
       </>
     )
   } else {
@@ -528,14 +674,16 @@ export function DetailPanel({
         <Row k="columns" v={<ColumnList columns={s?.columns ?? null} />} />
         <Row k="changes-only feed" v={s?.changesOnly ? 'yes (no backfill)' : 'no (materialized)'} />
         <Row k="stream" v={<code>{s?.streamPath}</code>} />
+        {live?.kind === 'shape' ? <Row k="envelopes emitted (live)" v={live.emitted.toLocaleString()} /> : null}
+        <InsideNote kind="shape" />
         {s ? <SqlBlock sql={shapeSql(s)} /> : null}
         {s ? <ShapeLiveView shape={s} /> : null}
         <div className="dp-note">
           {s?.isSubquery
-            ? 'Membership is driven by the shared subquery node(s) upstream plus the outer-row filter.'
+            ? 'Membership is driven by the shared subquery node(s) upstream plus the outer-row filter — when an inner value flips, the affected rows move in/out of this stream.'
             : s?.familyKey
-              ? 'Routed by key through a shared family — the engine keeps only per-shape metadata, no table rows.'
-              : 'A stateless filter over the change stream — enter/leave falls out of filtering each delta.'}
+              ? 'Fed by the shared route join upstream — the engine keeps only this shape’s routing entry and snapshot gate, no table rows.'
+              : 'Fed by its standalone filter — enter/leave falls out of filtering each delta.'}
         </div>
       </>
     )

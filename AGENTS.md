@@ -21,7 +21,7 @@ the project is growing toward).
 | `packages/loadgen` | Headless load generator (state-machine users; memory/CPU/disk sampling; Docker-scalable clients). |
 | `electric-conformance/` | Electric's own oracle/property/integration tests pointed at our `/v1/shape`. |
 | `docker/` | Containerized stack: `compose.yaml` (postgres + ds + engine + api), `Dockerfile.engine`, `Dockerfile.node`. `pnpm docker:up`. |
-| `apps/pipeline-viz` | Live pipeline explorer (shapes, shared families/nodes, per-node indexes) over `GET /graph`. |
+| `apps/pipeline-viz` | Live pipeline explorer (shapes, shared families/nodes, reactive per-node state + index dumps) over `GET /graph` + `/state` + `/trace`. |
 | `examples/linearlite` | The flagship demo. `scripts/linearlite.sh start <size>` boots everything. |
 
 ## Docs (read these before designing)

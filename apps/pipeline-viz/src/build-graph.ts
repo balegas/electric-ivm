@@ -4,24 +4,28 @@ import type { Edge, Node } from '@xyflow/react'
 import { keyLabel, predicateLabel } from './predicate-label'
 import type { EngineGraph } from './types'
 
+// The node kinds are the engine's real maintained structures — the same set `GET /graph` reports
+// and `/trace` hops name. Every logical id (`table:`, `family:`, `filter:`, `node:`, `shape:`) is
+// an engine id: trace hops and `state` events key on them directly, no translation. The `op-*`
+// kinds are the circuit view's operators — also engine-emitted (`/graph` `operators`), each bound
+// to its hop and state id by the engine.
 export type NodeKind =
-  // logical view
   | 'table'
   | 'family'
   | 'filter'
   | 'sqnode'
   | 'shape'
   | 'agg'
-  // raw dbsp operator view
-  | 'source'
-  | 'delta'
+  | 'op-source'
+  | 'op-delta'
   | 'op-filter'
-  | 'op-index'
+  | 'op-key'
   | 'op-arrange'
   | 'op-join'
-  | 'op-map'
-  | 'op-agg'
-  | 'sink'
+  | 'op-distinct'
+  | 'op-fold'
+  | 'op-project'
+  | 'op-sink'
 
 /** Identity of the underlying engine entity a graph node represents (used by the detail panel). */
 export type NodeRef =
@@ -31,8 +35,8 @@ export type NodeRef =
   | { kind: 'sqnode'; sig: string; innerTable: string; projCol: string }
   | { kind: 'shape'; shapeId: string }
   | { kind: 'aggshape'; shapeId: string }
-  /** A dbsp operator (raw view): its symbol, formula, and an explanatory note. */
-  | { kind: 'op'; op: string; formula: string; note: string }
+  /** A circuit-view operator: its kind, the trace-hop it animates under, and its display label. */
+  | { kind: 'op'; opKind: NodeKind; hop: string; label: string }
 
 export interface VizNodeData extends Record<string, unknown> {
   kind: NodeKind
@@ -40,27 +44,27 @@ export interface VizNodeData extends Record<string, unknown> {
   sub?: string
   /** How many things share this node (family members / subquery refcount) — drives the "shared" badge. */
   shared?: number
-  /** Small count badge, e.g. "5 keys" / "3 values". */
-  index?: string
   /** An id shown inline in the header tag row (e.g. the shape id next to "SHAPE OUTPUT"). */
   idTag?: string
   /** Render `label` as a highlighted expression (used for a shape's filter predicate). */
   highlight?: boolean
+  /** `GET /state` key whose live chips this node shows (absent = no state row). */
+  stateId?: string
   ref: NodeRef
   selected?: boolean
   dimmed?: boolean
 }
 
-interface RawNode {
+export interface RawNode {
   id: string
   data: VizNodeData
 }
-interface RawEdge {
+export interface RawEdge {
   id: string
   source: string
   target: string
   label?: string
-  kind: 'flow' | 'route' | 'subquery'
+  kind: 'flow' | 'route' | 'subquery' | 'state'
 }
 
 /**
@@ -77,10 +81,10 @@ function buildFull(g: EngineGraph): { nodes: Map<string, RawNode>; edges: RawEdg
     const existing = nodes.get(id)
     if (existing) {
       if (data.shared && (!existing.data.shared || data.shared > existing.data.shared)) existing.data.shared = data.shared
-      if (data.index && !existing.data.index) existing.data.index = data.index
       return
     }
-    nodes.set(id, { id, data })
+    // Logical node ids ARE the engine's state-summary ids, so every node gets live chips.
+    nodes.set(id, { id, data: { stateId: id, ...data } })
   }
   const edge = (source: string, target: string, kind: RawEdge['kind'], label?: string) => {
     const id = `${source}~>${target}~${label ?? ''}`
@@ -108,7 +112,6 @@ function buildFull(g: EngineGraph): { nodes: Map<string, RawNode>; edges: RawEdg
         kind: 'agg',
         label: `${fn}(${s.aggregate.col ?? '*'})`,
         sub: predicateLabel(s.where),
-        index: 'live scalar',
         ref: { kind: 'aggshape', shapeId: s.id },
       })
       edge(tableId(s.table), shapeId, 'flow', predicateLabel(s.where) === 'match all' ? undefined : 'filter')
@@ -135,7 +138,6 @@ function buildFull(g: EngineGraph): { nodes: Map<string, RawNode>; edges: RawEdg
         label: `route by (${s.familyKey.join(', ')})`,
         sub: shared > 1 ? `shared by ${shared} shapes` : undefined,
         shared,
-        index: `${shared} ${shared === 1 ? 'key' : 'keys'}`,
         ref: { kind: 'family', table: s.table, keyCols: s.familyKey },
       })
       edge(tableId(s.table), fid, 'flow')
@@ -158,9 +160,8 @@ function buildFull(g: EngineGraph): { nodes: Map<string, RawNode>; edges: RawEdg
       kind: 'sqnode',
       // No query expression on the canvas — the detail panel carries the full SQL.
       label: n.innerTable,
-      sub: `distinct ${n.projCol} · refcount ${n.refcount}`,
+      sub: `distinct ${n.projCol}`,
       shared: n.refcount,
-      index: `${n.distinctValues} ${n.distinctValues === 1 ? 'value' : 'values'}`,
       ref: { kind: 'sqnode', sig: n.sig, innerTable: n.innerTable, projCol: n.projCol },
     })
     add(tableId(n.innerTable), { kind: 'table', label: n.innerTable, ref: { kind: 'table', name: n.innerTable } })
@@ -210,9 +211,9 @@ function restrictToSelection(
 
 // Boxes handed to dagre — these are also the boxes the nodes RENDER at (the node fills its
 // laid-out box), so the height must cover the tallest kind's content (tag row + label + optional
-// sub line) or it clips. ONE default height for every kind: a connected row of mixed kinds reads
-// as a single centered line with level edges.
-const KIND_H = 72
+// sub line + live state row) or it clips. ONE default height for every kind: a connected row of
+// mixed kinds reads as a single centered line with level edges.
+export const KIND_H = 88
 const KIND_SIZE: Partial<Record<NodeKind, { w: number; h: number }>> = {
   table: { w: 150, h: KIND_H },
   family: { w: 220, h: KIND_H },
@@ -220,6 +221,17 @@ const KIND_SIZE: Partial<Record<NodeKind, { w: number; h: number }>> = {
   sqnode: { w: 250, h: KIND_H },
   shape: { w: 200, h: KIND_H },
   agg: { w: 210, h: KIND_H },
+  // circuit-view operators (denser boxes, same height so ranks stay level)
+  'op-source': { w: 150, h: KIND_H },
+  'op-delta': { w: 120, h: KIND_H },
+  'op-filter': { w: 150, h: KIND_H },
+  'op-key': { w: 150, h: KIND_H },
+  'op-arrange': { w: 180, h: KIND_H },
+  'op-join': { w: 150, h: KIND_H },
+  'op-distinct': { w: 180, h: KIND_H },
+  'op-fold': { w: 180, h: KIND_H },
+  'op-project': { w: 150, h: KIND_H },
+  'op-sink': { w: 180, h: KIND_H },
 }
 
 /** Optional layout hooks: `measure` overrides a node's box (return null to keep the default) —
@@ -231,7 +243,7 @@ export interface BuildOpts {
   alignSources?: boolean
 }
 
-function layout(
+export function layout(
   raw: { nodes: Map<string, RawNode>; edges: RawEdge[] },
   focus: string | null,
   opts?: BuildOpts,
@@ -250,7 +262,7 @@ function layout(
     for (const [id, n] of raw.nodes) {
       // High weight: the ranker otherwise trades a longer align edge for a shorter flow edge and
       // lets a source drift into a deeper rank (e.g. a table whose only consumer sits far right).
-      if (n.data.kind === 'table' || n.data.kind === 'source') g.setEdge('__align_root', id, { weight: 100 })
+      if (n.data.kind === 'table' || n.data.kind === 'op-source') g.setEdge('__align_root', id, { weight: 100 })
     }
   }
   dagre.layout(g)
@@ -285,8 +297,10 @@ function layout(
       target: e.target,
       animated: e.kind === 'subquery' && !dim,
       style: {
-        stroke: e.kind === 'subquery' ? '#a855f7' : e.kind === 'route' ? '#0ea5e9' : '#94a3b8',
+        stroke: e.kind === 'subquery' ? '#a855f7' : e.kind === 'route' ? '#0ea5e9' : e.kind === 'state' ? '#7e22ce' : '#94a3b8',
         strokeWidth: e.kind === 'flow' ? 1.5 : 2,
+        // A dashed edge = a stateful arrangement feeding a join (not a Z-set stream).
+        ...(e.kind === 'state' ? { strokeDasharray: '6 4' } : null),
         opacity: dim ? 0.12 : 1,
       },
     }
