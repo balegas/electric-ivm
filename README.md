@@ -202,16 +202,6 @@ ELECTRIC_IVM_ENGINE_URL=http://127.0.0.1:<engine-port> VIZ_PORT=5180 \
   pnpm --filter @electric-ivm/pipeline-viz dev
 ```
 
-**`apps/playground` — the dbsp playground (TS).** The audience-facing interactive demo: drive
-the Shape API against a tiny issue tracker and watch each write animate live through the real
-engine's pipeline to per-shape result cards — with a scene walkthrough, a shape composer, and
-click-to-inspect node details. Built for demo videos and public hosting.
-
-```bash
-pnpm demo:playground      # ephemeral PG + engine + server + app (+ HTTPS/2 front if caddy is installed)
-pnpm docker:playground    # the hosted stack (compose overlay), app on :5199
-```
-
 **`examples/linearlite` — the flagship demo app (TS).** A Linear-style issue tracker synced
 entirely through shapes (visibility subqueries, live counts, subset pagination):
 `pnpm demo:linearlite`, or `scripts/linearlite.sh start large` for a 100k-issue workload.
@@ -298,7 +288,6 @@ logic, and concurrent writers.
 | `examples/linearlite`, `examples/web` | TS | demo apps |
 | `docker/` | — | containerized stack |
 | `apps/pipeline-viz` | TS | live pipeline explorer (developer tool) |
-| `apps/playground` | TS | interactive dbsp playground (public demo: scenes, workspaces, trace animation) |
 
 Each package has its own README. Agent guidance for working in this repo: **AGENTS.md**.
 
