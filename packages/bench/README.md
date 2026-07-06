@@ -2,7 +2,7 @@
 
 Benchmark and measurement tooling for [electric-ivm](../../README.md). Every runner boots the full
 stack itself (durable-streams + engine, plus Postgres/API where relevant); results are written to
-files under [docs/bench/](../../docs/bench/) or the package directory.
+files under `docs/bench/` or the package directory.
 
 ## ElectricSQL benchmarking-fleet (`src/electric-bench-runner.ts`)
 
@@ -29,7 +29,7 @@ pnpm bench:fleet          # from the repo root — auto-clones the fleet repo on
 How engine memory evolves as shapes are created, across deployment sizes: seeds N issues + a
 project/membership graph (the LinearLite visibility model), creates subquery-visibility and
 status-equality shapes in batches, and samples the engine's `GET /memory` probes (RSS +
-cardinalities) at each milestone. Results: [docs/bench/shape-memory-matrix.md](../../docs/bench/shape-memory-matrix.md).
+cardinalities) at each milestone. Results are written to `docs/bench/shape-memory-matrix.md`.
 
 ```bash
 pnpm --filter @electric-ivm/bench shape-mem
@@ -49,4 +49,4 @@ MATRIX_SIZES=1000,10000,100000 MATRIX_USERS=10,25,50,100 MATRIX_PROJECTS=20 \
   `ADAPTER_LISTENING <url>`). Used by [electric-conformance/](../../electric-conformance/README.md).
 
 Companion: [packages/loadgen](../loadgen) (state-machine load-generator clients,
-Docker-scalable). Published measurements live in [docs/bench/](../../docs/bench/).
+Docker-scalable). Benchmark reports are written under `docs/bench/`.

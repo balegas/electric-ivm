@@ -56,7 +56,7 @@ subquery, and aggregation is an incremental operator over those deltas. The engi
 operators directly in Rust — stateless filters, key routers, shared inner-set nodes, running
 folds — rather than running a general dbsp circuit, so it keeps **no copy of any table**: engine
 RSS is ~19 MiB whether the database has 1k or 100k rows, +~0.8 KiB per shape
-([measurements](docs/bench/shape-memory-matrix.md)).
+(measured by the shape-memory matrix benchmark in `packages/bench`).
 
 ## A shape as a DBSP pipeline
 
@@ -258,7 +258,8 @@ pnpm bench:fleet    # clones electric-sql/benchmarking-fleet and runs its byo_el
 ```
 
 Load/observability companions: `packages/loadgen` (state-machine users; memory/CPU/disk vs workload,
-Docker-scalable clients) and `docs/bench/shape-memory-matrix.md` (memory vs shapes × deployment size).
+Docker-scalable clients) and the shape-memory matrix runner in `packages/bench` (memory vs shapes ×
+deployment size, written to `docs/bench/shape-memory-matrix.md`).
 
 ## Tests
 

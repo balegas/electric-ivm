@@ -38,7 +38,7 @@ Three layers, one idea — *maintain query results incrementally as the database
 reasoning about cost. State that scales with row count lives in Postgres; the engine keeps
 only per-shape metadata and, for subqueries, a shared set of *inner-query result values*.
 Baseline engine RSS is ~19 MiB whether the database has 1,000 or 100,000 rows
-(`docs/bench/shape-memory-matrix.md`).
+(measured by the shape-memory matrix benchmark in `packages/bench`).
 
 ### What dbsp is, and isn't, here
 
@@ -290,7 +290,7 @@ The question this section answers: **as you add shapes, users, and rows, where d
 state accumulate, what is shared vs per-shape vs per-user, and how does that show up in memory
 and disk?**
 
-The headline, measured (`docs/bench/shape-memory-matrix.md`): a steady fleet of *many* shapes
+The headline, measured (shape-memory matrix benchmark, `packages/bench`): a steady fleet of *many* shapes
 over a *large* table is cheap; the only deployment-size-sensitive cost is the **transient
 backfill working set** of a *materialized* shape.
 
@@ -315,7 +315,7 @@ users but with a tiny constant (a node holds the user's ~6 membership rows, not 
 
 ### 4.2 Memory: the numbers
 
-From `docs/bench/shape-memory-matrix.md` (Postgres mode, OTel RSS probe):
+From the shape-memory matrix run (Postgres mode, OTel RSS probe):
 
 - **Baseline RSS is independent of deployment size:** ~18.7 MiB at 1k issues, ~19.0 at 10k,
   ~18.7 at 100k. The engine keeps no table copy.
@@ -467,5 +467,6 @@ bounded keyset range query folded into the `WHERE`, so the engine never holds a 
 
 - `docs/ARCHITECTURE.md` — the system-level architecture (consistency fences, reliability,
   adapters) and the speedup backlog.
-- `docs/bench/shape-memory-matrix.md` — the measured memory-vs-shapes data used above.
+- `packages/bench/README.md` — the benchmark runners, including the shape-memory matrix that
+  produced the memory-vs-shapes data used above.
 - `docs/shapes-and-subqueries-guide.md` — the user-facing companion to this document.
