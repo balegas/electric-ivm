@@ -5,10 +5,10 @@
 //! backpressure into the hot path, and zero cost when nobody is subscribed
 //! (`receiver_count() == 0` short-circuits before any serialization).
 //!
-//! Node ids use the same namespace the pipeline visualizer's logical view derives from `/graph`
+//! Node ids use the same namespace the pipeline visualizer derives from `/graph`
 //! (`apps/pipeline-viz/src/build-graph.ts`): `table:<t>`, `filter:<shape-id>`,
 //! `family:<t>:<col,col>`, `node:<subquery-sig>`, `shape:<shape-id>` — so a UI can animate trace
-//! events onto the graph without translation.
+//! events and apply [`StateEvent`] summaries onto the graph without translation.
 
 use serde::Serialize;
 
@@ -53,6 +53,26 @@ pub enum GraphLifecycle {
     ShapeAdded { shape: String, table: String },
     #[serde(rename_all = "camelCase")]
     ShapeDropped { shape: String },
+}
+
+/// Live per-node state update, broadcast on the same channel as [`TraceEvent`] after a tailer
+/// finishes a batch (and after shape add/remove): the current [`NodeStateSummary`] of every node
+/// the batch touched, keyed by graph node id. Like lifecycle events it carries a `type` tag
+/// (`"state"`); data events carry none. A UI seeds from `GET /state` and applies these
+/// incrementally.
+///
+/// [`NodeStateSummary`]: crate::engine::NodeStateSummary
+#[derive(Debug, Clone, Serialize)]
+pub struct StateEvent {
+    #[serde(rename = "type")]
+    pub type_: &'static str,
+    pub nodes: std::collections::HashMap<String, crate::engine::NodeStateSummary>,
+}
+
+impl StateEvent {
+    pub fn new(nodes: std::collections::HashMap<String, crate::engine::NodeStateSummary>) -> Self {
+        StateEvent { type_: "state", nodes }
+    }
 }
 
 /// Outcome of one node visit. `passed` = the delta (or part of it) continued downstream;
