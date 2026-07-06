@@ -1,5 +1,5 @@
 {
-  "name": "@electric-lite/oracle",
+  "name": "@electric-ivm/oracle",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -10,7 +10,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@electric-lite/protocol": "workspace:*",
+    "@electric-ivm/protocol": "workspace:*",
     "@electric-sql/pglite": "^0.5.3",
     "pg": "^8.13.1"
   },

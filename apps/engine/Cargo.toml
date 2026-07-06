@@ -1,15 +1,15 @@
 [package]
-name = "electric-lite-engine"
+name = "electric-ivm-engine"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 
 [lib]
-name = "electric_lite_engine"
+name = "electric_ivm_engine"
 path = "src/lib.rs"
 
 [[bin]]
-name = "electric-lite-engine"
+name = "electric-ivm-engine"
 path = "src/main.rs"
 
 [dependencies]
@@ -35,6 +35,8 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
+# BroadcastStream adapter for the /trace SSE endpoint.
+tokio-stream = { version = "0.1", features = ["sync"] }
 axum = "0.8"
 # http to a localhost durable-streams server only -> no TLS backend needed.
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
@@ -45,3 +47,8 @@ uuid = { version = "1", features = ["v4"] }
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+memory-stats = "1"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["metrics"] }
+opentelemetry-prometheus = "0.27"
+prometheus = "0.13"

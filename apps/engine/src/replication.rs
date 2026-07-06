@@ -1,10 +1,23 @@
 //! Logical-replication ingestor: polls a Postgres `test_decoding` slot and turns each row change
-//! into a State-Protocol envelope (carrying old + new and the commit LSN), appended to the
+//! into a State-Protocol envelope (carrying old + new and the change's COMMIT LSN), appended to the
 //! durable-streams `table/<name>` stream. The engine's existing tailer consumes that stream, so the
 //! whole shape fan-out path is unchanged — only the *source* of table changes moves to Postgres.
+//!
+//! Delivery is read-then-commit: each poll PEEKS the slot (non-consuming), appends to durable-streams,
+//! and only then ADVANCES the slot. A failed append leaves the slot unadvanced, so the same changes
+//! are re-read next poll rather than lost. (Caveat: if appends to several table streams partially
+//! succeed within one poll, the succeeded ones may be re-appended on retry — a real system would need
+//! transactional multi-stream append or per-stream cursors.)
+//!
+//! Each envelope is stamped with its transaction's COMMIT LSN (not the per-change record LSN), so the
+//! backfill/replication boundary (`commit_lsn < seed_lsn`, see `engine::process_envelope`) lines up
+//! with snapshot *commit* visibility. test_decoding frames each xact as `BEGIN / <changes> / COMMIT`
+//! and the COMMIT row's LSN is the commit LSN; we buffer a transaction's changes and stamp them when
+//! its COMMIT row arrives.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use serde_json::{Map, Value as Json};
 
@@ -12,8 +25,11 @@ use crate::ds::{DsClient, Envelope, EnvelopeHeaders};
 use crate::pg;
 use crate::schema::{ColumnType, TableSchema};
 
-/// Long-running poll loop. Owns its own Postgres connection (a slot read is session-stateful, so it
-/// must not share a connection with backfill transactions).
+const SYNC_TABLE: &str = "__el_sync";
+const TOAST_SENTINEL: &str = "unchanged-toast-datum";
+
+/// Long-running ingestor. Reconnects on connection loss. Owns its own Postgres connection (a slot
+/// read is session-stateful, so it must not share a connection with backfill transactions).
 pub async fn run(
     pg_url: String,
     slot: String,
@@ -21,134 +37,314 @@ pub async fn run(
     ds: DsClient,
     tables: Arc<HashMap<String, TableSchema>>,
     last_lsn: Arc<std::sync::Mutex<String>>,
-    sync_seq: Arc<std::sync::atomic::AtomicI64>,
+    sync_seq: Arc<AtomicI64>,
 ) {
-    use std::sync::atomic::Ordering;
-    let client = match pg::connect(&pg_url).await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("replicator: connect failed: {e:#}");
-            return;
-        }
-    };
-    let query = "select lsn::text, data from pg_logical_slot_get_changes($1, NULL, NULL)";
+    // Outer loop: (re)connect after any connection-level failure.
     loop {
-        match client.query(query, &[&slot]).await {
-            Ok(rows) => {
-                // Collect per-table envelopes in commit order, then append once per table. A change to
-                // the per-database `__el_sync` sentinel table is not a data table — we only track the
-                // highest counter value seen, published *after* the batch is on the stream so a drain
-                // barrier can wait for the engine to have caught up to a known point in THIS database
-                // (robust under a shared multi-database Postgres where WAL LSNs are server-global).
-                let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
-                let mut max_lsn: Option<String> = None;
-                let mut max_sync: Option<i64> = None;
-                for r in &rows {
-                    let lsn: String = r.get(0);
-                    let data: String = r.get(1);
-                    max_lsn = Some(lsn.clone());
-                    if let Some(n) = parse_sync(&data) {
-                        max_sync = Some(max_sync.map_or(n, |m: i64| m.max(n)));
-                    } else if let Some(env) = parse_change(&data, &tables, &lsn) {
-                        pending.entry(env.type_.clone()).or_default().push(env);
-                    }
-                }
-                for (table, envs) in pending {
-                    if let Err(e) = ds.append(&format!("table/{table}"), &envs).await {
-                        tracing::error!("replicator: append table/{table} failed: {e:#}");
-                    }
-                }
-                if let Some(l) = max_lsn {
-                    *last_lsn.lock().unwrap() = l;
-                }
-                if let Some(n) = max_sync {
-                    sync_seq.fetch_max(n, Ordering::Relaxed);
+        let client = match pg::connect(&pg_url).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("replicator: connect failed: {e:#}; retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                continue;
+            }
+        };
+        if let Err(e) = poll_loop(&client, &slot, poll_ms, &ds, &tables, &last_lsn, &sync_seq).await {
+            tracing::error!("replicator: connection error: {e:#}; reconnecting");
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+}
+
+/// Inner poll loop; returns `Err` only on a connection-level failure (so the caller reconnects).
+async fn poll_loop(
+    client: &tokio_postgres::Client,
+    slot: &str,
+    poll_ms: u64,
+    ds: &DsClient,
+    tables: &HashMap<String, TableSchema>,
+    last_lsn: &Arc<std::sync::Mutex<String>>,
+    sync_seq: &Arc<AtomicI64>,
+) -> Result<(), tokio_postgres::Error> {
+    // PEEK (non-consuming): we only ADVANCE the slot after the batch is durably on the stream.
+    // The peek is CAPPED so a long backlog doesn't materialize wholesale in memory. A transaction can
+    // be cut by the cap; decode_batch only emits transactions whose COMMIT is in the batch and the
+    // slot advances to the last complete commit, so a cut transaction is simply re-peeked next poll.
+    // If a batch is all one giant open transaction (no COMMIT at the cap), the cap escalates until
+    // the commit fits — degrading, for that poll only, toward the old unbounded read.
+    let peek = "select lsn::text, data from pg_logical_slot_peek_changes($1, NULL, $2)";
+    const PEEK_CAP: i32 = 5000;
+    let mut cap: i32 = PEEK_CAP;
+    loop {
+        let rows = client.query(peek, &[&slot, &cap]).await?; // connection error -> reconnect
+        if !rows.is_empty() {
+            let pairs: Vec<(String, String)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+            let batch = decode_batch(&pairs, tables);
+            if batch.advance_to.is_none() && pairs.len() as i64 >= cap as i64 {
+                // No COMMIT in a full batch: one transaction bigger than the cap. Escalate and retry.
+                cap = cap.saturating_mul(4);
+                tracing::warn!("replicator: transaction exceeds peek cap; escalating cap to {cap}");
+                continue;
+            }
+            cap = PEEK_CAP;
+            // Append every table's envelopes; advance only if ALL succeed (else re-peek next poll).
+            // Re-appends after a partial failure (or a crash before the advance) duplicate envelopes
+            // on the succeeded streams; the tailer de-duplicates by the stamped (lsn, seq).
+            let mut all_ok = true;
+            for (table, envs) in &batch.pending {
+                if let Err(e) = ds.append(&format!("table/{table}"), envs).await {
+                    tracing::error!("replicator: append table/{table} failed: {e:#}; will retry");
+                    all_ok = false;
                 }
             }
-            Err(e) => {
-                tracing::error!("replicator: slot read failed: {e:#}; backing off");
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if all_ok {
+                let mut advanced = true;
+                if let Some(ref upto) = batch.advance_to {
+                    // Consume everything up to the last commit we processed. The LSN is a PG-produced
+                    // hex string (e.g. "0/78912C0"), formatted literally because a bound &str can't be
+                    // serialized into a `pg_lsn` parameter; the slot name stays a bound parameter.
+                    let q = format!("select pg_replication_slot_advance($1, '{upto}'::pg_lsn)");
+                    if let Err(e) = client.execute(&q, &[&slot]).await {
+                        tracing::error!("replicator: slot advance to {upto} failed: {e:#}");
+                        advanced = false;
+                    } else {
+                        *last_lsn.lock().unwrap() = upto.clone();
+                    }
+                }
+                // Publish the drain-barrier sentinel only once the slot actually advanced: a failed
+                // advance means the whole batch is re-peeked and re-appended, and the barrier must
+                // not claim "drained" while those duplicates are still in flight.
+                if advanced {
+                    if let Some(n) = batch.max_sync {
+                        sync_seq.fetch_max(n, Ordering::Relaxed);
+                    }
+                }
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(poll_ms)).await;
     }
 }
 
-/// Recognize a change to the `__el_sync` drain-barrier sentinel and extract its new counter value.
-/// The row is `... table public.__el_sync: UPDATE: old-key: id[…]:1 n[bigint]:K0 new-tuple: id[…]:1
-/// n[bigint]:K1` (or INSERT with a single `n[…]:K`); we want the LAST `n[...]:` (the new value).
-fn parse_sync(data: &str) -> Option<i64> {
-    if !data.contains("public.__el_sync:") {
-        return None;
-    }
-    let idx = data.rfind(" n[")?;
-    let rest = &data[idx..];
-    let val_start = rest.find("]:")? + 2;
-    let rest = &rest[val_start..];
-    let end = rest.find(' ').unwrap_or(rest.len());
-    rest[..end].parse::<i64>().ok()
+struct Batch {
+    /// Envelopes per table, each stamped with its transaction's commit LSN, in commit order.
+    pending: HashMap<String, Vec<Envelope>>,
+    /// Highest `__el_sync` counter seen in committed transactions (drain barrier).
+    max_sync: Option<i64>,
+    /// LSN of the last COMMIT we fully processed; the slot is advanced to here.
+    advance_to: Option<String>,
 }
 
-/// Parse one `test_decoding` line into an envelope, or `None` for BEGIN/COMMIT/unwatched tables.
-fn parse_change(data: &str, tables: &HashMap<String, TableSchema>, lsn: &str) -> Option<Envelope> {
-    let rest = data.strip_prefix("table ")?; // "public.users: INSERT: ..."
-    let (qualified, rest) = rest.split_once(": ")?; // "public.users", "INSERT: ..."
-    let table = qualified.rsplit('.').next().unwrap_or(qualified).trim_matches('"');
-    let ts = tables.get(table)?;
-    let (op, body) = rest.split_once(": ")?; // "INSERT", "id[integer]:1 ..."
+/// Decode a peeked batch (rows of `(lsn, data)`) into per-table envelopes, buffering each transaction
+/// so its changes can be stamped with the COMMIT LSN. test_decoding only ever emits *complete*
+/// transactions, so a `BEGIN` is always matched by a later `COMMIT` within the same batch.
+fn decode_batch(rows: &[(String, String)], tables: &HashMap<String, TableSchema>) -> Batch {
+    let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
+    let mut max_sync: Option<i64> = None;
+    let mut advance_to: Option<String> = None;
 
-    let make = |operation: &str, value: Option<Json>, old: Option<Json>, key_src: &Json| {
-        let key = key_from_obj(key_src, ts);
-        Envelope {
-            type_: table.to_string(),
-            key,
-            value,
-            old,
-            headers: EnvelopeHeaders {
-                operation: operation.to_string(),
-                txid: None,
-                offset: None,
-                lsn: Some(lsn.to_string()),
-            },
+    let mut tx_envs: Vec<Envelope> = Vec::new();
+    let mut tx_sync: Option<i64> = None;
+    for (lsn, data) in rows {
+        let data = data.as_str();
+        if data.starts_with("BEGIN") {
+            tx_envs.clear();
+            tx_sync = None;
+        } else if data.starts_with("COMMIT") {
+            // The COMMIT row's LSN is the transaction's commit LSN; stamp the buffered changes with
+            // it, the transaction's xid (for the backfill snapshot's xid-visibility fence), and each
+            // change's position within the transaction (for tailer-side de-duplication by (lsn, seq)).
+            let xid = data.split_whitespace().nth(1).map(str::to_string);
+            for (i, mut env) in tx_envs.drain(..).enumerate() {
+                env.headers.lsn = Some(lsn.clone());
+                env.headers.txid = xid.clone();
+                env.headers.seq = Some(i as u64);
+                pending.entry(env.type_.clone()).or_default().push(env);
+            }
+            if let Some(n) = tx_sync.take() {
+                max_sync = Some(max_sync.map_or(n, |m| m.max(n)));
+            }
+            advance_to = Some(lsn.clone());
+        } else if let Some((table, op, body)) = parse_row(&data) {
+            if table == SYNC_TABLE {
+                if let Some(n) = parse_sync_body(body) {
+                    tx_sync = Some(n);
+                }
+            } else if let Some(ts) = tables.get(table) {
+                if let Some(env) = build_envelope(table, ts, op, body) {
+                    tx_envs.push(env); // lsn stamped at COMMIT
+                }
+            }
         }
-    };
+    }
+    Batch { pending, max_sync, advance_to }
+}
 
+/// Split a `test_decoding` change line into `(table, op, body)`, or `None` for BEGIN/COMMIT/other.
+/// Handles schema-qualified and double-quoted identifiers (`public."My.Table"`).
+fn parse_row(data: &str) -> Option<(&str, &str, &str)> {
+    let rest = data.strip_prefix("table ")?; // `public.users: INSERT: ...`
+    let (qualified, rest) = rest.split_once(": ")?; // `public.users`, `INSERT: ...`
+    let (op, body) = rest.split_once(": ")?; // `INSERT`, `id[integer]:1 ...`
+    Some((table_ident(qualified), op, body))
+}
+
+/// The table component of a possibly schema-qualified, possibly quoted identifier. Returns a slice
+/// into `qualified` for the common unquoted case; quoted identifiers are matched on the unquoted form
+/// by callers via `tables.get`, so we strip surrounding quotes here.
+fn table_ident(qualified: &str) -> &str {
+    // Take the last dot-separated component, treating a trailing quoted segment as atomic.
+    if qualified.ends_with('"') {
+        // find the opening quote of the final `"..."` segment
+        let bytes = qualified.as_bytes();
+        let mut i = bytes.len() - 1; // closing quote
+        while i > 0 {
+            i -= 1;
+            if bytes[i] == b'"' {
+                // could be an escaped "" — but escaped quotes can't end the string, so the first
+                // quote we hit scanning back from the final char is the opener for simple names.
+                return &qualified[i + 1..qualified.len() - 1];
+            }
+        }
+        qualified
+    } else {
+        qualified.rsplit('.').next().unwrap_or(qualified)
+    }
+}
+
+/// Build an envelope from a parsed change (`op` body); LSN is stamped later at COMMIT.
+fn build_envelope(table: &str, ts: &TableSchema, op: &str, body: &str) -> Option<Envelope> {
+    let make = |operation: &str, value: Option<Json>, old: Option<Json>, key_src: &Json| Envelope {
+        type_: table.to_string(),
+        key: key_from_obj(key_src, ts),
+        value,
+        old,
+        headers: EnvelopeHeaders { operation: operation.to_string(), txid: None, offset: None, lsn: None, seq: None },
+    };
     match op {
         "INSERT" => {
             let new = Json::Object(parse_cols(body, ts));
             Some(make("insert", Some(new.clone()), None, &new))
         }
         "UPDATE" => {
-            // With REPLICA IDENTITY FULL: "old-key: <cols> new-tuple: <cols>".
-            let (old_seg, new_seg) = match body.split_once(" new-tuple: ") {
-                Some((o, n)) => (o.strip_prefix("old-key: ").unwrap_or(o), n),
-                None => ("", body), // no old (REPLICA IDENTITY DEFAULT) -> new only
+            // With REPLICA IDENTITY FULL: `old-key: <cols> new-tuple: <cols>`. The split token is
+            // matched OUTSIDE quotes so a text value containing " new-tuple: " can't break it.
+            let (old_seg, new_seg) = match find_unquoted(body, " new-tuple: ") {
+                Some(idx) => (body[..idx].strip_prefix("old-key: ").unwrap_or(&body[..idx]), &body[idx + " new-tuple: ".len()..]),
+                None => {
+                    // No old image: the table's REPLICA IDENTITY has been reset from FULL (e.g. a
+                    // migration recreated it). The engine can't retract the prior row, so a change
+                    // that moves a row OUT of a shape leaves it stale. Degraded and loud.
+                    tracing::error!(
+                        "replicator: UPDATE on {table} carries no old image — REPLICA IDENTITY is no \
+                         longer FULL; move-outs will be missed until it is restored and shapes recreated"
+                    );
+                    ("", body)
+                }
             };
-            let new = Json::Object(parse_cols(new_seg, ts));
-            let old = if old_seg.is_empty() { None } else { Some(Json::Object(parse_cols(old_seg, ts))) };
+            let mut new_map = parse_cols(new_seg, ts);
+            let old_map = if old_seg.is_empty() { None } else { Some(parse_cols(old_seg, ts)) };
+            // TOASTed-but-unchanged columns are omitted from new (see parse_cols); fill from old.
+            if let Some(ref om) = old_map {
+                for (k, v) in om {
+                    new_map.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+            let new = Json::Object(new_map);
+            let old = old_map.map(Json::Object);
             Some(make("update", Some(new.clone()), old, &new))
         }
         "DELETE" => {
+            if body.trim() == "(no-tuple-data)" {
+                // REPLICA IDENTITY reset: the delete carries no row at all. Retracting a phantom
+                // all-NULL row would be wrong either way — skip it, loudly.
+                tracing::error!(
+                    "replicator: DELETE on {table} carries no tuple data — REPLICA IDENTITY is no \
+                     longer FULL; the delete cannot be propagated and shapes will retain the row"
+                );
+                return None;
+            }
             let old = Json::Object(parse_cols(body, ts));
             Some(make("delete", None, Some(old.clone()), &old))
+        }
+        "TRUNCATE" => {
+            // Not supported: shapes/aggregates/subquery nodes would retain every truncated row.
+            tracing::error!(
+                "replicator: TRUNCATE on {table} is not supported — shapes over this table are now \
+                 stale and must be recreated"
+            );
+            None
         }
         _ => None,
     }
 }
 
-/// Extract the primary-key string from a parsed row object.
-fn key_from_obj(obj: &Json, ts: &TableSchema) -> String {
-    match obj.get(&ts.pk_name) {
-        Some(Json::Null) | None => "null".to_string(),
-        Some(Json::String(s)) => s.clone(),
-        Some(Json::Number(n)) => n.to_string(),
-        Some(Json::Bool(b)) => b.to_string(),
-        Some(v) => v.to_string(),
+/// Find `needle` in `haystack` at a position that is not inside a single-quoted string (`''` escape).
+fn find_unquoted(haystack: &str, needle: &str) -> Option<usize> {
+    let b = haystack.as_bytes();
+    let n = needle.as_bytes();
+    let mut i = 0;
+    let mut in_q = false;
+    while i < b.len() {
+        if in_q {
+            if b[i] == b'\'' {
+                if i + 1 < b.len() && b[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                in_q = false;
+            }
+            i += 1;
+        } else if b[i] == b'\'' {
+            in_q = true;
+            i += 1;
+        } else if b[i..].starts_with(n) {
+            return Some(i);
+        } else {
+            i += 1;
+        }
     }
+    None
 }
 
-/// Parse a `test_decoding` column segment ("c1[type]:v1 c2[type]:'a b' c3[type]:null") into a JSON
-/// object, converting each value by the column's schema type.
+/// Extract the new counter value from an `__el_sync` change body (last `n[...]:<int>`).
+fn parse_sync_body(body: &str) -> Option<i64> {
+    let idx = body.rfind(" n[").or_else(|| if body.starts_with("n[") { Some(0) } else { None })?;
+    let rest = &body[idx..];
+    let val_start = rest.find("]:")? + 2;
+    let rest = &rest[val_start..];
+    let end = rest.find(' ').unwrap_or(rest.len());
+    rest[..end].parse::<i64>().ok()
+}
+
+/// Extract the primary-key string from a parsed row object. For composite primary keys the column values
+/// are joined by the same separator [`TableSchema::key_string`] uses, so envelope keys match the engine's.
+fn key_from_obj(obj: &Json, ts: &TableSchema) -> String {
+    let one = |name: &str| -> String {
+        match obj.get(name) {
+            Some(Json::Null) | None => "null".to_string(),
+            Some(Json::String(s)) => s.clone(),
+            // Canonicalize through f64 for float pk columns so the envelope key matches the
+            // engine's `Value::to_key_string` (serde would print `1.0` where f64 prints `1`).
+            Some(Json::Number(n)) => match n.as_f64() {
+                Some(f) if ts.index.get(name).is_some_and(|&i| ts.columns[i].1 == ColumnType::Float) => {
+                    f.to_string()
+                }
+                _ => n.to_string(),
+            },
+            Some(Json::Bool(b)) => b.to_string(),
+            Some(v) => v.to_string(),
+        }
+    };
+    if ts.pk_cols.len() == 1 {
+        return one(&ts.pk_name);
+    }
+    ts.pk_cols.iter().map(|&i| one(&ts.columns[i].0)).collect::<Vec<_>>().join("\u{1f}")
+}
+
+/// Parse a `test_decoding` column segment (`c1[type]:v1 c2[type]:'a b' c3[type]:null`) into a JSON
+/// object, converting each value by the column's schema type. Columns reported as the TOAST sentinel
+/// (`unchanged-toast-datum`, an unmodified out-of-line value on UPDATE) are OMITTED so the caller can
+/// fill them from the old image. Quoted column names are unquoted before lookup.
 fn parse_cols(seg: &str, ts: &TableSchema) -> Map<String, Json> {
     let mut out = Map::new();
     let b = seg.as_bytes();
@@ -160,23 +356,56 @@ fn parse_cols(seg: &str, ts: &TableSchema) -> Map<String, Json> {
         if i >= b.len() {
             break;
         }
-        // column name up to '['
-        let name_start = i;
+        // column name (possibly double-quoted) up to '['
+        let name: String;
+        if b[i] == b'"' {
+            i += 1;
+            let mut s: Vec<u8> = Vec::new();
+            while i < b.len() {
+                if b[i] == b'"' {
+                    if i + 1 < b.len() && b[i + 1] == b'"' {
+                        s.push(b'"');
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                s.push(b[i]);
+                i += 1;
+            }
+            name = String::from_utf8_lossy(&s).into_owned();
+        } else {
+            let name_start = i;
+            while i < b.len() && b[i] != b'[' {
+                i += 1;
+            }
+            name = seg[name_start..i].to_string();
+        }
+        // skip "[type]" — bracket-depth aware, because array types nest brackets in the type name
+        // (`tags[integer[]]:'{1,2}'`): stopping at the first `]` would mis-parse this column AND drop
+        // every column after it (they'd silently read back as NULL).
         while i < b.len() && b[i] != b'[' {
             i += 1;
         }
-        if i >= b.len() {
-            break;
-        }
-        let name = &seg[name_start..i];
-        // skip "[type]"
-        while i < b.len() && b[i] != b']' {
+        let mut depth = 0usize;
+        while i < b.len() {
+            match b[i] {
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
             i += 1;
         }
         if i >= b.len() {
             break;
         }
-        i += 1; // past ']'
+        i += 1; // past the closing ']'
         if i >= b.len() || b[i] != b':' {
             break;
         }
@@ -211,26 +440,41 @@ fn parse_cols(seg: &str, ts: &TableSchema) -> Map<String, Json> {
             }
             value_text = seg[start..i].to_string();
         }
-        if let Some(ty) = ts.index.get(name).map(|&idx| ts.columns[idx].1) {
-            out.insert(name.to_string(), text_to_json(&value_text, is_quoted, ty));
+        // Omit TOASTed-unchanged columns so the caller fills them from the old image.
+        if !is_quoted && value_text == TOAST_SENTINEL {
+            continue;
+        }
+        if let Some(ty) = ts.index.get(&name).map(|&idx| ts.columns[idx].1) {
+            out.insert(name, text_to_json(&value_text, is_quoted, ty));
         }
     }
     out
 }
 
 /// Convert a `test_decoding` scalar (already unquoted) to JSON per the column type. Unquoted `null`
-/// is SQL NULL; quoted values are always present (text).
+/// is SQL NULL; quoted values are always present (text). A value that fails its type's parse (e.g.
+/// `NaN`/`Infinity` floats, out-of-range numerics) degrades to NULL — logged, because a real value
+/// silently becoming SQL NULL downstream is a corruption, not a convenience.
 fn text_to_json(text: &str, is_quoted: bool, ty: ColumnType) -> Json {
     if !is_quoted && text == "null" {
         return Json::Null;
     }
+    let fail = |ty: &str| {
+        tracing::error!("replicator: unparseable {ty} value {text:?} degraded to NULL");
+        Json::Null
+    };
     match ty {
-        ColumnType::Int => text.parse::<i64>().map(Json::from).unwrap_or(Json::Null),
-        ColumnType::Float => text.parse::<f64>().ok().and_then(serde_json::Number::from_f64).map(Json::Number).unwrap_or(Json::Null),
+        ColumnType::Int => text.parse::<i64>().map(Json::from).unwrap_or_else(|_| fail("int")),
+        ColumnType::Float => text
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(Json::Number)
+            .unwrap_or_else(|| fail("float")),
         ColumnType::Bool => match text {
             "t" | "true" => Json::Bool(true),
             "f" | "false" => Json::Bool(false),
-            _ => Json::Null,
+            _ => fail("bool"),
         },
         ColumnType::Text => Json::String(text.to_string()),
     }
@@ -247,16 +491,23 @@ mod tests {
         columns.insert("id".to_string(), ColumnDef { ty: ColumnType::Int });
         columns.insert("tenant".to_string(), ColumnDef { ty: ColumnType::Int });
         columns.insert("name".to_string(), ColumnDef { ty: ColumnType::Text });
-        let def = TableDef { columns, primary_key: "id".to_string() };
+        let def = TableDef { columns, primary_key: vec!["id".to_string()] };
         let mut m = HashMap::new();
         m.insert("users".to_string(), TableSchema::from_def("users", &def).unwrap());
         m
     }
 
+    // Test helper mirroring the old parse_change: build an envelope directly from a change line.
+    fn parse_change(data: &str, tables: &HashMap<String, TableSchema>) -> Option<Envelope> {
+        let (table, op, body) = parse_row(data)?;
+        let ts = tables.get(table)?;
+        build_envelope(table, ts, op, body)
+    }
+
     #[test]
     fn parses_insert_update_delete_with_old() {
         let t = users();
-        let ins = parse_change("table public.users: INSERT: id[integer]:1 tenant[integer]:7 name[text]:'a'", &t, "0/1").unwrap();
+        let ins = parse_change("table public.users: INSERT: id[integer]:1 tenant[integer]:7 name[text]:'a'", &t).unwrap();
         assert_eq!(ins.headers.operation, "insert");
         assert_eq!(ins.key, "1");
         assert_eq!(ins.value.as_ref().unwrap()["name"], "a");
@@ -264,13 +515,12 @@ mod tests {
 
         let upd = parse_change(
             "table public.users: UPDATE: old-key: id[integer]:1 tenant[integer]:7 name[text]:'a' new-tuple: id[integer]:1 tenant[integer]:7 name[text]:'b'",
-            &t, "0/2").unwrap();
+            &t).unwrap();
         assert_eq!(upd.headers.operation, "update");
         assert_eq!(upd.old.as_ref().unwrap()["name"], "a");
         assert_eq!(upd.value.as_ref().unwrap()["name"], "b");
-        assert_eq!(upd.headers.lsn.as_deref(), Some("0/2"));
 
-        let del = parse_change("table public.users: DELETE: id[integer]:1 tenant[integer]:7 name[text]:'b'", &t, "0/3").unwrap();
+        let del = parse_change("table public.users: DELETE: id[integer]:1 tenant[integer]:7 name[text]:'b'", &t).unwrap();
         assert_eq!(del.headers.operation, "delete");
         assert_eq!(del.key, "1");
         assert_eq!(del.old.as_ref().unwrap()["tenant"], 7);
@@ -278,36 +528,139 @@ mod tests {
     }
 
     #[test]
-    fn handles_null_and_quoted_spaces() {
+    fn handles_null_and_quoted_spaces_and_utf8() {
         let t = users();
-        let e = parse_change("table public.users: INSERT: id[integer]:5 tenant[integer]:null name[text]:'a b ''c'''", &t, "0/4").unwrap();
+        let e = parse_change("table public.users: INSERT: id[integer]:5 tenant[integer]:null name[text]:'a b ''c'''", &t).unwrap();
         assert_eq!(e.value.as_ref().unwrap()["tenant"], Json::Null);
         assert_eq!(e.value.as_ref().unwrap()["name"], "a b 'c'");
-
-        // Multi-byte UTF-8 must round-trip intact (not be split byte-by-byte).
-        let u = parse_change("table public.users: INSERT: id[integer]:6 name[text]:'café ☃ 北京'", &t, "0/5").unwrap();
+        let u = parse_change("table public.users: INSERT: id[integer]:6 name[text]:'café ☃ 北京'", &t).unwrap();
         assert_eq!(u.value.as_ref().unwrap()["name"], "café ☃ 北京");
     }
 
     #[test]
-    fn ignores_begin_commit_and_unwatched() {
+    fn update_split_is_quote_aware() {
+        // A text value literally containing " new-tuple: " must not break the old/new split.
         let t = users();
-        assert!(parse_change("BEGIN 700", &t, "0/1").is_none());
-        assert!(parse_change("COMMIT 700", &t, "0/1").is_none());
-        assert!(parse_change("table public.other: INSERT: id[integer]:1", &t, "0/1").is_none());
+        let line = "table public.users: UPDATE: old-key: id[integer]:1 name[text]:'x' new-tuple: id[integer]:1 name[text]:'evil new-tuple: hack'";
+        let upd = parse_change(line, &t).unwrap();
+        assert_eq!(upd.old.as_ref().unwrap()["name"], "x");
+        assert_eq!(upd.value.as_ref().unwrap()["name"], "evil new-tuple: hack");
     }
 
     #[test]
-    fn parse_sync_extracts_new_counter() {
-        // UPDATE with REPLICA IDENTITY FULL: take the new-tuple's n, not the old one.
-        assert_eq!(
-            parse_sync("table public.__el_sync: UPDATE: old-key: id[integer]:1 n[bigint]:4 new-tuple: id[integer]:1 n[bigint]:5"),
-            Some(5)
+    fn toast_unchanged_value_filled_from_old() {
+        // An unchanged TOASTed column appears as the sentinel in new-tuple; fill it from old.
+        let t = users();
+        let line = "table public.users: UPDATE: old-key: id[integer]:1 tenant[integer]:7 name[text]:'big original' new-tuple: id[integer]:1 tenant[integer]:9 name[text]:unchanged-toast-datum";
+        let upd = parse_change(line, &t).unwrap();
+        assert_eq!(upd.value.as_ref().unwrap()["tenant"], 9); // changed col taken from new
+        assert_eq!(upd.value.as_ref().unwrap()["name"], "big original"); // unchanged toast from old
+    }
+
+    #[test]
+    fn quoted_identifiers() {
+        // Quoted, schema-qualified table name + quoted column name resolve to the unquoted form.
+        let mut columns = BTreeMap::new();
+        columns.insert("id".to_string(), ColumnDef { ty: ColumnType::Int });
+        columns.insert("name".to_string(), ColumnDef { ty: ColumnType::Text });
+        let def = TableDef { columns, primary_key: vec!["id".to_string()] };
+        let mut m = HashMap::new();
+        m.insert("users".to_string(), TableSchema::from_def("users", &def).unwrap());
+        let e = parse_change(r#"table public."users": INSERT: "id"[integer]:1 "name"[text]:'a'"#, &m).unwrap();
+        assert_eq!(e.key, "1");
+        assert_eq!(e.value.as_ref().unwrap()["name"], "a");
+    }
+
+    fn rows(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(l, d)| (l.to_string(), d.to_string())).collect()
+    }
+
+    #[test]
+    fn decode_batch_stamps_commit_lsn() {
+        let t = users();
+        // A transaction: BEGIN, one insert (record lsn 0/10), COMMIT (commit lsn 0/20).
+        let batch = decode_batch(
+            &rows(&[
+                ("0/A", "BEGIN 700"),
+                ("0/10", "table public.users: INSERT: id[integer]:1 name[text]:'a'"),
+                ("0/20", "COMMIT 700"),
+            ]),
+            &t,
         );
-        // INSERT / default identity: single n.
-        assert_eq!(parse_sync("table public.__el_sync: UPDATE: id[integer]:1 n[bigint]:9"), Some(9));
-        // Unrelated changes are ignored.
-        assert_eq!(parse_sync("table public.users: INSERT: id[integer]:1 name[text]:'a'"), None);
-        assert_eq!(parse_sync("BEGIN 700"), None);
+        let envs = &batch.pending["users"];
+        assert_eq!(envs.len(), 1);
+        // Stamped with the COMMIT lsn (0/20), not the per-change record lsn (0/10).
+        assert_eq!(envs[0].headers.lsn.as_deref(), Some("0/20"));
+        assert_eq!(batch.advance_to.as_deref(), Some("0/20"));
+    }
+
+    /// Array-typed columns nest brackets in the test_decoding type name (`tags[integer[]]`). The type
+    /// skip must be bracket-depth aware or this column AND every later column silently parse as NULL.
+    #[test]
+    fn array_type_names_do_not_truncate_the_row() {
+        let mut columns = BTreeMap::new();
+        columns.insert("id".to_string(), ColumnDef { ty: ColumnType::Int });
+        columns.insert("tags".to_string(), ColumnDef { ty: ColumnType::Text });
+        columns.insert("name".to_string(), ColumnDef { ty: ColumnType::Text });
+        let def = TableDef { columns, primary_key: vec!["id".to_string()] };
+        let mut m = HashMap::new();
+        m.insert("users".to_string(), TableSchema::from_def("users", &def).unwrap());
+        let e = parse_change(
+            "table public.users: INSERT: id[integer]:1 tags[integer[]]:'{1,2}' name[text]:'after'",
+            &m,
+        )
+        .unwrap();
+        assert_eq!(e.value.as_ref().unwrap()["tags"], "{1,2}");
+        assert_eq!(e.value.as_ref().unwrap()["name"], "after"); // the column after the array survives
+    }
+
+    /// COMMIT stamps each buffered change with the transaction's xid (the snapshot-gate fence) and its
+    /// position within the transaction (the tailer's de-duplication key).
+    #[test]
+    fn decode_batch_stamps_xid_and_seq() {
+        let t = users();
+        let batch = decode_batch(
+            &rows(&[
+                ("0/A", "BEGIN 700"),
+                ("0/10", "table public.users: INSERT: id[integer]:1 name[text]:'a'"),
+                ("0/12", "table public.users: INSERT: id[integer]:2 name[text]:'b'"),
+                ("0/20", "COMMIT 700"),
+            ]),
+            &t,
+        );
+        let envs = &batch.pending["users"];
+        assert_eq!(envs.len(), 2);
+        assert_eq!(envs[0].headers.txid.as_deref(), Some("700"));
+        assert_eq!(envs[0].headers.seq, Some(0));
+        assert_eq!(envs[1].headers.txid.as_deref(), Some("700"));
+        assert_eq!(envs[1].headers.seq, Some(1));
+    }
+
+    /// A DELETE with no tuple data (REPLICA IDENTITY no longer FULL) must be skipped, not turned into
+    /// a phantom all-NULL retraction; TRUNCATE produces no envelope.
+    #[test]
+    fn degraded_forms_are_skipped() {
+        let t = users();
+        assert!(parse_change("table public.users: DELETE: (no-tuple-data)", &t).is_none());
+        assert!(parse_change("table public.users: TRUNCATE: (no-flags)", &t).is_none());
+    }
+
+    #[test]
+    fn parse_sync_anchored_to_sync_table() {
+        let t = users();
+        // A data row whose TEXT value contains the sentinel substring must NOT be taken as sync.
+        let batch = decode_batch(
+            &rows(&[
+                ("0/A", "BEGIN 1"),
+                ("0/10", "table public.users: INSERT: id[integer]:1 name[text]:'public.__el_sync: n[bigint]:999'"),
+                ("0/20", "COMMIT 1"),
+                ("0/B", "BEGIN 2"),
+                ("0/30", "table public.__el_sync: UPDATE: id[integer]:1 n[bigint]:5"),
+                ("0/40", "COMMIT 2"),
+            ]),
+            &t,
+        );
+        assert_eq!(batch.max_sync, Some(5)); // only the real sentinel row counts
+        assert_eq!(batch.pending["users"].len(), 1); // the data row is still ingested
     }
 }

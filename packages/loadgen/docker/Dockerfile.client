@@ -1,0 +1,23 @@
+# Load-generator CLIENT worker image. Runs LOADGEN_MODE=client — it connects to an already-running
+# infra (API + durable-streams + Postgres) and drives simulated users. It does NOT boot infra or the
+# Rust engine, so this is a pure Node image. Scale it with `docker compose up --scale client=N` to run
+# many client "nodes", each in its own network namespace (its own ephemeral-port range) — the way to
+# push past a single machine's outbound-connection ceiling.
+#
+# Build context is the repo root (see compose.yaml).
+
+FROM node:22-slim
+
+RUN corepack enable
+WORKDIR /repo
+
+# Copy the whole monorepo (a .dockerignore prunes node_modules/target/.git). pnpm resolves the
+# workspace; the client only pulls the JS packages it needs (client/protocol/api + pg). `--ignore-scripts`
+# skips native postinstall builds (e.g. LMDB in @durable-streams/server) — client mode never loads them
+# (durable-streams-server is lazily imported only in infra mode).
+COPY . .
+RUN pnpm install --ignore-scripts
+
+WORKDIR /repo/packages/loadgen
+ENV LOADGEN_MODE=client
+CMD ["pnpm", "exec", "tsx", "src/run.ts"]

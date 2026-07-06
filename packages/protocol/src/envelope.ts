@@ -17,6 +17,18 @@ export interface StreamEnvelope {
     txid?: string
     /** Stamped by the server on read; never sent by producers. */
     offset?: string
+    /**
+     * Postgres commit LSN (`"HI/LO"` hex) of the change, stamped by the engine on live shape/feed
+     * envelopes. Lets a subset client position its live tail at the page snapshot — drop deltas with
+     * `lsn < snapshotLsn`. Absent on backfill rows and in library (no-Postgres) mode.
+     */
+    lsn?: string
+    /**
+     * Position of the change within its transaction, stamped by the replication ingestor on
+     * table-stream envelopes. `(lsn, seq)` uniquely identifies a change so the engine tailer can
+     * skip duplicates from the ingestor's at-least-once redelivery. Not present on shape streams.
+     */
+    seq?: number
   }
 }
 

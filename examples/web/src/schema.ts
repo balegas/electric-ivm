@@ -1,4 +1,4 @@
-import type { Schema } from '@electric-lite/protocol'
+import type { Schema } from '@electric-ivm/protocol'
 
 export const schema: Schema = {
   tables: {

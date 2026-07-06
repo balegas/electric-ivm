@@ -3,7 +3,7 @@
 // record, so we also write to it directly (bypassing the applyOp helper) to prove the engine tracks
 // the database itself — and still compare the materialized shape to the oracle (the same Postgres).
 
-import type { Schema, ShapeDef } from '@electric-lite/protocol'
+import type { Schema, ShapeDef } from '@electric-ivm/protocol'
 import pgpkg from 'pg'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { formatCompare } from './compare.js'

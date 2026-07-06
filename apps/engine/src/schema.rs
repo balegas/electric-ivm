@@ -1,4 +1,4 @@
-//! Schema types (deserialized from the control-plane JSON, mirroring `@electric-lite/protocol`)
+//! Schema types (deserialized from the control-plane JSON, mirroring `@electric-ivm/protocol`)
 //! and their compiled, positional runtime form.
 
 use std::collections::BTreeMap;
@@ -29,8 +29,22 @@ pub struct TableDef {
     // BTreeMap gives a deterministic (sorted) column order regardless of JSON key order, which
     // we use as the positional Row order. Only internal consistency matters.
     pub columns: BTreeMap<String, ColumnDef>,
-    #[serde(rename = "primaryKey")]
-    pub primary_key: String,
+    // Accepts a single column name (`"id"`) or an ordered list (`["a","b"]`) for composite keys.
+    #[serde(rename = "primaryKey", deserialize_with = "de_primary_key")]
+    pub primary_key: Vec<String>,
+}
+
+fn de_primary_key<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum One {
+        Many(Vec<String>),
+        Single(String),
+    }
+    Ok(match One::deserialize(d)? {
+        One::Single(s) => vec![s],
+        One::Many(v) => v,
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -44,10 +58,18 @@ pub struct TableSchema {
     pub name: String,
     pub columns: Vec<(String, ColumnType)>,
     pub index: HashMap<String, usize>,
+    /// First primary-key column index/name/type. For single-PK tables this IS the pk; for composite-PK
+    /// tables (only used as subquery inner tables) it's the first key column — prefer `pk_cols`/`key_string`.
     pub pk_index: usize,
     pub pk_name: String,
     pub pk_type: ColumnType,
+    /// All primary-key column indices, in order. Length 1 for the common single-PK case.
+    pub pk_cols: Vec<usize>,
 }
+
+/// Separator joining composite-key column values into the durable-stream `key` string. Chosen to not
+/// collide with real id text (the standard schema's ids are `l1-1` etc.).
+const PK_SEP: char = '\u{1f}';
 
 impl TableSchema {
     pub fn from_def(name: &str, def: &TableDef) -> Result<Self> {
@@ -55,18 +77,40 @@ impl TableSchema {
             def.columns.iter().map(|(c, d)| (c.clone(), d.ty)).collect();
         let index: HashMap<String, usize> =
             columns.iter().enumerate().map(|(i, (c, _))| (c.clone(), i)).collect();
-        let pk_index = *index
-            .get(&def.primary_key)
-            .ok_or_else(|| anyhow::anyhow!("primaryKey '{}' is not a column", def.primary_key))?;
+        if def.primary_key.is_empty() {
+            anyhow::bail!("table '{name}' has no primary key");
+        }
+        let pk_cols: Vec<usize> = def
+            .primary_key
+            .iter()
+            .map(|c| index.get(c).copied().ok_or_else(|| anyhow::anyhow!("primaryKey '{c}' is not a column")))
+            .collect::<Result<_>>()?;
+        let pk_index = pk_cols[0];
         let pk_type = columns[pk_index].1;
         Ok(TableSchema {
             name: name.to_string(),
             columns,
             index,
             pk_index,
-            pk_name: def.primary_key.clone(),
+            pk_name: def.primary_key[0].clone(),
             pk_type,
+            pk_cols,
         })
+    }
+
+    /// The durable-stream event `key` for a row: the single PK value's key-string, or composite PK column
+    /// values joined by [`PK_SEP`]. This is the row identity used for routing, dedup, and subquery
+    /// contributor ref-counting.
+    pub fn key_string(&self, row: &Row) -> Result<String> {
+        if self.pk_cols.len() == 1 {
+            return Ok(row.get(self.pk_cols[0])?.to_key_string());
+        }
+        let parts: Vec<String> = self
+            .pk_cols
+            .iter()
+            .map(|&i| row.get(i).map(Value::to_key_string))
+            .collect::<Result<_>>()?;
+        Ok(parts.join(&PK_SEP.to_string()))
     }
 
     pub fn column_index(&self, col: &str) -> Result<usize> {
@@ -90,10 +134,23 @@ impl TableSchema {
 
     /// Serialize a `Row` back to a JSON object keyed by column name.
     pub fn row_to_json(&self, row: &Row) -> serde_json::Value {
-        let mut m = serde_json::Map::with_capacity(self.columns.len());
-        for (i, (cname, _)) in self.columns.iter().enumerate() {
-            let v = row.0.get(i).cloned().unwrap_or(Value::Null);
-            m.insert(cname.clone(), v.to_json());
+        self.row_to_json_cols(row, None)
+    }
+
+    /// Serialize a row to a JSON object. With `cols = Some(indices)` only those columns are emitted
+    /// (a shape's output projection); `None` emits the full row. Used to keep large unused columns out
+    /// of a shape's stream (e.g. the list view never reads `description`).
+    pub fn row_to_json_cols(&self, row: &Row, cols: Option<&[usize]>) -> serde_json::Value {
+        let mut m = serde_json::Map::with_capacity(cols.map_or(self.columns.len(), <[usize]>::len));
+        let mut emit = |i: usize| {
+            if let Some((cname, _)) = self.columns.get(i) {
+                let v = row.0.get(i).cloned().unwrap_or(Value::Null);
+                m.insert(cname.clone(), v.to_json());
+            }
+        };
+        match cols {
+            Some(cols) => cols.iter().for_each(|&i| emit(i)),
+            None => (0..self.columns.len()).for_each(emit),
         }
         serde_json::Value::Object(m)
     }

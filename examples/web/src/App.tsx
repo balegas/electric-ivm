@@ -2,9 +2,8 @@ import type { Collection } from '@tanstack/db'
 import { useLiveQuery } from '@tanstack/react-db'
 import { useEffect, useState } from 'react'
 
-import type { ShapeMaterialization } from '@electric-lite/client'
+import type { ShapeMaterialization } from '@electric-ivm/client'
 
-import { client } from './electric'
 import { getShapes, type Shapes } from './shapes'
 
 interface Todo {
@@ -12,6 +11,25 @@ interface Todo {
   title: string
   priority: number
   done: boolean
+}
+
+// Writes go to Postgres (the system of record) via the dev server's /pg/write middleware; the engine
+// picks them up through logical replication and updates the live shapes. Fire-and-forget from the UI
+// (the live shape reflects the result), but failures are surfaced rather than silently swallowed.
+async function pgWrite(body: { table: string; op: 'insert' | 'update' | 'delete'; pk: number; row?: Todo | object }) {
+  try {
+    const res = await fetch('/pg/write', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '')
+      console.error(`pg/write ${body.op} ${body.table} failed: ${res.status} ${detail}`)
+    }
+  } catch (e) {
+    console.error(`pg/write ${body.op} ${body.table} failed:`, e)
+  }
 }
 
 // Render a shape's TanStack DB collection reactively via @tanstack/react-db's useLiveQuery.
@@ -32,7 +50,7 @@ export function App(): JSX.Element {
   useEffect(() => {
     getShapes().then(setShapes)
   }, [])
-  if (!shapes) return <div className="loading">Connecting to electric-lite…</div>
+  if (!shapes) return <div className="loading">Connecting to electric-ivm…</div>
   return <Board shapes={shapes} />
 }
 
@@ -42,12 +60,12 @@ function Board({ shapes }: { shapes: Shapes }): JSX.Element {
   const nextId = all.reduce((m, t) => Math.max(m, Number(t.id)), 0) + 1
 
   const addTodo = (title: string, priority: number) =>
-    client.tables.todos.insert({ id: nextId, title, priority, done: false })
+    pgWrite({ table: 'todos', op: 'insert', pk: nextId, row: { id: nextId, title, priority, done: false } })
   const toggle = (t: Todo) =>
-    client.tables.todos.update({ id: Number(t.id), title: t.title, priority: t.priority, done: !t.done })
+    pgWrite({ table: 'todos', op: 'update', pk: Number(t.id), row: { id: Number(t.id), title: t.title, priority: t.priority, done: !t.done } })
   const bump = (t: Todo, d: number) =>
-    client.tables.todos.update({ id: Number(t.id), title: t.title, priority: Math.min(5, Math.max(1, t.priority + d)), done: t.done })
-  const remove = (t: Todo) => client.tables.todos.delete(Number(t.id))
+    pgWrite({ table: 'todos', op: 'update', pk: Number(t.id), row: { id: Number(t.id), title: t.title, priority: Math.min(5, Math.max(1, t.priority + d)), done: t.done } })
+  const remove = (t: Todo) => pgWrite({ table: 'todos', op: 'delete', pk: Number(t.id) })
 
   const liveSorted = [...live].sort((a, b) => b.priority - a.priority || Number(a.id) - Number(b.id))
   const allSorted = [...all].sort((a, b) => Number(a.id) - Number(b.id))
@@ -55,10 +73,11 @@ function Board({ shapes }: { shapes: Shapes }): JSX.Element {
   return (
     <div className="app">
       <header>
-        <h1>electric-lite</h1>
+        <h1>electric-ivm</h1>
         <p>
-          A reactive database: writes flow through durable streams → a dbsp filter circuit per shape →
-          materialized live in the browser with <strong>stream-db + TanStack DB</strong>.
+          A reactive database: writes go to <strong>Postgres</strong> → captured via logical
+          replication → a dbsp filter circuit per shape → materialized live in the browser with{' '}
+          <strong>stream-db + TanStack DB</strong>.
         </p>
       </header>
 

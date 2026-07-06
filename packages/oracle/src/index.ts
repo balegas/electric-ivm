@@ -1,6 +1,6 @@
-// pglite-backed oracle: a real Postgres that receives the same change events as electric-lite
+// pglite-backed oracle: a real Postgres that receives the same change events as electric-ivm
 // and answers `SELECT * WHERE <predicate>` for any shape. The conformance invariant is that
-// electric-lite's materialized shape set equals this oracle's result set for the same op stream.
+// electric-ivm's materialized shape set equals this oracle's result set for the same op stream.
 
 import { PGlite } from '@electric-sql/pglite'
 import {
@@ -11,7 +11,7 @@ import {
   type ShapeDef,
   shapeSelectSql,
   tableDDL,
-} from '@electric-lite/protocol'
+} from '@electric-ivm/protocol'
 import pgpkg from 'pg'
 
 export interface Oracle {

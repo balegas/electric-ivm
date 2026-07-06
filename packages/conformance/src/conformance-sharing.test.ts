@@ -1,9 +1,9 @@
 // Pipeline-sharing conformance: many shapes that differ only in an equality constant must (a) each
 // still match pglite exactly, and (b) share ONE dbsp circuit per template rather than spawning N.
 // Sharing is verified via the engine's `GET /tables/:name/families` introspection endpoint.
-// See docs/superpowers/specs/2026-06-27-shape-pipeline-sharing-design.md.
+// See docs/ivm-engine-internals.md §3 (shared execution strategies).
 
-import type { Schema, ShapeDef } from '@electric-lite/protocol'
+import type { Schema, ShapeDef } from '@electric-ivm/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { formatCompare } from './compare.js'
 import { applyOp, bootHarness, drainEngine, type Harness, waitForConvergence } from './harness.js'

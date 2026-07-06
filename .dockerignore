@@ -1,0 +1,9 @@
+**/node_modules
+target
+.git
+**/dist
+results
+examples/*/node_modules
+.playwright-mcp
+*.log
+erl_crash.dump

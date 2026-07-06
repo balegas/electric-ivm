@@ -1,11 +1,11 @@
 // Oracle-driven property/fuzz test: the loop an agent iterates against. For each random seed
 // it generates random-predicate shapes (eq/neq/lt/lte/gt/gte + and/or/not over the schema),
-// applies a random op stream to electric-lite AND pglite, and asserts every shape's
+// applies a random op stream to electric-ivm AND pglite, and asserts every shape's
 // client-materialized set equals the oracle. A failure prints the seed for exact replay.
 //
 // Tunables (env): FUZZ_SEEDS (scenarios per run), FUZZ_SHAPES, FUZZ_OPS, SEED (base seed).
 
-import type { Schema } from '@electric-lite/protocol'
+import type { Schema } from '@electric-ivm/protocol'
 import { describe, expect, it } from 'vitest'
 import { formatCompare } from './compare.js'
 import { applyOp, bootHarness, drainEngine, waitForConvergence } from './harness.js'

@@ -25,13 +25,19 @@ const schemaSchema = z.object({
   ),
 })
 
-// Recursive predicate AST: leaf | and | or | not.
+// Recursive predicate AST: leaf | is-null | and | or | not | in-subquery.
 const predicateSchema: z.ZodType = z.lazy(() =>
   z.union([
     z.object({ col: z.string(), op: leafOp, value: valueSchema }),
+    z.object({ col: z.string(), isNull: z.boolean() }),
     z.object({ and: z.array(predicateSchema) }),
     z.object({ or: z.array(predicateSchema) }),
     z.object({ not: predicateSchema }),
+    z.object({
+      col: z.string(),
+      in: z.object({ table: z.string(), project: z.string(), where: predicateSchema.optional() }),
+      negated: z.boolean().optional(),
+    }),
   ]),
 )
 
@@ -61,9 +67,9 @@ export const appRouter = t.router({
 
   shapes: t.router({
     create: t.procedure
-      .input(z.object({ table: z.string(), where: predicateSchema.optional() }))
+      .input(z.object({ table: z.string(), where: predicateSchema.optional(), columns: z.array(z.string()).optional() }))
       .mutation(async ({ input, ctx }) =>
-        ctx.core.createShape({ table: input.table, where: input.where as never }),
+        ctx.core.createShape({ table: input.table, where: input.where as never, columns: input.columns }),
       ),
 
     get: t.procedure.input(z.object({ id: z.string() })).query(async ({ input, ctx }) => {
@@ -71,6 +77,64 @@ export const appRouter = t.router({
       if (!handle) throw new TRPCError({ code: 'NOT_FOUND', message: `shape ${input.id} not found` })
       return handle
     }),
+
+    delete: t.procedure
+      .input(z.object({ id: z.string() }))
+      .mutation(async ({ input, ctx }) => {
+        await ctx.core.dropShape(input.id)
+        return { ok: true as const }
+      }),
+  }),
+
+  // Subset queries — the non-materialized counterpart to shapes. `query` is a one-shot, cacheable
+  // read (no stream, no live state); page by moving a keyset cursor in `where` or bumping `offset`.
+  // `live` opens a changes-only tail feed on the base predicate that the client follows to keep a
+  // loaded page live (re-checking view membership client-side) — a single predicate, no range fanout.
+  subset: t.router({
+    query: t.procedure
+      .input(
+        z.object({
+          table: z.string(),
+          where: predicateSchema.optional(),
+          columns: z.array(z.string()).optional(),
+          orderBy: z.object({ col: z.string(), desc: z.boolean().optional() }).optional(),
+          limit: z.number().int().nonnegative().optional(),
+          offset: z.number().int().nonnegative().optional(),
+        }),
+      )
+      .query(async ({ input, ctx }) =>
+        ctx.core.querySubset({
+          table: input.table,
+          where: input.where as never,
+          columns: input.columns,
+          orderBy: input.orderBy,
+          limit: input.limit,
+          offset: input.offset,
+        }),
+      ),
+
+    live: t.procedure
+      .input(z.object({ table: z.string(), where: predicateSchema.optional(), columns: z.array(z.string()).optional() }))
+      .mutation(async ({ input, ctx }) =>
+        ctx.core.createSubsetFeed({ table: input.table, where: input.where as never, columns: input.columns }),
+      ),
+  }),
+
+  // Scalar aggregations (COUNT/SUM/AVG/MIN/MAX) over a filter — an electric-ivm extension, maintained
+  // incrementally by the engine and streamed as a single live value.
+  aggregate: t.router({
+    create: t.procedure
+      .input(
+        z.object({
+          table: z.string(),
+          where: predicateSchema.optional(),
+          fn: z.enum(['count', 'sum', 'avg', 'min', 'max']),
+          col: z.string().optional(),
+        }),
+      )
+      .mutation(async ({ input, ctx }) =>
+        ctx.core.createAggregate({ table: input.table, where: input.where as never, fn: input.fn, col: input.col }),
+      ),
   }),
 })
 

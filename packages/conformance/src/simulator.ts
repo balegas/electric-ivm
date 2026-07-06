@@ -3,7 +3,7 @@
 // pk space (so inserts/updates/deletes naturally overlap and exercise enter/leave/update).
 
 import { en, Faker, generateMersenne53Randomizer } from '@faker-js/faker'
-import type { ChangeEvent, Row, Schema, TableDef, Value } from '@electric-lite/protocol'
+import type { ChangeEvent, Row, Schema, TableDef, Value } from '@electric-ivm/protocol'
 
 export interface SimOp {
   table: string
@@ -92,7 +92,7 @@ export function randomSeed(): number {
   return f.seed()
 }
 
-import type { LeafOp, Predicate, ShapeDef } from '@electric-lite/protocol'
+import type { LeafOp, Predicate, ShapeDef } from '@electric-ivm/protocol'
 
 const ALL_OPS: LeafOp[] = ['eq', 'neq', 'lt', 'lte', 'gt', 'gte']
 
@@ -143,6 +143,10 @@ export function randomShapeDefs(
   function leaf(def: TableDef): Predicate {
     const cols = Object.entries(def.columns)
     const [col, c] = f.helpers.arrayElement(cols)
+    // ~10% null-test leaves (`col IS [NOT] NULL`) — the one predicate that is TRUE on a NULL cell.
+    if (f.datatype.boolean(0.1)) {
+      return { col, isNull: f.datatype.boolean() }
+    }
     // bool columns only get eq/neq (ordering is uninteresting); others get any op.
     const op = c.type === 'bool' ? f.helpers.arrayElement<LeafOp>(['eq', 'neq']) : f.helpers.arrayElement(ALL_OPS)
     return { col, op, value: genValue(c.type) }

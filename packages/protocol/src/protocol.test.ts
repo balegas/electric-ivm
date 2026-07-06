@@ -2,10 +2,13 @@ import { describe, expect, it } from 'vitest'
 import {
   changeEventToDML,
   evaluate,
+  type InSubqueryPredicate,
+  isInSubquery,
   type Predicate,
   PredicateError,
   predicateToSql,
   type Row,
+  type Schema,
   shapeSelectSql,
   tableDDL,
   type TableDef,
@@ -102,6 +105,63 @@ describe('predicateToSql', () => {
   })
 })
 
+describe('subqueries', () => {
+  const schema: Schema = {
+    tables: {
+      parent: { columns: { id: { type: 'int' }, active: { type: 'bool' } }, primaryKey: 'id' },
+      child: { columns: { id: { type: 'int' }, parent_id: { type: 'int' } }, primaryKey: 'id' },
+    },
+  }
+  const sub: InSubqueryPredicate = {
+    col: 'parent_id',
+    in: { table: 'parent', project: 'id', where: { col: 'active', op: 'eq', value: true } },
+  }
+
+  it('recognizes an in-subquery leaf (and not as a plain leaf)', () => {
+    expect(isInSubquery(sub)).toBe(true)
+    expect(isInSubquery({ col: 'parent_id', op: 'eq', value: 1 } as Predicate)).toBe(false)
+  })
+
+  it('validates the inner where against the inner table', () => {
+    expect(() => validatePredicate(sub, schema.tables.child!, schema)).not.toThrow()
+    const badInnerCol: InSubqueryPredicate = {
+      col: 'parent_id',
+      in: { table: 'parent', project: 'id', where: { col: 'nope', op: 'eq', value: true } },
+    }
+    expect(() => validatePredicate(badInnerCol, schema.tables.child!, schema)).toThrow(PredicateError)
+    const badProject: InSubqueryPredicate = { col: 'parent_id', in: { table: 'parent', project: 'nope' } }
+    expect(() => validatePredicate(badProject, schema.tables.child!, schema)).toThrow(PredicateError)
+    const badOuterCol: InSubqueryPredicate = { col: 'nope', in: { table: 'parent', project: 'id' } }
+    expect(() => validatePredicate(badOuterCol, schema.tables.child!, schema)).toThrow(PredicateError)
+    expect(() => validatePredicate(sub, schema.tables.child!)).toThrow(/requires a schema/)
+  })
+
+  it('evaluate() throws on a subquery (resolved via SQL, not the row evaluator)', () => {
+    expect(() => evaluate(sub, { parent_id: 1 })).toThrow(/subquery/)
+  })
+
+  it('emits IN (SELECT …) SQL with parameterized inner literals', () => {
+    const f = predicateToSql(sub, 1)
+    expect(f.text).toBe('"parent_id" IN (SELECT "id" FROM "parent" WHERE "active" = $1)')
+    expect(f.params).toEqual([true])
+  })
+
+  it('emits NOT IN and supports an omitted inner where', () => {
+    const f = predicateToSql({ col: 'parent_id', negated: true, in: { table: 'parent', project: 'id' } }, 1)
+    expect(f.text).toBe('"parent_id" NOT IN (SELECT "id" FROM "parent")')
+    expect(f.params).toEqual([])
+  })
+
+  it('composes inside shapeSelectSql with surrounding params', () => {
+    const where: Predicate = { and: [{ col: 'id', op: 'gt', value: 5 }, sub] }
+    const f = shapeSelectSql('child', where)
+    expect(f.text).toBe(
+      'SELECT * FROM "child" WHERE ("id" > $1 AND "parent_id" IN (SELECT "id" FROM "parent" WHERE "active" = $2))',
+    )
+    expect(f.params).toEqual([5, true])
+  })
+})
+
 describe('tableDDL', () => {
   it('emits CREATE TABLE with a primary key', () => {
     const ddl = tableDDL('users', users)
@@ -114,8 +174,20 @@ describe('tableDDL', () => {
 })
 
 describe('changeEventToDML', () => {
-  it('upserts on insert/update', () => {
+  it('upserts the full row on insert', () => {
     const f = changeEventToDML('users', users, { op: 'insert', pk: 1, row: alice })
+    expect(f.text).toContain('INSERT INTO "users"')
+    expect(f.text).toContain('ON CONFLICT ("id") DO UPDATE SET')
+    expect(f.text).toContain('"name" = EXCLUDED."name"')
+    expect(f.params).toEqual([1, 'Alice', 30, true, 9.5])
+  })
+  it('updates only the columns present in the row (partial patch)', () => {
+    const f = changeEventToDML('users', users, { op: 'update', pk: 1, row: { name: 'Alicia', age: 31 } })
+    expect(f.text).toBe('UPDATE "users" SET "name" = $1, "age" = $2 WHERE "id" = $3')
+    expect(f.params).toEqual(['Alicia', 31, 1])
+  })
+  it('upserts when a full row is given (an update with a new pk inserts it — Electric semantics)', () => {
+    const f = changeEventToDML('users', users, { op: 'update', pk: 1, row: alice })
     expect(f.text).toContain('INSERT INTO "users"')
     expect(f.text).toContain('ON CONFLICT ("id") DO UPDATE SET')
     expect(f.text).toContain('"name" = EXCLUDED."name"')

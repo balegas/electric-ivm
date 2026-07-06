@@ -1,17 +1,20 @@
 {
-  "name": "@electric-lite/bench",
+  "name": "@electric-ivm/bench",
   "version": "0.0.0",
   "private": true,
   "type": "module",
   "scripts": {
     "bench": "tsx src/run.ts",
-    "memtest": "tsx src/memtest.ts"
+    "shape-mem": "tsx src/shape-mem-matrix.ts",
+    "electric-adapter": "tsx src/electric-adapter.ts",
+    "electric-fleet": "tsx src/electric-bench-runner.ts"
   },
   "dependencies": {
-    "@electric-lite/protocol": "workspace:*",
-    "@electric-lite/api": "workspace:*",
-    "@electric-lite/client": "workspace:*",
+    "@electric-ivm/protocol": "workspace:*",
+    "@electric-ivm/api": "workspace:*",
+    "@electric-ivm/client": "workspace:*",
     "@durable-streams/server": "^0.3.7",
+    "pg": "^8.13.1",
     "tsx": "^4.19.2"
   }
 }

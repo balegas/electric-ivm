@@ -1,5 +1,5 @@
 {
-  "name": "electric-lite",
+  "name": "electric-ivm",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -11,12 +11,16 @@
     "test": "vitest run",
     "test:conformance": "vitest run packages/conformance",
     "test:fuzz": "vitest run packages/conformance/src/conformance-fuzz.test.ts",
-    "engine:build": "cargo build -p electric-lite-engine",
-    "engine:test": "cargo test -p electric-lite-engine",
+    "engine:build": "cargo build -p electric-ivm-engine",
+    "engine:test": "cargo test -p electric-ivm-engine",
     "loop": "bash scripts/conformance-loop.sh",
-    "demo": "pnpm --filter @electric-lite/examples demo",
-    "demo:web": "pnpm --filter @electric-lite/web start",
-    "bench": "pnpm --filter @electric-lite/bench bench"
+    "demo": "pnpm --filter @electric-ivm/examples demo",
+    "demo:web": "pnpm --filter @electric-ivm/web start",
+    "demo:linearlite": "pnpm --filter @electric-ivm/linearlite start",
+    "bench": "pnpm --filter @electric-ivm/bench bench",
+    "bench:fleet": "pnpm --filter @electric-ivm/bench electric-fleet",
+    "docker:build": "docker compose -f docker/compose.yaml build",
+    "docker:up": "docker compose -f docker/compose.yaml up"
   },
   "devDependencies": {
     "typescript": "^5.7.2",

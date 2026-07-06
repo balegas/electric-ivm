@@ -1,6 +1,6 @@
 //! Control-plane HTTP API (the swappable interface in front of the engine).
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -16,18 +16,86 @@ pub fn router(engine: Engine) -> Router {
         .route("/health", get(|| async { "ok" }))
         .route("/schema", post(define_schema))
         .route("/shapes", post(create_shape))
+        .route("/aggregate", post(create_aggregate))
         .route("/shapes/{id}", get(get_shape).delete(drop_shape))
+        .route("/shapes/{id}/rows", get(get_shape_rows))
+        .route("/shapes/{id}/log", get(get_shape_log))
+        .route("/query", post(query_subset))
         .route("/tables/{name}/offset", get(table_offset))
         .route("/tables/{name}/families", get(table_families))
+        .route("/subqueries", get(subquery_stats))
+        .route("/graph", get(get_graph))
+        .route("/graph/node", get(get_node_index))
         .route("/replication/lsn", get(replication_lsn))
         .route("/metrics", get(get_metrics))
         .route("/metrics/reset", post(reset_metrics))
+        .route("/memory", get(get_memory))
+        .route("/metrics/prometheus", get(get_prometheus))
+        // Per-envelope pipeline trace (SSE) — best-effort, for visualization/debugging.
+        .route("/trace", get(get_trace))
+        // Electric-protocol adapter: lets Electric's official client + oracle harness read our shapes.
+        .route("/v1/shape", get(crate::electric::shape))
         .with_state(engine)
+}
+
+/// SSE stream of per-envelope [`crate::trace::TraceEvent`]s (one JSON object per `data:` line).
+/// Lossy by design: a lagging subscriber silently skips the events it missed rather than slowing
+/// envelope processing.
+async fn get_trace(State(engine): State<Engine>) -> impl IntoResponse {
+    use tokio_stream::StreamExt;
+    let rx = engine.trace_sender().subscribe();
+    let stream = tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|item| match item {
+        Ok(json) => Some(Ok::<_, std::convert::Infallible>(
+            axum::response::sse::Event::default().data(json.as_str()),
+        )),
+        // Lagged: drop the gap marker; the consumer treats trace as best-effort animation.
+        Err(_) => None,
+    });
+    axum::response::sse::Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
 #[derive(Deserialize)]
 struct DefineSchemaReq {
     schema: Schema,
+}
+
+#[derive(Deserialize)]
+struct SubsetOrderByReq {
+    col: String,
+    #[serde(default)]
+    desc: bool,
+}
+
+/// A one-shot subset query (the non-materialized counterpart to `/shapes`).
+#[derive(Deserialize)]
+struct QueryReq {
+    table: String,
+    #[serde(default, rename = "where")]
+    where_: Option<PredicateJson>,
+    #[serde(default)]
+    columns: Option<Vec<String>>,
+    #[serde(default, rename = "orderBy")]
+    order_by: Option<SubsetOrderByReq>,
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    offset: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct QueryResp {
+    rows: Vec<serde_json::Value>,
+    lsn: String,
+}
+
+async fn query_subset(
+    State(engine): State<Engine>,
+    Json(req): Json<QueryReq>,
+) -> Result<Json<QueryResp>, AppError> {
+    let order_by = req.order_by.map(|o| (o.col, o.desc));
+    let (rows, lsn) =
+        engine.query_subset(&req.table, req.where_, req.columns, order_by, req.limit, req.offset).await?;
+    Ok(Json(QueryResp { rows, lsn }))
 }
 
 async fn define_schema(
@@ -43,6 +111,13 @@ struct CreateShapeReq {
     table: String,
     #[serde(default, rename = "where")]
     where_: Option<PredicateJson>,
+    /// Optional output projection: column names to sync. Omitted = the full row.
+    #[serde(default)]
+    columns: Option<Vec<String>>,
+    /// When true, skip the backfill and stream only future matching changes (a non-materialized live
+    /// tail feed). Used by subset queries; a normal materialized shape leaves this false.
+    #[serde(default, rename = "changesOnly")]
+    changes_only: bool,
 }
 
 #[derive(Serialize)]
@@ -65,7 +140,28 @@ async fn create_shape(
     State(engine): State<Engine>,
     Json(req): Json<CreateShapeReq>,
 ) -> Result<Json<ShapeResp>, AppError> {
-    let rec = engine.create_shape(&req.table, req.where_).await?;
+    // share = true: identical reference shapes from multiple clients collapse to one maintained stream.
+    let rec = engine.create_shape(&req.table, req.where_, req.columns, req.changes_only, true).await?;
+    Ok(Json(ShapeResp::of(&engine, rec)))
+}
+
+#[derive(Deserialize)]
+struct AggregateReq {
+    table: String,
+    #[serde(default, rename = "where")]
+    where_: Option<PredicateJson>,
+    #[serde(rename = "fn")]
+    func: crate::engine::AggFn,
+    #[serde(default)]
+    col: Option<String>,
+}
+
+/// Create a scalar aggregation shape (electric-ivm extension; not in the Electric protocol).
+async fn create_aggregate(
+    State(engine): State<Engine>,
+    Json(req): Json<AggregateReq>,
+) -> Result<Json<ShapeResp>, AppError> {
+    let rec = engine.create_aggregate(&req.table, req.where_, req.func, req.col).await?;
     Ok(Json(ShapeResp::of(&engine, rec)))
 }
 
@@ -77,6 +173,157 @@ async fn get_shape(
         Some(rec) => Ok(Json(ShapeResp::of(&engine, rec))),
         None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("shape {id} not found") }),
     }
+}
+
+#[derive(Deserialize)]
+struct ShapeRowsQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct ShapeRowEntry {
+    key: String,
+    value: serde_json::Value,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ShapeRowsResp {
+    id: String,
+    table: String,
+    changes_only: bool,
+    /// Total materialized rows (before the display cap).
+    count: usize,
+    truncated: bool,
+    rows: Vec<ShapeRowEntry>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ShapeLogEntry {
+    op: String,
+    key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<serde_json::Value>,
+    /// Prior row on update/delete (REPLICA IDENTITY FULL) — lets a UI show what a delete removed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    old: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lsn: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ShapeLogResp {
+    id: String,
+    table: String,
+    changes_only: bool,
+    /// Total envelopes on the stream (before the tail cap).
+    total: usize,
+    /// Oldest → newest; capped to the tail (`limit`).
+    entries: Vec<ShapeLogEntry>,
+}
+
+/// The change log of an **existing** shape: the tail of its stream as-is (insert/update/delete
+/// envelopes, oldest → newest). Drives the visualizer's feed-shape "live log" view, which polls
+/// this. Read-only — creates no shape.
+async fn get_shape_log(
+    State(engine): State<Engine>,
+    Path(id): Path<String>,
+    Query(q): Query<ShapeRowsQuery>,
+) -> Result<Json<ShapeLogResp>, AppError> {
+    let Some(rec) = engine.get_shape(&id).await else {
+        return Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("shape {id} not found") });
+    };
+    let limit = q.limit.unwrap_or(50).min(500);
+    let mut entries: std::collections::VecDeque<ShapeLogEntry> = std::collections::VecDeque::new();
+    let mut total = 0usize;
+    // Walked over the WHOLE stream (not just the returned tail): which keys are live and their
+    // last value. Lets the wire ops (upsert/delete) be reported as insert vs update exactly, and
+    // gives a delete entry the row it removed.
+    let mut live: std::collections::HashMap<String, Option<serde_json::Value>> = std::collections::HashMap::new();
+    let mut offset = "-1".to_string();
+    loop {
+        let r = engine.read_shape_stream(&rec.stream_path, &offset, false).await?;
+        let empty = r.envelopes.is_empty();
+        for env in r.envelopes {
+            total += 1;
+            let (op, old) = if env.headers.operation == "delete" {
+                let last = live.remove(&env.key).flatten();
+                ("delete".to_string(), env.old.or(last))
+            } else {
+                let existed = live.insert(env.key.clone(), env.value.clone()).is_some();
+                (if existed { "update".to_string() } else { "insert".to_string() }, env.old)
+            };
+            entries.push_back(ShapeLogEntry { op, key: env.key, value: env.value, old, lsn: env.headers.lsn });
+            if entries.len() > limit {
+                entries.pop_front();
+            }
+        }
+        // Break when caught up, the page was empty, or the offset failed to advance (a defensive
+        // guard against a non-empty page with a missing/unchanged next offset looping forever).
+        let advanced = r.next_offset.as_deref().is_some_and(|n| n != offset);
+        if let Some(n) = r.next_offset {
+            offset = n;
+        }
+        if r.up_to_date || empty || !advanced {
+            break;
+        }
+    }
+    Ok(Json(ShapeLogResp {
+        id: rec.id,
+        table: rec.table,
+        changes_only: rec.changes_only,
+        total,
+        entries: entries.into_iter().collect(),
+    }))
+}
+
+/// The current contents of an **existing** shape, materialized by folding its stream — creates no new
+/// shape (unlike `/v1/shape`). Drives the visualizer's live "contents" preview, which polls this.
+async fn get_shape_rows(
+    State(engine): State<Engine>,
+    Path(id): Path<String>,
+    Query(q): Query<ShapeRowsQuery>,
+) -> Result<Json<ShapeRowsResp>, AppError> {
+    let Some(rec) = engine.get_shape(&id).await else {
+        return Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("shape {id} not found") });
+    };
+    // Fold the shape's whole stream (catch-up reads from -1) into the current key→row map.
+    let mut rows: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
+    let mut offset = "-1".to_string();
+    loop {
+        let r = engine.read_shape_stream(&rec.stream_path, &offset, false).await?;
+        let empty = r.envelopes.is_empty();
+        for env in r.envelopes {
+            if env.headers.operation == "delete" {
+                rows.remove(&env.key);
+            } else if let Some(v) = env.value {
+                rows.insert(env.key, v);
+            }
+        }
+        // Same defensive break as get_shape_log: never spin on a non-advancing offset.
+        let advanced = r.next_offset.as_deref().is_some_and(|n| n != offset);
+        if let Some(n) = r.next_offset {
+            offset = n;
+        }
+        if r.up_to_date || empty || !advanced {
+            break;
+        }
+    }
+    let count = rows.len();
+    let limit = q.limit.unwrap_or(200).min(2000);
+    let mut entries: Vec<ShapeRowEntry> =
+        rows.into_iter().map(|(key, value)| ShapeRowEntry { key, value }).collect();
+    // Deterministic order for a stable preview: by numeric key when possible, else lexicographic.
+    entries.sort_by(|a, b| match (a.key.parse::<i64>(), b.key.parse::<i64>()) {
+        (Ok(x), Ok(y)) => x.cmp(&y),
+        _ => a.key.cmp(&b.key),
+    });
+    let truncated = entries.len() > limit;
+    entries.truncate(limit);
+    Ok(Json(ShapeRowsResp { id: rec.id, table: rec.table, changes_only: rec.changes_only, count, truncated, rows: entries }))
 }
 
 async fn drop_shape(
@@ -107,6 +354,36 @@ async fn table_families(
     }
 }
 
+/// Full pipeline graph for the visualizer (`GET /graph`): tables, shapes with routing placement, and
+/// the shared subquery node/edge DAG. Adds no cost to the hot path — reads in-memory topology only.
+async fn get_graph(State(engine): State<Engine>) -> Json<crate::engine::EngineGraph> {
+    Json(engine.graph().await)
+}
+
+#[derive(Deserialize)]
+struct NodeIndexQuery {
+    sig: String,
+    #[serde(default)]
+    cap: Option<usize>,
+}
+
+/// The live inner-set index of one subquery node (`GET /graph/node?sig=…`) — values + contributor
+/// counts, for the visualizer's node-detail "index" view.
+async fn get_node_index(
+    State(engine): State<Engine>,
+    Query(q): Query<NodeIndexQuery>,
+) -> Result<Json<crate::engine::NodeIndex>, AppError> {
+    match engine.node_index(&q.sig, q.cap.unwrap_or(500)).await {
+        Some(idx) => Ok(Json(idx)),
+        None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("node {} not found", q.sig) }),
+    }
+}
+
+async fn subquery_stats(State(engine): State<Engine>) -> Json<serde_json::Value> {
+    let nodes = engine.subquery_stats().await;
+    Json(serde_json::json!({ "nodes": nodes }))
+}
+
 async fn replication_lsn(State(engine): State<Engine>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "lsn": engine.replication_lsn(), "sync": engine.replication_sync() }))
 }
@@ -118,6 +395,25 @@ async fn get_metrics() -> Json<serde_json::Value> {
 async fn reset_metrics() -> Json<serde_json::Value> {
     crate::metrics::metrics().reset();
     Json(serde_json::json!({ "ok": true }))
+}
+
+/// JSON memory snapshot — process RSS/virtual + engine cardinalities. Recomputes cardinalities fresh so
+/// the harness reads the exact state right after creating a batch of shapes (and republishes the OTel
+/// gauges in the same pass).
+async fn get_memory(State(engine): State<Engine>) -> Json<serde_json::Value> {
+    let card = engine.mem_cardinalities().await;
+    crate::mem::publish(&card);
+    Json(crate::mem::snapshot_json())
+}
+
+/// OpenTelemetry metrics in Prometheus exposition format (what an OTel collector's prometheus receiver
+/// scrapes). Reflects the last published sample (refreshed by the background sampler + every `/memory`).
+async fn get_prometheus() -> Response {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        crate::mem::prometheus_text(),
+    )
+        .into_response()
 }
 
 struct AppError {

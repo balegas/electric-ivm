@@ -1,0 +1,34 @@
+{
+  "name": "@electric-ivm/linearlite",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx start.ts",
+    "vite": "vite"
+  },
+  "dependencies": {
+    "@durable-streams/server": "^0.3.7",
+    "@durable-streams/state": "^0.3.1",
+    "@electric-ivm/api": "workspace:*",
+    "@electric-ivm/client": "workspace:*",
+    "@electric-ivm/protocol": "workspace:*",
+    "@faker-js/faker": "^10.5.0",
+    "@tanstack/db": "^0.6.12",
+    "@tanstack/react-db": "^0.1.90",
+    "@tanstack/react-virtual": "^3.14.4",
+    "pg": "^8.13.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.11.10",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.0"
+  }
+}

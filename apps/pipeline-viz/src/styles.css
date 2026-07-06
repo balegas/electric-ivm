@@ -1,0 +1,927 @@
+* {
+  box-sizing: border-box;
+}
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  color: #0f172a;
+}
+.app {
+  display: grid;
+  grid-template-columns: 340px 1fr;
+  height: 100vh;
+  transition: grid-template-columns 0.2s ease;
+}
+.app.sidebar-collapsed {
+  grid-template-columns: 0 1fr;
+}
+
+/* Sidebar */
+.sidebar {
+  position: relative;
+  border-right: 1px solid #e2e8f0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: #f8fafc;
+  overflow: hidden;
+  min-width: 0;
+}
+.app.sidebar-collapsed .sidebar {
+  border-right: none;
+}
+/* Fixed-width children (following the drag-resized --sidebar-w): content clips during the
+   collapse animation instead of wrapping. The exceptions below MUST keep the same specificity
+   (0-2-0) so document order resolves them — a :not() chain here once out-ranked them. */
+.sidebar > *:not(.sidebar-resize) {
+  width: var(--sidebar-w, 340px);
+}
+/* These carry 12px horizontal margins, so their layout width is the sidebar - 24. */
+.sidebar > .viewtabs,
+.sidebar > .search,
+.sidebar > .err {
+  width: calc(var(--sidebar-w, 340px) - 24px);
+}
+/* The collapse button keeps its small intrinsic size. */
+.sidebar > .sidebar-collapse {
+  width: auto;
+}
+/* Drag handle on the sidebar's right edge. */
+.sidebar-resize {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 6px;
+  height: 100%;
+  cursor: col-resize;
+}
+.sidebar-resize:hover {
+  background: #cbd5e180;
+}
+.app.resizing {
+  transition: none;
+  user-select: none;
+  cursor: col-resize;
+}
+.sidebar-collapse {
+  margin: auto 12px 12px;
+  align-self: flex-start;
+  width: auto;
+  padding: 10px 14px;
+  border: 1px solid #cbd5e1;
+  background: #fff;
+  border-radius: 10px;
+  color: #64748b;
+  font-size: 18px;
+  cursor: pointer;
+}
+.sidebar-collapse:hover {
+  background: #f1f5f9;
+  color: #0f172a;
+}
+.sidebar-reopen {
+  position: fixed;
+  bottom: 16px;
+  left: 16px;
+  z-index: 10;
+  padding: 10px 14px;
+  border: 1px solid #cbd5e1;
+  background: #fff;
+  border-radius: 10px;
+  color: #64748b;
+  font-size: 18px;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.08);
+}
+.sidebar-reopen:hover {
+  background: #f1f5f9;
+  color: #0f172a;
+}
+/* Controls + MiniMap live bottom-RIGHT, side by side (never stacked): the minimap sits to the
+   left of the controls strip. Bottom-left stays free for the floating ☰ reopen button. */
+.react-flow__minimap {
+  margin-right: 56px;
+}
+.brand {
+  padding: 14px 16px;
+  border-bottom: 1px solid #e2e8f0;
+}
+.brand-title {
+  font-weight: 700;
+  font-size: 15px;
+}
+.brand-sub {
+  font-size: 12px;
+  color: #64748b;
+}
+.toolbar {
+  display: flex;
+  gap: 8px;
+  padding: 8px 12px 0;
+  align-items: center;
+}
+.btn {
+  font-size: 12px;
+  padding: 6px 10px;
+  border: 1px solid #cbd5e1;
+  background: #fff;
+  border-radius: 6px;
+  cursor: pointer;
+  color: #0f172a;
+}
+.btn:hover {
+  background: #f1f5f9;
+}
+.btn-on {
+  background: #0f172a;
+  color: #fff;
+  border-color: #0f172a;
+}
+/* .btn:hover's pale background out-specifies .btn-on, turning the active button
+   white-on-white — keep the active state dark under the cursor. */
+.btn.btn-on:hover {
+  background: #1e293b;
+}
+.btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+/* Square icon buttons (↻, 🗑): emoji and text glyphs render at different natural
+   sizes — a fixed box + font-size/line-height keeps them visually identical. */
+.btn-icon {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.counts {
+  padding: 10px 16px 2px;
+  font-size: 12px;
+  color: #475569;
+}
+.err {
+  margin: 8px 12px;
+  padding: 8px;
+  background: #fef2f2;
+  color: #b91c1c;
+  border-radius: 6px;
+  font-size: 12px;
+}
+.hint {
+  padding: 6px 16px 10px;
+  font-size: 11px;
+  color: #94a3b8;
+  line-height: 1.4;
+}
+
+.list {
+  overflow: auto;
+  flex: 1;
+  padding: 4px 8px 12px;
+}
+.tgroup-h {
+  position: sticky;
+  top: 0;
+  background: #f8fafc;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #64748b;
+  padding: 8px 8px 4px;
+}
+.shape-row {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: 1px solid transparent;
+  background: #fff;
+  border-radius: 7px;
+  padding: 7px 9px;
+  margin: 3px 0;
+  cursor: pointer;
+}
+.shape-row:hover {
+  border-color: #cbd5e1;
+}
+.shape-on {
+  border-color: #16a34a;
+  background: #f0fdf4;
+}
+.shape-row-top {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.shape-id {
+  font-weight: 700;
+  font-size: 12px;
+  font-family: ui-monospace, monospace;
+}
+.badge {
+  font-size: 9.5px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-weight: 600;
+}
+.k-fam {
+  background: #e0f2fe;
+  color: #0369a1;
+}
+.k-std {
+  background: #fef3c7;
+  color: #b45309;
+}
+.k-sq {
+  background: #f3e8ff;
+  color: #7e22ce;
+}
+.k-feed {
+  background: #e2e8f0;
+  color: #475569;
+}
+.shape-pred {
+  font-size: 11px;
+  color: #475569;
+  margin-top: 3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: ui-monospace, monospace;
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 10px 12px;
+  border-top: 1px solid #e2e8f0;
+}
+.lg {
+  font-size: 10px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  border: 1px solid;
+}
+.lg-table {
+  background: #e2e8f0;
+  color: #334155;
+  border-color: #334155;
+}
+.lg-family {
+  background: #e0f2fe;
+  color: #0369a1;
+  border-color: #0369a1;
+}
+.lg-filter {
+  background: #fef3c7;
+  color: #b45309;
+  border-color: #b45309;
+}
+.lg-sqnode {
+  background: #f3e8ff;
+  color: #7e22ce;
+  border-color: #7e22ce;
+}
+.lg-shape {
+  background: #dcfce7;
+  color: #166534;
+  border-color: #166534;
+}
+
+/* Canvas */
+.canvas {
+  position: relative;
+  min-width: 0;
+}
+.empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: #94a3b8;
+  font-size: 14px;
+}
+.stamp {
+  position: absolute;
+  bottom: 8px;
+  right: 12px;
+  font-size: 11px;
+  color: #94a3b8;
+  pointer-events: none;
+}
+
+/* Nodes */
+/* Custom node renderers may interpose a wrapper div (e.g. the trace-flash overlay) between React
+   Flow's sized node wrapper and .pnode. It must span the full laid-out box, otherwise .pnode's
+   height:100% resolves against an auto-height parent and collapses to content height: every node
+   then top-anchors inside its (center-aligned) dagre box, so a row of connected nodes reads
+   top-aligned and edge handles sit off the row's midline. */
+.react-flow__node > div:not(.pnode) {
+  height: 100%;
+}
+.pnode {
+  border: 2px solid;
+  border-radius: 9px;
+  padding: 7px 10px;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+}
+.pnode-selected {
+  box-shadow: 0 0 0 3px #16a34a55;
+}
+.pnode-tag {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+}
+.pnode-shared {
+  color: #be123c;
+  background: #ffe4e6;
+  border-radius: 999px;
+  padding: 0 6px;
+}
+.pnode-label {
+  font-size: 12px;
+  font-weight: 600;
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: ui-monospace, monospace;
+}
+.pnode-sub {
+  font-size: 10px;
+  color: #64748b;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Shape id shown inline in the header tag row (an outlined pill in the node's accent colour). */
+.pnode-idtag {
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  font-weight: 700;
+}
+/* Highlighted filter expression: a boxed code chip so the predicate stands out inside the node. */
+.pnode-label.pnode-highlight {
+  background: #ffffff;
+  border: 1px solid rgba(22, 101, 52, 0.35);
+  border-radius: 5px;
+  padding: 3px 7px;
+  color: #14532d;
+  font-weight: 700;
+}
+
+/* Metrics header */
+.metrics {
+  display: flex;
+  gap: 6px;
+  padding: 10px 12px 4px;
+}
+.metric {
+  flex: 1;
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 7px;
+  padding: 6px 8px;
+  text-align: center;
+}
+.metric-n {
+  display: block;
+  font-weight: 700;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+.metric-l {
+  font-size: 10px;
+  color: #64748b;
+}
+
+/* Search */
+.search {
+  margin: 6px 12px;
+  padding: 7px 9px;
+  border: 1px solid #cbd5e1;
+  border-radius: 7px;
+  font-size: 12px;
+  outline: none;
+}
+.search:focus {
+  border-color: #0ea5e9;
+}
+
+/* Node extras */
+.pnode-tag-r {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+.pnode-index {
+  color: #0369a1;
+  background: #e0f2fe;
+  border-radius: 999px;
+  padding: 0 6px;
+  font-weight: 700;
+}
+.pnode-dimmed {
+  opacity: 0.28;
+}
+
+/* Detail drawer */
+.detail {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  bottom: 12px;
+  width: 330px;
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  box-shadow: 0 8px 30px rgba(15, 23, 42, 0.16);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.detail-h {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 12px;
+  border-bottom: 1px solid #e2e8f0;
+  background: #f8fafc;
+}
+.detail-title {
+  font-weight: 700;
+  font-size: 13px;
+}
+.detail-x {
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: #64748b;
+  font-size: 14px;
+}
+.detail-body {
+  padding: 10px 12px;
+  overflow: auto;
+}
+.dp-row {
+  display: flex;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 12px;
+  border-bottom: 1px dashed #f1f5f9;
+}
+.dp-k {
+  color: #64748b;
+  min-width: 96px;
+}
+.dp-v {
+  color: #0f172a;
+  font-weight: 500;
+  word-break: break-word;
+}
+.dp-v code,
+.dp-key {
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  background: #f1f5f9;
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+.dp-sec {
+  margin: 12px 0 6px;
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #94a3b8;
+}
+.dp-sql {
+  margin-top: 12px;
+}
+.dp-sql-h {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+.dp-copy {
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: none;
+  color: #475569;
+  background: #f1f5f9;
+  border: 1px solid #e2e8f0;
+  border-radius: 5px;
+  padding: 1px 8px;
+  cursor: pointer;
+}
+.dp-copy:hover {
+  background: #e2e8f0;
+}
+.dp-sql-code {
+  margin: 0;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #0f172a;
+  background: #0f172a08;
+  border: 1px solid #e2e8f0;
+  border-left: 3px solid #a855f7;
+  border-radius: 6px;
+  padding: 8px 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+}
+.dp-cols {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+}
+.dp-col-chip {
+  font-family: ui-monospace, monospace;
+  font-size: 10.5px;
+  background: #eef2ff;
+  color: #3730a3;
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+.dp-cols-all {
+  color: #64748b;
+  font-style: italic;
+}
+.dp-contents-h {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.dp-contents-n {
+  font-weight: 600;
+  color: #475569;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.dp-live-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-left: 4px;
+  border-radius: 999px;
+  background: #10b981;
+  box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.5);
+  animation: dp-pulse 1.8s infinite;
+}
+@keyframes dp-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.5);
+  }
+  70% {
+    box-shadow: 0 0 0 5px rgba(16, 185, 129, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(16, 185, 129, 0);
+  }
+}
+/* Aggregation detail: the prominent live scalar stat (teal, matching the Σ node). */
+.dp-agg {
+  margin: 2px 0 10px;
+  padding: 8px 12px 9px;
+  background: #f0fdfa;
+  border: 1px solid #99f6e4;
+  border-left: 3px solid #0d9488;
+  border-radius: 6px;
+}
+.dp-agg-l {
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #0d9488;
+}
+.dp-agg-n {
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1.25;
+  color: #0f172a;
+  font-variant-numeric: tabular-nums;
+}
+.dp-agg-e {
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  color: #475569;
+}
+.dp-table-wrap {
+  max-height: 300px;
+  overflow: auto;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+}
+.dp-table {
+  border-collapse: collapse;
+  font-size: 11px;
+  width: 100%;
+  font-family: ui-monospace, monospace;
+}
+.dp-table th {
+  position: sticky;
+  top: 0;
+  background: #f8fafc;
+  color: #64748b;
+  font-weight: 600;
+  text-align: left;
+  padding: 4px 8px;
+  border-bottom: 1px solid #e2e8f0;
+  white-space: nowrap;
+}
+.dp-table td {
+  padding: 3px 8px;
+  border-bottom: 1px solid #f1f5f9;
+  color: #0f172a;
+  white-space: nowrap;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.dp-table tbody tr:hover {
+  background: #f8fafc;
+}
+.dp-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.dp-index {
+  max-height: 220px;
+  overflow: auto;
+}
+.dp-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  padding: 2px 0;
+}
+.dp-item-sub {
+  color: #64748b;
+  font-size: 11px;
+}
+.dp-arrow {
+  color: #94a3b8;
+}
+.dp-badge-n {
+  margin-left: auto;
+  font-size: 10px;
+  background: #f3e8ff;
+  color: #7e22ce;
+  border-radius: 999px;
+  padding: 1px 7px;
+  font-weight: 600;
+}
+.dp-shape-link {
+  border: 1px solid #bbf7d0;
+  background: #f0fdf4;
+  color: #166534;
+  border-radius: 5px;
+  padding: 1px 7px;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.dp-shape-link:hover {
+  background: #dcfce7;
+}
+.dp-note {
+  margin-top: 10px;
+  font-size: 11px;
+  color: #64748b;
+  line-height: 1.45;
+  background: #f8fafc;
+  padding: 8px;
+  border-radius: 7px;
+  border: 1px solid #eef2f7;
+}
+.dp-err {
+  color: #b91c1c;
+  font-size: 11px;
+}
+.dp-empty-idx {
+  color: #94a3b8;
+  font-size: 11px;
+  font-style: italic;
+}
+
+/* View tabs (Logical | dbsp circuit) */
+.viewtabs {
+  display: flex;
+  gap: 0;
+  margin: 10px 12px 2px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  overflow: hidden;
+}
+.vtab {
+  flex: 1;
+  border: none;
+  background: #fff;
+  padding: 7px 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #475569;
+  cursor: pointer;
+}
+.vtab + .vtab {
+  border-left: 1px solid #cbd5e1;
+}
+.vtab-on {
+  background: #0f172a;
+  color: #fff;
+}
+.lg-delta {
+  background: #ffedd5;
+  color: #c2410c;
+  border-color: #c2410c;
+}
+.lg-index {
+  background: #ccfbf1;
+  color: #0f766e;
+  border-color: #0f766e;
+}
+.lg-join {
+  background: #dbeafe;
+  color: #1d4ed8;
+  border-color: #1d4ed8;
+}
+
+/* Aggregation */
+.k-agg {
+  background: #ccfbf1;
+  color: #0d9488;
+}
+.lg-agg {
+  background: #ccfbf1;
+  color: #0d9488;
+  border-color: #0d9488;
+}
+
+/* ---- node flash overlay (trace) ---- */
+.flash {
+  border-radius: 11px;
+  animation: flash-ring 1s ease-out;
+  position: relative;
+}
+.flash-pass {
+  --flash: #16a34a;
+}
+.flash-fold {
+  --flash: #0d9488;
+}
+.flash-drop {
+  --flash: #dc2626;
+}
+@keyframes flash-ring {
+  0% {
+    box-shadow: 0 0 0 0 var(--flash);
+  }
+  35% {
+    box-shadow: 0 0 0 5px color-mix(in srgb, var(--flash) 45%, transparent);
+  }
+  100% {
+    box-shadow: 0 0 0 8px transparent;
+  }
+}
+.flash-x {
+  position: absolute;
+  top: -16px;
+  right: -6px;
+  z-index: 10;
+  font-size: 10px;
+  font-weight: 800;
+  color: #fff;
+  background: #dc2626;
+  border-radius: 999px;
+  padding: 1px 7px;
+  animation: flash-fadeout 1.1s forwards;
+}
+@keyframes flash-fadeout {
+  0%, 70% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+/* newly created structure (graph diff after a shapeAdded/shapeDropped lifecycle event) */
+.flash-new {
+  --flash: #7c3aed;
+  animation-duration: 2.4s;
+}
+.flash-star {
+  position: absolute;
+  top: -16px;
+  right: -6px;
+  z-index: 10;
+  font-size: 10px;
+  font-weight: 800;
+  color: #fff;
+  background: #7c3aed;
+  border-radius: 999px;
+  padding: 1px 7px;
+  animation: flash-fadeout 2.5s forwards;
+}
+
+/* shape deletion controls */
+.shape-del {
+  margin-left: auto;
+  color: #94a3b8;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 0 5px;
+  border-radius: 5px;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.shape-row:hover .shape-del {
+  opacity: 1;
+}
+.shape-del:hover {
+  color: #fff;
+  background: #dc2626;
+}
+.btn-danger {
+  color: #dc2626;
+}
+.btn-danger:disabled {
+  color: #cbd5e1;
+}
+
+/* feed-shape change log (detail panel) */
+.dp-log td {
+  vertical-align: top;
+}
+.dp-log-op {
+  font-weight: 800;
+  font-family: ui-monospace, monospace;
+  width: 18px;
+  text-align: center;
+}
+.dp-op-ins .dp-log-op { color: #16a34a; }
+.dp-op-upd .dp-log-op { color: #0ea5e9; }
+.dp-op-del .dp-log-op { color: #dc2626; }
+.dp-op-del .dp-log-row { color: #94a3b8; text-decoration: line-through; }
+.dp-log-key {
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  color: #64748b;
+  white-space: nowrap;
+  width: 48px;
+}
+.dp-log-row {
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  color: #334155;
+}
+
+/* table data browser (detail panel) */
+.dp-browse-nav {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.dp-page-btn {
+  font-size: 11px;
+  padding: 2px 8px;
+  border: 1px solid #cbd5e1;
+  background: #fff;
+  border-radius: 5px;
+  cursor: pointer;
+  color: #334155;
+}
+.dp-page-btn:hover:not(:disabled) {
+  background: #f1f5f9;
+}
+.dp-page-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.dp-page-n {
+  font-size: 11px;
+  color: #64748b;
+  white-space: nowrap;
+}

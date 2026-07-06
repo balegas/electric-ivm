@@ -1,5 +1,5 @@
 {
-  "name": "@electric-lite/examples",
+  "name": "@electric-ivm/examples",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -7,9 +7,9 @@
     "demo": "tsx todos-demo.ts"
   },
   "dependencies": {
-    "@electric-lite/protocol": "workspace:*",
-    "@electric-lite/api": "workspace:*",
-    "@electric-lite/client": "workspace:*",
+    "@electric-ivm/protocol": "workspace:*",
+    "@electric-ivm/api": "workspace:*",
+    "@electric-ivm/client": "workspace:*",
     "@durable-streams/server": "^0.3.7",
     "tsx": "^4.19.2"
   }

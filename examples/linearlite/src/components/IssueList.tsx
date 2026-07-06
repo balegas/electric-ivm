@@ -1,0 +1,354 @@
+import { ilike, or } from '@tanstack/db'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+
+import type { AggregateDef, Predicate } from '@electric-ivm/protocol'
+
+import type { Filters } from '../App'
+import { navigate } from '../App'
+import {
+  type Issue,
+  type IssueQuery,
+  issuesShapeDef,
+  issuesSubsetDef,
+  LIST_COLUMNS,
+  moveIssue,
+  projectIssuesSubsetDef,
+  updateIssue,
+} from '../electric'
+import { PRIORITY_RANK } from '../schema'
+import { useCurrentUser } from '../lib/CurrentUser'
+import { useAggregate, useShapeRows, useSubset } from '../lib/useShape'
+
+/** Build a browse-view filter predicate (project visibility + status/priority/my-tasks) for the counter. */
+function inList(col: string, vals: (string | number)[]): Predicate {
+  return vals.length === 1 ? { col, op: 'eq', value: vals[0] } : { or: vals.map((v) => ({ col, op: 'eq', value: v })) }
+}
+function buildBrowseWhere(projectIds: number[], filters: Filters, userName: string): Predicate {
+  const clauses: Predicate[] = [inList('project_id', projectIds)]
+  if (filters.statuses.length) clauses.push(inList('status', filters.statuses))
+  if (filters.priorities.length) clauses.push(inList('priority', filters.priorities))
+  if (filters.myTasksOnly) clauses.push({ col: 'username', op: 'eq', value: userName })
+  return clauses.length === 1 ? clauses[0] : { and: clauses }
+}
+import { Virtual } from '../lib/Virtual'
+import { Avatar, displayId, formatDate, PriorityMenu, ProjectMenu, StatusMenu } from './ui'
+import { TopFilter } from './TopFilter'
+
+/** Derive the engine-side issue query (visibility + filters) from the UI filters and the current user. */
+function toIssueQuery(filters: Filters, userId: number, userName: string): IssueQuery {
+  return {
+    userId,
+    userName,
+    statuses: filters.statuses,
+    priorities: filters.priorities,
+    projectId: filters.projectId,
+    myTasksOnly: filters.myTasksOnly,
+  }
+}
+
+function IssueRow({ issue }: { issue: Issue }): JSX.Element {
+  const { projects } = useCurrentUser()
+  return (
+    <div className="issue-row">
+      <span onClick={(e) => e.stopPropagation()}>
+        <PriorityMenu value={issue.priority} onChange={(priority) => updateIssue(issue, { priority })} />
+      </span>
+      <span onClick={(e) => e.stopPropagation()}>
+        <StatusMenu value={issue.status} onChange={(status) => updateIssue(issue, { status })} />
+      </span>
+      <span className="issue-id">{displayId(issue.id)}</span>
+      <button type="button" className="issue-title" onClick={() => navigate(`#/issue/${issue.id}`)}>
+        {issue.title}
+      </button>
+      <span onClick={(e) => e.stopPropagation()}>
+        <ProjectMenu value={issue.project_id} projects={projects} onChange={(project_id) => moveIssue(issue, project_id)} />
+      </span>
+      <span className="issue-date">{formatDate(issue.created)}</span>
+      <Avatar name={issue.username} />
+    </div>
+  )
+}
+
+function listTitle(filters: Filters, showSearch?: boolean): string {
+  if (showSearch) return 'Search'
+  if (filters.myTasksOnly) return 'My Tasks'
+  if (filters.projectId !== null) return 'Project'
+  const s = filters.statuses
+  if (s.length === 1 && s[0] === 'backlog') return 'Backlog'
+  if (s.length === 2 && s.includes('todo') && s.includes('in_progress')) return 'Active'
+  if (s.length === 0 && filters.priorities.length === 0) return 'All Issues'
+  return 'Issues'
+}
+
+/** Shared list chrome: header + virtualized rows. `onEndReached` drives subset "load more". */
+function ListChrome({
+  filters,
+  setFilters,
+  showSearch,
+  rows,
+  loading,
+  onEndReached,
+  count,
+}: {
+  filters: Filters
+  setFilters: (f: Filters) => void
+  showSearch?: boolean
+  rows: Issue[]
+  loading: boolean
+  onEndReached?: () => void
+  /** Server-maintained COUNT of the matching set; falls back to the loaded-rows length when absent. */
+  count?: number | null
+}): JSX.Element {
+  return (
+    <div className="list-pane">
+      <TopFilter
+        title={listTitle(filters, showSearch)}
+        count={count ?? rows.length}
+        filters={filters}
+        setFilters={setFilters}
+        showSearch={showSearch}
+      />
+      {loading && <div className="empty">Loading…</div>}
+      {!loading && rows.length === 0 && <div className="empty">No issues match.</div>}
+      {!loading && rows.length > 0 && (
+        // Only the visible rows are mounted (see Virtual): renders ~30 nodes instead of one per issue.
+        <Virtual
+          className="issue-list-viewport"
+          items={rows}
+          getKey={(issue) => issue.id}
+          estimateSize={41}
+          renderItem={(issue) => <IssueRow issue={issue} />}
+          onEndReached={onEndReached}
+        />
+      )}
+    </div>
+  )
+}
+
+interface FeedState {
+  rows: Issue[]
+  loadMore: () => void
+  hasMore: boolean
+}
+
+/**
+ * One project's subset feed (`project_id = P`), paginated + live. Renders nothing — it reports its
+ * loaded rows + paging controls up to {@link BrowseList} via `register`. Kept mounted for every project
+ * the user belongs to (regardless of the active filter) so switching project/status is instant client
+ * work and the underlying engine feed is reused across users and filter changes.
+ */
+function ProjectSubsetFeed({
+  projectId,
+  orderCol,
+  desc,
+  register,
+}: {
+  projectId: number
+  orderCol: 'created' | 'modified'
+  desc: boolean
+  register: (projectId: number, state: FeedState | null) => void
+}): JSX.Element | null {
+  const { rows, loadMore, hasMore } = useSubset<Issue>(
+    projectIssuesSubsetDef(projectId, { col: orderCol, desc }),
+    (b) =>
+      b
+        .orderBy(({ t }: { t: Issue }) => t[orderCol], desc ? 'desc' : 'asc')
+        .orderBy(({ t }: { t: Issue }) => t.id, 'asc')
+        .select(({ t }: { t: Issue }) => t),
+    [orderCol, desc],
+  )
+  // Report state up; on unmount (lost membership) clear this feed from the merge.
+  useEffect(() => {
+    register(projectId, { rows, loadMore, hasMore })
+    return () => register(projectId, null)
+  }, [projectId, rows, loadMore, hasMore, register])
+  return null
+}
+
+/** Feed-map key for the all-visible-issues subquery feed. */
+const VISIBLE_FEED = -1
+
+/**
+ * The all-issues browse feed as **one subquery-backed subset**: `project_id IN (SELECT project_id
+ * FROM project_members WHERE user_id = me)`. Visibility is evaluated by the engine's shared
+ * subquery node — membership changes re-scope the feed server-side — instead of the client merging
+ * one per-project feed. Paginated + live-tailed like any subset.
+ */
+function VisibleIssuesFeed({
+  userId,
+  userName,
+  orderCol,
+  desc,
+  register,
+}: {
+  userId: number
+  userName: string
+  orderCol: 'created' | 'modified'
+  desc: boolean
+  register: (feedKey: number, state: FeedState | null) => void
+}): JSX.Element | null {
+  const { rows, loadMore, hasMore } = useSubset<Issue>(
+    issuesSubsetDef(
+      { userId, userName, statuses: [], priorities: [], projectId: null, myTasksOnly: false },
+      { col: orderCol, desc },
+      LIST_COLUMNS,
+    ),
+    (b) =>
+      b
+        .orderBy(({ t }: { t: Issue }) => t[orderCol], desc ? 'desc' : 'asc')
+        .orderBy(({ t }: { t: Issue }) => t.id, 'asc')
+        .select(({ t }: { t: Issue }) => t),
+    [userId, orderCol, desc],
+  )
+  useEffect(() => {
+    register(VISIBLE_FEED, { rows, loadMore, hasMore })
+    return () => register(VISIBLE_FEED, null)
+  }, [rows, loadMore, hasMore, register])
+  return null
+}
+
+/**
+ * Browse the visible issues. The all-projects view is **one subquery-backed subset** — the engine
+ * evaluates `project_id IN (SELECT project_id FROM project_members WHERE user_id = me)` through its
+ * shared subquery node, so visibility lives server-side and membership changes re-scope the feed.
+ * Selecting a single project uses that project's plain `project_id = P` subset (shared across users).
+ * Status/priority/my-tasks selection and ordering happen on the client over the loaded window, so
+ * switching filters is instant with no new engine request.
+ */
+function BrowseList({ filters, setFilters }: { filters: Filters; setFilters: (f: Filters) => void }): JSX.Element {
+  const { myProjectIds, currentUserId, currentUserName } = useCurrentUser()
+  const memberIds = useMemo(() => [...myProjectIds].sort((a, b) => a - b), [myProjectIds])
+  const orderCol: 'created' | 'modified' = filters.orderBy === 'modified' ? 'modified' : 'created'
+  const desc = filters.dir === 'desc'
+
+  const [feeds, setFeeds] = useState<Map<number, FeedState>>(new Map())
+  const register = useCallback((projectId: number, state: FeedState | null) => {
+    setFeeds((prev) => {
+      const next = new Map(prev)
+      if (state) next.set(projectId, state)
+      else next.delete(projectId)
+      return next
+    })
+  }, [])
+
+  // Which feed drives the current view: the selected project's subset, else the visibility subquery.
+  const activeIds = filters.projectId ? [filters.projectId] : [VISIBLE_FEED]
+
+  const rendered = useMemo(() => {
+    let all: Issue[] = []
+    for (const pid of activeIds) all = all.concat(feeds.get(pid)?.rows ?? [])
+    if (filters.statuses.length) all = all.filter((i) => filters.statuses.includes(i.status))
+    if (filters.priorities.length) all = all.filter((i) => filters.priorities.includes(i.priority))
+    if (filters.myTasksOnly) all = all.filter((i) => i.username === currentUserName)
+    all.sort((a, b) => {
+      const d =
+        filters.orderBy === 'priority'
+          ? PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority]
+          : (a[orderCol] as number) - (b[orderCol] as number)
+      return (desc ? -d : d) || a.id - b.id
+    })
+    return all
+  }, [feeds, activeIds, filters.statuses, filters.priorities, filters.myTasksOnly, filters.orderBy, orderCol, desc, currentUserName])
+
+  const hasMore = activeIds.some((pid) => feeds.get(pid)?.hasMore)
+  const loadMore = () => {
+    for (const pid of activeIds) {
+      const f = feeds.get(pid)
+      if (f?.hasMore) f.loadMore()
+    }
+  }
+
+  // The header count is a real **server-maintained COUNT aggregation** over the visible+filtered set —
+  // the true total, updating live on writes — not the length of the client-loaded (paginated) window.
+  // Aggregations don't take subquery predicates, so the count keeps the expanded member-project list.
+  const aggProjects = filters.projectId ? [filters.projectId] : memberIds
+  const aggDef: AggregateDef | null = aggProjects.length
+    ? { table: 'issues', where: buildBrowseWhere(aggProjects, filters, currentUserName), fn: 'count' }
+    : null
+  const agg = useAggregate(aggDef)
+
+  return (
+    <>
+      {filters.projectId ? (
+        <ProjectSubsetFeed
+          key={filters.projectId}
+          projectId={filters.projectId}
+          orderCol={orderCol}
+          desc={desc}
+          register={register}
+        />
+      ) : (
+        <VisibleIssuesFeed
+          key={currentUserId}
+          userId={currentUserId}
+          userName={currentUserName}
+          orderCol={orderCol}
+          desc={desc}
+          register={register}
+        />
+      )}
+      <ListChrome
+        filters={filters}
+        setFilters={setFilters}
+        rows={rendered}
+        count={aggDef ? agg.value : 0}
+        loading={feeds.size === 0}
+        onEndReached={() => {
+          if (hasMore) loadMore()
+        }}
+      />
+    </>
+  )
+}
+
+/**
+ * Search across issues. Search must match on `description`, so it uses the full materialized shape
+ * (not the projected subset) and refines client-side. This is the deliberate counterpart to browse:
+ * shapes for "sync this set", subset queries for "page through this set".
+ */
+function SearchList({ filters, setFilters }: { filters: Filters; setFilters: (f: Filters) => void }): JSX.Element {
+  // Strip `%`/`_` from the search term: TanStack DB's ilike treats them as wildcards and has no
+  // ESCAPE, so a literal `%`/`_` would otherwise match everything. (We want plain substring search.)
+  const { currentUserId, currentUserName } = useCurrentUser()
+  const q = filters.q.trim().replace(/[%_]/g, '')
+  const dir = filters.dir
+  const dateSort = filters.orderBy === 'created' || filters.orderBy === 'modified'
+  const { rows, loading } = useShapeRows<Issue>(
+    issuesShapeDef(toIssueQuery(filters, currentUserId, currentUserName)),
+    (b) => {
+      let query = b
+      if (q) query = query.where(({ t }: { t: Issue }) => or(ilike(t.title, `%${q}%`), ilike(t.description, `%${q}%`)))
+      if (dateSort)
+        query = query
+          .orderBy(({ t }: { t: Issue }) => t[filters.orderBy as 'created' | 'modified'], dir)
+          .orderBy(({ t }: { t: Issue }) => t.id, 'asc')
+      return query.select(({ t }: { t: Issue }) => t)
+    },
+    [q, filters.orderBy, dir],
+  )
+
+  const sign = dir === 'asc' ? 1 : -1
+  const sorted =
+    filters.orderBy === 'priority'
+      ? [...rows].sort((a, b) => sign * (PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority]) || a.id - b.id)
+      : rows
+
+  return <ListChrome filters={filters} setFilters={setFilters} showSearch rows={sorted} loading={loading} />
+}
+
+export function IssueList({
+  filters,
+  setFilters,
+  showSearch,
+}: {
+  filters: Filters
+  setFilters: (f: Filters) => void
+  showSearch?: boolean
+  onNewIssue: () => void
+}): JSX.Element {
+  return showSearch ? (
+    <SearchList filters={filters} setFilters={setFilters} />
+  ) : (
+    <BrowseList filters={filters} setFilters={setFilters} />
+  )
+}
