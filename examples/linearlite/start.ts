@@ -40,6 +40,7 @@ let engineProc: ChildProcess | undefined
 let api: ApiServer | undefined
 let vite: ViteDevServer | undefined
 let caddyProc: ChildProcess | undefined
+let vizCaddyProc: ChildProcess | undefined
 let vizProc: ChildProcess | undefined
 let shuttingDown = false
 
@@ -47,6 +48,7 @@ async function shutdown(code = 0): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
   vizProc?.kill('SIGKILL')
+  vizCaddyProc?.kill('SIGKILL')
   caddyProc?.kill('SIGKILL')
   engineProc?.kill('SIGKILL')
   if (pg) {
@@ -371,9 +373,21 @@ try {
   // Auto-launched pointed at the engine; set DEMO_VIZ=0 to skip, DEMO_VIZ_PORT to change the port.
   if (process.env.DEMO_VIZ !== '0') {
     const vizPort = process.env.DEMO_VIZ_PORT ?? '5180'
+    const vizHttpsOn = process.env.DEMO_HTTPS !== '0' && caddyProc != null
+    const vizHttpsPort = process.env.DEMO_VIZ_HTTPS_PORT ?? '5443'
+    // VIZ_HOST pins the bind so the Caddy front below has a deterministic upstream (vite's default
+    // binding varies by platform — see the webui proxy above, which must dial the exact bound address).
+    // VIZ_HMR_CLIENT_PORT makes vite's HMR websocket dial the caddy front (wss) instead of the
+    // hardcoded plain-HTTP vite port, which a browser on the https URL cannot reach.
     vizProc = spawn('pnpm', ['--filter', '@electric-ivm/pipeline-viz', 'dev'], {
       cwd: repoRoot(),
-      env: { ...process.env, ELECTRIC_IVM_ENGINE_URL: engineUrl, VIZ_PORT: vizPort },
+      env: {
+        ...process.env,
+        ELECTRIC_IVM_ENGINE_URL: engineUrl,
+        VIZ_PORT: vizPort,
+        VIZ_HOST: '127.0.0.1',
+        ...(vizHttpsOn ? { VIZ_HMR_CLIENT_PORT: vizHttpsPort } : {}),
+      },
       stdio: 'ignore',
     })
     vizProc.on('exit', (c) => {
@@ -381,6 +395,22 @@ try {
     })
     console.log(`\n🔬 Pipeline visualizer →  http://localhost:${vizPort}/`)
     console.log('   The live dbsp pipeline of this engine — click shapes to see how they are maintained.')
+
+    // Same HTTP/2 front as the webui: the explorer holds a /trace SSE stream open plus per-card
+    // polls, so it hits the same ~6-per-origin HTTP/1.1 cap (lifecycle events stall behind other
+    // requests and the graph misses updates until a refresh). A second caddy instance needs its
+    // own admin port; upstream is the pinned 127.0.0.1 host above.
+    if (vizHttpsOn) {
+      vizCaddyProc = spawn(
+        'caddy',
+        ['reverse-proxy', '--from', `https://localhost:${vizHttpsPort}`, '--to', `127.0.0.1:${vizPort}`],
+        { stdio: 'inherit', env: { ...process.env, CADDY_ADMIN: 'localhost:2027' } },
+      )
+      vizCaddyProc.on('exit', (c) => {
+        if (!shuttingDown) console.warn(`viz caddy proxy exited (${c}); explorer continues over HTTP only`)
+      })
+      console.log(`🔒 Visualizer HTTPS (HTTP/2) →  https://localhost:${vizHttpsPort}/`)
+    }
   }
 
   console.log(`\n👉 Open a URL above. LinearLite (${PRIORITIES.length} priorities, ${STATUSES.length} statuses)`)

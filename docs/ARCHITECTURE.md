@@ -307,6 +307,11 @@ Threads are flat in the number of shapes *and* in the number of equality templat
   `engine_family_circuits`, …) — the cardinalities that drive RSS; `GET /metrics/prometheus` exports.
 - `GET /graph`, `GET /graph/node?sig=…`, `GET /shapes/{id}/rows` — the live pipeline topology + node
   indexes + shape contents, consumed by the **pipeline explorer** (`apps/pipeline-viz`).
+- `GET /state`, `GET /state/node?id=…` — per-node live state: summaries for every pipeline node
+  (offsets, emit counters, routing-index/inner-set cardinalities, fold values) and on-demand deep
+  dumps (a family's routing index contents, an aggregate's fold internals incl. the MIN/MAX
+  multiset). Summaries are also pushed as `{"type":"state"}` events on `/trace` after each batch,
+  which is what makes the explorer's node chips reactive without polling.
 - `GET /tables/<t>/families`, `GET /subqueries` — sharing topology (proof that N shapes share one
   router/node).
 
@@ -368,4 +373,4 @@ predicate (which recreates the feed per click) — see AGENTS.md "gotchas".
 | `packages/client/src/index.ts` | client: shapes/aggregations, tracked lifecycles, `awaitTxId` |
 | `packages/client/src/subset.ts` | subset queries: page merge, LSN watermarks, tombstones, feed lifecycle |
 | `docker/` | containerized stack (engine, durable-streams, API, Postgres) |
-| `apps/pipeline-viz` | live pipeline explorer over `GET /graph` |
+| `apps/pipeline-viz` | live pipeline explorer over `GET /graph` + `/state` + `/trace` |

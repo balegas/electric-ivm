@@ -1,6 +1,8 @@
-// Map a TraceEvent onto the currently rendered graph: which nodes flash (pass/drop/fold) and
-// which edges pulse (a dot travels along them). Trace hops carry LOGICAL-view node ids
-// (table:/family:/filter:/node:/shape:); the dbsp view expands each into its operator chain.
+// Map a TraceEvent onto the rendered graph: which nodes flash (pass/drop/fold) and which edges
+// pulse (a dot travels along them). Trace hops carry the engine's node ids (table:/family:/
+// filter:/node:/shape:). In the logical view these ARE the rendered ids (identity mapping); in
+// the circuit view each hop expands to the operator ids the ENGINE stamped with that hop
+// (`OpNode.hop` via build-circuit's hopIndex) — declared, not guessed.
 
 import type { Edge } from '@xyflow/react'
 
@@ -34,36 +36,17 @@ const outcomeFlash: Record<string, FlashKind> = {
   dropped: 'drop',
 }
 
-/** Expand a logical hop node id to the ids used by the current view (see build-dbsp for the
- *  dbsp-view id scheme). Also used to expand graph-diff ids when flashing newly created nodes. */
-export function viewNodes(node: string, view: 'logical' | 'dbsp'): string[] {
-  if (view === 'logical') return [node]
-  const [kind, ...rest] = node.split(':')
-  const id = rest.join(':')
-  switch (kind) {
-    case 'table':
-      return [`src:${id}`, `d:${id}`]
-    case 'filter':
-      return [`f:${id}`, `m:${id}`]
-    case 'family':
-      // family:<table>:<cols> -> ix/pa/j keyed `${table}:${cols}` in build-dbsp
-      return [`ix:${id}`, `pa:${id}`, `j:${id}`]
-    case 'node':
-      return [`sf:${id}`, `si:${id}`, `dist:${id}`]
-    case 'shape':
-      return [`m:${id}`, `snk:${id}`, `fold:${id}`, `sj:${id}`]
-    default:
-      return [node]
-  }
-}
+/** Expand a hop id to rendered node ids: identity for the logical view, or the engine-declared
+ *  operator group for the circuit view. */
+export type HopExpand = (hop: string) => string[]
 
 /** Compute the flash/pulse decoration for one trace event against the rendered edge list. Nodes
  *  not present in the rendered graph are silently skipped (e.g. other selections). */
-export function eventDecor(ev: TraceEvent, view: 'logical' | 'dbsp', edges: Edge[], present: Set<string>): Decor {
+export function eventDecor(ev: TraceEvent, edges: Edge[], present: Set<string>, expand: HopExpand): Decor {
   const nodes = new Map<string, FlashKind>()
   for (const hop of ev.hops) {
     const flash: FlashKind = outcomeFlash[hop.outcome] ?? 'pass'
-    for (const id of viewNodes(hop.node, view)) {
+    for (const id of expand(hop.node)) {
       if (!present.has(id)) continue
       // keep the strongest signal: drop > fold > pass
       const prev = nodes.get(id)

@@ -1,20 +1,20 @@
 import { Background, Controls, MiniMap, ReactFlow, type Edge, type Node, type NodeProps } from '@xyflow/react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
+import { buildCircuit, hopIndex } from './build-circuit'
 import { buildGraph, type NodeRef, type VizNodeData } from './build-graph'
-import { buildDbspGraph } from './build-dbsp'
 import { DetailPanel } from './DetailPanel'
 import { edgeTypes, type PulseEdgeData } from './edges'
 import { PipelineNode } from './nodes'
 import { predicateLabel } from './predicate-label'
 import { shapeSql } from './shape-sql'
-import { eventDecor, mergeDecor, viewNodes, type Decor, type FlashKind } from './trace-anim'
-import type { EngineGraph, GraphShape, TraceEvent, TraceLifecycle } from './types'
-import { useAggValues } from './useAggValues'
+import { applyState, seedState } from './state-store'
+import { eventDecor, mergeDecor, type Decor, type FlashKind } from './trace-anim'
+import type { EngineGraph, GraphShape, TraceMessage } from './types'
 import { useTrace } from './useTrace'
 
 type Mode = 'all' | 'select'
-type View = 'logical' | 'dbsp'
+type View = 'logical' | 'circuit'
 
 /** How long a trace decoration (flash + pulse) stays on screen after the last event. */
 const DECOR_TTL_MS = 1100
@@ -38,7 +38,8 @@ function FlashNode(props: NodeProps) {
 }
 const nodeTypes = { pipeline: FlashNode }
 
-/** Logical-namespace ids that appear in `next` but not `prev` — the structure a create added. */
+/** Node ids that appear in `next` but not `prev` — the structure a create added. The ids are the
+ *  engine's own namespace, so they match rendered node ids directly. */
 function graphDiff(prev: EngineGraph, next: EngineGraph): Set<string> {
   const added = new Set<string>()
   const famKey = (s: GraphShape) => (s.familyKey ? `${s.table}:${s.familyKey.join(',')}` : null)
@@ -103,7 +104,7 @@ export default function App() {
       if (!gr.ok) throw new Error(`engine /graph → ${gr.status}`)
       const text = await gr.text()
       // Only publish a new graph when the CONTENT changed: a fresh object identity per poll makes
-      // React Flow rebuild every edge each 2.5s, which kills in-flight pulse animations.
+      // React Flow rebuild every edge each poll, which kills in-flight pulse animations.
       if (text !== lastGraphJson.current) {
         lastGraphJson.current = text
         setGraph(JSON.parse(text) as EngineGraph)
@@ -117,6 +118,11 @@ export default function App() {
 
   useEffect(() => {
     void load()
+    void seedState()
+    // Slow safety re-seed: the trace broadcast is lossy by design (a lagging subscriber drops
+    // events), and some fronts buffer SSE — a periodic full snapshot bounds any staleness.
+    const t = setInterval(() => void seedState(), 10_000)
+    return () => clearInterval(t)
   }, [load])
   useEffect(() => {
     // Hold the poll while a lifecycle settle is pending — it must not publish the intermediate
@@ -134,11 +140,21 @@ export default function App() {
     if (!graph) return { nodes: [], edges: [] }
     if (mode === 'select' && selected.size === 0) return { nodes: [], edges: [] }
     const sel = mode === 'all' ? 'all' : selected
-    const f = focus?.id ?? null
-    // alignSources pins every replication-source (table) node into the leftmost rank.
+    // alignSources pins every replication-source node into the leftmost rank.
     const opts = { alignSources: true }
-    return view === 'dbsp' ? buildDbspGraph(graph, sel, f, opts) : buildGraph(graph, sel, f, opts)
+    return view === 'circuit' ? buildCircuit(graph, sel, focus?.id ?? null, opts) : buildGraph(graph, sel, focus?.id ?? null, opts)
   }, [graph, mode, selected, focus, view])
+
+  // hop id → rendered node ids: identity in the logical view; in the circuit view, the operator
+  // group the ENGINE stamped with that hop (OpNode.hop) — trace flashes and fresh-structure
+  // highlights expand through this, never through client-side guessing.
+  const expandHop = useMemo(() => {
+    if (view === 'logical' || !graph) return (h: string) => [h]
+    const idx = hopIndex(graph)
+    return (h: string) => idx.get(h) ?? []
+  }, [view, graph])
+  const expandRef = useRef(expandHop)
+  expandRef.current = expandHop
 
   // Live trace decoration: flashes on nodes, travelling delta dots on edges. Refs let the trace
   // callback map events against the CURRENT render without re-subscribing.
@@ -148,13 +164,16 @@ export default function App() {
   edgesRef.current = edges
   const presentRef = useRef(new Set<string>())
   presentRef.current = useMemo(() => new Set(nodes.map((n) => n.id)), [nodes])
-  const viewRef = useRef(view)
-  viewRef.current = view
 
   const lifecycleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const onTrace = useCallback(
-    (ev: TraceEvent | TraceLifecycle) => {
+    (ev: TraceMessage) => {
       if ('type' in ev) {
+        if (ev.type === 'state') {
+          // Per-node state push — feed the store; subscribed chips re-render, the graph doesn't.
+          applyState(ev.nodes)
+          return
+        }
         // Structure changed (shape created/dropped) — refresh once the churn settles instead of
         // waiting for the next poll; the graph-diff effect below highlights what appeared.
         // Lifecycle events arrive in bursts (a client interaction creates several shapes at once,
@@ -167,7 +186,7 @@ export default function App() {
         }, LIFECYCLE_SETTLE_MS)
         return
       }
-      const d = eventDecor(ev, viewRef.current, edgesRef.current, presentRef.current)
+      const d = eventDecor(ev, edgesRef.current, presentRef.current, expandRef.current)
       if (d.nodes.size === 0 && d.edges.size === 0) return
       setDecor((prev) => mergeDecor(prev, d))
       if (decorTimer.current) clearTimeout(decorTimer.current)
@@ -175,7 +194,11 @@ export default function App() {
     },
     [load],
   )
-  useTrace(true, onTrace)
+  // On every (re)connect, re-seed the state store — state events pushed while disconnected are gone.
+  const onTraceOpen = useCallback(() => {
+    void seedState()
+  }, [])
+  useTrace(true, onTrace, onTraceOpen)
   useEffect(
     () => () => {
       if (decorTimer.current) clearTimeout(decorTimer.current)
@@ -186,7 +209,7 @@ export default function App() {
   )
 
   // Newly created structure: diff each graph load against the previous one and highlight what
-  // appeared (logical-namespace ids, expanded to the current view's ids at render time).
+  // appeared. Diff ids are engine node ids, so they match rendered ids directly.
   const [fresh, setFresh] = useState<Set<string> | null>(null)
   const freshTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const prevGraphRef = useRef<EngineGraph | null>(null)
@@ -202,16 +225,13 @@ export default function App() {
     freshTimer.current = setTimeout(() => setFresh(null), FRESH_TTL_MS)
   }, [graph])
 
-  // Live scalar per aggregation shape (e.g. the current COUNT(*)), shown on the agg nodes below.
-  const aggValues = useAggValues(graph)
-
   // Keep the detail panel meaningful across shape churn: clients drop + recreate identical shapes
   // under new ids (e.g. every LinearLite navigation), which would orphan a panel pinned to the old
   // id. When the focused shape vanishes, retarget to the same-query replacement if one exists.
   const focusShapeSig = useRef<{ id: string; sig: string } | null>(null)
   useEffect(() => {
     if (!graph || !focus) return
-    const m = focus.id.match(/^(?:shape|snk):(.+)$/)
+    const m = focus.id.match(/^shape:(.+)$/)
     if (!m) return
     const id = m[1]!
     const sigOf = (s: GraphShape) =>
@@ -226,7 +246,7 @@ export default function App() {
     if (repl) {
       focusShapeSig.current = { id: repl.id, sig: sigOf(repl) }
       setFocus({
-        id: focus.id.startsWith('snk:') ? `snk:${repl.id}` : `shape:${repl.id}`,
+        id: `shape:${repl.id}`,
         ref: repl.aggregate ? { kind: 'aggshape', shapeId: repl.id } : { kind: 'shape', shapeId: repl.id },
       })
     } else {
@@ -234,28 +254,21 @@ export default function App() {
     }
   }, [graph, focus])
 
+  // Fresh-structure ids are logical hop ids; expand them for the current view.
   const freshIds = useMemo(() => {
     if (!fresh) return null
-    const s = new Set<string>()
-    for (const l of fresh) for (const id of viewNodes(l, view)) s.add(id)
-    return s
-  }, [fresh, view])
+    const out = new Set<string>()
+    for (const h of fresh) for (const id of expandHop(h)) out.add(id)
+    return out
+  }, [fresh, expandHop])
 
   const decorated = useMemo(() => {
     const dn =
-      decor || freshIds || aggValues.size > 0
+      decor || freshIds
         ? nodes.map((n) => {
-            const d = n.data as VizNodeData
             const flash = decor?.nodes.get(n.id) ?? (freshIds?.has(n.id) ? ('new' as const) : undefined)
-            // Aggregation nodes show their live scalar in the index chip: the logical Σ node is
-            // `shape:{id}` (kind 'agg'), the dbsp fold is `fold:{id}` (kind 'op-agg') — either way
-            // the shape id is the part after the first ':'.
-            const agg =
-              d.kind === 'agg' || d.kind === 'op-agg'
-                ? aggValues.get(n.id.slice(n.id.indexOf(':') + 1))
-                : undefined
-            if (!flash && !agg) return n
-            return { ...n, data: { ...d, ...(agg ? { index: agg } : null), ...(flash ? { flash } : null) } }
+            if (!flash) return n
+            return { ...n, data: { ...(n.data as VizNodeData), flash } }
           })
         : nodes
     // Edges ALWAYS use the pulse type — flipping an edge's `type` when a decoration appears would
@@ -271,7 +284,7 @@ export default function App() {
       return { ...e, type: 'pulse', data, style: undefined }
     })
     return { nodes: dn, edges: de }
-  }, [nodes, edges, decor, freshIds, aggValues])
+  }, [nodes, edges, decor, freshIds])
 
   // Force-drop a shape from the engine. The resulting shapeDropped lifecycle event refreshes the
   // canvas via the settled path; selection/focus are pruned so the view doesn't dangle.
@@ -283,7 +296,7 @@ export default function App() {
       next.delete(id)
       return next
     })
-    setFocus((f) => (f && (f.id === `shape:${id}` || f.id === `snk:${id}`) ? null : f))
+    setFocus((f) => (f && f.id === `shape:${id}` ? null : f))
   }, [])
 
   // Shared shapes are ref-counted (one DELETE = one decrement), so sweep in passes until the
@@ -353,9 +366,9 @@ export default function App() {
             Logical
           </button>
           <button
-            className={view === 'dbsp' ? 'vtab vtab-on' : 'vtab'}
+            className={view === 'circuit' ? 'vtab vtab-on' : 'vtab'}
             onClick={() => {
-              setView('dbsp')
+              setView('circuit')
               setFocus(null)
             }}
           >
@@ -464,23 +477,23 @@ export default function App() {
 
         {view === 'logical' ? (
           <div className="legend">
-            <span className="lg lg-table">table</span>
-            <span className="lg lg-family">family router</span>
-            <span className="lg lg-filter">filter</span>
-            <span className="lg lg-sqnode">subquery node</span>
-            <span className="lg lg-agg">Σ aggregation</span>
-            <span className="lg lg-shape">shape</span>
+            <span className="lg lg-table">table · Δ source</span>
+            <span className="lg lg-filter">σ filter</span>
+            <span className="lg lg-family">↦⋈ route join</span>
+            <span className="lg lg-sqnode">IN-set arrange</span>
+            <span className="lg lg-agg">Σ fold</span>
+            <span className="lg lg-shape">shape out</span>
           </div>
         ) : (
           <div className="legend">
             <span className="lg lg-table">source</span>
             <span className="lg lg-delta">Δ change</span>
             <span className="lg lg-filter">σ filter</span>
-            <span className="lg lg-index">↦ index</span>
+            <span className="lg lg-index">↦ key</span>
             <span className="lg lg-sqnode">arrange (state)</span>
             <span className="lg lg-join">⋈ join</span>
             <span className="lg lg-agg">Σ fold</span>
-            <span className="lg lg-shape">sink</span>
+            <span className="lg lg-shape">π · sink</span>
           </div>
         )}
 
@@ -499,6 +512,11 @@ export default function App() {
       <main className="canvas">
         {mode === 'select' && selected.size === 0 ? (
           <div className="empty">Select one or more shapes to see their maintained pipeline.</div>
+        ) : view === 'circuit' && graph && !graph.operators ? (
+          <div className="empty">
+            This engine doesn&apos;t emit the operator decomposition (<code>/graph</code> has no{' '}
+            <code>operators</code>) — restart it with the current build to use the circuit view.
+          </div>
         ) : (
           <ReactFlow
             nodes={decorated.nodes}

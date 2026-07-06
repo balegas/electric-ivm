@@ -1,25 +1,83 @@
 import { Handle, Position, type NodeProps } from '@xyflow/react'
 
-import type { NodeKind, VizNodeData } from './build-graph'
+import type { VizNodeData } from './build-graph'
+import { KIND_META, fmtScalar } from './node-meta'
+import { useNodeState } from './state-store'
+import type { NodeStateSummary } from './types'
 
-const KIND_META: Record<NodeKind, { color: string; bg: string; tag: string }> = {
-  // logical view
-  table: { color: '#334155', bg: '#e2e8f0', tag: 'TABLE' },
-  family: { color: '#0369a1', bg: '#e0f2fe', tag: 'FAMILY ROUTER' },
-  filter: { color: '#b45309', bg: '#fef3c7', tag: 'FILTER' },
-  sqnode: { color: '#7e22ce', bg: '#f3e8ff', tag: 'SUBQUERY NODE' },
-  shape: { color: '#166534', bg: '#dcfce7', tag: 'SHAPE OUTPUT' },
-  agg: { color: '#0d9488', bg: '#ccfbf1', tag: 'Σ AGGREGATION' },
-  // raw dbsp operator view
-  source: { color: '#334155', bg: '#e2e8f0', tag: 'Z-SET SOURCE' },
-  delta: { color: '#c2410c', bg: '#ffedd5', tag: 'Δ CHANGE' },
-  'op-filter': { color: '#b45309', bg: '#fef3c7', tag: 'σ FILTER' },
-  'op-index': { color: '#0f766e', bg: '#ccfbf1', tag: '↦ INDEX' },
-  'op-arrange': { color: '#7e22ce', bg: '#f3e8ff', tag: 'ARRANGE · STATE' },
-  'op-join': { color: '#1d4ed8', bg: '#dbeafe', tag: '⋈ JOIN' },
-  'op-map': { color: '#475569', bg: '#e2e8f0', tag: 'π MAP' },
-  'op-agg': { color: '#0d9488', bg: '#ccfbf1', tag: 'Σ FOLD · STATE' },
-  sink: { color: '#166534', bg: '#dcfce7', tag: 'SINK · shape out' },
+/** The live state row of one node card. Chips come straight from the engine's state summaries
+ *  (seeded by `GET /state`, updated by SSE `state` events) — each card subscribes to its own node
+ *  id, so state ticks re-render only the touched chips, never the graph. */
+function StateChips({ id }: { id: string }) {
+  const s = useNodeState(id)
+  if (!s) return <div className="pnode-state pnode-state-empty">—</div>
+  return <div className="pnode-state">{chips(s)}</div>
+}
+
+function chips(s: NodeStateSummary): React.ReactNode {
+  switch (s.kind) {
+    case 'table':
+      return (
+        <>
+          <span className="chip" title="table-stream envelopes processed since start">
+            {s.envelopes.toLocaleString()} env
+          </span>
+          <span className="chip chip-dim" title="processed offset (the convergence barrier)">
+            @{s.processedOffset}
+          </span>
+        </>
+      )
+    case 'filter':
+      return (
+        <span className="chip" title="envelopes this filter has emitted downstream">
+          {s.emitted.toLocaleString()} out
+        </span>
+      )
+    case 'family':
+      return (
+        <>
+          <span className="chip chip-state" title="distinct key tuples in the routing index">
+            {s.keys.toLocaleString()} {s.keys === 1 ? 'key' : 'keys'}
+          </span>
+          <span className="chip" title="shapes registered across those keys">
+            {s.shapes.toLocaleString()} {s.shapes === 1 ? 'shape' : 'shapes'}
+          </span>
+        </>
+      )
+    case 'shape':
+      return (
+        <span className="chip" title="envelopes appended to this shape stream (backfill + live)">
+          {s.emitted.toLocaleString()} env
+        </span>
+      )
+    case 'aggregate':
+      return (
+        <>
+          <span className="chip chip-value" title="current aggregate value (live)">
+            = {fmtScalar(s.value)}
+          </span>
+          <span className="chip chip-dim" title="matching rows (Σ of Z-set weights)">
+            n={s.count.toLocaleString()}
+          </span>
+          {s.multisetLen > 0 ? (
+            <span className="chip chip-state" title="values held in the MIN/MAX retraction multiset">
+              {s.multisetLen.toLocaleString()} in multiset
+            </span>
+          ) : null}
+        </>
+      )
+    case 'subqueryNode':
+      return (
+        <>
+          <span className="chip chip-state" title="distinct values in the maintained inner set">
+            {s.distinctValues.toLocaleString()} {s.distinctValues === 1 ? 'value' : 'values'}
+          </span>
+          <span className="chip" title="dependents referencing this node">
+            ref {s.refcount}
+          </span>
+        </>
+      )
+  }
 }
 
 export function PipelineNode({ data }: NodeProps) {
@@ -37,18 +95,19 @@ export function PipelineNode({ data }: NodeProps) {
           {d.idTag ? <span className="pnode-idtag">{d.idTag}</span> : null}
         </span>
         <span className="pnode-tag-r">
-          {d.index ? <span className="pnode-index">{d.index}</span> : null}
           {d.shared && d.shared > 1 ? <span className="pnode-shared">shared ×{d.shared}</span> : null}
         </span>
       </div>
       <div className={`pnode-label${d.highlight ? ' pnode-highlight' : ''}`} title={d.label}>
         {d.label}
       </div>
-      {d.sub ? (
-        <div className="pnode-sub" title={d.sub}>
-          {d.sub}
+      {/* Operators carry their dbsp formula as the sub line; logical nodes their own sub text. */}
+      {d.sub ?? (d.kind.startsWith('op-') ? meta.formula : undefined) ? (
+        <div className="pnode-sub" title={d.sub ?? meta.formula}>
+          {d.sub ?? meta.formula}
         </div>
       ) : null}
+      {d.stateId ? <StateChips id={d.stateId} /> : null}
       <Handle type="source" position={Position.Right} />
     </div>
   )

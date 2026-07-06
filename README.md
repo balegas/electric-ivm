@@ -191,10 +191,13 @@ ELECTRIC_IVM_PG_TABLES='*' target/debug/electric-ivm-engine   # prints ENGINE_LI
 writes, shapes, subset queries, aggregations). Run via the demos or `docker/api-server.ts`.
 
 **`apps/pipeline-viz` — the pipeline explorer (TS).** A developer/debugging GUI that attaches to
-any running engine and renders the maintained dbsp pipeline (logical + circuit views, node
-details, live shape contents / change logs, paginated table browsing) with live trace animation —
-every replicated change pulses through the graph, and shape creation/removal highlights the new
-paths. Includes shape management (drop one / sweep all). Auto-launched by `pnpm demo:linearlite`,
+any running engine and renders the maintained dbsp pipeline — one graph in the engine's own node
+namespace, with the **live state of every node** on its card (routing-index sizes, subquery
+inner-set sizes, fold values, emit counters — pushed over the `/trace` SSE stream, not polled).
+Node details dump full operator state (routing indexes, aggregation multisets, inner sets), live
+shape contents / change logs, and paginated table browsing; live trace animation pulses every
+replicated change through the graph, and shape creation/removal highlights the new paths.
+Includes shape management (drop one / sweep all). Auto-launched by `pnpm demo:linearlite`,
 or standalone:
 
 ```bash
