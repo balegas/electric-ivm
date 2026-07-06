@@ -402,7 +402,7 @@ impl SubqueryRegistry {
         let gate = if changes_only {
             crate::pg::SnapshotGate::passthrough()
         } else {
-            let (wsql, params) = crate::sql::predicate_json_to_sql(where_json, 1);
+            let (wsql, params) = crate::sql::predicate_json_to_sql(where_json, 1, &self.schemas, outer_table);
             let bf = {
                 let client = self.pg().await?;
                 crate::pg::backfill_where(&client, &outer_ts, Some((wsql, params))).await?
@@ -448,7 +448,8 @@ impl SubqueryRegistry {
                 (n.inner_table.clone(), n.where_json.clone(), n.proj_col)
             };
             let ts = self.schemas.get(&inner_table).cloned().context("seed: unknown inner table")?;
-            let wsql = where_json.as_ref().map(|w| crate::sql::predicate_json_to_sql(w, 1));
+            let wsql =
+                where_json.as_ref().map(|w| crate::sql::predicate_json_to_sql(w, 1, &self.schemas, &inner_table));
             let bf = crate::pg::backfill_where(&client, &ts, wsql).await?;
             let node = self.nodes.get_mut(&sig).context("seed: node vanished")?;
             node.gate = bf.gate;
@@ -809,7 +810,7 @@ impl SubqueryRegistry {
     /// Query candidate rows of `ts` where `col = value` (current Postgres state).
     async fn query_candidates(&self, ts: &TableSchema, col: usize, value: &Value) -> Result<Vec<Row>> {
         let client = self.pg().await?;
-        let where_sql = value_eq_sql(&ts.columns[col].0, value);
+        let where_sql = value_eq_sql(&ts.columns[col].0, value, ts.pg_types.get(col).and_then(|o| o.as_deref()));
         let bf = crate::pg::backfill_where(&client, ts, Some(where_sql)).await?;
         Ok(bf.rows)
     }
@@ -936,16 +937,20 @@ pub fn referenced_tables(p: &PredicateJson) -> Vec<String> {
     out
 }
 
-/// Build a `WHERE col = value` fragment + params for a move query-back. Text is parameterized; other
-/// scalars are inlined (mirrors the SQL emitter). NULL never reaches here (handled by full re-derive).
-fn value_eq_sql(col: &str, value: &Value) -> (String, Vec<String>) {
+/// Build a `WHERE col = value` fragment + params for a move query-back (the LIVE re-derive path).
+/// Text is parameterized; other scalars are inlined (mirrors the SQL emitter). A text param is cast to
+/// the column's native Postgres type (`$1::text::uuid`) when known — same as the backfill emitters, so
+/// a uuid/timestamptz column doesn't hit tokio-postgres's `String -> uuid` refusal (which used to fail
+/// this path SILENTLY, dropping live subquery move-ins) — else the `col::text = $1` fallback. NULL
+/// never reaches here (handled by full re-derive).
+fn value_eq_sql(col: &str, value: &Value, pg_type: Option<&str>) -> (String, Vec<String>) {
     let name = crate::pg::quote_ident(col);
     match value {
         Value::Null => (format!("{name} IS NULL"), Vec::new()),
         Value::Int(i) => (format!("{name} = {i}"), Vec::new()),
         Value::Float(f) => (format!("{name} = {}", f.0), Vec::new()),
         Value::Bool(b) => (format!("{name} = {}", if *b { "true" } else { "false" }), Vec::new()),
-        Value::Text(s) => (format!("{name} = $1"), vec![s.clone()]),
+        Value::Text(s) => (crate::sql::text_param_cmp(&name, "=", 1, pg_type), vec![s.clone()]),
     }
 }
 

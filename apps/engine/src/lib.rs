@@ -9,6 +9,7 @@
 //! schema gives names to the positions. See `docs/ARCHITECTURE.md` and
 //! `docs/ivm-engine-internals.md` for the system design.
 
+pub mod config;
 pub mod ds;
 pub mod electric;
 pub mod engine;
@@ -16,7 +17,9 @@ pub mod fault;
 pub mod http;
 pub mod mem;
 pub mod metrics;
+pub mod params;
 pub mod pg;
+pub mod statsd;
 pub mod predicate;
 pub mod replication;
 pub mod schema;

@@ -22,6 +22,12 @@ pub enum ColumnType {
 pub struct ColumnDef {
     #[serde(rename = "type")]
     pub ty: ColumnType,
+    /// The raw Postgres type name (`pg_type.typname` / `udt_name`, e.g. `uuid`, `timestamptz`) captured
+    /// at introspection. `None` in library mode (schema defined via JSON, which only carries the coarse
+    /// [`ColumnType`]). Used to cast bound text params to the native type in backfill SQL so uuid/int
+    /// comparisons stay index-eligible (see `sql.rs`).
+    #[serde(default, skip)]
+    pub pg_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -65,6 +71,9 @@ pub struct TableSchema {
     pub pk_type: ColumnType,
     /// All primary-key column indices, in order. Length 1 for the common single-PK case.
     pub pk_cols: Vec<usize>,
+    /// Raw Postgres type name per column (parallel to [`Self::columns`]); `None` in library mode. Used
+    /// to cast bound text params to the native type in backfill SQL (index-eligible comparisons).
+    pub pg_types: Vec<Option<String>>,
 }
 
 /// Separator joining composite-key column values into the durable-stream `key` string. Chosen to not
@@ -75,6 +84,7 @@ impl TableSchema {
     pub fn from_def(name: &str, def: &TableDef) -> Result<Self> {
         let columns: Vec<(String, ColumnType)> =
             def.columns.iter().map(|(c, d)| (c.clone(), d.ty)).collect();
+        let pg_types: Vec<Option<String>> = def.columns.values().map(|d| d.pg_type.clone()).collect();
         let index: HashMap<String, usize> =
             columns.iter().enumerate().map(|(i, (c, _))| (c.clone(), i)).collect();
         if def.primary_key.is_empty() {
@@ -95,7 +105,14 @@ impl TableSchema {
             pk_name: def.primary_key[0].clone(),
             pk_type,
             pk_cols,
+            pg_types,
         })
+    }
+
+    /// The raw Postgres type name of a column by name (for casting bound params to the native type).
+    /// `None` in library mode or for an unknown column.
+    pub fn pg_type_of(&self, col: &str) -> Option<&str> {
+        self.index.get(col).and_then(|&i| self.pg_types.get(i)).and_then(|o| o.as_deref())
     }
 
     /// The durable-stream event `key` for a row: the single PK value's key-string, or composite PK column

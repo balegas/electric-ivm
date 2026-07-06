@@ -1,7 +1,9 @@
 # Build the Docker images and publish them to the GitHub Container Registry.
 #
-#   ghcr.io/<owner>/electric-ivm/engine  — the Rust engine (replication ingest, shapes, /v1/shape)
-#   ghcr.io/<owner>/electric-ivm/node    — durable-streams server + extended API (CMD selects)
+#   ghcr.io/<owner>/electric-ivm/engine   — the Rust engine (replication ingest, shapes, /v1/shape)
+#   ghcr.io/<owner>/electric-ivm/node     — durable-streams server + extended API (CMD selects)
+#   ghcr.io/<owner>/electric-ivm/electric — single fleet-conformance image (ds + engine in one
+#                                           container; drop-in for electricsql/electric)
 #
 # Pushes to main publish `main` + `sha-…` tags; version tags (v*) publish semver tags; pull
 # requests build without pushing.
@@ -29,6 +31,8 @@ jobs:
             dockerfile: docker/Dockerfile.engine
           - name: node
             dockerfile: docker/Dockerfile.node
+          - name: electric
+            dockerfile: docker/Dockerfile.electric
     steps:
       - uses: actions/checkout@v4
 
