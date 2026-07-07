@@ -786,7 +786,12 @@ body,
 /* ---- node flash overlay (trace) ---- */
 .flash {
   border-radius: 11px;
+  /* Staged propagation: --flash-delay (set per node from its pipeline rank) holds the ring back
+     until the travelling delta actually reaches this node. `backwards` keeps it invisible while
+     waiting. */
   animation: flash-ring 1s ease-out;
+  animation-delay: var(--flash-delay, 0ms);
+  animation-fill-mode: backwards;
   position: relative;
 }
 .flash-pass {
@@ -810,6 +815,7 @@ body,
   }
 }
 .flash-x {
+  animation-delay: var(--flash-delay, 0ms) !important;
   position: absolute;
   top: -16px;
   right: -6px;
@@ -980,4 +986,94 @@ body,
   text-transform: uppercase;
   color: #64748b;
   margin-bottom: 2px;
+}
+
+
+/* ---- sidebar activity log (trace events, replayable) ---- */
+.logsec {
+  border-top: 1px solid #e2e8f0;
+  margin-top: 4px;
+}
+.logsec-h {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+  color: #334155;
+}
+.logsec-h:hover {
+  background: #f1f5f9;
+}
+.logsec-count {
+  font-size: 10px;
+  font-weight: 800;
+  color: #64748b;
+  background: #e2e8f0;
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+.loglist {
+  max-height: 220px;
+  overflow-y: auto;
+  padding: 0 8px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.log-empty {
+  font-size: 11px;
+  color: #94a3b8;
+  padding: 4px 6px 8px;
+}
+.log-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  width: 100%;
+  border: 0;
+  background: none;
+  text-align: left;
+  padding: 3px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 11px;
+  color: #334155;
+}
+.log-row:hover {
+  background: #eef2f7;
+}
+.log-time {
+  color: #94a3b8;
+  font-variant-numeric: tabular-nums;
+  flex: none;
+}
+.log-table {
+  font-weight: 700;
+  flex: none;
+}
+.log-op {
+  font-weight: 800;
+  flex: none;
+}
+.lop-ins {
+  color: #16a34a;
+}
+.lop-del {
+  color: #dc2626;
+}
+.lop-upd {
+  color: #0ea5e9;
+}
+.log-hint {
+  color: #64748b;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }

@@ -287,6 +287,13 @@ export function layout(
       data: { ...n.data, selected: n.id === focus, dimmed: lit ? !lit.has(n.id) : false },
       width: s.w,
       height: s.h,
+      // Pre-seed the measured size: React Flow's adoptUserNodes treats a node object WITHOUT
+      // `measured` as re-initialized and resets its measured handle bounds — and since every
+      // graph publish rebuilds these node objects, a freshly added node could lose the race and
+      // stay unmeasured forever, silently rendering NO edges (its edge positions stay null).
+      // With `measured` present, previously measured handle bounds survive republishing and only
+      // genuinely new nodes take the one initial ResizeObserver measurement.
+      measured: { width: s.w, height: s.h },
     }
   })
   const edges: Edge[] = raw.edges.map((e) => {
