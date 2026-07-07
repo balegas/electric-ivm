@@ -60,18 +60,19 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 
 ## Build & Test
 
-_Add your build and test commands here_
-
 ```bash
-# Example:
-# npm install
-# npm test
+pnpm engine:test                          # Rust unit + integration (fast)
+ELECTRIC_IVM_ENGINE_PREBUILT=1 pnpm test  # full vitest suite (boots its own Postgres)
+pnpm demo:linearlite                      # demo stack: PG + engine + LinearLite + pipeline visualizer
 ```
+
+Full commands, the demo/visualizer runbook (incl. driving the visualizer with the Playwright MCP),
+invariants, and gotchas live in **AGENTS.md** — read it before touching the engine or the apps.
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+See AGENTS.md (layout + docs index) and `docs/ARCHITECTURE.md`.
 
 ## Conventions & Patterns
 
-_Add your project-specific conventions here_
+See the Invariants and Gotchas sections of AGENTS.md.
