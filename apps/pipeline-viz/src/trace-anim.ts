@@ -15,8 +15,9 @@ import type { TraceEvent } from './types'
 
 export type FlashKind = 'pass' | 'drop' | 'fold'
 
-/** One dot-travel / one rank of node flashes. */
-export const STEP_MS = 420
+/** One dot-travel / one rank of node flashes. Deliberately unhurried — the point of the
+ *  animation is READING the propagation, not signalling that something happened. */
+export const STEP_MS = 750
 
 export interface NodeFlash {
   kind: FlashKind
