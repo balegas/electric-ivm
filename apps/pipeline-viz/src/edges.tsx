@@ -7,13 +7,54 @@
 // the browser begin the motion right then, exactly like the original unstaged behavior.
 
 import { BaseEdge, getBezierPath, type EdgeProps } from '@xyflow/react'
-import { useEffect, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import type { EdgePulse } from './trace-anim'
 
 export interface PulseEdgeData extends Record<string, unknown> {
   pulse?: EdgePulse | undefined
   baseStyle?: React.CSSProperties
+}
+
+/** The travelling dot + weight label, driven by requestAnimationFrame over the edge path
+ *  (`getPointAtLength`). Deliberately NOT SMIL: `begin` offsets resolve against the edge-svg's
+ *  long-running timeline and browsers increasingly don't tick SMIL at all — a rAF loop moves in
+ *  every engine and starts exactly when this group mounts (its stage). */
+function TravelDot({ pulse, path }: { pulse: EdgePulse; path: string }) {
+  const groupRef = useRef<SVGGElement | null>(null)
+  const measureRef = useRef<SVGPathElement | null>(null)
+  useLayoutEffect(() => {
+    const p = measureRef.current
+    const g = groupRef.current
+    if (!p || !g) return
+    const total = p.getTotalLength()
+    const t0 = performance.now()
+    let raf = 0
+    const tick = (now: number) => {
+      const k = Math.min(1, (now - t0) / pulse.durMs)
+      const pt = p.getPointAtLength(total * k)
+      g.setAttribute('transform', `translate(${pt.x}, ${pt.y})`)
+      g.style.opacity = '1'
+      if (k < 1) raf = requestAnimationFrame(tick)
+    }
+    raf = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(raf)
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- one shot per mount; the group is keyed by pulse id
+  }, [])
+  return (
+    <>
+      {/* invisible copy of the edge path, used only to measure travel positions */}
+      <path ref={measureRef} d={path} fill="none" stroke="none" />
+      <g ref={groupRef} style={{ opacity: 0 }}>
+        <circle r={5} fill={pulse.color} opacity={0.95} />
+        {pulse.label ? (
+          <text fontSize={11} fontWeight={700} fill={pulse.color} dy={-8}>
+            {pulse.label}
+          </text>
+        ) : null}
+      </g>
+    </>
+  )
 }
 
 export function PulseEdge(props: EdgeProps) {
@@ -43,7 +84,6 @@ export function PulseEdge(props: EdgeProps) {
   }, [pulse?.id, pulse?.delayMs, pulse?.durMs])
 
   const show = pulse != null && staged === pulse.id
-  const dur = pulse ? `${pulse.durMs}ms` : '0.8s'
   return (
     <>
       <BaseEdge
@@ -56,19 +96,7 @@ export function PulseEdge(props: EdgeProps) {
           transition: pulse ? `stroke 0.2s ${pulse.delayMs}ms` : 'stroke 0.2s',
         }}
       />
-      {show ? (
-        <g key={pulse.id}>
-          <circle r={5} fill={pulse.color} opacity={0.95}>
-            <animateMotion dur={dur} repeatCount="1" fill="freeze" path={path} />
-          </circle>
-          {pulse.label ? (
-            <text fontSize={11} fontWeight={700} fill={pulse.color} dy={-8}>
-              <animateMotion dur={dur} repeatCount="1" fill="freeze" path={path} />
-              {pulse.label}
-            </text>
-          ) : null}
-        </g>
-      ) : null}
+      {show ? <TravelDot key={pulse.id} pulse={pulse} path={path} /> : null}
     </>
   )
 }
