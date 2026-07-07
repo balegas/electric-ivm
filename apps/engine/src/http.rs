@@ -370,14 +370,29 @@ async fn get_shape_rows(
     Ok(Json(ShapeRowsResp { id: rec.id, table: rec.table, changes_only: rec.changes_only, count, truncated, rows: entries }))
 }
 
+#[derive(Deserialize)]
+struct ReleaseShapeQuery {
+    /// `?purge=true` force-drops the shape NOW (full teardown, stream deleted), bypassing the
+    /// retention lifecycle — an admin/debug operation (the visualizer's trash button).
+    #[serde(default)]
+    purge: bool,
+}
+
 /// `DELETE /shapes/{id}` = unsubscribe. Releases one subscription (refcount); the shape itself is
 /// retained and follows the retention lifecycle (idle → dormant → evicted) — see `crate::retention`.
+/// With `?purge=true` it instead force-drops the shape immediately (subscribed clients recreate via
+/// the normal 404 / must-refetch path).
 async fn release_shape(
     State(engine): State<Engine>,
     Path(id): Path<String>,
-) -> Json<serde_json::Value> {
-    engine.release_shape(&id).await;
-    Json(serde_json::json!({ "ok": true }))
+    Query(q): Query<ReleaseShapeQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if q.purge {
+        engine.purge_shape(&id).await?;
+    } else {
+        engine.release_shape(&id).await;
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 async fn table_offset(

@@ -87,7 +87,7 @@ unchanged.
 | `POST /schema` | define the schema (library mode; Postgres mode self-configures by introspection) |
 | `POST /shapes` | create a shape (`table`, `where`, `columns`, `changesOnly`) — identical definitions share one stream |
 | `POST /aggregate` | create a live scalar aggregation (`table`, `where`, `fn`, `col`) |
-| `GET /shapes/{id}` / `DELETE /shapes/{id}` | look up a shape (incl. its retention `state`) / release one subscription — the shape is retained and ages through the retention lifecycle |
+| `GET /shapes/{id}` / `DELETE /shapes/{id}` | look up a shape (incl. its retention `state`) / release one subscription — the shape is retained and ages through the retention lifecycle. `DELETE …?purge=true` force-drops it immediately (admin/debug; the visualizer's trash) |
 | `GET /shapes/{id}/rows` | current contents of an existing shape (folds its stream; visualizer preview) |
 | `GET /shapes/{id}/log` | tail of a shape's stream as-is (op/key/value/lsn) — the visualizer's feed change log |
 | `POST /query` | one-shot subset query: `SELECT … ORDER BY … LIMIT/OFFSET` + snapshot LSN |

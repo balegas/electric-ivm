@@ -908,12 +908,16 @@ impl Engine {
 
     /// Snapshot the whole maintained pipeline for the visualizer: tables, every registered shape with
     /// its routing placement (family key / standalone / subquery), the shared subquery node+edge DAG,
-    /// and the exploded per-operator decomposition for the circuit view.
+    /// and the exploded per-operator decomposition for the circuit view. Deterministically ordered
+    /// (tables by name, shapes by numeric id, nodes/edges by signature): the maps behind it iterate
+    /// in random order, and a consumer diffing consecutive snapshots (the visualizer's "did the
+    /// structure change" check) must see byte-identical output for an unchanged pipeline.
     pub async fn graph(&self) -> EngineGraph {
         let (tables, shapes, schemas) = {
             let st = self.state.lock().await;
-            let tables: Vec<String> = st.tables.keys().cloned().collect();
-            let shapes: Vec<GraphShape> = st
+            let mut tables: Vec<String> = st.tables.keys().cloned().collect();
+            tables.sort();
+            let mut shapes: Vec<GraphShape> = st
                 .shapes
                 .values()
                 .map(|r| GraphShape {
@@ -928,6 +932,7 @@ impl Engine {
                     aggregate: r.aggregate.clone(),
                 })
                 .collect();
+            shapes.sort_by_key(|s| s.id.strip_prefix('s').and_then(|n| n.parse::<u64>().ok()).unwrap_or(u64::MAX));
             let schemas: HashMap<String, TableSchema> = st.tables.clone();
             (tables, shapes, schemas)
         };
@@ -939,7 +944,7 @@ impl Engine {
                 .unwrap_or_else(|| format!("col{idx}"))
         };
         let reg = self.subqueries.lock().await;
-        let subquery_nodes: Vec<GraphNode> = reg
+        let mut subquery_nodes: Vec<GraphNode> = reg
             .nodes
             .values()
             .map(|n| GraphNode {
@@ -950,7 +955,8 @@ impl Engine {
                 refcount: n.refcount,
             })
             .collect();
-        let subquery_edges: Vec<GraphEdge> = reg
+        subquery_nodes.sort_by(|a, b| a.sig.cmp(&b.sig));
+        let mut subquery_edges: Vec<GraphEdge> = reg
             .edges
             .iter()
             .map(|e| {
@@ -975,6 +981,8 @@ impl Engine {
                 }
             })
             .collect();
+        subquery_edges
+            .sort_by(|a, b| (&a.node_sig, &a.dependent_kind, &a.dependent_id).cmp(&(&b.node_sig, &b.dependent_kind, &b.dependent_id)));
         let (operators, op_edges) = circuit_ops(&tables, &shapes, &subquery_nodes, &subquery_edges);
         EngineGraph { tables, shapes, subquery_nodes, subquery_edges, operators, op_edges }
     }
@@ -1006,6 +1014,38 @@ impl Engine {
         }
         drop(st);
         self.touch_shape(id);
+    }
+
+    /// Force-drop a shape NOW, bypassing the retention lifecycle: full teardown (record, share
+    /// entries, lifecycle entry, tailer routing, subquery-registry entry, durable stream)
+    /// regardless of refcount or lifecycle state. An admin/debug operation (`DELETE
+    /// /shapes/{id}?purge=true`, the visualizer's trash button) — subscribed clients see their
+    /// stream vanish and recreate via the normal 404 / must-refetch path. The tailer command
+    /// queue is FIFO, so a purge ordered after an in-flight resume removes whatever the resume
+    /// registered.
+    pub async fn purge_shape(&self, id: &str) -> Result<()> {
+        let mut st = self.state.lock().await;
+        self.lives.lock().unwrap().remove(id);
+        if let Some(share) = st.feed_shares.remove(id) {
+            st.feed_by_sig.remove(&share.sig);
+        }
+        let removed = st.shapes.remove(id);
+        if let Some(rec) = &removed {
+            if let Some(t) = st.tailers.get(&rec.table) {
+                let _ = t.cmd_tx.send(TailerCmd::RemoveShape { shape_id: id.to_string() });
+            }
+        }
+        drop(st);
+        // Subquery shapes live in the registry (a no-op for plain shapes).
+        self.subqueries.lock().await.drop_subquery_shape(id);
+        if let Some(rec) = removed {
+            if let Err(e) = self.ds.delete_stream(&rec.stream_path).await {
+                tracing::warn!("failed to delete stream {} for purged shape {id}: {e:#}", rec.stream_path);
+            }
+            trace_lifecycle(&self.trace_tx, crate::trace::GraphLifecycle::ShapeDropped { shape: id.to_string() });
+            tracing::info!("purged shape {id} (forced)");
+        }
+        Ok(())
     }
 
     /// Record an engine-visible read of a shape (drives the retention idle timer + LRU order).
