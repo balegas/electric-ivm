@@ -172,7 +172,7 @@ describe('subset feed sharing (dedup + refcount)', () => {
     })
   const shapeExists = async (id: string) => (await fetch(`${h.engineUrl}/shapes/${encodeURIComponent(id)}`)).status === 200
 
-  it('identical changes-only feeds share one stream; distinct predicates do not; ref-count governs teardown', async () => {
+  it('identical changes-only feeds share one stream; distinct predicates do not; releases retain the shape', async () => {
     await pg('INSERT INTO items (id, n) VALUES (1, 10), (2, 20)')
     await drainEngine(h)
 
@@ -190,9 +190,15 @@ describe('subset feed sharing (dedup + refcount)', () => {
     await fetch(`${h.engineUrl}/shapes/${a1.shapeId}`, { method: 'DELETE' })
     expect(await shapeExists(a1.shapeId)).toBe(true)
 
-    // Dropping the last holder tears it down.
+    // Releasing the LAST holder no longer tears the shape down: it stays active/warm and is
+    // retired by the retention lifecycle instead (idle → dormant → evicted; GH issue #9).
     await fetch(`${h.engineUrl}/shapes/${a2.shapeId}`, { method: 'DELETE' })
-    expect(await shapeExists(a1.shapeId)).toBe(false)
+    expect(await shapeExists(a1.shapeId)).toBe(true)
+
+    // A rejoin after full release reattaches to the SAME retained shape (warm reconnect).
+    const a3 = await createFeed(whereA)
+    expect(a3.shapeId).toBe(a1.shapeId)
+    expect(a3.streamPath).toBe(a1.streamPath)
 
     // The distinct feed is unaffected.
     expect(await shapeExists(b.shapeId)).toBe(true)

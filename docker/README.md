@@ -100,6 +100,8 @@ via `tsx`.
 - `ELECTRIC_IVM_PG_TABLES` — comma list of tables instead of `*`.
 - `DS_MEMORY=1` (on the `ds` service) — in-memory streams: no fsync-per-append ceiling, no persistence.
 - Engine tuning: `ELECTRIC_IVM_PG_SLOT`, `ELECTRIC_IVM_PG_POLL_MS`, `ELECTRIC_IVM_LOG`,
-  `ELECTRIC_HANDLE_TTL` (idle `/v1/shape` handle eviction).
+  `ELECTRIC_HANDLE_TTL` (idle `/v1/shape` handle-state eviction; the shape is retained), and the
+  shape-retention knobs `ELECTRIC_IVM_SHAPE_IDLE_SECS`, `ELECTRIC_IVM_SHAPE_DORMANT_TTL_SECS`,
+  `ELECTRIC_IVM_MAX_SHAPES`, `ELECTRIC_IVM_SHAPE_DISK_BUDGET_MB` (see `apps/engine/README.md`).
 
 Related: `packages/loadgen/docker/` scales headless load-generator *clients* against a host-run stack.

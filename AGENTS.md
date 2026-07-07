@@ -64,6 +64,69 @@ loadgen`; `SWEEP_USERS=…` for comparison tables; Docker client scaling in `pac
 Use `DS_MEMORY=1` at high concurrency (the file-backed test server fsyncs per append — the ceiling is
 storage, not the engine).
 
+## Demo + visualizer: start, drive, verify (agent runbook)
+
+**Start everything with one command** (rebuilds the engine, boots an ephemeral throwaway Postgres
+with `wal_level=logical`, durable-streams, the API, LinearLite, and the pipeline visualizer wired
+to the engine):
+
+```bash
+pnpm demo:linearlite > /tmp/demo.log 2>&1 &     # agents: run in background, tail the log
+# ready when the log prints "👉 Open a URL above"
+```
+
+Fixed URLs: LinearLite `http://localhost:5174` (HTTPS/HTTP-2 `https://localhost:8443`), visualizer
+`http://localhost:5180` (`https://localhost:5443`). Ephemeral ports for the rest — grep the log:
+`postgres →`, `engine →`, `api →`. `DEMO_SEED_COUNT=<n>` scales the faker seed (default 512 issues).
+Data resets every run. **Restarting:** kill the previous run first or Vite silently binds 5175 —
+`pkill -f electric-ivm-engine; pkill -f caddy; pkill -f linearlite/start.ts`, then relaunch (if a
+port lingers: `lsof -ti :5174 -ti :5180 | xargs kill`).
+
+The **visualizer** can also attach to any running engine on its own:
+`ELECTRIC_IVM_ENGINE_URL=http://127.0.0.1:<port> pnpm --filter @electric-ivm/pipeline-viz dev`.
+Its dev server proxies `/engine/*` → the engine control plane, so browser-side `fetch('/engine/graph')`
+etc. work from the page — the backbone of the verification workflow below.
+
+### Typical verification workflow (Playwright MCP)
+
+Use the Playwright MCP browser to drive both apps; keep LinearLite and the visualizer in two tabs
+(`browser_tabs` to create/select, `browser_navigate` to each URL).
+
+1. **Make the pipeline do something.** Drive LinearLite: switch the "Viewing as" user
+   (`browser_select_option` on the sidebar `<select>`) to create/join that user's shapes; open the
+   Board view or an issue detail for more; drag cards / edit issues for live writes. For surgical
+   writes, `psql` straight at the demo Postgres (URL from the log) — replication picks it up.
+2. **Verify engine state from the viz page** with `browser_evaluate` — no CORS friction thanks to
+   the proxy: `await (await fetch('/engine/graph')).json()` (shapes/nodes/edges),
+   `/engine/shapes/{id}` (incl. retention `state`), `/engine/metrics`, `/engine/state`.
+3. **Verify the canvas against the engine.** Count DOM vs graph:
+   `document.querySelectorAll('.react-flow__node').length` / `'.react-flow__edge'` vs
+   `graph.shapes` — nodes render immediately, edges must too (regression test: clear shapes via the
+   trash button, switch user, edges must appear without a reload).
+4. **Verify animations deterministically** via the sidebar **Activity** log (last 50 replicated
+   changes): click an entry with `browser_evaluate` and sample in the same script — dot positions
+   over time (`.react-flow__edge g circle` → `getBoundingClientRect()`), staged flash delays
+   (`.flash` → `--flash-delay`), pulse stagger. Replay beats racing a live write's timing.
+5. **Eyeball it.** `browser_take_screenshot` after driving — a blank or stale frame is a failure
+   even when the DOM probes pass. Check the browser console output for React/engine errors.
+
+Retention interplay while testing: an open LinearLite tab holds subscriptions (refcount ≥ 1), which
+blocks dormancy for its shapes; `GET /shapes/{id}` is deliberately NOT a retention touch, so
+polling it never keeps a shape alive. To exercise dormancy/eviction fast, boot with second-scale
+knobs (`ELECTRIC_IVM_SHAPE_IDLE_SECS=1 ELECTRIC_IVM_RETENTION_SWEEP_SECS=1 …`) — see
+`packages/conformance/src/conformance-retention.test.ts` for the canonical sequence.
+
+### Testing checklist before claiming done
+
+```bash
+pnpm engine:test                          # Rust unit + integration (fast)
+ELECTRIC_IVM_ENGINE_PREBUILT=1 pnpm test  # full vitest suite (set the var iff you already built)
+./electric-conformance/run.sh oracle      # Electric's own oracle vs /v1/shape (needs elixir + ../electric)
+```
+
+Then, for anything touching the engine's live path, shapes, or the visualizer: **drive the demo as
+above** — the suites don't render a canvas or exercise the browser.
+
 ## Invariants (violate these and conformance will catch you — eventually)
 
 - **Postgres is the system of record; the engine holds no table copy.** Backfills read matching rows
@@ -86,9 +149,10 @@ storage, not the engine).
 - **Shape creation is atomic.** On any failure, everything (record, share entries, registry
   refcounts/edges, stream) rolls back and the error propagates — including to joiners waiting on the
   share's ready-watch. Never leave a signature pointing at a dead stream.
-- **Sharing lifecycle:** equal shapes share one id+stream, ref-counted; N joiners each delete exactly
-  once; the final drop deletes the durable stream. Client `close()` must be one-shot (a double
-  delete steals another subscriber's refcount).
+- **Sharing lifecycle:** equal shapes share one id+stream, ref-counted; N joiners each release
+  exactly once. The final release does NOT delete anything: the shape stays active/warm and is
+  retired by the retention lifecycle (idle → dormant → evicted; `engine/src/retention.rs`). Client
+  `close()` must still be one-shot (a double delete steals another subscriber's refcount).
 - **Shapes vs subset queries stay distinct.** Ranges/`orderBy`/`limit` live ONLY in subset queries
   (never live-tailed); a `changes_only` feed uses a passthrough gate and the client reads from the
   offset captured *before* the page snapshot.
@@ -102,9 +166,11 @@ storage, not the engine).
   moves past it) before the transaction becomes visible to snapshots — the gap includes a WAL fsync.
   The xid gate (`pg_current_snapshot()`) decides both the dropped-row and boundary-duplicate cases
   exactly. See `pg.rs::SnapshotGate`.
-- **The client must delete what it creates — there is no server-side reaper.** Every create path
-  needs a guaranteed, retried, one-shot delete; `track()` in `packages/client/src/index.ts` is the
-  pattern. An unpaired create pins a shared feed's refcount forever.
+- **The client should still release what it creates** (`track()` in `packages/client/src/index.ts`
+  is the pattern), but the engine now has a server-side reaper: an unpaired create pins the shape
+  active only until the retention sweeper's idle/dormancy/eviction layers retire it
+  (`engine/src/retention.rs`). A leaked refcount (double create, missed release) DOES still pin a
+  shape active forever — releases must stay paired one-to-one with creates.
 - **Backfill and replication must produce byte-identical text values.** `to_jsonb(t)` renders
   timestamps ISO-`T`-style; `test_decoding` uses Postgres text output. Same cell, different string →
   broken retractions/routing/MIN-MAX. Backfill casts text-mapped columns with `::text`

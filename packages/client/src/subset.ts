@@ -81,11 +81,11 @@ function isNotFoundError(e: unknown): boolean {
 }
 
 /**
- * Drop a server-side shape/feed subscriber ref, retrying transient failures. The engine refcounts
- * per identical create and there is NO server-side reaper — a swallowed delete leaks the shape (and
- * its stream) forever — so retry with backoff and only warn once if the delete never lands. "Not
- * found" counts as success (the shape was already dropped, e.g. its stream reaped after the final
- * drop).
+ * Release a server-side shape/feed subscriber ref, retrying transient failures. The engine
+ * refcounts per identical create; the final release does not delete the shape (the retention
+ * lifecycle — idle → dormant → evicted — retires it), but a swallowed release leaks a refcount
+ * that pins the shape active forever, so retry with backoff and only warn once if the delete
+ * never lands. "Not found" counts as success (the shape was already evicted by retention).
  */
 export async function deleteShapeWithRetry(trpc: Trpc, id: string): Promise<void> {
   const attempts = 5

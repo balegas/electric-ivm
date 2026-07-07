@@ -22,6 +22,7 @@ pub mod pg;
 pub mod statsd;
 pub mod predicate;
 pub mod replication;
+pub mod retention;
 pub mod schema;
 pub mod sql;
 pub mod subquery;

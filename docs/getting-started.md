@@ -195,7 +195,9 @@ loop with the new offset. If nothing happens within the long-poll window (defaul
 `ELECTRIC_LIVE_TIMEOUT_MS`) you get `204 No Content`: just re-issue the request.
 
 If the handle has been evicted (idle for `ELECTRIC_HANDLE_TTL`, default 600 s) you get
-`409 Conflict` with `[{"headers":{"control":"must-refetch"}}]` — restart from `offset=-1`.
+`409 Conflict` with `[{"headers":{"control":"must-refetch"}}]` — restart from `offset=-1` (the
+re-snapshot rejoins the retained shape; the engine keeps idle shapes dormant for days before
+evicting them — see the retention section of `apps/engine/README.md`).
 Malformed requests (unknown table/column, bad `where`) are `400` with `{"message":"…"}`.
 
 ### What the SQL `where` accepts

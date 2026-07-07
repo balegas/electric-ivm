@@ -10,14 +10,23 @@ import { predicateLabel } from './predicate-label'
 import { shapeSql } from './shape-sql'
 import { applyState, seedState } from './state-store'
 import { eventDecor, mergeDecor, type Decor, type FlashKind } from './trace-anim'
-import type { EngineGraph, GraphShape, TraceMessage } from './types'
+import type { EngineGraph, GraphShape, TraceEvent, TraceMessage } from './types'
 import { useTrace } from './useTrace'
 
 type Mode = 'all' | 'select'
 type View = 'logical' | 'circuit'
 
-/** How long a trace decoration (flash + pulse) stays on screen after the last event. */
+/** How long a trace decoration (flash + pulse) stays on screen past its last stage. */
 const DECOR_TTL_MS = 1100
+/** How many trace events the activity log retains (newest first). */
+const LOG_CAP = 50
+
+/** One activity-log entry: a captured trace event, replayable on click. */
+interface LogEntry {
+  key: number
+  at: number
+  ev: TraceEvent
+}
 /** How long newly created nodes/paths stay highlighted after a graph change. */
 const FRESH_TTL_MS = 2500
 /** How long the graph structure must be quiet before a lifecycle-triggered refresh. Clients
@@ -25,11 +34,13 @@ const FRESH_TTL_MS = 2500
  *  settling past that renders one net change instead of thrashing the layout twice. */
 const LIFECYCLE_SETTLE_MS = 1000
 
-/** Node wrapper adding the trace flash overlay around the base renderer. */
+/** Node wrapper adding the trace flash overlay around the base renderer. The flash is staged
+ *  (`flashDelay`): downstream nodes light up only when the travelling delta reaches them. */
 function FlashNode(props: NodeProps) {
-  const d = props.data as VizNodeData & { flash?: FlashKind | 'new' }
+  const d = props.data as VizNodeData & { flash?: FlashKind | 'new'; flashDelay?: number }
+  const style = d.flashDelay ? ({ '--flash-delay': `${d.flashDelay}ms` } as React.CSSProperties) : undefined
   return (
-    <div className={d.flash ? `flash flash-${d.flash}` : undefined}>
+    <div className={d.flash ? `flash flash-${d.flash}` : undefined} style={style}>
       {d.flash === 'drop' ? <span className="flash-x">✕ dropped</span> : null}
       {d.flash === 'new' ? <span className="flash-star">★ new</span> : null}
       <PipelineNode {...props} />
@@ -59,6 +70,18 @@ function graphDiff(prev: EngineGraph, next: EngineGraph): Set<string> {
   const prevTables = new Set(prev.tables)
   for (const t of next.tables) if (!prevTables.has(t)) added.add(`table:${t}`)
   return added
+}
+
+/** Compact one-line summary of a trace event for the activity log. */
+function logSummary(ev: TraceEvent): { op: string; cls: string; hint: string } {
+  const w = ev.delta.reduce((a, d) => a + d.w, 0)
+  const op = ev.delta.length === 0 ? '·' : ev.delta.length > 1 && w === 0 ? '± update' : w > 0 ? '+ insert' : '− delete'
+  const cls = w > 0 ? 'lop-ins' : w < 0 ? 'lop-del' : 'lop-upd'
+  const row = ev.delta.find((d) => d.w > 0)?.row ?? ev.delta[0]?.row
+  const id = row && 'id' in row ? String(row.id) : null
+  const reached = ev.shapes.length
+  const hint = `${id ? `id ${id} · ` : ''}${reached} shape${reached === 1 ? '' : 's'}`
+  return { op, cls, hint }
 }
 
 function kindOf(s: GraphShape): { label: string; cls: string } {
@@ -165,6 +188,22 @@ export default function App() {
   const presentRef = useRef(new Set<string>())
   presentRef.current = useMemo(() => new Set(nodes.map((n) => n.id)), [nodes])
 
+  // Apply one trace event's staged decoration against the CURRENT render (used by both the live
+  // stream and activity-log replays). The decor stays up for the whole staged run + a tail.
+  const applyEventDecor = useCallback((ev: TraceEvent) => {
+    const d = eventDecor(ev, edgesRef.current, presentRef.current, expandRef.current)
+    if (d.nodes.size === 0 && d.edges.size === 0) return
+    setDecor((prev) => mergeDecor(prev, d))
+    if (decorTimer.current) clearTimeout(decorTimer.current)
+    decorTimer.current = setTimeout(() => setDecor(null), d.totalMs + DECOR_TTL_MS)
+  }, [])
+
+  // Activity log: the last LOG_CAP trace events, newest first — each entry replays its animation
+  // on click. Collapsed by default (a sidebar section header toggles it).
+  const [log, setLog] = useState<LogEntry[]>([])
+  const [logOpen, setLogOpen] = useState(false)
+  const logSeq = useRef(1)
+
   const lifecycleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const onTrace = useCallback(
     (ev: TraceMessage) => {
@@ -186,13 +225,10 @@ export default function App() {
         }, LIFECYCLE_SETTLE_MS)
         return
       }
-      const d = eventDecor(ev, edgesRef.current, presentRef.current, expandRef.current)
-      if (d.nodes.size === 0 && d.edges.size === 0) return
-      setDecor((prev) => mergeDecor(prev, d))
-      if (decorTimer.current) clearTimeout(decorTimer.current)
-      decorTimer.current = setTimeout(() => setDecor(null), DECOR_TTL_MS)
+      setLog((prev) => [{ key: logSeq.current++, at: Date.now(), ev }, ...prev].slice(0, LOG_CAP))
+      applyEventDecor(ev)
     },
-    [load],
+    [load, applyEventDecor],
   )
   // On every (re)connect, re-seed the state store — state events pushed while disconnected are gone.
   const onTraceOpen = useCallback(() => {
@@ -266,9 +302,10 @@ export default function App() {
     const dn =
       decor || freshIds
         ? nodes.map((n) => {
-            const flash = decor?.nodes.get(n.id) ?? (freshIds?.has(n.id) ? ('new' as const) : undefined)
+            const df = decor?.nodes.get(n.id)
+            const flash = df?.kind ?? (freshIds?.has(n.id) ? ('new' as const) : undefined)
             if (!flash) return n
-            return { ...n, data: { ...(n.data as VizNodeData), flash } }
+            return { ...n, data: { ...(n.data as VizNodeData), flash, flashDelay: df?.delayMs ?? 0 } }
           })
         : nodes
     // Edges ALWAYS use the pulse type — flipping an edge's `type` when a decoration appears would
@@ -280,16 +317,21 @@ export default function App() {
       const baseStyle = isFresh ? { ...e.style, stroke: '#7c3aed', strokeWidth: 2.5 } : e.style
       // The pulse keeps the id of the event that created it — re-rendering after a merge must not
       // restart dots already in flight on other edges.
-      const data: PulseEdgeData = { pulse: decor?.edges.get(e.id), baseStyle }
-      return { ...e, type: 'pulse', data, style: undefined }
+      const pulse = decor?.edges.get(e.id)
+      const data: PulseEdgeData = { pulse, baseStyle }
+      // A pulsing edge is lifted above the node cards (each edge is its own stacked svg): the
+      // travelling dot + weight label must never disappear behind a component it passes.
+      return { ...e, type: 'pulse', data, style: undefined, zIndex: pulse ? 1000 : undefined }
     })
     return { nodes: dn, edges: de }
   }, [nodes, edges, decor, freshIds])
 
-  // Force-drop a shape from the engine. The resulting shapeDropped lifecycle event refreshes the
-  // canvas via the settled path; selection/focus are pruned so the view doesn't dangle.
+  // Force-drop a shape from the engine (`?purge=true` bypasses the retention lifecycle — a bare
+  // DELETE only releases a subscription and the shape would stay on the canvas as active/dormant).
+  // The resulting shapeDropped lifecycle event refreshes the canvas via the settled path;
+  // selection/focus are pruned so the view doesn't dangle.
   const deleteShape = useCallback(async (id: string) => {
-    await fetch(`/engine/shapes/${encodeURIComponent(id)}`, { method: 'DELETE' }).catch(() => {})
+    await fetch(`/engine/shapes/${encodeURIComponent(id)}?purge=true`, { method: 'DELETE' }).catch(() => {})
     setSelected((prev) => {
       if (!prev.has(id)) return prev
       const next = new Set(prev)
@@ -299,8 +341,8 @@ export default function App() {
     setFocus((f) => (f && f.id === `shape:${id}` ? null : f))
   }, [])
 
-  // Shared shapes are ref-counted (one DELETE = one decrement), so sweep in passes until the
-  // graph reports no shapes (bounded — a client re-creating shapes concurrently can win).
+  // Purge every shape (force-drop, bypassing retention refcounts/lifecycle). Sweep in passes
+  // until the graph reports no shapes (bounded — a client re-creating shapes concurrently can win).
   const deleteAll = useCallback(async () => {
     for (let pass = 0; pass < 5; pass++) {
       const r = await fetch('/engine/graph').catch(() => null)
@@ -308,7 +350,7 @@ export default function App() {
       const g = (await r.json()) as EngineGraph
       if (g.shapes.length === 0) break
       await Promise.all(
-        g.shapes.map((s) => fetch(`/engine/shapes/${encodeURIComponent(s.id)}`, { method: 'DELETE' }).catch(() => {})),
+        g.shapes.map((s) => fetch(`/engine/shapes/${encodeURIComponent(s.id)}?purge=true`, { method: 'DELETE' }).catch(() => {})),
       )
     }
     setSelected(new Set())
@@ -473,6 +515,37 @@ export default function App() {
               })}
             </div>
           ))}
+        </div>
+
+        <div className="logsec">
+          <button className="logsec-h" onClick={() => setLogOpen((o) => !o)} title="Recent replicated changes — click one to replay its animation">
+            <span>{logOpen ? '▾' : '▸'} Activity</span>
+            {log.length > 0 ? <span className="logsec-count">{log.length}</span> : null}
+          </button>
+          {logOpen ? (
+            <div className="loglist">
+              {log.length === 0 ? (
+                <div className="log-empty">No replicated changes seen yet — write to Postgres and they land here.</div>
+              ) : (
+                log.map((e) => {
+                  const s = logSummary(e.ev)
+                  return (
+                    <button
+                      key={e.key}
+                      className="log-row"
+                      title="Replay this change's animation on the canvas"
+                      onClick={() => applyEventDecor(e.ev)}
+                    >
+                      <span className="log-time">{new Date(e.at).toLocaleTimeString()}</span>
+                      <span className="log-table">{e.ev.table}</span>
+                      <span className={`log-op ${s.cls}`}>{s.op}</span>
+                      <span className="log-hint">{s.hint}</span>
+                    </button>
+                  )
+                })
+              )}
+            </div>
+          ) : null}
         </div>
 
         {view === 'logical' ? (

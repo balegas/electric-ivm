@@ -106,7 +106,7 @@ export interface TraceEvent {
 /** Graph-lifecycle event on the same `/trace` feed (crate::trace::GraphLifecycle): the pipeline's
  *  structure changed. Distinguished from data TraceEvents by the `type` field. */
 export interface TraceLifecycle {
-  type: 'shapeAdded' | 'shapeDropped'
+  type: 'shapeAdded' | 'shapeDropped' | 'shapeDormant' | 'shapeReactivated'
   shape: string
   table?: string
 }

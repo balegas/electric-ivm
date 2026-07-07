@@ -53,6 +53,12 @@ pub enum GraphLifecycle {
     ShapeAdded { shape: String, table: String },
     #[serde(rename_all = "camelCase")]
     ShapeDropped { shape: String },
+    /// The shape went dormant (retention idle timer): engine state dropped, stream retained.
+    #[serde(rename_all = "camelCase")]
+    ShapeDormant { shape: String },
+    /// A touch reactivated a dormant shape (table-stream replay, no Postgres backfill).
+    #[serde(rename_all = "camelCase")]
+    ShapeReactivated { shape: String, table: String },
 }
 
 /// Live per-node state update, broadcast on the same channel as [`TraceEvent`] after a tailer

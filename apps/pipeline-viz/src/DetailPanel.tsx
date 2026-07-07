@@ -631,14 +631,6 @@ export function DetailPanel({
           </>
         ) : null}
         <InsideNote kind={node.opKind} />
-        <div className="dp-note">
-          In the <b>dbsp circuit</b> view every box is one operator the engine declares it executes
-          (from <code>/graph</code>'s operator decomposition), every arrow a Z-set stream — dashed =
-          a stateful arrangement feeding a join. Operators shared underneath (a table's Δ, a
-          family's params arrangement, a subquery's distinct node) appear once, exactly as the
-          engine shares them. Click the same structure in the <b>Logical</b> view for full state
-          dumps.
-        </div>
       </>
     )
   } else if (node.kind === 'aggshape') {

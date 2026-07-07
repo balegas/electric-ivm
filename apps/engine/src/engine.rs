@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use dbsp::ZWeight;
@@ -16,6 +17,7 @@ use std::sync::atomic::Ordering;
 use crate::ds::{DsClient, Envelope, EnvelopeHeaders};
 use crate::metrics::{Timer, metrics};
 use crate::predicate::{CompiledPredicate, PredicateJson};
+use crate::retention::{EvictReason, LifeState, RetentionConfig, ShapeLife, SweepShape};
 use crate::schema::{Schema, TableSchema, compile_schema};
 use crate::subquery::{SubqueryRegistry, predicate_has_subquery, referenced_tables};
 use crate::value::{Row, Value};
@@ -51,6 +53,14 @@ pub struct Engine {
     /// Best-effort per-envelope trace broadcast (see [`crate::trace`]). Events are serialized once
     /// and only when someone is subscribed; slow subscribers lag and drop.
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
+    /// Per-shape retention lifecycle (active / dormant / transitioning) + `last_read`. A separate
+    /// sync mutex (not `EngineState`) so hot read paths can touch it without the async engine
+    /// lock. Lock order: when both are held, `state` first, then `lives`; never across `.await`.
+    lives: Arc<std::sync::Mutex<HashMap<String, ShapeLife>>>,
+    /// Retention tuning (read from the environment at construction; see [`RetentionConfig`]).
+    retention: Arc<RetentionConfig>,
+    /// Set once the background retention sweeper has been spawned (idempotent lazy start).
+    retention_started: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct EngineState {
@@ -359,6 +369,29 @@ enum TailerCmd {
         ready: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     },
     RemoveShape { shape_id: String },
+    /// Retention: unregister a plain row shape (standalone or family-routed) and hand back its
+    /// resume state — the tailer's current table-stream offset (everything at/below it has been
+    /// fanned to the shape's stream) and the shape's backfill-snapshot gate. `None` if the shape
+    /// is unknown to this tailer or is an aggregate (aggregates cannot go dormant — their fold
+    /// state is not rebuildable from a bounded replay).
+    DeactivateShape {
+        shape_id: String,
+        resp: tokio::sync::oneshot::Sender<Option<(String, crate::pg::SnapshotGate)>>,
+    },
+    /// Retention: reactivate a dormant shape — replay `table/<name>` from `resume_offset`,
+    /// append the shape's matching deltas to its retained stream (no Postgres backfill), then
+    /// re-register it for live routing. Runs inline in the tailer loop, so no live envelope can
+    /// interleave with the replay.
+    ResumeShape {
+        shape_id: String,
+        num_id: u64,
+        stream_path: String,
+        pred: Arc<CompiledPredicate>,
+        out_cols: Option<Arc<Vec<usize>>>,
+        resume_offset: String,
+        gate: crate::pg::SnapshotGate,
+        ready: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
     /// Dump the full internal state of one node this tailer owns (`family:<t>:<cols>` → the
     /// routing index contents; an aggregate `shape:<sid>` → the fold internals incl. the MIN/MAX
     /// multiset). `None` if the node id is unknown to this tailer. Serves `GET /state/node`.
@@ -386,6 +419,9 @@ impl Engine {
             health: Arc::new(std::sync::atomic::AtomicU8::new(HEALTH_ACTIVE)),
             subqueries,
             trace_tx: tokio::sync::broadcast::channel(crate::trace::CHANNEL_CAP).0,
+            lives: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            retention: Arc::new(RetentionConfig::from_env()),
+            retention_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -555,6 +591,7 @@ impl Engine {
         // Whole shape-creation timer (backfill + registration); emitted by the creator on success only
         // (joiners return early before this fires) as `create_snapshot_task.stop.duration`.
         let created_at = std::time::Instant::now();
+        self.ensure_retention_sweeper();
         let mut st = self.state.lock().await;
         let ts = match st.tables.get(table) {
             Some(ts) => ts.clone(),
@@ -580,6 +617,13 @@ impl Engine {
                     drop(st);
                     if let Err(e) = await_share_ready(ready, &existing_id).await {
                         // The failed creator already removed the share entries; undo nothing.
+                        return Err(e);
+                    }
+                    // A rejoin is a touch: if the shape went dormant since the last subscriber
+                    // left, reactivate it (table-stream replay) before handing out the stream.
+                    if let Err(e) = self.ensure_active(&existing_id).await {
+                        // Roll the failed join back so the dead subscription doesn't pin the shape.
+                        self.release_shape(&existing_id).await;
                         return Err(e);
                     }
                     return Ok(rec);
@@ -624,6 +668,7 @@ impl Engine {
                 aggregate: None,
             };
             st.shapes.insert(id.clone(), rec.clone());
+            self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
             // Register this (first) subquery shape so later identical ones join it by ref-count.
             // Joiners wait on `ready_tx` — the shape isn't live until the registry has seeded its
             // nodes and backfilled the stream.
@@ -657,6 +702,7 @@ impl Engine {
                     // wake any joiners with the failure.
                     let mut st = self.state.lock().await;
                     st.shapes.remove(&id);
+                    self.lives.lock().unwrap().remove(&id);
                     if let Some(share) = st.feed_shares.remove(&id) {
                         st.feed_by_sig.remove(&share.sig);
                     }
@@ -706,6 +752,7 @@ impl Engine {
             aggregate: None,
         };
         st.shapes.insert(id.clone(), rec.clone());
+        self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
         // Register the (first) shared feed so later identical subset feeds join it. Joiners wait on
         // `share_tx` for the backfill outcome.
         let (share_tx, share_rx) = tokio::sync::watch::channel(None);
@@ -732,6 +779,7 @@ impl Engine {
                 // later identical create would join) and surface the error to the caller.
                 let mut st = self.state.lock().await;
                 st.shapes.remove(&id);
+                self.lives.lock().unwrap().remove(&id);
                 if let Some(share) = st.feed_shares.remove(&id) {
                     st.feed_by_sig.remove(&share.sig);
                 }
@@ -756,6 +804,7 @@ impl Engine {
         func: AggFn,
         col: Option<String>,
     ) -> Result<ShapeRecord> {
+        self.ensure_retention_sweeper();
         let mut st = self.state.lock().await;
         let ts = st.tables.get(table).cloned().ok_or_else(|| anyhow::anyhow!("unknown table '{table}'"))?;
         if where_.as_ref().is_some_and(predicate_has_subquery) {
@@ -780,6 +829,7 @@ impl Engine {
                 let ready = share.ready.clone();
                 drop(st);
                 await_share_ready(ready, &existing_id).await?;
+                self.touch_shape(&existing_id); // aggregates never go dormant; a join is still a read
                 return Ok(rec);
             }
         }
@@ -822,6 +872,7 @@ impl Engine {
             aggregate: Some(AggInfo { func, col }),
         };
         st.shapes.insert(id.clone(), rec.clone());
+        self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
         // Register this (first) aggregate so later identical ones join it by ref-count.
         let (share_tx, share_rx) = tokio::sync::watch::channel(None);
         st.feed_by_sig.insert(agg_sig.clone(), id.clone());
@@ -840,6 +891,7 @@ impl Engine {
             Err(e) => {
                 let mut st = self.state.lock().await;
                 st.shapes.remove(&id);
+                self.lives.lock().unwrap().remove(&id);
                 if let Some(share) = st.feed_shares.remove(&id) {
                     st.feed_by_sig.remove(&share.sig);
                 }
@@ -856,12 +908,16 @@ impl Engine {
 
     /// Snapshot the whole maintained pipeline for the visualizer: tables, every registered shape with
     /// its routing placement (family key / standalone / subquery), the shared subquery node+edge DAG,
-    /// and the exploded per-operator decomposition for the circuit view.
+    /// and the exploded per-operator decomposition for the circuit view. Deterministically ordered
+    /// (tables by name, shapes by numeric id, nodes/edges by signature): the maps behind it iterate
+    /// in random order, and a consumer diffing consecutive snapshots (the visualizer's "did the
+    /// structure change" check) must see byte-identical output for an unchanged pipeline.
     pub async fn graph(&self) -> EngineGraph {
         let (tables, shapes, schemas) = {
             let st = self.state.lock().await;
-            let tables: Vec<String> = st.tables.keys().cloned().collect();
-            let shapes: Vec<GraphShape> = st
+            let mut tables: Vec<String> = st.tables.keys().cloned().collect();
+            tables.sort();
+            let mut shapes: Vec<GraphShape> = st
                 .shapes
                 .values()
                 .map(|r| GraphShape {
@@ -876,6 +932,7 @@ impl Engine {
                     aggregate: r.aggregate.clone(),
                 })
                 .collect();
+            shapes.sort_by_key(|s| s.id.strip_prefix('s').and_then(|n| n.parse::<u64>().ok()).unwrap_or(u64::MAX));
             let schemas: HashMap<String, TableSchema> = st.tables.clone();
             (tables, shapes, schemas)
         };
@@ -887,7 +944,7 @@ impl Engine {
                 .unwrap_or_else(|| format!("col{idx}"))
         };
         let reg = self.subqueries.lock().await;
-        let subquery_nodes: Vec<GraphNode> = reg
+        let mut subquery_nodes: Vec<GraphNode> = reg
             .nodes
             .values()
             .map(|n| GraphNode {
@@ -898,7 +955,8 @@ impl Engine {
                 refcount: n.refcount,
             })
             .collect();
-        let subquery_edges: Vec<GraphEdge> = reg
+        subquery_nodes.sort_by(|a, b| a.sig.cmp(&b.sig));
+        let mut subquery_edges: Vec<GraphEdge> = reg
             .edges
             .iter()
             .map(|e| {
@@ -923,6 +981,8 @@ impl Engine {
                 }
             })
             .collect();
+        subquery_edges
+            .sort_by(|a, b| (&a.node_sig, &a.dependent_kind, &a.dependent_id).cmp(&(&b.node_sig, &b.dependent_kind, &b.dependent_id)));
         let (operators, op_edges) = circuit_ops(&tables, &shapes, &subquery_nodes, &subquery_edges);
         EngineGraph { tables, shapes, subquery_nodes, subquery_edges, operators, op_edges }
     }
@@ -941,18 +1001,33 @@ impl Engine {
         })
     }
 
-    pub async fn drop_shape(&self, id: &str) -> Result<()> {
+    /// Release one subscription on a shape (extended-API `DELETE /shapes/{id}`, `/v1/shape` handle
+    /// eviction). Refcount-0 does **not** tear the shape down anymore: the shape stays active (a
+    /// brief reconnect rejoins it warm), goes dormant after the retention idle timeout, and is
+    /// eventually evicted by the layered retention policy — see [`crate::retention`]. Releasing is
+    /// also a touch (it resets the idle timer), so the idle countdown starts at the disconnect.
+    /// Infallible: it only adjusts in-memory counters.
+    pub async fn release_shape(&self, id: &str) {
         let mut st = self.state.lock().await;
-        // Shared subset feed: decrement the ref-count; only actually tear it down when the last
-        // subscriber leaves. (A materialized shape / unshared feed is not in `feed_shares` → drops now.)
         if let Some(share) = st.feed_shares.get_mut(id) {
             share.refcount = share.refcount.saturating_sub(1);
-            if share.refcount > 0 {
-                return Ok(());
-            }
-            let sig = share.sig.clone();
-            st.feed_shares.remove(id);
-            st.feed_by_sig.remove(&sig);
+        }
+        drop(st);
+        self.touch_shape(id);
+    }
+
+    /// Force-drop a shape NOW, bypassing the retention lifecycle: full teardown (record, share
+    /// entries, lifecycle entry, tailer routing, subquery-registry entry, durable stream)
+    /// regardless of refcount or lifecycle state. An admin/debug operation (`DELETE
+    /// /shapes/{id}?purge=true`, the visualizer's trash button) — subscribed clients see their
+    /// stream vanish and recreate via the normal 404 / must-refetch path. The tailer command
+    /// queue is FIFO, so a purge ordered after an in-flight resume removes whatever the resume
+    /// registered.
+    pub async fn purge_shape(&self, id: &str) -> Result<()> {
+        let mut st = self.state.lock().await;
+        self.lives.lock().unwrap().remove(id);
+        if let Some(share) = st.feed_shares.remove(id) {
+            st.feed_by_sig.remove(&share.sig);
         }
         let removed = st.shapes.remove(id);
         if let Some(rec) = &removed {
@@ -961,18 +1036,361 @@ impl Engine {
             }
         }
         drop(st);
-        // Subquery shapes live in the registry (a no-op here if `id` was a plain shape).
+        // Subquery shapes live in the registry (a no-op for plain shapes).
         self.subqueries.lock().await.drop_subquery_shape(id);
-        // Final drop: delete the durable stream. Without this every dropped shape orphans its stream
-        // on the storage server forever (disk leak observed under loadgen open/close churn). Any
-        // still-in-flight tailer append observes the 404 and discards cleanly (`append_reliable`).
         if let Some(rec) = removed {
             if let Err(e) = self.ds.delete_stream(&rec.stream_path).await {
-                tracing::warn!("failed to delete stream {} for dropped shape {id}: {e:#}", rec.stream_path);
+                tracing::warn!("failed to delete stream {} for purged shape {id}: {e:#}", rec.stream_path);
             }
             trace_lifecycle(&self.trace_tx, crate::trace::GraphLifecycle::ShapeDropped { shape: id.to_string() });
+            tracing::info!("purged shape {id} (forced)");
         }
         Ok(())
+    }
+
+    /// Record an engine-visible read of a shape (drives the retention idle timer + LRU order).
+    fn touch_shape(&self, id: &str) {
+        if let Some(life) = self.lives.lock().unwrap().get_mut(id) {
+            life.last_read = Instant::now();
+        }
+    }
+
+    /// The shape's retention lifecycle, for introspection (`GET /shapes/{id}`).
+    pub async fn shape_lifecycle(&self, id: &str) -> Option<&'static str> {
+        self.lives.lock().unwrap().get(id).map(|l| match l.state {
+            LifeState::Active => "active",
+            LifeState::Deactivating { .. } => "deactivating",
+            LifeState::Dormant { .. } => "dormant",
+            LifeState::Reactivating { .. } => "reactivating",
+        })
+    }
+
+    /// Make sure a shape is active, reactivating it from dormancy if needed ("any touch
+    /// reactivates"): replay `table/<name>` from the shape's resume offset through its predicate
+    /// onto the retained stream — no Postgres backfill — then re-register it for live routing.
+    /// Concurrent touches coalesce onto one replay; a touch during deactivation waits for the
+    /// transition to settle first. Also refreshes `last_read`.
+    pub async fn ensure_active(&self, id: &str) -> Result<()> {
+        loop {
+            enum Step {
+                Done,
+                WaitDeactivate(tokio::sync::watch::Receiver<bool>),
+                WaitReactivate(tokio::sync::watch::Receiver<Option<bool>>),
+            }
+            let step = {
+                let mut lives = self.lives.lock().unwrap();
+                match lives.get_mut(id) {
+                    // Unknown to retention (already evicted, or never tracked): nothing to do here —
+                    // the caller's own record lookup decides between 404 and normal service.
+                    None => Step::Done,
+                    Some(life) => {
+                        life.last_read = Instant::now();
+                        match &life.state {
+                            LifeState::Active => Step::Done,
+                            LifeState::Deactivating { done } => Step::WaitDeactivate(done.clone()),
+                            LifeState::Reactivating { done } => Step::WaitReactivate(done.clone()),
+                            LifeState::Dormant { resume_offset, gate, .. } => {
+                                // Kick off the replay in a DETACHED task: `ensure_active` futures
+                                // are dropped when an HTTP client disconnects, and a cancelled
+                                // in-place replay would strand the shape in `Reactivating`. The
+                                // task always settles the lifecycle state and publishes the
+                                // outcome; this caller then awaits THIS attempt's channel (so a
+                                // deterministic failure surfaces once — it never respawns in a
+                                // loop), like any concurrent toucher.
+                                let resume_offset = resume_offset.clone();
+                                let gate = gate.clone();
+                                let (tx, rx) = tokio::sync::watch::channel(None);
+                                life.state = LifeState::Reactivating { done: rx.clone() };
+                                let engine = self.clone();
+                                let id = id.to_string();
+                                tokio::spawn(async move {
+                                    let res = engine.resume_dormant(&id, resume_offset.clone(), gate.clone()).await;
+                                    let mut lives = engine.lives.lock().unwrap();
+                                    match res {
+                                        Ok(()) => {
+                                            if let Some(life) = lives.get_mut(&id) {
+                                                life.state = LifeState::Active;
+                                                life.last_read = Instant::now();
+                                            }
+                                            let _ = tx.send(Some(true));
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("reactivating shape {id} failed: {e:#}");
+                                            // Restore the dormant resume state so a later touch can retry.
+                                            if let Some(life) = lives.get_mut(&id) {
+                                                life.state =
+                                                    LifeState::Dormant { since: Instant::now(), resume_offset, gate };
+                                            }
+                                            let _ = tx.send(Some(false));
+                                        }
+                                    }
+                                });
+                                Step::WaitReactivate(rx)
+                            }
+                        }
+                    }
+                }
+            };
+            match step {
+                Step::Done => return Ok(()),
+                Step::WaitDeactivate(mut rx) => {
+                    // Deactivation in flight: wait for it to settle, then loop (we'll see Dormant).
+                    while !*rx.borrow_and_update() {
+                        if rx.changed().await.is_err() {
+                            break; // deactivator vanished; re-inspect the state
+                        }
+                    }
+                }
+                Step::WaitReactivate(mut rx) => loop {
+                    let outcome = *rx.borrow_and_update();
+                    match outcome {
+                        Some(true) => return Ok(()),
+                        Some(false) => bail!("shape '{id}' reactivation failed; retry the read"),
+                        None => {
+                            if rx.changed().await.is_err() {
+                                bail!("shape '{id}' reactivator died; retry the read");
+                            }
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    /// The replay half of a reactivation: hand the dormant shape's resume state to its table's
+    /// tailer, which replays the table stream and re-registers the shape (see
+    /// [`TailerCmd::ResumeShape`]). Split from [`ensure_active`] so the lifecycle bookkeeping
+    /// around it stays in one place.
+    async fn resume_dormant(&self, id: &str, resume_offset: String, gate: crate::pg::SnapshotGate) -> Result<()> {
+        let mut st = self.state.lock().await;
+        let rec = st.shapes.get(id).cloned().with_context(|| format!("shape '{id}' vanished during reactivation"))?;
+        let ts = st.tables.get(&rec.table).cloned().with_context(|| format!("unknown table '{}'", rec.table))?;
+        let pred = Arc::new(CompiledPredicate::compile_opt(rec.where_json.as_ref(), &ts)?);
+        let out_cols = resolve_columns(&ts, rec.columns.clone())?;
+        let num_id: u64 = id.strip_prefix('s').and_then(|n| n.parse().ok()).context("unparseable shape id")?;
+        if !st.tailers.contains_key(&rec.table) {
+            let handle =
+                spawn_tailer(self.ds.clone(), ts.clone(), self.pg_url.clone(), self.subqueries.clone(), self.trace_tx.clone());
+            st.tailers.insert(rec.table.clone(), handle);
+        }
+        let tailer = st.tailers.get(&rec.table).expect("tailer just ensured");
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        tailer
+            .cmd_tx
+            .send(TailerCmd::ResumeShape {
+                shape_id: id.to_string(),
+                num_id,
+                stream_path: rec.stream_path.clone(),
+                pred,
+                out_cols,
+                resume_offset,
+                gate,
+                ready: ready_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("tailer for '{}' is gone", rec.table))?;
+        drop(st);
+        ready_rx
+            .await
+            .unwrap_or_else(|_| Err("tailer dropped the ready channel".to_string()))
+            .map_err(|e| anyhow::anyhow!("shape '{id}' reactivation failed: {e}"))?;
+        metrics().shapes_reactivated.fetch_add(1, Ordering::Relaxed);
+        trace_lifecycle(
+            &self.trace_tx,
+            crate::trace::GraphLifecycle::ShapeReactivated { shape: id.to_string(), table: rec.table.clone() },
+        );
+        tracing::info!("reactivated dormant shape {id} (table {})", rec.table);
+        Ok(())
+    }
+
+    /// Move an idle refcount-0 shape from active to dormant: the tailer unregisters it and hands
+    /// back the resume state (table-stream offset + snapshot gate); the stream and record are
+    /// retained. Rechecks eligibility under the locks — a touch or rejoin racing the sweep wins.
+    async fn deactivate_shape(&self, id: &str) -> Result<()> {
+        let st = self.state.lock().await;
+        let Some(rec) = st.shapes.get(id).cloned() else { return Ok(()) }; // already gone
+        if rec.is_subquery || rec.aggregate.is_some() {
+            return Ok(()); // never dormant (state not rebuildable from a bounded replay)
+        }
+        if st.feed_shares.get(id).is_some_and(|s| s.refcount > 0) {
+            return Ok(()); // resubscribed since the sweep snapshot
+        }
+        let Some(tailer_tx) = st.tailers.get(&rec.table).map(|t| t.cmd_tx.clone()) else { return Ok(()) };
+        let (done_tx, done_rx) = tokio::sync::watch::channel(false);
+        {
+            let mut lives = self.lives.lock().unwrap();
+            let Some(life) = lives.get_mut(id) else { return Ok(()) };
+            if !matches!(life.state, LifeState::Active)
+                || life.last_read.elapsed() < self.retention.idle_timeout
+            {
+                return Ok(()); // touched or already transitioning since the sweep snapshot
+            }
+            life.state = LifeState::Deactivating { done: done_rx };
+        }
+        drop(st);
+
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        let sent = tailer_tx.send(TailerCmd::DeactivateShape { shape_id: id.to_string(), resp: resp_tx }).is_ok();
+        let resume = if sent { resp_rx.await.ok().flatten() } else { None };
+        let mut lives = self.lives.lock().unwrap();
+        let Some(life) = lives.get_mut(id) else { return Ok(()) };
+        match resume {
+            Some((resume_offset, gate)) => {
+                life.state = LifeState::Dormant { since: Instant::now(), resume_offset, gate };
+                drop(lives);
+                metrics().shapes_dormanted.fetch_add(1, Ordering::Relaxed);
+                trace_lifecycle(&self.trace_tx, crate::trace::GraphLifecycle::ShapeDormant { shape: id.to_string() });
+                tracing::debug!("shape {id} went dormant (idle)");
+            }
+            None => {
+                // The tailer didn't know the shape (or is gone): leave it active. Reset the idle
+                // clock so the sweep backs off a full idle window instead of re-attempting (and
+                // re-warning) every sweep.
+                life.state = LifeState::Active;
+                life.last_read = Instant::now();
+                drop(lives);
+                tracing::warn!("deactivating shape {id}: tailer returned no resume state; left active");
+            }
+        }
+        let _ = done_tx.send(true);
+        Ok(())
+    }
+
+    /// Evict a shape: delete its record, share entries, lifecycle entry, and durable stream. A
+    /// returning `/v1/shape` client gets `409 must-refetch`; an extended-API client gets `404` and
+    /// recreates. Normally only **dormant** shapes are evicted; the exception is non-parkable
+    /// shapes (subquery / aggregate — see [`crate::retention`]), which the TTL layer evicts
+    /// straight from active with a full teardown. Rechecks eligibility under the locks — a
+    /// reactivation or rejoin racing the sweep wins.
+    async fn evict_shape(&self, id: &str, reason: EvictReason) -> Result<()> {
+        let mut st = self.state.lock().await;
+        let Some(rec) = st.shapes.get(id).cloned() else { return Ok(()) };
+        let parkable = !rec.is_subquery && rec.aggregate.is_none();
+        {
+            let mut lives = self.lives.lock().unwrap();
+            let evictable = match lives.get(id) {
+                Some(life) if matches!(life.state, LifeState::Dormant { .. }) => true,
+                // A non-parkable shape is evicted from active only if it is still idle past the
+                // full grace window (a touch since the sweep snapshot wins).
+                Some(life) if !parkable && matches!(life.state, LifeState::Active) => {
+                    life.last_read.elapsed() >= self.retention.idle_timeout + self.retention.dormant_ttl
+                }
+                _ => false, // transitioning (or already evicted) since the sweep snapshot
+            };
+            if !evictable {
+                return Ok(());
+            }
+            if st.feed_shares.get(id).is_some_and(|s| s.refcount > 0) {
+                return Ok(());
+            }
+            lives.remove(id);
+        }
+        if let Some(share) = st.feed_shares.remove(id) {
+            st.feed_by_sig.remove(&share.sig);
+        }
+        let removed = st.shapes.remove(id);
+        // A dormant shape is already unregistered from its tailer; a non-parkable one is still
+        // live and needs the full teardown (tailer routing for aggregates, registry for subqueries).
+        if !parkable {
+            if let Some(t) = st.tailers.get(&rec.table) {
+                let _ = t.cmd_tx.send(TailerCmd::RemoveShape { shape_id: id.to_string() });
+            }
+        }
+        drop(st);
+        if !parkable {
+            self.subqueries.lock().await.drop_subquery_shape(id);
+        }
+        if let Some(rec) = removed {
+            if let Err(e) = self.ds.delete_stream(&rec.stream_path).await {
+                tracing::warn!("failed to delete stream {} for evicted shape {id}: {e:#}", rec.stream_path);
+            }
+            metrics().shapes_evicted.fetch_add(1, Ordering::Relaxed);
+            trace_lifecycle(&self.trace_tx, crate::trace::GraphLifecycle::ShapeDropped { shape: id.to_string() });
+            tracing::info!("evicted shape {id} ({})", reason.as_str());
+        }
+        Ok(())
+    }
+
+    /// One retention sweep: snapshot every shape's status, run the pure layered policy
+    /// ([`crate::retention::plan_sweep`]), then execute the plan. Public so a harness can force a
+    /// sweep instead of waiting for the background interval.
+    pub async fn retention_sweep(&self) {
+        let cfg = self.retention.clone();
+        let snapshot: Vec<SweepShape> = {
+            let st = self.state.lock().await;
+            let bytes = self.ds.appended_bytes_with_prefix("shape/");
+            let lives = self.lives.lock().unwrap();
+            st.shapes
+                .values()
+                .map(|rec| {
+                    let life = lives.get(&rec.id);
+                    let (idle, dormant_for, in_transition) = match life {
+                        None => (std::time::Duration::ZERO, None, true), // mid-create; leave alone
+                        Some(l) => match &l.state {
+                            LifeState::Active => (l.last_read.elapsed(), None, false),
+                            LifeState::Dormant { since, .. } => (l.last_read.elapsed(), Some(since.elapsed()), false),
+                            LifeState::Deactivating { .. } | LifeState::Reactivating { .. } => {
+                                (l.last_read.elapsed(), None, true)
+                            }
+                        },
+                    };
+                    SweepShape {
+                        id: rec.id.clone(),
+                        refcount: st.feed_shares.get(&rec.id).map(|s| s.refcount).unwrap_or(0),
+                        idle,
+                        dormant_for,
+                        in_transition,
+                        dormancy_eligible: !rec.is_subquery && rec.aggregate.is_none(),
+                        stream_bytes: bytes.get(&rec.stream_path).copied().unwrap_or(0),
+                    }
+                })
+                .collect()
+        };
+        let plan = crate::retention::plan_sweep(&cfg, &snapshot);
+        if plan.over_capacity {
+            metrics().retention_pressure.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                "retention: {} shapes exceed max_shapes={} but nothing dormant is left to evict — \
+                 every shape is actively subscribed or recently read; raise ELECTRIC_IVM_MAX_SHAPES or lower the idle timeout",
+                snapshot.len(),
+                cfg.max_shapes
+            );
+        }
+        if plan.over_budget {
+            metrics().retention_pressure.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                "retention: shape streams exceed the disk budget ({} bytes) but nothing dormant is left to evict — \
+                 raise ELECTRIC_IVM_SHAPE_DISK_BUDGET_MB or lower the idle timeout",
+                cfg.disk_budget_bytes
+            );
+        }
+        for id in &plan.deactivate {
+            if let Err(e) = self.deactivate_shape(id).await {
+                tracing::warn!("retention: deactivating shape {id} failed: {e:#}");
+            }
+        }
+        for (id, reason) in &plan.evict {
+            if let Err(e) = self.evict_shape(id, *reason).await {
+                tracing::warn!("retention: evicting shape {id} failed: {e:#}");
+            }
+        }
+    }
+
+    /// Spawn (once) the background retention sweeper. Started lazily from the shape-create paths
+    /// so library users that never create shapes never run it.
+    fn ensure_retention_sweeper(&self) {
+        if self.retention_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let engine = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(engine.retention.sweep_interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await; // the first tick fires immediately; skip it
+            loop {
+                tick.tick().await;
+                engine.retention_sweep().await;
+            }
+        });
     }
 
     /// Number of maintained subquery nodes (for the sharing-topology introspection endpoint).
@@ -992,8 +1410,12 @@ impl Engine {
     }
 
     /// Read a shape's durable stream (catch-up or long-poll live) — used by the Electric adapter to turn
-    /// the engine's shape output into Electric `/v1/shape` change messages.
+    /// the engine's shape output into Electric `/v1/shape` change messages. A data read is a full
+    /// retention touch: it reactivates a dormant shape before reading (so a parked stream is never
+    /// served stale) and refreshes `last_read`. `ensure_active` is a cheap lifecycle-map check when
+    /// the shape is active (the common case) or the path is not a shape stream.
     pub async fn read_shape_stream(&self, path: &str, offset: &str, live: bool) -> Result<crate::ds::ReadResult> {
+        self.ensure_active(sid_of_path(path)).await?;
         self.ds.read(path, offset, live).await
     }
 
@@ -1018,8 +1440,16 @@ impl Engine {
         };
         let (sq_nodes, sq_contributors, sq_distinct, sq_shapes, sq_edges) =
             self.subqueries.lock().await.mem_totals();
+        let shapes_dormant = self
+            .lives
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|l| matches!(l.state, LifeState::Dormant { .. }))
+            .count();
         crate::mem::Cardinalities {
             shapes,
+            shapes_dormant,
             tailers,
             tables,
             families,
@@ -1033,6 +1463,9 @@ impl Engine {
         }
     }
 
+    /// Look up a shape record. Deliberately NOT a retention touch: this is a metadata lookup
+    /// (the visualizer and harnesses poll it), not a read of the shape's data — counting it
+    /// would keep observed shapes active forever.
     pub async fn get_shape(&self, id: &str) -> Option<ShapeRecord> {
         self.state.lock().await.shapes.get(id).cloned()
     }
@@ -1751,25 +2184,46 @@ async fn tailer_loop(
                     let _ = resp.send(val);
                 }
                 Some(TailerCmd::RemoveShape { shape_id }) => {
-                    if aggregates.remove(&shape_id).is_some() {
-                        // an aggregation shape — nothing else to unwind
-                    } else if shapes.remove(&shape_id).is_none()
-                        && let Some((key_cols, num_id, key_tuple)) = family_of.remove(&shape_id)
-                        && let Some(router) = families.get_mut(&key_cols)
-                    {
-                        // Drop the shape from its key's routing list (the shape stream is torn down
-                        // elsewhere); discard the router once it routes to no shapes.
-                        if let Some(routed) = router.index.get_mut(&key_tuple) {
-                            routed.retain(|rs| rs.num_id != num_id);
-                            if routed.is_empty() {
-                                router.index.remove(&key_tuple);
-                            }
-                        }
-                        if router.index.is_empty() {
-                            families.remove(&key_cols);
-                        }
+                    if aggregates.remove(&shape_id).is_none() {
+                        unregister_shape_routing(&mut shapes, &mut families, &mut family_of, &shape_id);
                     }
                     emitted.remove(&shape_id);
+                    publish_stats(&stats, &shapes, &families);
+                    publish_node_states(
+                        &ts, &offset, envelopes_total, &shapes, &families, &family_of, &aggregates,
+                        &emitted, &node_states, &subqueries, &trace_tx,
+                    ).await;
+                }
+                Some(TailerCmd::DeactivateShape { shape_id, resp }) => {
+                    // Unregister like RemoveShape, but capture the shape's snapshot gate and hand
+                    // back the resume state. The batch preceding this command was fully fanned out
+                    // + flushed (commands and reads are one serialized select loop), so the current
+                    // `offset` is exactly "the shape's stream is complete up to here". Aggregates
+                    // are not deactivatable (their fold state is not replayable) — `None`.
+                    let gate = if aggregates.contains_key(&shape_id) {
+                        None
+                    } else {
+                        unregister_shape_routing(&mut shapes, &mut families, &mut family_of, &shape_id)
+                    };
+                    emitted.remove(&shape_id);
+                    let _ = resp.send(gate.map(|g| (offset.clone(), g)));
+                    publish_stats(&stats, &shapes, &families);
+                    publish_node_states(
+                        &ts, &offset, envelopes_total, &shapes, &families, &family_of, &aggregates,
+                        &emitted, &node_states, &subqueries, &trace_tx,
+                    ).await;
+                }
+                Some(TailerCmd::ResumeShape {
+                    shape_id, num_id, stream_path, pred, out_cols, resume_offset, gate, ready,
+                }) => {
+                    let res = resume_shape_routed(
+                        &ds, &ts, &table_path, &mut shapes, &mut families, &mut family_of, &mut emitted,
+                        shape_id, num_id, stream_path, pred, out_cols, resume_offset, gate,
+                    ).await;
+                    if let Err(e) = &res {
+                        tracing::error!("resume_shape failed: {e:#}");
+                    }
+                    let _ = ready.send(res.map_err(|e| format!("{e:#}")));
                     publish_stats(&stats, &shapes, &families);
                     publish_node_states(
                         &ts, &offset, envelopes_total, &shapes, &families, &family_of, &aggregates,
@@ -1937,37 +2391,90 @@ async fn add_shape_routed(
     out_cols: Option<Arc<Vec<usize>>>,
     changes_only: bool,
 ) -> Result<()> {
+    // Backfill = current matching rows from Postgres (emitted as upserts). The predicate is pushed
+    // into the SELECT so only matching rows are read (for an equality template that is exactly the
+    // key-matching rows — the engine never holds a table copy); `matches()` below is the final
+    // authority (and a safety net if the SQL is ever a looser superset). Each shape records its own
+    // snapshot gate for the live-change reconciliation. A `changes_only` feed skips the backfill
+    // entirely and forwards every future match (passthrough gate) — this is the non-materialized
+    // live tail a subset query follows.
     let proj = out_cols.as_deref().map(Vec::as_slice);
+    let gate = if changes_only {
+        crate::pg::SnapshotGate::passthrough()
+    } else {
+        let t0 = std::time::Instant::now();
+        let bf = pg_backfill(pg_url, ts, Some(pred.as_ref())).await?;
+        let make_new_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let out: Vec<(Row, ZWeight)> = bf.rows.iter().filter(|r| pred.matches(r)).map(|r| (r.clone(), 1)).collect();
+        let rows = out.len() as u64;
+        let mut snapshot_bytes = 0u64;
+        if !out.is_empty() {
+            let envs = translate_output(ts, out, None, None, proj);
+            if crate::statsd::enabled() {
+                snapshot_bytes = envs_bytes(&envs);
+            }
+            ds.append(&stream_path, &envs).await?;
+            emitted.insert(shape_id.clone(), envs.len() as u64);
+        }
+        crate::statsd::snapshot_stored(rows, snapshot_bytes, make_new_ms);
+        bf.gate
+    };
+    register_shape_routing(shapes, families, family_of, shape_id, num_id, stream_path, pred, out_cols, gate);
+    Ok(())
+}
+
+/// Unregister a plain row shape (standalone or family-routed) from the tailer's live routing,
+/// returning its snapshot gate if it was registered. Shared by `RemoveShape` (gate discarded) and
+/// `DeactivateShape` (the gate becomes part of the dormant resume state). Aggregates are not
+/// handled here. A registered family shape whose routing entry is unexpectedly missing yields a
+/// passthrough gate — a resume replaying pre-backfill changes appends absolute per-pk ops, which
+/// are harmless duplicates for readers.
+fn unregister_shape_routing(
+    shapes: &mut HashMap<String, StandaloneShape>,
+    families: &mut HashMap<Vec<usize>, KeyRouter>,
+    family_of: &mut HashMap<String, (Vec<usize>, u64, Row)>,
+    shape_id: &str,
+) -> Option<crate::pg::SnapshotGate> {
+    if let Some(s) = shapes.remove(shape_id) {
+        return Some(s.gate);
+    }
+    let (key_cols, num_id, key_tuple) = family_of.remove(shape_id)?;
+    let mut gate = None;
+    if let Some(router) = families.get_mut(&key_cols) {
+        if let Some(routed) = router.index.get_mut(&key_tuple) {
+            gate = routed.iter().find(|rs| rs.num_id == num_id).map(|rs| rs.gate.clone());
+            routed.retain(|rs| rs.num_id != num_id);
+            if routed.is_empty() {
+                router.index.remove(&key_tuple);
+            }
+        }
+        if router.index.is_empty() {
+            families.remove(&key_cols);
+        }
+    }
+    gate.or_else(|| Some(crate::pg::SnapshotGate::passthrough()))
+}
+
+/// Register a plain row shape into the tailer's live routing: an equality template joins its
+/// shared family router (routed by key tuple); anything else becomes a standalone stateless
+/// filter. Shared by first-time registration ([`add_shape_routed`]) and dormant-shape resume
+/// ([`resume_shape_routed`]), which differ only in how the stream got seeded.
+#[allow(clippy::too_many_arguments)]
+fn register_shape_routing(
+    shapes: &mut HashMap<String, StandaloneShape>,
+    families: &mut HashMap<Vec<usize>, KeyRouter>,
+    family_of: &mut HashMap<String, (Vec<usize>, u64, Row)>,
+    shape_id: String,
+    num_id: u64,
+    stream_path: String,
+    pred: Arc<CompiledPredicate>,
+    out_cols: Option<Arc<Vec<usize>>>,
+    gate: crate::pg::SnapshotGate,
+) {
     match pred.equality_template() {
         Some(pairs) => {
             let key_cols: Vec<usize> = pairs.iter().map(|(c, _)| *c).collect();
             let key_tuple = Row(pairs.into_iter().map(|(_, v)| v).collect());
-
-            // Per-shape backfill straight from Postgres: the predicate IS this shape's key equality, so
-            // the pushdown reads only the key-matching rows — the engine never holds a table copy. Each
-            // shape records its own snapshot gate for the live-change reconciliation. A `changes_only`
-            // feed skips the backfill entirely and forwards every future match (passthrough gate).
-            let gate = if changes_only {
-                crate::pg::SnapshotGate::passthrough()
-            } else {
-                let t0 = std::time::Instant::now();
-                let bf = pg_backfill(pg_url, ts, Some(pred.as_ref())).await?;
-                let make_new_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                let out: Vec<(Row, ZWeight)> = bf.rows.iter().map(|r| (r.clone(), 1)).collect();
-                let rows = out.len() as u64;
-                let mut snapshot_bytes = 0u64;
-                if !out.is_empty() {
-                    let envs = translate_output(ts, out, None, None, proj);
-                    if crate::statsd::enabled() {
-                        snapshot_bytes = envs_bytes(&envs);
-                    }
-                    ds.append(&stream_path, &envs).await?;
-                    emitted.insert(shape_id.clone(), envs.len() as u64);
-                }
-                crate::statsd::snapshot_stored(rows, snapshot_bytes, make_new_ms);
-                bf.gate
-            };
-
             let router = families
                 .entry(key_cols.clone())
                 .or_insert_with(|| KeyRouter { key_cols: key_cols.clone(), index: HashMap::new() });
@@ -1980,36 +2487,96 @@ async fn add_shape_routed(
             family_of.insert(shape_id, (key_cols, num_id, key_tuple));
         }
         None => {
-            // Standalone filter: backfill = current matching rows from Postgres (emitted as upserts).
-            // Push the predicate into the SELECT so only matching rows are read; `matches()` below is
-            // the final authority (and a safety net if the SQL is ever a looser superset). A
-            // `changes_only` feed skips the backfill and forwards only future matches (passthrough
-            // gate) — this is the non-materialized live tail a subset query follows.
-            let gate = if changes_only {
-                crate::pg::SnapshotGate::passthrough()
-            } else {
-                let t0 = std::time::Instant::now();
-                let bf = pg_backfill(pg_url, ts, Some(pred.as_ref())).await?;
-                let make_new_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                let out: Vec<(Row, ZWeight)> =
-                    bf.rows.iter().filter(|r| pred.matches(r)).map(|r| (r.clone(), 1)).collect();
-                let rows = out.len() as u64;
-                let mut snapshot_bytes = 0u64;
-                if !out.is_empty() {
-                    let envs = translate_output(ts, out, None, None, proj);
-                    if crate::statsd::enabled() {
-                        snapshot_bytes = envs_bytes(&envs);
-                    }
-                    ds.append(&stream_path, &envs).await?;
-                    emitted.insert(shape_id.clone(), envs.len() as u64);
-                }
-                crate::statsd::snapshot_stored(rows, snapshot_bytes, make_new_ms);
-                bf.gate
-            };
             shapes.insert(shape_id, StandaloneShape { pred, stream_path, gate, out_cols });
         }
     }
+}
+
+/// Reactivate a dormant shape (retention): replay the table stream from `resume_offset`, appending
+/// the shape's matching deltas to its **retained** stream — no Postgres backfill — then register it
+/// for live routing. Runs inline in the tailer loop, so no live envelope can interleave with the
+/// replay; envelopes past the tailer's own read position are replayed here AND processed again by
+/// the live loop, which is safe (shape envelopes are absolute per-pk upsert/delete — an
+/// at-least-once duplicate is idempotent for stream readers, the same argument as
+/// `append_reliable`). Replay length is bounded by the table stream's history (its trim watermark,
+/// once trimming exists) — the retention dormancy TTL keeps that window finite.
+#[allow(clippy::too_many_arguments)]
+async fn resume_shape_routed(
+    ds: &DsClient,
+    ts: &TableSchema,
+    table_path: &str,
+    shapes: &mut HashMap<String, StandaloneShape>,
+    families: &mut HashMap<Vec<usize>, KeyRouter>,
+    family_of: &mut HashMap<String, (Vec<usize>, u64, Row)>,
+    emitted: &mut HashMap<String, u64>,
+    shape_id: String,
+    num_id: u64,
+    stream_path: String,
+    pred: Arc<CompiledPredicate>,
+    out_cols: Option<Arc<Vec<usize>>>,
+    resume_offset: String,
+    gate: crate::pg::SnapshotGate,
+) -> Result<()> {
+    let proj = out_cols.as_deref().map(Vec::as_slice);
+    let mut from = resume_offset;
+    let mut replayed: u64 = 0;
+    loop {
+        let r = ds.read(table_path, &from, false).await?;
+        let mut envs: Vec<Envelope> = Vec::new();
+        for env in &r.envelopes {
+            match replay_envelope_for_shape(ts, &pred, &gate, proj, env) {
+                Ok(mut out) => envs.append(&mut out),
+                // A malformed envelope is skipped, matching the live loop's stance (log, keep going).
+                Err(e) => tracing::error!("replaying envelope for shape {shape_id}: {e:#}"),
+            }
+        }
+        if !envs.is_empty() {
+            replayed += envs.len() as u64;
+            if !ds.append_reliable(&stream_path, &envs).await {
+                bail!("shape stream {stream_path} is gone");
+            }
+        }
+        // Page until caught up; never spin on a non-advancing offset (same guard as the fold paths).
+        let advanced = r.next_offset.as_deref().is_some_and(|n| n != from);
+        if let Some(n) = r.next_offset {
+            from = n;
+        }
+        if r.up_to_date || !advanced {
+            break;
+        }
+    }
+    if replayed > 0 {
+        *emitted.entry(shape_id.clone()).or_insert(0) += replayed;
+    }
+    register_shape_routing(shapes, families, family_of, shape_id, num_id, stream_path, pred, out_cols, gate);
     Ok(())
+}
+
+/// One table-stream envelope through one shape's filter, for the dormant-resume replay: input
+/// delta → snapshot-gate skip → predicate filter → projected output envelopes. Pure (same
+/// building blocks as the live loop: [`apply_envelope`], [`eval_standalone`],
+/// [`translate_output`]), so the replay semantics are unit-testable.
+fn replay_envelope_for_shape(
+    ts: &TableSchema,
+    pred: &CompiledPredicate,
+    gate: &crate::pg::SnapshotGate,
+    out_cols: Option<&[usize]>,
+    env: &Envelope,
+) -> Result<Vec<Envelope>> {
+    let (delta, txid, lsn) = apply_envelope(ts, env)?;
+    if delta.is_empty() {
+        return Ok(Vec::new());
+    }
+    let lsn_u64 = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0);
+    let xid = txid.as_deref().and_then(|s| s.parse::<u64>().ok());
+    if gate.should_skip(lsn_u64, xid) {
+        return Ok(Vec::new());
+    }
+    let out = eval_standalone(pred, &delta);
+    if out.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(translate_output(ts, out, txid, lsn, out_cols))
 }
 
 /// Read a backfill snapshot from Postgres (current rows + snapshot LSN). `filter`, when given, is the
@@ -2898,5 +3465,99 @@ mod tests {
         assert_eq!(mx.value(), serde_json::json!(8));
         mx.apply(&vec![Tup2(active(8), -1)]);
         assert_eq!(mx.value(), serde_json::json!(5));
+    }
+
+    // ---- dormant-shape resume replay (retention) ------------------------------------------------
+
+    fn active_pred(ts: &TableSchema) -> CompiledPredicate {
+        CompiledPredicate::compile_opt(
+            Some(&serde_json::from_value(serde_json::json!({"col":"active","op":"eq","value":true})).unwrap()),
+            ts,
+        )
+        .unwrap()
+    }
+
+    fn replay_ops(ts: &TableSchema, pred: &CompiledPredicate, env: &Envelope) -> Vec<(String, String)> {
+        replay_envelope_for_shape(ts, pred, &crate::pg::SnapshotGate::passthrough(), None, env)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.headers.operation, e.key))
+            .collect()
+    }
+
+    /// The resume replay must produce the same enter/leave/stay transitions the live loop would
+    /// have: an insert of a matching row enters, an update crossing the predicate boundary emits
+    /// upsert-or-delete accordingly, and non-matching traffic is dropped.
+    #[test]
+    fn replay_classifies_predicate_transitions() {
+        let ts = users();
+        let pred = active_pred(&ts);
+        let row = |id: i64, active: bool| serde_json::json!({ "id": id, "name": "n", "active": active });
+
+        // Insert of a matching row → upsert; insert of a non-matching row → nothing.
+        assert_eq!(
+            replay_ops(&ts, &pred, &env("insert", "1", Some(row(1, true)), None)),
+            vec![("upsert".to_string(), "1".to_string())]
+        );
+        assert!(replay_ops(&ts, &pred, &env("insert", "2", Some(row(2, false)), None)).is_empty());
+
+        // Update leaving the predicate → delete; entering it → upsert; staying inside → upsert.
+        assert_eq!(
+            replay_ops(&ts, &pred, &env("update", "1", Some(row(1, false)), Some(row(1, true)))),
+            vec![("delete".to_string(), "1".to_string())]
+        );
+        assert_eq!(
+            replay_ops(&ts, &pred, &env("update", "1", Some(row(1, true)), Some(row(1, false)))),
+            vec![("upsert".to_string(), "1".to_string())]
+        );
+        assert_eq!(
+            replay_ops(&ts, &pred, &env("update", "1", Some(row(1, true)), Some(row(1, true)))),
+            Vec::<(String, String)>::new(),
+            "a no-op update (old == new) produces an empty delta"
+        );
+
+        // Delete of a matching row → delete; of a non-matching row → nothing.
+        assert_eq!(
+            replay_ops(&ts, &pred, &env("delete", "1", None, Some(row(1, true)))),
+            vec![("delete".to_string(), "1".to_string())]
+        );
+        assert!(replay_ops(&ts, &pred, &env("delete", "2", None, Some(row(2, false)))).is_empty());
+    }
+
+    /// Replayed changes already covered by the shape's backfill snapshot must be skipped — the
+    /// gate travels through dormancy so a shape that went dormant right after creation doesn't
+    /// double-apply its backfill era on resume.
+    #[test]
+    fn replay_respects_the_snapshot_gate() {
+        let ts = users();
+        let pred = active_pred(&ts);
+        // Gate at LSN 100 (no xids): changes with commit LSN < 100 are already in the backfill.
+        let gate = crate::pg::SnapshotGate::parse("", "0/64");
+        let row = serde_json::json!({ "id": 1, "name": "n", "active": true });
+        let mut e = env("insert", "1", Some(row), None);
+        e.headers.lsn = Some("0/32".into()); // LSN 50 < 100 → already seeded, skip
+        assert!(replay_envelope_for_shape(&ts, &pred, &gate, None, &e).unwrap().is_empty());
+        e.headers.lsn = Some("0/C8".into()); // LSN 200 > 100 → replay
+        assert_eq!(replay_envelope_for_shape(&ts, &pred, &gate, None, &e).unwrap().len(), 1);
+    }
+
+    /// The replay applies the shape's column projection, like the live path.
+    #[test]
+    fn replay_projects_output_columns() {
+        let ts = users();
+        let pred = active_pred(&ts);
+        let proj = resolve_columns(&ts, Some(vec!["active".to_string()])).unwrap();
+        let row = serde_json::json!({ "id": 1, "name": "secret", "active": true });
+        let out = replay_envelope_for_shape(
+            &ts,
+            &pred,
+            &crate::pg::SnapshotGate::passthrough(),
+            proj.as_deref().map(Vec::as_slice),
+            &env("insert", "1", Some(row), None),
+        )
+        .unwrap();
+        let value = out[0].value.as_ref().unwrap();
+        assert!(value.get("active").is_some() && value.get("id").is_some(), "pk always projected");
+        assert!(value.get("name").is_none(), "unprojected column must not leak through the replay");
     }
 }

@@ -21,10 +21,17 @@
 //!   elapses, then returns `204`. Every individual ds poll is bounded by the *remaining* deadline
 //!   (`poll_live_until`): the ds server's own long-poll window can exceed ours, and an idle stream
 //!   must still produce the 204 on time.
-//! - Handles are evicted after sitting idle for `ELECTRIC_HANDLE_TTL` seconds (default 600): the engine
-//!   shape and its durable stream are dropped, and a late request on the evicted handle gets the
-//!   standard `409 must-refetch` (the client re-snapshots). Without this every initial `GET` leaks a
-//!   shape + stream + registry entry forever.
+//! - Identical shape definitions (same table + canonical `where` + columns) share ONE engine shape
+//!   (`create_shape` with `share = true`): concurrent clients and returning clients rejoin the same
+//!   retained stream instead of re-backfilling from Postgres. Handles stay **per client** (each
+//!   snapshot mints a unique handle id over the shared stream), so cursor state is never contended
+//!   across clients; each live handle holds one subscription on the shared shape.
+//! - Handles are evicted after sitting idle for `ELECTRIC_HANDLE_TTL` seconds (default 600). This is
+//!   **handle-state cleanup only**: the per-handle cursor state is dropped and the shape subscription
+//!   released — the underlying engine shape and its durable stream are retained and follow the
+//!   retention lifecycle (idle → dormant → evicted; see [`crate::retention`]). A late request on the
+//!   evicted handle gets the standard `409 must-refetch`; the client's re-snapshot rejoins the
+//!   retained shape (reactivating it if dormant) rather than rebuilding from Postgres.
 //! - Errors split by who must act: validation failures (bad `where`, unknown table/column, missing
 //!   handle, table/handle mismatch) are 400 with an Electric-style `{"message": …}` body — the client
 //!   treats 400 as fatal. Everything else (durable-streams hiccups, engine failures) is 500 so the
@@ -79,6 +86,11 @@ pub struct ShapeParams {
 /// registry lock itself is only ever held briefly (get/insert/remove), never across I/O.
 struct HandleEntry {
     stream_path: String,
+    /// The underlying (shared) engine shape this handle subscribes to. Handles are per-client —
+    /// identical definitions share ONE engine shape/stream but each snapshot mints its own handle,
+    /// so per-handle cursor state is never contended across clients — and each live handle holds
+    /// exactly one shape subscription, released when the handle is evicted.
+    shape_id: String,
     table: String,
     pk_name: String,
     /// When this handle was last touched by a request — drives idle-TTL eviction.
@@ -128,8 +140,10 @@ fn live_timeout() -> Duration {
     })
 }
 
-/// Idle TTL for `/v1/shape` handles: a handle not touched for this long is evicted (its engine shape
-/// and durable stream are dropped). `ELECTRIC_HANDLE_TTL` env var, in seconds; default 600 (10 min).
+/// Idle TTL for `/v1/shape` handles: a handle not touched for this long has its per-handle cursor
+/// state evicted and its shape subscription released. The underlying shape + stream are retained
+/// (retention lifecycle, see [`crate::retention`]) — this is handle-state cleanup, not shape
+/// teardown. `ELECTRIC_HANDLE_TTL` env var, in seconds; default 600 (10 min).
 fn handle_ttl() -> Duration {
     static TTL: OnceLock<Duration> = OnceLock::new();
     *TTL.get_or_init(|| {
@@ -141,8 +155,11 @@ fn handle_ttl() -> Duration {
     })
 }
 
-/// Spawn (once) the background evictor that drops handles idle longer than [`handle_ttl`]. A request
-/// arriving with an evicted handle gets the standard `409 must-refetch` and re-snapshots.
+/// Spawn (once) the background evictor that cleans up handles idle longer than [`handle_ttl`]:
+/// the per-handle cursor state is dropped and the shape's subscription released (`release_shape`)
+/// — the shape itself is retained and ages through the retention lifecycle. A request arriving
+/// with an evicted handle gets the standard `409 must-refetch` and re-snapshots (rejoining the
+/// retained shape).
 fn ensure_evictor(engine: &Engine) {
     static STARTED: OnceLock<()> = OnceLock::new();
     STARTED.get_or_init(|| {
@@ -163,20 +180,16 @@ fn ensure_evictor(engine: &Engine) {
                 for (id, entry) in idle {
                     // Skip a handle mid-request (its state mutex is held). Holding the guard while we
                     // unregister keeps a racing request from mutating state we are tearing down; a
-                    // request that snatched the Arc just before removal fails its read (stream gone),
-                    // returns a 5xx, and the retry gets 409 must-refetch.
+                    // request that snatched the Arc just before removal still reads the retained
+                    // stream fine, and its next request gets 409 must-refetch (registry miss).
                     let Ok(guard) = entry.state.try_lock() else { continue };
                     if entry.last_access.lock().unwrap().elapsed() <= ttl {
                         continue; // touched between the scan and now
                     }
                     handles().lock().unwrap().remove(&id);
                     drop(guard);
-                    match engine.drop_shape(&id).await {
-                        Ok(()) => tracing::debug!("evicted idle electric handle {id}"),
-                        Err(e) => {
-                            tracing::warn!("evicting idle electric handle {id}: drop_shape failed: {e:#}")
-                        }
-                    }
+                    engine.release_shape(&entry.shape_id).await;
+                    tracing::debug!("evicted idle electric handle {id} (shape retained)");
                 }
             }
         });
@@ -721,10 +734,20 @@ async fn shape_inner(
             crate::predicate::CompiledPredicate::compile_with(pr, &ts, &mut ValidateOnly)
                 .map_err(|e| ApiError::bad_request(format!("invalid where clause: {e:#}")))?;
         }
-        // share = false: the Electric handle model keys live cursor state by shape id per request, so
-        // each /v1/shape request needs its own shape (no id sharing).
-        let rec = engine.create_shape(&p.table, pred, columns.clone(), false, false).await?;
-        let (rows, tail) = materialize(&engine, &rec.stream_path).await?;
+        // share = true: identical /v1/shape definitions collapse to ONE engine shape/stream. A
+        // returning client's re-snapshot rejoins the retained shape — reactivated inside
+        // `create_shape` if it went dormant — instead of re-backfilling from Postgres. The handle
+        // minted below stays per-client (see the module docs).
+        let rec = engine.create_shape(&p.table, pred, columns.clone(), false, true).await?;
+        let (rows, tail) = match materialize(&engine, &rec.stream_path).await {
+            Ok(v) => v,
+            Err(e) => {
+                // Failed after taking the create/join subscription: give it back, or the dead
+                // subscription pins the shape active forever.
+                engine.release_shape(&rec.id).await;
+                return Err(e.into());
+            }
+        };
 
         let mut messages = Vec::with_capacity(rows.len() + 1);
         let mut keys = HashSet::with_capacity(rows.len());
@@ -735,10 +758,17 @@ async fn shape_inner(
         messages.push(control_msg("up-to-date"));
 
         let schema_str = serde_json::to_string(&schema_json(&ts, &columns)).unwrap_or_default();
+        // Handles are per-client even though the shape is shared: a unique handle id per snapshot
+        // keeps each client's cursor state (key set / offset) private, so one client's live
+        // long-poll never head-of-line blocks another's positioned read and offsets never thrash.
+        // The suffix keeps handle ids disjoint from shape ids. Each handle holds the one shape
+        // subscription its create/join took; the idle evictor releases it with the handle.
+        let handle_id = format!("{}h{}", rec.id, next_cursor());
         handles().lock().unwrap().insert(
-            rec.id.clone(),
+            handle_id.clone(),
             Arc::new(HandleEntry {
                 stream_path: rec.stream_path.clone(),
+                shape_id: rec.id.clone(),
                 table: p.table.clone(),
                 pk_name: ts.pk_name.clone(),
                 last_access: std::sync::Mutex::new(Instant::now()),
@@ -748,7 +778,7 @@ async fn shape_inner(
         );
 
         let mut headers = HeaderMap::new();
-        headers.insert(HeaderName::from_static("electric-handle"), hv(&rec.id));
+        headers.insert(HeaderName::from_static("electric-handle"), hv(&handle_id));
         headers.insert(HeaderName::from_static("electric-offset"), hv(&tail));
         headers.insert(HeaderName::from_static("electric-schema"), hv(&schema_str));
         headers.insert(HeaderName::from_static("electric-up-to-date"), hv(""));
@@ -1015,6 +1045,7 @@ mod tests {
     fn test_entry() -> Arc<HandleEntry> {
         Arc::new(HandleEntry {
             stream_path: "s".into(),
+            shape_id: "s1".into(),
             table: "t".into(),
             pk_name: "id".into(),
             last_access: std::sync::Mutex::new(Instant::now()),
