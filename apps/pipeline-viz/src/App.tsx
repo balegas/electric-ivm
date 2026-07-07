@@ -317,8 +317,11 @@ export default function App() {
       const baseStyle = isFresh ? { ...e.style, stroke: '#7c3aed', strokeWidth: 2.5 } : e.style
       // The pulse keeps the id of the event that created it — re-rendering after a merge must not
       // restart dots already in flight on other edges.
-      const data: PulseEdgeData = { pulse: decor?.edges.get(e.id), baseStyle }
-      return { ...e, type: 'pulse', data, style: undefined }
+      const pulse = decor?.edges.get(e.id)
+      const data: PulseEdgeData = { pulse, baseStyle }
+      // A pulsing edge is lifted above the node cards (each edge is its own stacked svg): the
+      // travelling dot + weight label must never disappear behind a component it passes.
+      return { ...e, type: 'pulse', data, style: undefined, zIndex: pulse ? 1000 : undefined }
     })
     return { nodes: dn, edges: de }
   }, [nodes, edges, decor, freshIds])

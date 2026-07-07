@@ -22,20 +22,25 @@ export function PulseEdge(props: EdgeProps) {
   const [path] = getBezierPath({ sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition })
   const pulse = data.pulse
 
-  // The pulse becomes visible (and its motion starts) when its stage begins.
+  // The pulse becomes visible (and its motion starts) when its stage begins, and is removed a
+  // short linger after it arrives — a dot frozen at the path end sits half-hidden under the
+  // target node's card, which reads as a stray number lying around the canvas.
+  const LINGER_MS = 500
   const [staged, setStaged] = useState<number | null>(null) // pulse.id currently shown
   useEffect(() => {
     if (!pulse) {
       setStaged(null)
       return
     }
+    const timers: ReturnType<typeof setTimeout>[] = []
     if (pulse.delayMs <= 0) {
       setStaged(pulse.id)
-      return
+    } else {
+      timers.push(setTimeout(() => setStaged(pulse.id), pulse.delayMs))
     }
-    const t = setTimeout(() => setStaged(pulse.id), pulse.delayMs)
-    return () => clearTimeout(t)
-  }, [pulse?.id, pulse?.delayMs])
+    timers.push(setTimeout(() => setStaged(null), pulse.delayMs + pulse.durMs + LINGER_MS))
+    return () => timers.forEach(clearTimeout)
+  }, [pulse?.id, pulse?.delayMs, pulse?.durMs])
 
   const show = pulse != null && staged === pulse.id
   const dur = pulse ? `${pulse.durMs}ms` : '0.8s'
