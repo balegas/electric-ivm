@@ -25,11 +25,14 @@ Tunables: `ORACLE_RUNS`, `ORACLE_SHAPE_COUNT`, `ORACLE_BATCH_COUNT`, `ORACLE_MUT
 
 ## Adapter behavior notes (`/v1/shape`)
 
-- **Handle idle-TTL.** Every initial `GET /v1/shape` (offset=-1) creates one engine shape + durable
-  stream keyed by the returned `electric-handle`. Handles idle longer than **`ELECTRIC_HANDLE_TTL`**
-  seconds (default `600`) are evicted by a background task: the shape and its stream are dropped, and a
-  later request on that handle gets the standard `409` + `must-refetch` control (the client
-  re-snapshots). Set the env var on the engine process to tune it (e.g. `ELECTRIC_HANDLE_TTL=60`).
+- **Handle idle-TTL.** Every initial `GET /v1/shape` (offset=-1) creates or **rejoins** the engine
+  shape for that definition (identical definitions share one shape, so the `electric-handle` is the
+  shared shape id). Handles idle longer than **`ELECTRIC_HANDLE_TTL`** seconds (default `600`) have
+  their handle state evicted by a background task; the shape and its stream are retained under the
+  engine's retention lifecycle (idle shapes go dormant and are eventually evicted — see
+  `apps/engine/README.md`). A later request on an evicted handle gets the standard `409` +
+  `must-refetch` control (the client re-snapshots, rejoining the retained shape). Set the env var on
+  the engine process to tune it (e.g. `ELECTRIC_HANDLE_TTL=60`).
 - **Errors.** Validation failures (bad `where`, unknown table/column, `offset` without a `handle`,
   table not matching the handle's shape) are `400` with an Electric-style `{"message": …}` body;
   transient/internal failures (durable-streams hiccups, backfill errors) are `500` so the client

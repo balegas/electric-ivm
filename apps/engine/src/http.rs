@@ -20,7 +20,7 @@ pub fn router(engine: Engine) -> Router {
         .route("/schema", post(define_schema))
         .route("/shapes", post(create_shape))
         .route("/aggregate", post(create_aggregate))
-        .route("/shapes/{id}", get(get_shape).delete(drop_shape))
+        .route("/shapes/{id}", get(get_shape).delete(release_shape))
         .route("/shapes/{id}/rows", get(get_shape_rows))
         .route("/shapes/{id}/log", get(get_shape_log))
         .route("/query", post(query_subset))
@@ -160,12 +160,16 @@ struct ShapeResp {
     table: String,
     stream_path: String,
     stream_url: String,
+    /// Retention lifecycle: `active` | `deactivating` | `dormant` | `reactivating` (see
+    /// `crate::retention`). Shapes handed out by create are always active.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<&'static str>,
 }
 
 impl ShapeResp {
     fn of(engine: &Engine, rec: ShapeRecord) -> Self {
         let stream_url = engine.stream_url(&rec.stream_path);
-        ShapeResp { shape_id: rec.id, table: rec.table, stream_path: rec.stream_path, stream_url }
+        ShapeResp { shape_id: rec.id, table: rec.table, stream_path: rec.stream_path, stream_url, state: None }
     }
 }
 
@@ -203,7 +207,10 @@ async fn get_shape(
     Path(id): Path<String>,
 ) -> Result<Json<ShapeResp>, AppError> {
     match engine.get_shape(&id).await {
-        Some(rec) => Ok(Json(ShapeResp::of(&engine, rec))),
+        Some(rec) => {
+            let state = engine.shape_lifecycle(&rec.id).await;
+            Ok(Json(ShapeResp { state, ..ShapeResp::of(&engine, rec) }))
+        }
         None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("shape {id} not found") }),
     }
 }
@@ -269,6 +276,8 @@ async fn get_shape_log(
     let Some(rec) = engine.get_shape(&id).await else {
         return Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("shape {id} not found") });
     };
+    // A touch reactivates: if the shape is dormant, replay it live first so the log is current.
+    engine.ensure_active(&id).await?;
     let limit = q.limit.unwrap_or(50).min(500);
     let mut entries: std::collections::VecDeque<ShapeLogEntry> = std::collections::VecDeque::new();
     let mut total = 0usize;
@@ -323,6 +332,8 @@ async fn get_shape_rows(
     let Some(rec) = engine.get_shape(&id).await else {
         return Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("shape {id} not found") });
     };
+    // A touch reactivates: if the shape is dormant, replay it live first so the fold is current.
+    engine.ensure_active(&id).await?;
     // Fold the shape's whole stream (catch-up reads from -1) into the current key→row map.
     let mut rows: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
     let mut offset = "-1".to_string();
@@ -359,12 +370,14 @@ async fn get_shape_rows(
     Ok(Json(ShapeRowsResp { id: rec.id, table: rec.table, changes_only: rec.changes_only, count, truncated, rows: entries }))
 }
 
-async fn drop_shape(
+/// `DELETE /shapes/{id}` = unsubscribe. Releases one subscription (refcount); the shape itself is
+/// retained and follows the retention lifecycle (idle → dormant → evicted) — see `crate::retention`.
+async fn release_shape(
     State(engine): State<Engine>,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    engine.drop_shape(&id).await?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+) -> Json<serde_json::Value> {
+    engine.release_shape(&id).await;
+    Json(serde_json::json!({ "ok": true }))
 }
 
 async fn table_offset(

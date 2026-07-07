@@ -38,7 +38,12 @@ discover the bound port.
 | `ELECTRIC_IVM_PG_POLL_MS` | `50` | Replication-slot poll interval |
 | `ELECTRIC_IVM_BIND` | `127.0.0.1:0` | Bind address (`:0` = ephemeral port) |
 | `ELECTRIC_IVM_LOG` | `info` | `tracing` EnvFilter (e.g. `warn`, `electric_ivm_engine=debug`) |
-| `ELECTRIC_HANDLE_TTL` | `600` | Seconds a `/v1/shape` handle may sit idle before eviction (drops its shape + stream; a late request gets `409 must-refetch`) |
+| `ELECTRIC_IVM_SHAPE_IDLE_SECS` | `1800` | Retention: idle time (no engine-visible reads, refcount 0) before an active shape goes **dormant** (engine state dropped; stream + record retained). `0` disables dormancy |
+| `ELECTRIC_IVM_SHAPE_DORMANT_TTL_SECS` | `604800` (7 days) | Retention: how long a shape may stay dormant before it is **evicted** (stream + record deleted). `0` disables the TTL layer |
+| `ELECTRIC_IVM_MAX_SHAPES` | `10000` | Retention: total shape-count cap; over it, least-recently-read **dormant** shapes are evicted (active shapes never are). `0` = unlimited |
+| `ELECTRIC_IVM_SHAPE_DISK_BUDGET_MB` | `0` (disabled) | Retention: cap on shape-stream bytes (engine-side accounting of appended bytes — resets on restart); over it, least-recently-read dormant shapes are evicted |
+| `ELECTRIC_IVM_RETENTION_SWEEP_SECS` | `60` | Retention: background sweep interval |
+| `ELECTRIC_HANDLE_TTL` | `600` | Seconds a `/v1/shape` handle may sit idle before its **handle state** is evicted and its shape subscription released (the shape + stream are retained and follow the retention lifecycle); a late request gets `409 must-refetch` and rejoins the retained shape |
 | `ELECTRIC_LIVE_TIMEOUT_MS` | `20000` | Overall deadline for a `live=true` `/v1/shape` long-poll, then `204` |
 
 ### Benchmarking-fleet surface (`ELECTRIC_*`)
@@ -82,7 +87,7 @@ unchanged.
 | `POST /schema` | define the schema (library mode; Postgres mode self-configures by introspection) |
 | `POST /shapes` | create a shape (`table`, `where`, `columns`, `changesOnly`) — identical definitions share one stream |
 | `POST /aggregate` | create a live scalar aggregation (`table`, `where`, `fn`, `col`) |
-| `GET /shapes/{id}` / `DELETE /shapes/{id}` | look up / drop (decrement) a shape |
+| `GET /shapes/{id}` / `DELETE /shapes/{id}` | look up a shape (incl. its retention `state`) / release one subscription — the shape is retained and ages through the retention lifecycle |
 | `GET /shapes/{id}/rows` | current contents of an existing shape (folds its stream; visualizer preview) |
 | `GET /shapes/{id}/log` | tail of a shape's stream as-is (op/key/value/lsn) — the visualizer's feed change log |
 | `POST /query` | one-shot subset query: `SELECT … ORDER BY … LIMIT/OFFSET` + snapshot LSN |
@@ -95,3 +100,28 @@ unchanged.
 
 The `/v1/shape` adapter parses Electric's SQL `where` grammar and is validated against Electric's own
 oracle/property/integration tests ([electric-conformance/](../../electric-conformance/README.md)).
+
+## Shape retention lifecycle
+
+Shapes follow a three-tier lifecycle (`src/retention.rs`) instead of delete-on-last-unsubscribe —
+a deliberate divergence from upstream Electric, which keeps every retained shape actively
+maintained:
+
+- **Active** — maintained live. Unsubscribing (`DELETE /shapes/{id}`, `/v1/shape` handle expiry)
+  does not deactivate; brief reconnects rejoin the same warm stream.
+- **Dormant** — after `ELECTRIC_IVM_SHAPE_IDLE_SECS` with no reads and no subscribers: engine
+  routing state is dropped, the durable stream and shape record are retained at zero engine cost.
+  Any touch (rejoin, `/v1/shape` re-snapshot, rows/log read) reactivates by replaying the
+  `table/<name>` stream from the captured resume offset — no Postgres backfill.
+- **Evicted** — stream + record deleted. Returning `/v1/shape` clients get `409 must-refetch` and
+  re-snapshot; extended-API clients get `404` and recreate.
+
+Eviction is layered, least-recently-read first, and **dormant-only** (active shapes are never
+evicted): the dormancy TTL (hygiene), the `ELECTRIC_IVM_MAX_SHAPES` count cap (engine cost bound),
+and the disk budget (hard backstop). When a cap/budget is exceeded with nothing dormant to evict,
+the engine logs loudly and bumps the `retention_pressure` metric instead of evicting.
+
+Subquery and aggregate shapes never go dormant (their state is not rebuildable from a bounded
+replay); once unsubscribed, the TTL layer instead evicts them straight from active after the same
+total grace an ordinary shape gets (idle timeout + dormancy TTL). Lifecycle state is in-memory
+today — restart recovery (persistent catalog, GH #8) will persist it.

@@ -25,6 +25,8 @@ use prometheus::{Registry, TextEncoder};
 #[derive(Clone, Default, serde::Serialize)]
 pub struct Cardinalities {
     pub shapes: usize,
+    /// Shapes currently dormant (retention lifecycle: stream retained, engine state dropped).
+    pub shapes_dormant: usize,
     pub tailers: usize,
     pub tables: usize,
     pub families: usize,
@@ -43,6 +45,7 @@ struct Gauges {
     rss_bytes: AtomicU64,
     virtual_bytes: AtomicU64,
     shapes: AtomicU64,
+    shapes_dormant: AtomicU64,
     tailers: AtomicU64,
     tables: AtomicU64,
     families: AtomicU64,
@@ -79,6 +82,7 @@ pub fn publish(card: &Cardinalities) {
     g.rss_bytes.store(rss, Ordering::Relaxed);
     g.virtual_bytes.store(virt, Ordering::Relaxed);
     g.shapes.store(card.shapes as u64, Ordering::Relaxed);
+    g.shapes_dormant.store(card.shapes_dormant as u64, Ordering::Relaxed);
     g.tailers.store(card.tailers as u64, Ordering::Relaxed);
     g.tables.store(card.tables as u64, Ordering::Relaxed);
     g.families.store(card.families as u64, Ordering::Relaxed);
@@ -106,6 +110,7 @@ pub fn snapshot_json() -> serde_json::Value {
         },
         "cardinalities": {
             "shapes": g.shapes.load(Ordering::Relaxed),
+            "shapes_dormant": g.shapes_dormant.load(Ordering::Relaxed),
             "tailers": g.tailers.load(Ordering::Relaxed),
             "tables": g.tables.load(Ordering::Relaxed),
             "families": g.families.load(Ordering::Relaxed),
@@ -165,6 +170,7 @@ pub fn init_otel() -> SdkMeterProvider {
     gauge!("engine_process_resident_memory", "Resident set size of the engine process", rss_bytes, "By");
     gauge!("engine_process_virtual_memory", "Virtual memory of the engine process", virtual_bytes, "By");
     gauge!("engine_shapes", "Registered shapes (all kinds)", shapes, "");
+    gauge!("engine_shapes_dormant", "Dormant shapes (retention: stream retained, engine state dropped)", shapes_dormant, "");
     gauge!("engine_tailers", "Per-table replication tailers", tailers, "");
     gauge!("engine_tables", "Tables with a known schema", tables, "");
     gauge!("engine_family_circuits", "Shared equality family circuits (each holds the base table once)", families, "");

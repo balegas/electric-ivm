@@ -2,6 +2,8 @@
 //! offset-resumable reads (catch-up + long-poll live). Offsets are opaque tokens; we just
 //! persist and replay `Stream-Next-Offset`.
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
@@ -56,11 +58,37 @@ enum AppendError {
 pub struct DsClient {
     base: String,
     http: reqwest::Client,
+    /// Bytes appended per stream path since this process started (serialized request bodies).
+    /// The durable-streams server exposes no per-stream sizes, so this engine-side accounting is
+    /// what the retention disk-budget layer works from. It undercounts streams that already
+    /// existed before the process started (restart persistence is the catalog work, GH #8).
+    appended: std::sync::Arc<std::sync::Mutex<HashMap<String, u64>>>,
 }
 
 impl DsClient {
     pub fn new(base: impl Into<String>) -> Self {
-        DsClient { base: base.into(), http: reqwest::Client::new() }
+        DsClient {
+            base: base.into(),
+            http: reqwest::Client::new(),
+            appended: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Tracked bytes appended to `path` since process start (0 if never appended).
+    pub fn appended_bytes(&self, path: &str) -> u64 {
+        self.appended.lock().unwrap().get(path).copied().unwrap_or(0)
+    }
+
+    /// Snapshot of tracked appended bytes for every stream path with the given prefix
+    /// (e.g. `"shape/"` for the retention disk budget).
+    pub fn appended_bytes_with_prefix(&self, prefix: &str) -> HashMap<String, u64> {
+        self.appended
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _)| p.starts_with(prefix))
+            .map(|(p, b)| (p.clone(), *b))
+            .collect()
     }
 
     pub fn base(&self) -> &str {
@@ -104,11 +132,16 @@ impl DsClient {
         if envelopes.is_empty() {
             return Ok(());
         }
+        // Serialize once ourselves (instead of `.json(...)`) so the successful append's byte size
+        // can be recorded for the retention disk-budget accounting.
+        let payload = serde_json::to_vec(envelopes)
+            .map_err(|e| AppendError::Other(anyhow::Error::new(e).context(format!("serializing POST {path}"))))?;
+        let payload_len = payload.len() as u64;
         let res = self
             .http
             .post(self.stream_url(path))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(envelopes)
+            .body(payload)
             .send()
             .await
             .map_err(|e| AppendError::Other(anyhow::Error::new(e).context(format!("POST {path}"))))?;
@@ -116,6 +149,7 @@ impl DsClient {
         // Drain the body so the connection can be pooled and reused (avoids a socket leak per append).
         let body = res.text().await.unwrap_or_default();
         if status.is_success() {
+            *self.appended.lock().unwrap().entry(path.to_string()).or_insert(0) += payload_len;
             Ok(())
         } else if status.as_u16() == 404 {
             Err(AppendError::Gone)
@@ -161,6 +195,7 @@ impl DsClient {
         let status = res.status();
         let body = res.text().await.unwrap_or_default();
         if status.is_success() || status.as_u16() == 404 {
+            self.appended.lock().unwrap().remove(path);
             Ok(())
         } else {
             bail!("DELETE {path} -> {status}: {body}")

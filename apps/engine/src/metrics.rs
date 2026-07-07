@@ -100,6 +100,10 @@ pub struct Metrics {
     pub envelopes: AtomicU64,    // table change events processed
     pub shape_appends: AtomicU64, // appends to shape streams
     pub family_steps: AtomicU64,  // family circuit transactions (write path)
+    pub shapes_dormanted: AtomicU64,   // retention: active -> dormant transitions
+    pub shapes_reactivated: AtomicU64, // retention: dormant -> active (table-stream replay)
+    pub shapes_evicted: AtomicU64,     // retention: dormant shapes evicted (stream deleted)
+    pub retention_pressure: AtomicU64, // retention: sweeps where a cap/budget was exceeded with nothing dormant to evict
     pub process_envelope: Hist,   // end-to-end fan-out latency per table envelope
     pub family_step: Hist,        // one family circuit transaction
     pub append: Hist,             // one shape-stream append (durable-streams round-trip)
@@ -112,6 +116,10 @@ pub fn metrics() -> &'static Metrics {
         envelopes: AtomicU64::new(0),
         shape_appends: AtomicU64::new(0),
         family_steps: AtomicU64::new(0),
+        shapes_dormanted: AtomicU64::new(0),
+        shapes_reactivated: AtomicU64::new(0),
+        shapes_evicted: AtomicU64::new(0),
+        retention_pressure: AtomicU64::new(0),
         process_envelope: Hist::new(),
         family_step: Hist::new(),
         append: Hist::new(),
@@ -125,6 +133,10 @@ impl Metrics {
                 "envelopes_processed": self.envelopes.load(Ordering::Relaxed),
                 "shape_appends": self.shape_appends.load(Ordering::Relaxed),
                 "family_steps": self.family_steps.load(Ordering::Relaxed),
+                "shapes_dormanted": self.shapes_dormanted.load(Ordering::Relaxed),
+                "shapes_reactivated": self.shapes_reactivated.load(Ordering::Relaxed),
+                "shapes_evicted": self.shapes_evicted.load(Ordering::Relaxed),
+                "retention_pressure": self.retention_pressure.load(Ordering::Relaxed),
             },
             "process_envelope_us": self.process_envelope.snapshot(),
             "family_step_us": self.family_step.snapshot(),
@@ -138,6 +150,10 @@ impl Metrics {
         self.envelopes.store(0, Ordering::Relaxed);
         self.shape_appends.store(0, Ordering::Relaxed);
         self.family_steps.store(0, Ordering::Relaxed);
+        self.shapes_dormanted.store(0, Ordering::Relaxed);
+        self.shapes_reactivated.store(0, Ordering::Relaxed);
+        self.shapes_evicted.store(0, Ordering::Relaxed);
+        self.retention_pressure.store(0, Ordering::Relaxed);
         self.process_envelope.reset();
         self.family_step.reset();
         self.append.reset();

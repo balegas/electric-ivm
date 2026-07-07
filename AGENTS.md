@@ -86,9 +86,10 @@ storage, not the engine).
 - **Shape creation is atomic.** On any failure, everything (record, share entries, registry
   refcounts/edges, stream) rolls back and the error propagates — including to joiners waiting on the
   share's ready-watch. Never leave a signature pointing at a dead stream.
-- **Sharing lifecycle:** equal shapes share one id+stream, ref-counted; N joiners each delete exactly
-  once; the final drop deletes the durable stream. Client `close()` must be one-shot (a double
-  delete steals another subscriber's refcount).
+- **Sharing lifecycle:** equal shapes share one id+stream, ref-counted; N joiners each release
+  exactly once. The final release does NOT delete anything: the shape stays active/warm and is
+  retired by the retention lifecycle (idle → dormant → evicted; `engine/src/retention.rs`). Client
+  `close()` must still be one-shot (a double delete steals another subscriber's refcount).
 - **Shapes vs subset queries stay distinct.** Ranges/`orderBy`/`limit` live ONLY in subset queries
   (never live-tailed); a `changes_only` feed uses a passthrough gate and the client reads from the
   offset captured *before* the page snapshot.
@@ -102,9 +103,11 @@ storage, not the engine).
   moves past it) before the transaction becomes visible to snapshots — the gap includes a WAL fsync.
   The xid gate (`pg_current_snapshot()`) decides both the dropped-row and boundary-duplicate cases
   exactly. See `pg.rs::SnapshotGate`.
-- **The client must delete what it creates — there is no server-side reaper.** Every create path
-  needs a guaranteed, retried, one-shot delete; `track()` in `packages/client/src/index.ts` is the
-  pattern. An unpaired create pins a shared feed's refcount forever.
+- **The client should still release what it creates** (`track()` in `packages/client/src/index.ts`
+  is the pattern), but the engine now has a server-side reaper: an unpaired create pins the shape
+  active only until the retention sweeper's idle/dormancy/eviction layers retire it
+  (`engine/src/retention.rs`). A leaked refcount (double create, missed release) DOES still pin a
+  shape active forever — releases must stay paired one-to-one with creates.
 - **Backfill and replication must produce byte-identical text values.** `to_jsonb(t)` renders
   timestamps ISO-`T`-style; `test_decoding` uses Postgres text output. Same cell, different string →
   broken retractions/routing/MIN-MAX. Backfill casts text-mapped columns with `::text`

@@ -257,11 +257,14 @@ carry their commit LSN for exactly this. Key invariants (all regression-tested):
 
 `GET /v1/shape` (`electric.rs`) serves the ElectricSQL client protocol directly from the engine:
 `table` + SQL `where` (+ `columns`) are parsed (`where_sql.rs`) into the same predicate AST used
-everywhere else, one engine shape is created per handle (`share=false`), the shape stream is folded
-into the Electric message shape (insert/update/delete + `up-to-date` control messages), and live
-requests long-poll. Handles are evicted after an idle TTL (`ELECTRIC_HANDLE_TTL`), dropping the
-backing shape + stream; a request with an evicted handle gets `409 must-refetch`, which the Electric
-client handles by re-syncing. Conformance against Electric's own oracle + integration tests lives in
+everywhere else, identical `/v1/shape` definitions share ONE engine shape (`share=true`, so the
+handle is the shared shape id), the shape stream is folded into the Electric message shape
+(insert/update/delete + `up-to-date` control messages), and live requests long-poll. Handle state
+is evicted after an idle TTL (`ELECTRIC_HANDLE_TTL`); the backing shape + stream are **retained**
+and follow the engine's three-tier retention lifecycle (active / dormant / evicted — idle shapes
+drop their engine state but keep the stream, and any touch reactivates them by table-stream replay;
+see `apps/engine/src/retention.rs`). A request with an evicted handle gets `409 must-refetch`,
+which the Electric client handles by re-syncing onto the retained shape. Conformance against Electric's own oracle + integration tests lives in
 `electric-conformance/` (see its README for scope and known gaps — e.g. row `tags` are not emitted;
 absolute membership emission makes them unnecessary for convergence).
 

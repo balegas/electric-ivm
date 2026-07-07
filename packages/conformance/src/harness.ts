@@ -50,6 +50,7 @@ async function spawnEngine(
   tables: string[],
   slot: string,
   fault?: string,
+  extraEnv?: Record<string, string>,
 ): Promise<{ url: string; proc: ChildProcess; stderr: () => string }> {
   const proc = spawn(engineBin(), [], {
     env: {
@@ -62,6 +63,7 @@ async function spawnEngine(
       ELECTRIC_IVM_PG_SLOT: slot,
       ELECTRIC_IVM_PG_POLL_MS: '25',
       ...(fault ? { ELECTRIC_IVM_FAULT: fault } : {}),
+      ...(extraEnv ?? {}),
     },
     // Pipe stderr so tests can assert on engine logs (e.g. no silent `process_envelope failed`); teed
     // back to our stderr below so it stays visible.
@@ -120,6 +122,8 @@ export interface BootOptions {
    * Postgres column types the coarse protocol Schema can't express (e.g. `uuid`). Must create every
    * table in `schema` with `REPLICA IDENTITY FULL`. */
   ddl?: string
+  /** Extra env vars for the engine process (e.g. retention tuning: `ELECTRIC_IVM_SHAPE_IDLE_SECS`). */
+  engineEnv?: Record<string, string>
 }
 
 function adminUrl(): string {
@@ -217,7 +221,7 @@ export async function bootHarness(schema: Schema, opts: BootOptions = {}): Promi
     server = new DurableStreamTestServer({ port: 0 })
     const dsUrl = await server.start()
     const tables = Object.keys(schema.tables)
-    const spawned = await spawnEngine(dsUrl, pgUrl, tables, slot, opts.fault)
+    const spawned = await spawnEngine(dsUrl, pgUrl, tables, slot, opts.fault, opts.engineEnv)
     proc = spawned.proc
     const engineUrl = spawned.url
     api = await createApiServer({ dsUrl, engineUrl })
