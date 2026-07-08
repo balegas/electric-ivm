@@ -147,11 +147,49 @@ function ShapeLiveView({ shape }: { shape: GraphShape }) {
   return shape.changesOnly ? <ShapeLogView shapeId={shape.id} /> : <ShapeContentsView shapeId={shape.id} />
 }
 
+/** An aggregate shape's live output: its SINK emits a single scalar row (`{key:"agg",
+ *  value:{n,value}}`), so render the scalar big rather than as a one-cell table. Fed by the same
+ *  event-driven rows fetch as every other shape, so it updates as changes arrive. */
+function AggregateScalarView({ shape }: { shape: GraphShape }) {
+  const { rows, live, loading, error } = useShapeContents(true, shape.id, 1)
+  const fn = shape.aggregate?.func.toUpperCase() ?? '?'
+  const expr = `${fn}(${shape.aggregate?.col ?? '*'})`
+  const val = rows[0]?.value as { value?: unknown } | undefined
+  const scalar = val && typeof val === 'object' && 'value' in val ? val.value : (val as unknown)
+  return (
+    <div className="dp-contents">
+      <div className="dp-sec dp-contents-h">
+        <span>live output {live ? <span className="dp-live-dot" title="refetched on each change" /> : null}</span>
+      </div>
+      <div className="dp-note">This sink emits a single scalar — the aggregate’s current value.</div>
+      {error ? <div className="dp-err">{error}</div> : null}
+      <div className="dp-agg">
+        <div className="dp-agg-l">current value</div>
+        <div className="dp-agg-n">{loading && rows.length === 0 ? '…' : fmtScalar(scalar)}</div>
+        <div className="dp-agg-e">{expr}</div>
+      </div>
+    </div>
+  )
+}
+
+/** The live materialized output of a SINK operator (`snk:<id>`): the shape's current rows,
+ *  refetched as changes arrive. Aggregates render their scalar; a removed shape clears gracefully. */
+function SinkView({ shape }: { shape: GraphShape | undefined }) {
+  if (!shape) return <div className="dp-note">shape removed — nothing to show.</div>
+  return shape.aggregate ? <AggregateScalarView shape={shape} /> : <ShapeLiveView shape={shape} />
+}
+
 const BROWSE_PAGE = 25
 
 /** Paginated browser over a table's rows via the engine's one-shot subset query
  *  (`POST /query` with limit/offset) — each page is fetched on demand, no shape is
- *  created and nothing is materialized, so large tables never load upfront. */
+ *  created and nothing is materialized, so large tables never load upfront.
+ *
+ *  Insert lives here too: a `+ add row` affordance below the rows reveals an inline
+ *  editable row aligned to the table's columns; submitting inserts into Postgres via
+ *  the engine (`POST /engine/table/{table}/rows`), then reloads the current page so the
+ *  new row shows. The insert is captured by logical replication, so the pipeline animates
+ *  on its own. Blank inputs are omitted (column default / NULL). */
 function TableBrowser({ table }: { table: string }) {
   const [page, setPage] = useState(0)
   const [rows, setRows] = useState<Record<string, unknown>[]>([])
@@ -159,8 +197,41 @@ function TableBrowser({ table }: { table: string }) {
   const [error, setError] = useState<string | null>(null)
   const [nonce, setNonce] = useState(0)
 
+  // Table schema (columns + PK) — the authoritative column list for the header and the
+  // inline editor, so the add-row lines up even when the table (and thus the query) is empty.
+  const [schema, setSchema] = useState<TableSchemaInfo | null>(null)
+
+  // Inline add-row editor state.
+  const [adding, setAdding] = useState(false)
+  const [values, setValues] = useState<Record<string, string>>({})
+  const [inserting, setInserting] = useState(false)
+  const [insertErr, setInsertErr] = useState<string | null>(null)
+  const [okFlash, setOkFlash] = useState(false)
+
   useEffect(() => {
     setPage(0)
+    setAdding(false)
+    setValues({})
+    setInsertErr(null)
+  }, [table])
+
+  // Fetch the column list once per table (used for the header and the inline editor).
+  useEffect(() => {
+    let alive = true
+    setSchema(null)
+    void (async () => {
+      try {
+        const r = await fetch(`/engine/table/${encodeURIComponent(table)}/schema`)
+        if (!r.ok) throw new Error(`schema → ${r.status}`)
+        const s = (await r.json()) as TableSchemaInfo
+        if (alive) setSchema(s)
+      } catch {
+        // Non-fatal: fall back to deriving columns from the fetched rows.
+      }
+    })()
+    return () => {
+      alive = false
+    }
   }, [table])
 
   useEffect(() => {
@@ -210,7 +281,55 @@ function TableBrowser({ table }: { table: string }) {
     }
   }, [table, page, nonce])
 
-  const columns = rows.length ? Object.keys(rows[0]!) : []
+  // Prefer the schema's columns (order + PK); fall back to whatever the rows expose.
+  const columns = schema ? schema.columns.map((c) => c.name) : rows.length ? Object.keys(rows[0]!) : []
+  const colInfo = useMemo(() => {
+    const m = new Map<string, TableColumn>()
+    schema?.columns.forEach((c) => m.set(c.name, c))
+    return m
+  }, [schema])
+
+  const openEditor = () => {
+    setValues({})
+    setInsertErr(null)
+    setAdding(true)
+  }
+  const closeEditor = () => {
+    setAdding(false)
+    setValues({})
+    setInsertErr(null)
+  }
+
+  const submit = async () => {
+    setInserting(true)
+    setInsertErr(null)
+    // Only send filled-in fields; blank inputs fall through to the column default / NULL.
+    const cols: Record<string, string> = {}
+    for (const [k, v] of Object.entries(values)) if (v !== '') cols[k] = v
+    try {
+      const r = await fetch(`/engine/table/${encodeURIComponent(table)}/rows`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ columns: cols }),
+      })
+      if (!r.ok) {
+        const eb = (await r.json().catch(() => null)) as { error?: string } | null
+        throw new Error(eb?.error ?? `insert → ${r.status}`)
+      }
+      // Success: clear the editor and reload the current page so the new row shows.
+      setValues({})
+      setAdding(false)
+      setOkFlash(true)
+      setTimeout(() => setOkFlash(false), 1600)
+      setNonce((n) => n + 1)
+    } catch (e) {
+      setInsertErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setInserting(false)
+    }
+  }
+
+  const hasCols = columns.length > 0
   return (
     <div className="dp-contents">
       <div className="dp-sec dp-contents-h">
@@ -236,10 +355,10 @@ function TableBrowser({ table }: { table: string }) {
         one-shot subset query, {BROWSE_PAGE} rows per page — pages load on demand, nothing is materialized.
       </div>
       {error ? <div className="dp-err">{error}</div> : null}
-      {!error && !loading && rows.length === 0 ? (
+      {!error && !loading && rows.length === 0 && !adding ? (
         <div className="dp-empty-idx">{page === 0 ? 'table is empty' : 'no more rows'}</div>
       ) : null}
-      {rows.length > 0 ? (
+      {hasCols && (rows.length > 0 || adding) ? (
         <div className="dp-table-wrap">
           <table className="dp-table">
             <thead>
@@ -259,10 +378,58 @@ function TableBrowser({ table }: { table: string }) {
                   ))}
                 </tr>
               ))}
+              {adding ? (
+                <tr className="dp-addrow-tr">
+                  {columns.map((c, i) => {
+                    const info = colInfo.get(c)
+                    return (
+                      <td key={c}>
+                        <input
+                          className="dp-cell-i"
+                          value={values[c] ?? ''}
+                          placeholder={info?.hasDefault ? 'auto' : info?.pk ? 'required' : 'default / null'}
+                          title={
+                            info
+                              ? `${c} · ${info.pgType ?? info.type}${info.pk ? ' · pk' : ''}${info.hasDefault ? ' · auto' : ''}`
+                              : c
+                          }
+                          autoFocus={i === 0}
+                          disabled={inserting}
+                          onChange={(e) => setValues((v) => ({ ...v, [c]: e.target.value }))}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') void submit()
+                            else if (e.key === 'Escape') closeEditor()
+                          }}
+                        />
+                      </td>
+                    )
+                  })}
+                </tr>
+              ) : null}
             </tbody>
           </table>
         </div>
       ) : null}
+      {insertErr ? <div className="dp-err">{insertErr}</div> : null}
+      <div className="dp-addrow-bar">
+        {adding ? (
+          <>
+            <button className="dp-copy" disabled={inserting} onClick={() => void submit()}>
+              {inserting ? 'inserting…' : '✓ insert'}
+            </button>
+            <button className="dp-copy" disabled={inserting} onClick={closeEditor}>
+              cancel
+            </button>
+          </>
+        ) : (
+          <>
+            <button className="dp-addrow-open" disabled={loading} title="insert a row into this table" onClick={openEditor}>
+              + add row
+            </button>
+            {okFlash ? <span className="dp-addrow-ok">✓ inserted</span> : null}
+          </>
+        )}
+      </div>
     </div>
   )
 }
@@ -275,7 +442,7 @@ function ShapeContentsView({ shapeId }: { shapeId: string }) {
     <div className="dp-contents">
       <div className="dp-sec dp-contents-h">
         <span>
-          live contents {live ? <span className="dp-live-dot" title="polling every 2s" /> : null}
+          live contents {live ? <span className="dp-live-dot" title="refetched on each change" /> : null}
         </span>
         <span className="dp-contents-n">
           {loading ? 'loading…' : `${count.toLocaleString()} row${count === 1 ? '' : 's'}`}
@@ -427,136 +594,13 @@ interface TableColumn {
   type: string
   pgType: string | null
   pk: boolean
+  /** Postgres auto-supplies the value when omitted (IDENTITY / DEFAULT) → optional in the add-row form. */
+  hasDefault?: boolean
 }
 interface TableSchemaInfo {
   table: string
   columns: TableColumn[]
   primaryKey: string[]
-}
-
-/** Add-row affordance for a table-source node: a `+` reveals one input per column; submitting inserts a
- *  new row into Postgres via the engine (`POST /engine/table/{table}/rows`). The write is captured by
- *  logical replication and flows through the pipeline, so the change animates and the chips advance on
- *  their own — no manual refresh. Blank fields are omitted (column default / NULL). */
-function AddRowForm({ table }: { table: string }) {
-  const [open, setOpen] = useState(false)
-  const [schema, setSchema] = useState<TableSchemaInfo | null>(null)
-  const [schemaErr, setSchemaErr] = useState<string | null>(null)
-  const [values, setValues] = useState<Record<string, string>>({})
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [okFlash, setOkFlash] = useState(false)
-
-  // Fetch the column list when the form opens (re-fetches if the table changes).
-  useEffect(() => {
-    if (!open) return
-    let alive = true
-    setSchema(null)
-    setSchemaErr(null)
-    void (async () => {
-      try {
-        const r = await fetch(`/engine/table/${encodeURIComponent(table)}/schema`)
-        if (!r.ok) throw new Error(`schema → ${r.status}`)
-        const s = (await r.json()) as TableSchemaInfo
-        if (alive) setSchema(s)
-      } catch (e) {
-        if (alive) setSchemaErr(String(e))
-      }
-    })()
-    return () => {
-      alive = false
-    }
-  }, [open, table])
-
-  const reset = () => {
-    setValues({})
-    setError(null)
-  }
-
-  const submit = async () => {
-    setBusy(true)
-    setError(null)
-    // Only send filled-in fields; blank inputs fall through to the column default / NULL.
-    const columns: Record<string, string> = {}
-    for (const [k, v] of Object.entries(values)) if (v !== '') columns[k] = v
-    try {
-      const r = await fetch(`/engine/table/${encodeURIComponent(table)}/rows`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ columns }),
-      })
-      if (!r.ok) {
-        const body = (await r.json().catch(() => null)) as { error?: string } | null
-        throw new Error(body?.error ?? `insert → ${r.status}`)
-      }
-      reset()
-      setOkFlash(true)
-      setTimeout(() => setOkFlash(false), 1600)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  if (!open) {
-    return (
-      <div className="dp-addrow">
-        <button className="dp-addrow-open" onClick={() => setOpen(true)}>
-          + add row
-        </button>
-        {okFlash ? <span className="dp-addrow-ok">✓ inserted</span> : null}
-      </div>
-    )
-  }
-  return (
-    <div className="dp-addrow dp-addrow-form">
-      <div className="dp-sec">new row → {table}</div>
-      {schemaErr ? <div className="dp-err">{schemaErr}</div> : null}
-      {!schema && !schemaErr ? <div className="dp-note">loading columns…</div> : null}
-      {schema ? (
-        <>
-          <div className="dp-addrow-fields">
-            {schema.columns.map((c) => (
-              <label key={c.name} className="dp-field">
-                <span className="dp-field-l">
-                  {c.name}
-                  {c.pk ? (
-                    <span className="dp-field-pk" title="primary key">
-                      pk
-                    </span>
-                  ) : null}
-                  <span className="dp-field-t">{c.pgType ?? c.type}</span>
-                </span>
-                <input
-                  className="dp-field-i"
-                  value={values[c.name] ?? ''}
-                  placeholder={c.pk ? 'required' : 'default / null'}
-                  onChange={(e) => setValues((v) => ({ ...v, [c.name]: e.target.value }))}
-                />
-              </label>
-            ))}
-          </div>
-          {error ? <div className="dp-err">{error}</div> : null}
-          <div className="dp-addrow-actions">
-            <button className="dp-copy" disabled={busy} onClick={() => void submit()}>
-              {busy ? 'inserting…' : '✓ insert'}
-            </button>
-            <button
-              className="dp-copy"
-              disabled={busy}
-              onClick={() => {
-                setOpen(false)
-                reset()
-              }}
-            >
-              cancel
-            </button>
-          </div>
-        </>
-      ) : null}
-    </div>
-  )
 }
 
 /** Format a Z-set weight with its sign (`+1`, `−1`, `+2`) using the app's unicode minus. */
@@ -696,7 +740,6 @@ export function DetailPanel({
             </div>
           ))}
         </div>
-        <AddRowForm table={node.name} />
         <TableBrowser table={node.name} />
       </>
     )
@@ -826,13 +869,14 @@ export function DetailPanel({
         <InsideNote kind={node.opKind} />
         {/* Source operator: same write + browse affordances as the logical table node. */}
         {node.opKind === 'op-source' && opTable ? (
-          <>
-            <AddRowForm table={opTable} />
-            <TableBrowser table={opTable} />
-          </>
+          <TableBrowser table={opTable} />
         ) : null}
         {/* Δ change operator: the reconstructed Z-set of the most recent change on this table. */}
         {node.opKind === 'op-delta' && opTable ? <DeltaView table={opTable} /> : null}
+        {/* Sink operator: the shape's live materialized output (its hop is `shape:<id>`). */}
+        {node.opKind === 'op-sink' ? (
+          <SinkView shape={graph.shapes.find((x) => x.id === (node.hop.startsWith('shape:') ? node.hop.slice('shape:'.length) : ''))} />
+        ) : null}
       </>
     )
   } else if (node.kind === 'aggshape') {

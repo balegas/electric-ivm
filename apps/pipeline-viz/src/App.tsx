@@ -8,11 +8,13 @@ import { DetailPanel } from './DetailPanel'
 import { edgeTypes, type PulseEdgeData } from './edges'
 import { PipelineNode } from './nodes'
 import { predicateLabel } from './predicate-label'
+import { recordShapeChanges } from './shape-change-store'
 import { shapeSql } from './shape-sql'
 import { applyStateStaggered, seedState } from './state-store'
 import { eventDecor, mergeDecor, type Decor, type FlashKind } from './trace-anim'
 import type { EngineGraph, GraphShape, TraceEvent, TraceMessage } from './types'
 import { useTrace } from './useTrace'
+import { WhereEditor } from './WhereEditor'
 
 type Mode = 'all' | 'select'
 type View = 'logical' | 'circuit'
@@ -149,14 +151,13 @@ function NewShapeForm({ tables, onCreated }: { tables: string[]; onCreated: () =
           </option>
         ))}
       </select>
-      <input
-        className="newshape-where"
-        placeholder="WHERE clause (optional) — e.g. status <> 'done'"
+      <WhereEditor
         value={where}
-        onChange={(e) => setWhere(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter') void create()
-        }}
+        onChange={setWhere}
+        onSubmit={() => void create()}
+        table={table}
+        tables={tables}
+        placeholder="WHERE clause (optional) — e.g. status <> 'done'"
       />
       {error ? <div className="err newshape-err">{error}</div> : null}
       <div className="newshape-actions">
@@ -352,6 +353,9 @@ export default function App() {
       // Capture this change's Z-set as the latest delta for its table — the Δ change operator's
       // panel (and its inline peek) reconstruct the weighted rows from it.
       recordDelta(ev)
+      // Bump the change tick for every shape this event touched, so a SINK/shape-out row preview
+      // refetches immediately (reuses this one SSE — no second connection).
+      recordShapeChanges(ev.shapes)
       applyEventDecor(ev)
     },
     [load, applyEventDecor],
