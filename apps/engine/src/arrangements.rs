@@ -37,7 +37,7 @@ use dbsp::circuit::{CircuitConfig, CircuitStorageConfig, StorageCacheConfig, Sto
 use dbsp::dynamic::{DowncastTrait, Erase};
 use dbsp::trace::{BatchReader as DynBatchReaderTrait, Cursor};
 use dbsp::typed_batch::{BatchReader, SpineSnapshot};
-use dbsp::{OrdIndexedZSet, Runtime, ZSetHandle};
+use dbsp::{OrdIndexedZSet, OutputHandle, Runtime, ZSetHandle};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::value::{Row, Tup2, Value, ZWeight};
@@ -48,6 +48,23 @@ use crate::value::{Row, Tup2, Value, ZWeight};
 pub struct IndexSpec {
     pub table: String,
     pub cols: Vec<usize>,
+}
+
+/// One counts pipeline: the live COUNT of `table`'s rows per distinct projection of
+/// `group_cols` (`map_index(group) → weighted_count`). At most one per table. Aggregate
+/// shapes whose predicate decomposes over these columns are served by summing groups.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CountSpec {
+    pub table: String,
+    pub group_cols: Vec<usize>,
+}
+
+/// The net change of one count group in one circuit step: the group's count moved by `delta`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CountDelta {
+    pub table: String,
+    pub group: Row,
+    pub delta: i64,
 }
 
 /// Tuning knobs, resolved from `ELECTRIC_IVM_DBSP_*` env vars (see `config.rs`).
@@ -88,6 +105,13 @@ type Snapshot = SpineSnapshot<OrdIndexedZSet<Row, Row>>;
 /// A published read slot. `None` until the first step after circuit construction.
 type Slot = Arc<RwLock<Option<Snapshot>>>;
 
+/// The snapshot type published per counts pipeline: current count, keyed by the group.
+type CountSnapshot = SpineSnapshot<OrdIndexedZSet<Row, ZWeight>>;
+type CountSlot = Arc<RwLock<Option<CountSnapshot>>>;
+
+/// The transaction-accumulated output handle of a counts pipeline.
+type CountOutput = OutputHandle<SpineSnapshot<OrdIndexedZSet<Row, ZWeight>>>;
+
 /// One envelope's worth of change, stamped for de-duplication. `lsn`/`seq` are `None` for
 /// library-mode envelopes (no replication stamps), which bypass the highwater (they are only
 /// produced by tests that never redeliver).
@@ -101,7 +125,13 @@ pub struct StampedDelta {
 enum Cmd {
     /// Apply one change-log batch (any number of transactions) and step the circuit once.
     /// `next_offset` is the change-log position after this batch; recorded for checkpoints.
-    Batch { deltas: Vec<StampedDelta>, next_offset: Option<String> },
+    /// `resp` acknowledges completion with the step's count-group deltas — awaiting it is
+    /// what gives the feeder read-your-writes over the snapshots.
+    Batch {
+        deltas: Vec<StampedDelta>,
+        next_offset: Option<String>,
+        resp: Option<oneshot::Sender<Vec<CountDelta>>>,
+    },
     /// Seed one chunk of a table's initial snapshot (bypasses the highwater: seeding is
     /// fenced by the snapshot gate at the feed site, not by replication stamps).
     SeedChunk { table: String, rows: Vec<Row>, done: Option<oneshot::Sender<Result<(), String>>> },
@@ -127,6 +157,8 @@ struct Meta {
 pub struct Arrangements {
     tx: mpsc::Sender<Cmd>,
     slots: Arc<HashMap<IndexSpec, Slot>>,
+    /// Counts pipelines: per table, the group columns and the published count snapshot.
+    counts: Arc<HashMap<String, (Vec<usize>, CountSlot)>>,
     /// Tables whose initial seed completed (lookups against unseeded tables return `None`).
     seeded: Arc<HashMap<String, AtomicBool>>,
     /// Change-log offset to resume replay from (from the restored checkpoint), if any.
@@ -139,15 +171,33 @@ pub struct Arrangements {
 impl Arrangements {
     /// Build the circuit (restoring from the latest compatible checkpoint if one exists)
     /// and start the circuit thread. `specs` must include every index that lookups will
-    /// need; it is deduplicated and ordered for a stable circuit layout.
-    pub fn start(cfg: ArrangementsConfig, mut specs: Vec<IndexSpec>) -> Result<Arrangements> {
+    /// need, and `counts` every count-group pipeline (at most one per table, and each
+    /// counted table must also have at least one index — that is what creates its input).
+    /// Both are deduplicated and ordered for a stable circuit layout.
+    pub fn start(
+        cfg: ArrangementsConfig,
+        mut specs: Vec<IndexSpec>,
+        mut counts: Vec<CountSpec>,
+    ) -> Result<Arrangements> {
         specs.sort();
         specs.dedup();
+        counts.sort();
+        counts.dedup();
         anyhow::ensure!(!specs.is_empty(), "arrangements: no indexes registered");
+        for pair in counts.windows(2) {
+            anyhow::ensure!(pair[0].table != pair[1].table, "arrangements: one counts spec per table");
+        }
+        for c in &counts {
+            anyhow::ensure!(
+                specs.iter().any(|s| s.table == c.table),
+                "arrangements: counts table '{}' has no index (no input)",
+                c.table
+            );
+        }
 
         std::fs::create_dir_all(&cfg.dir)
             .with_context(|| format!("creating dbsp dir {}", cfg.dir.display()))?;
-        let layout = layout_fingerprint(&specs);
+        let layout = layout_fingerprint(&specs, &counts);
         let meta = read_meta(&cfg.dir);
         // A layout change means a different circuit: dbsp would refuse the checkpoint via its
         // own fingerprint check; discard state proactively so we reseed instead of erroring.
@@ -184,6 +234,9 @@ impl Arrangements {
         // Read slots, created up front and shared with the constructor closure.
         let slots: Arc<HashMap<IndexSpec, Slot>> =
             Arc::new(specs.iter().map(|s| (s.clone(), Slot::default())).collect());
+        let count_slots: Arc<HashMap<String, (Vec<usize>, CountSlot)>> = Arc::new(
+            counts.iter().map(|c| (c.table.clone(), (c.group_cols.clone(), CountSlot::default()))).collect(),
+        );
         let seeded: Arc<HashMap<String, AtomicBool>> = Arc::new(
             specs.iter().map(|s| (s.table.clone(), AtomicBool::new(meta.is_some()))).collect(),
         );
@@ -198,9 +251,11 @@ impl Arrangements {
         }
 
         let ctor_slots = slots.clone();
+        let ctor_counts = count_slots.clone();
         let ctor_tables = per_table.clone();
-        let (mut dbsp, inputs) = Runtime::init_circuit(circuit_config, move |circuit| {
+        let (mut dbsp, (inputs, count_outputs)) = Runtime::init_circuit(circuit_config, move |circuit| {
             let mut handles: HashMap<String, ZSetHandle<Row>> = HashMap::new();
+            let mut count_handles: HashMap<String, CountOutput> = HashMap::new();
             for (table, table_specs) in &ctor_tables {
                 let (stream, handle) = circuit.add_input_zset::<Row>();
                 for spec in table_specs {
@@ -215,9 +270,26 @@ impl Arrangements {
                             *slot.write().expect("slot lock") = Some(spine.ro_snapshot());
                         });
                 }
+                // The counts pipeline: the first *computing* operator in the circuit. One
+                // maintained integer per distinct group projection; the output stream carries
+                // the per-step count deltas (retract old count, insert new), and the trace
+                // snapshot serves aggregate seeding.
+                if let Some((gcols, cslot)) = ctor_counts.get(table) {
+                    let gcols = gcols.clone();
+                    let cslot = cslot.clone();
+                    let counted = stream
+                        .map_index(move |row| (project(row, &gcols), ()))
+                        .weighted_count();
+                    counted.integrate_trace().apply(move |spine| {
+                        *cslot.write().expect("count slot lock") = Some(spine.ro_snapshot());
+                    });
+                    // `accumulate_output`, not `output`: a transaction can span several
+                    // microsteps, and the plain mailbox only holds the last one's delta.
+                    count_handles.insert(table.clone(), counted.accumulate_output());
+                }
                 handles.insert(table.clone(), handle);
             }
-            Ok(handles)
+            Ok((handles, count_handles))
         })
         .map_err(|e| anyhow::anyhow!("arrangements: init_circuit: {e}"))?;
 
@@ -236,12 +308,13 @@ impl Arrangements {
         let thread_cfg = cfg.clone();
         std::thread::Builder::new()
             .name("dbsp-arrangements".into())
-            .spawn(move || circuit_thread(dbsp, inputs, rx, thread_cfg, layout, restored_hw))
+            .spawn(move || circuit_thread(dbsp, inputs, count_outputs, rx, thread_cfg, layout, restored_hw))
             .context("spawning dbsp-arrangements thread")?;
 
         Ok(Arrangements {
             tx,
             slots,
+            counts: count_slots,
             seeded,
             restored_offset,
             served: Arc::new(AtomicU64::new(0)),
@@ -255,14 +328,24 @@ impl Arrangements {
         self.restored_offset.as_deref()
     }
 
-    /// Feed one change-log batch. Await-safe (bounded channel = backpressure).
-    pub async fn apply_batch(&self, deltas: Vec<StampedDelta>, next_offset: Option<String>) {
+    /// Feed one change-log batch and wait for the circuit to step. Returns the step's
+    /// count-group deltas (empty when nothing new applied). Awaiting completion is what
+    /// gives the caller read-your-writes over the snapshots: after `apply_batch` returns,
+    /// lookups and count reads reflect this batch.
+    pub async fn apply_batch(
+        &self,
+        deltas: Vec<StampedDelta>,
+        next_offset: Option<String>,
+    ) -> Vec<CountDelta> {
         if deltas.is_empty() && next_offset.is_none() {
-            return;
+            return Vec::new();
         }
-        if self.tx.send(Cmd::Batch { deltas, next_offset }).await.is_err() {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        if self.tx.send(Cmd::Batch { deltas, next_offset, resp: Some(resp_tx) }).await.is_err() {
             tracing::error!("arrangements: circuit thread gone; dropping batch");
+            return Vec::new();
         }
+        resp_rx.await.unwrap_or_default()
     }
 
     /// Feed one seeding chunk. The last chunk of a table should be sent with `finish_seed`.
@@ -370,6 +453,52 @@ impl Arrangements {
         self.slots.contains_key(&IndexSpec { table: table.to_string(), cols: cols.to_vec() })
     }
 
+    /// The group columns of `table`'s counts pipeline, if one is compiled in.
+    pub fn counts_group_cols(&self, table: &str) -> Option<&[usize]> {
+        self.counts.get(table).map(|(cols, _)| cols.as_slice())
+    }
+
+    /// The registered counts specs, in stable (sorted) order.
+    pub fn count_specs(&self) -> Vec<CountSpec> {
+        let mut specs: Vec<CountSpec> = self
+            .counts
+            .iter()
+            .map(|(t, (cols, _))| CountSpec { table: t.clone(), group_cols: cols.clone() })
+            .collect();
+        specs.sort();
+        specs
+    }
+
+    /// Every current count group of `table` with its count. `None` = no counts pipeline
+    /// or table not seeded (caller falls back); `Some(vec![])` = authoritative empty.
+    /// A group's current count is the value with positive net weight in the trace.
+    pub fn count_groups(&self, table: &str) -> Option<Vec<(Row, i64)>> {
+        if !self.seeded.get(table)?.load(Ordering::Acquire) {
+            self.fallback.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let (_, slot) = self.counts.get(table)?;
+        let guard = slot.read().expect("count slot lock");
+        let snap = guard.as_ref()?;
+        let mut out = Vec::new();
+        let mut cursor = snap.inner().cursor();
+        while cursor.key_valid() {
+            let group = unsafe { cursor.key().downcast::<Row>() }.clone();
+            while cursor.val_valid() {
+                if **cursor.weight() > 0 {
+                    let count = *unsafe { cursor.val().downcast::<ZWeight>() };
+                    if count != 0 {
+                        out.push((group.clone(), count));
+                    }
+                }
+                cursor.step_val();
+            }
+            cursor.step_key();
+        }
+        self.served.fetch_add(1, Ordering::Relaxed);
+        Some(out)
+    }
+
     /// Checkpoint now (also runs on the periodic cadence and at shutdown).
     pub async fn checkpoint(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
@@ -395,13 +524,23 @@ fn project(row: &Row, cols: &[usize]) -> Row {
     Row(cols.iter().map(|&i| row.0.get(i).cloned().unwrap_or(Value::Null)).collect())
 }
 
-fn layout_fingerprint(specs: &[IndexSpec]) -> String {
+fn layout_fingerprint(specs: &[IndexSpec], counts: &[CountSpec]) -> String {
     let mut s = String::new();
     for spec in specs {
         s.push_str(&spec.table);
         s.push(':');
         for c in &spec.cols {
             s.push_str(&c.to_string());
+            s.push(',');
+        }
+        s.push(';');
+    }
+    for c in counts {
+        s.push_str("counts:");
+        s.push_str(&c.table);
+        s.push(':');
+        for g in &c.group_cols {
+            s.push_str(&g.to_string());
             s.push(',');
         }
         s.push(';');
@@ -425,10 +564,32 @@ fn write_meta(dir: &std::path::Path, meta: &Meta) {
     }
 }
 
+/// Drain a counts output handle: the transaction's per-group net deltas. The output stream
+/// is the delta of the (group → count) relation — a changed group appears as retract(old
+/// count) + insert(new count), so `Σ value×weight` per group is exactly the count's change.
+fn drain_count_deltas(table: &str, handle: &CountOutput, out: &mut Vec<CountDelta>) {
+    let batch = handle.concat();
+    let mut cursor = batch.inner().cursor();
+    while cursor.key_valid() {
+        let group = unsafe { cursor.key().downcast::<Row>() }.clone();
+        let mut delta: i64 = 0;
+        while cursor.val_valid() {
+            let count = *unsafe { cursor.val().downcast::<ZWeight>() };
+            delta += count * **cursor.weight();
+            cursor.step_val();
+        }
+        if delta != 0 {
+            out.push(CountDelta { table: table.to_string(), group, delta });
+        }
+        cursor.step_key();
+    }
+}
+
 /// The circuit thread: owns the `DBSPHandle`, applies batches, steps, checkpoints.
 fn circuit_thread(
     mut dbsp: dbsp::DBSPHandle,
     inputs: HashMap<String, ZSetHandle<Row>>,
+    count_outputs: HashMap<String, CountOutput>,
     mut rx: mpsc::Receiver<Cmd>,
     cfg: ArrangementsConfig,
     layout: String,
@@ -462,7 +623,7 @@ fn circuit_thread(
 
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
-            Cmd::Batch { deltas, next_offset } => {
+            Cmd::Batch { deltas, next_offset, resp } => {
                 let mut touched = false;
                 for d in deltas {
                     // De-duplication: replay overlap after a restore, or redelivery upstream.
@@ -482,13 +643,22 @@ fn circuit_thread(
                     handle.append(&mut buf);
                     touched = true;
                 }
+                let mut count_deltas = Vec::new();
                 if touched {
-                    if let Err(e) = dbsp.transaction() {
-                        tracing::error!("arrangements: transaction failed: {e}");
+                    match dbsp.transaction() {
+                        Ok(()) => {
+                            for (table, handle) in &count_outputs {
+                                drain_count_deltas(table, handle, &mut count_deltas);
+                            }
+                        }
+                        Err(e) => tracing::error!("arrangements: transaction failed: {e}"),
                     }
                 }
                 if next_offset.is_some() {
                     offset = next_offset;
+                }
+                if let Some(resp) = resp {
+                    let _ = resp.send(count_deltas);
                 }
                 if let Some(every) = cfg.checkpoint_every {
                     if touched && last_ckpt.elapsed() >= every {
@@ -566,7 +736,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn seed_lookup_delta_lookup() {
         let dir = tempdir();
-        let arr = Arrangements::start(test_cfg(&dir), specs()).unwrap();
+        let arr = Arrangements::start(test_cfg(&dir), specs(), vec![]).unwrap();
         assert_eq!(arr.restored_offset(), None);
 
         // Unseeded: lookups refuse (fallback contract).
@@ -623,7 +793,7 @@ mod tests {
     async fn checkpoint_restore_resumes_offset_and_dedup() {
         let dir = tempdir();
         {
-            let arr = Arrangements::start(test_cfg(&dir), specs()).unwrap();
+            let arr = Arrangements::start(test_cfg(&dir), specs(), vec![]).unwrap();
             arr.seed_chunk("t", vec![row(&[1, 10])]).await.unwrap();
             arr.finish_seed("t");
             arr.apply_batch(
@@ -639,7 +809,7 @@ mod tests {
             arr.shutdown().await; // checkpoints
         }
         {
-            let arr = Arrangements::start(test_cfg(&dir), specs()).unwrap();
+            let arr = Arrangements::start(test_cfg(&dir), specs(), vec![]).unwrap();
             assert_eq!(arr.restored_offset(), Some("off-42"));
             // Restored tables serve immediately (state came from the checkpoint).
             assert_eq!(arr.lookup("t", &[0], &row(&[2])), Some(vec![row(&[2, 20])]));
@@ -665,7 +835,7 @@ mod tests {
     async fn layout_change_discards_state() {
         let dir = tempdir();
         {
-            let arr = Arrangements::start(test_cfg(&dir), specs()).unwrap();
+            let arr = Arrangements::start(test_cfg(&dir), specs(), vec![]).unwrap();
             arr.seed_chunk("t", vec![row(&[1, 10])]).await.unwrap();
             arr.finish_seed("t");
             arr.shutdown().await;
@@ -675,10 +845,81 @@ mod tests {
             let arr = Arrangements::start(
                 test_cfg(&dir),
                 vec![IndexSpec { table: "t".into(), cols: vec![0] }],
+                vec![],
             )
             .unwrap();
             assert_eq!(arr.restored_offset(), None);
             assert_eq!(arr.lookup("t", &[0], &row(&[1])), None); // unseeded again
+            arr.shutdown().await;
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn counts_pipeline_seed_deltas_dedup_restore() {
+        let dir = tempdir();
+        let counts = vec![CountSpec { table: "t".into(), group_cols: vec![1] }];
+        {
+            let arr = Arrangements::start(test_cfg(&dir), specs(), counts.clone()).unwrap();
+            assert_eq!(arr.counts_group_cols("t"), Some(&[1][..]));
+            // Seed: groups 10 → 2 rows, 30 → 1 row.
+            arr.seed_chunk("t", vec![row(&[1, 10]), row(&[2, 10]), row(&[3, 30])]).await.unwrap();
+            arr.finish_seed("t");
+            let mut groups = arr.count_groups("t").unwrap();
+            groups.sort();
+            assert_eq!(groups, vec![(row(&[10]), 2), (row(&[30]), 1)]);
+
+            // A delta: one row moves group 10 → 20, one row deleted from 30. The step's count
+            // deltas are returned by apply_batch, netted per group.
+            let mut deltas = arr
+                .apply_batch(
+                    vec![StampedDelta {
+                        table: "t".into(),
+                        delta: vec![
+                            Tup2(row(&[2, 10]), -1),
+                            Tup2(row(&[2, 20]), 1),
+                            Tup2(row(&[3, 30]), -1),
+                        ],
+                        lsn: Some(50),
+                        seq: Some(0),
+                    }],
+                    Some("off-9".into()),
+                )
+                .await;
+            deltas.sort_by(|a, b| a.group.cmp(&b.group));
+            assert_eq!(
+                deltas,
+                vec![
+                    CountDelta { table: "t".into(), group: row(&[10]), delta: -1 },
+                    CountDelta { table: "t".into(), group: row(&[20]), delta: 1 },
+                    CountDelta { table: "t".into(), group: row(&[30]), delta: -1 },
+                ]
+            );
+            // A redelivered stamp is a no-op (no count deltas).
+            let dup = arr
+                .apply_batch(
+                    vec![StampedDelta {
+                        table: "t".into(),
+                        delta: vec![Tup2(row(&[2, 10]), -1)],
+                        lsn: Some(50),
+                        seq: Some(0),
+                    }],
+                    None,
+                )
+                .await;
+            assert_eq!(dup, vec![]);
+            let mut groups = arr.count_groups("t").unwrap();
+            groups.sort();
+            assert_eq!(groups, vec![(row(&[10]), 1), (row(&[20]), 1)]);
+            arr.shutdown().await; // checkpoints (counts trace included)
+        }
+        {
+            // Restore: counts state comes back from the checkpoint, offset + highwater intact.
+            let arr = Arrangements::start(test_cfg(&dir), specs(), counts).unwrap();
+            assert_eq!(arr.restored_offset(), Some("off-9"));
+            let mut groups = arr.count_groups("t").unwrap();
+            groups.sort();
+            assert_eq!(groups, vec![(row(&[10]), 1), (row(&[20]), 1)]);
             arr.shutdown().await;
         }
         std::fs::remove_dir_all(&dir).ok();
@@ -734,6 +975,7 @@ mod tests {
                 ..ArrangementsConfig::default()
             },
             vec![IndexSpec { table: "t".into(), cols: vec![0] }],
+            vec![],
         )
         .unwrap();
 
@@ -784,6 +1026,7 @@ mod tests {
                 ..ArrangementsConfig::default()
             },
             vec![IndexSpec { table: "t".into(), cols: vec![0] }],
+            vec![],
         )
         .unwrap();
 

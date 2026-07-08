@@ -79,6 +79,8 @@ pub struct Engine {
     /// Per-table seed-snapshot gates fencing the arrangement feed (fresh seeds only; empty
     /// after a checkpoint restore, where the highwater does the fencing instead).
     arr_gates: Arc<std::sync::RwLock<HashMap<String, crate::pg::SnapshotGate>>>,
+    /// Serve template-matching shapes/aggregates from the circuit (`ELECTRIC_IVM_DBSP_SERVE`).
+    dbsp_serve: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// One tailer envelope's worth of deferred subquery flips (see [`Engine::flip_tx`]).
@@ -187,6 +189,10 @@ struct EngineState {
     /// Covers plain, subquery, and aggregate shapes. `feed_by_sig`: signature -> shape_id;
     /// `feed_shares`: shape_id -> (sig, refcount).
     feed_by_sig: HashMap<String, String>,
+    /// Circuit-served placement per shape id (label like `all` / `static:project_id` /
+    /// `dynamic:project_id` / `counts`), plus the arrangement column serving it — feeds the
+    /// graph payload so the visualizer can draw pipeline→shape edges.
+    circuit_placement: HashMap<String, CircuitPlacement>,
     feed_shares: HashMap<String, FeedShare>,
 }
 
@@ -313,6 +319,10 @@ pub struct GraphShape {
     pub is_subquery: bool,
     /// Present iff this shape is a scalar aggregation (COUNT/SUM/…).
     pub aggregate: Option<AggInfo>,
+    /// Present iff this shape is **circuit-served** (seeded + maintained by the dbsp pipeline);
+    /// says which cohort form serves it (`all` / `static:<col>` / `dynamic:<col>` / `counts`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub circuit: Option<CircuitPlacement>,
     /// Retention lifecycle: `active` | `deactivating` | `dormant` | `reactivating` (`None` while
     /// the record is mid-create). A dormant shape keeps its stream + record but holds no routing
     /// state — the visualizer renders it parked instead of live.
@@ -424,7 +434,23 @@ pub struct ArrangementGraph {
     pub fallback: u64,
     pub inputs: Vec<ArrInput>,
     pub indexes: Vec<ArrIndex>,
+    /// Counts pipelines (`map_index(group) → weighted_count`), one per counted table.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub counts: Vec<ArrCounts>,
     pub consumers: Vec<ArrConsumer>,
+}
+
+/// One counts pipeline node in the compiled circuit.
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+pub struct ArrCounts {
+    /// `arr:counts:<table>`.
+    pub id: String,
+    /// The feeding table input's node id (the input→counts edge).
+    pub input: String,
+    pub table: String,
+    pub group_cols: Vec<String>,
+    pub seeded: bool,
 }
 
 /// The whole maintained pipeline at an instant: tables, shapes (with their routing placement),
@@ -552,6 +578,9 @@ type SharedTables = Arc<std::sync::RwLock<HashMap<String, TableSchema>>>;
 pub struct TableStats {
     pub families: Vec<FamilyStat>,
     pub standalone: usize,
+    /// Circuit-served shapes + aggregates on this table.
+    #[serde(default)]
+    pub circuit: usize,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -604,6 +633,31 @@ enum SequencerCmd {
         resp: tokio::sync::oneshot::Sender<Option<(String, crate::pg::SnapshotGate)>>,
     },
     RemoveShape { table: String, shape_id: String },
+    /// Create a **circuit-served** shape: seeded from arrangement snapshots inside the
+    /// sequencer (between transactions, so the read is consistent with the processed offset by
+    /// construction — no Postgres backfill, no snapshot gate), then updated by routing each
+    /// transaction's deltas through (cohort groups ∧ residual predicate).
+    CreateCircuitShape {
+        table: String,
+        shape_id: String,
+        num_id: u64,
+        stream_path: String,
+        constraint: PlannedConstraint,
+        residual: Option<Arc<CompiledPredicate>>,
+        out_cols: Option<Arc<Vec<usize>>>,
+        /// `false` on catalog restore: the stream is already complete up to the resume offset.
+        seed: bool,
+        ready: tokio::sync::oneshot::Sender<std::result::Result<u64, String>>,
+    },
+    /// Create a **circuit-served** COUNT aggregate over the table's counts pipeline: seeded by
+    /// summing matching groups, then updated from the pipeline's per-transaction group deltas.
+    CreateCircuitAgg {
+        table: String,
+        shape_id: String,
+        stream_path: String,
+        constraints: Vec<Option<std::collections::HashSet<Value>>>,
+        ready: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
     /// Dump the full internal state of one node (`family:<t>:<cols>` → the routing index
     /// contents; an aggregate `shape:<sid>` → the fold internals incl. the MIN/MAX multiset).
     /// `None` if the node id is unknown. Serves `GET /state/node`.
@@ -648,6 +702,7 @@ impl Engine {
                 next_shape_id: 1,
                 feed_by_sig: HashMap::new(),
                 feed_shares: HashMap::new(),
+                circuit_placement: HashMap::new(),
             })),
             pg_url,
             repl_lsn: Arc::new(std::sync::Mutex::new("0/0".to_string())),
@@ -668,6 +723,7 @@ impl Engine {
             dbsp_cfg: Arc::new(std::sync::Mutex::new(None)),
             arrangements: Arc::new(std::sync::Mutex::new(None)),
             arr_gates: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            dbsp_serve: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -696,6 +752,21 @@ impl Engine {
                 None => tracing::warn!("ELECTRIC_IVM_DBSP_INDEXES: unknown column {t}.{c}; skipping"),
             }
         }
+        let mut counts: Vec<crate::arrangements::CountSpec> = Vec::new();
+        for (t, cols) in &cfg.counts {
+            let Some(ts) = schemas.get(t) else {
+                tracing::warn!("ELECTRIC_IVM_DBSP_COUNTS: unknown table {t}; skipping");
+                continue;
+            };
+            let resolved: Option<Vec<usize>> =
+                cols.iter().map(|c| ts.index.get(c).copied()).collect();
+            match resolved {
+                Some(group_cols) => {
+                    counts.push(crate::arrangements::CountSpec { table: t.clone(), group_cols })
+                }
+                None => tracing::warn!("ELECTRIC_IVM_DBSP_COUNTS: unknown column in {t}:{cols:?}; skipping"),
+            }
+        }
         let arr_cfg = crate::arrangements::ArrangementsConfig {
             dir: cfg.dir.clone(),
             cache_mib: cfg.cache_mib,
@@ -705,7 +776,7 @@ impl Engine {
             ..crate::arrangements::ArrangementsConfig::default()
         };
         let chunk = arr_cfg.seed_chunk_rows;
-        let arr = crate::arrangements::Arrangements::start(arr_cfg, specs)?;
+        let arr = crate::arrangements::Arrangements::start(arr_cfg, specs, counts)?;
         if arr.restored_offset().is_none() {
             let url = self.pg_url.clone().context("arrangements need a pg_url to seed")?;
             let client = crate::pg::connect(&url).await?;
@@ -729,6 +800,7 @@ impl Engine {
         }
         self.subqueries.lock().await.set_arrangements(arr.clone());
         *self.arrangements.lock().unwrap() = Some(arr);
+        self.dbsp_serve.store(cfg.serve, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -818,14 +890,15 @@ impl Engine {
         // Replay the durable shape catalog (restores shapes + the change-log replay offset), then
         // start the sequencer from the restored position. Runs before the ingestor so the restored
         // routing sees every replayed change.
-        if let Err(e) = self.restore_catalog(&compiled).await {
-            tracing::error!("catalog restore failed (continuing empty): {e:#}");
-        }
-        // Start (and seed or restore) the dbsp arrangement layer BEFORE the sequencer spawns:
-        // the sequencer captures the handle + seed gates at spawn time. A failure here degrades
-        // to Postgres query-backs (the engine still runs), it does not abort boot.
+        // Start (and seed or restore) the dbsp arrangement layer BEFORE the catalog restore:
+        // the restore spawns the sequencer (which captures the handle + seed gates) and may
+        // re-register circuit-served shapes, both of which need the layer up. A failure here
+        // degrades to Postgres query-backs (the engine still runs), it does not abort boot.
         if let Err(e) = self.maybe_start_arrangements(&compiled).await {
             tracing::error!("dbsp arrangements failed to start (falling back to Postgres): {e:#}");
+        }
+        if let Err(e) = self.restore_catalog(&compiled).await {
+            tracing::error!("catalog restore failed (continuing empty): {e:#}");
         }
         {
             let mut st = self.state.lock().await;
@@ -1214,6 +1287,104 @@ impl Engine {
             }
         }
 
+        // Circuit-served path: when serving is enabled and the predicate decomposes over the
+        // compiled arrangements, the shape is seeded from snapshots inside the sequencer — no
+        // Postgres backfill, no gate. Bookkeeping (catalog/sharing/lives) matches the legacy
+        // path exactly. `changes_only` feeds stay on the legacy (passthrough) path.
+        if !changes_only && self.dbsp_serve.load(std::sync::atomic::Ordering::Acquire) {
+            let arr = self.arrangements.lock().unwrap().clone();
+            if let Some(arr) = arr {
+                if let Some(plan) = plan_circuit_shape(where_.as_ref(), &ts, &st.tables, &arr) {
+                    let residual = match plan.residual.as_ref() {
+                        Some(r) => Some(Arc::new(CompiledPredicate::compile(r, &ts)?)),
+                        None => None,
+                    };
+                    let placement = match &plan.constraint {
+                        PlannedConstraint::All => CircuitPlacement { label: "all".into(), col: None, counts: false },
+                        PlannedConstraint::Static { col, .. } => CircuitPlacement {
+                            label: format!("static:{}", ts.columns[*col].0), col: Some(*col), counts: false,
+                        },
+                        PlannedConstraint::Dynamic { col, .. } => CircuitPlacement {
+                            label: format!("dynamic:{}", ts.columns[*col].0), col: Some(*col), counts: false,
+                        },
+                    };
+                    let cmd_tx = self.ensure_sequencer(&mut st).cmd_tx.clone();
+                    let (ready_tx2, ready_rx2) = tokio::sync::oneshot::channel();
+                    cmd_tx
+                        .send(SequencerCmd::CreateCircuitShape {
+                            table: table.to_string(),
+                            shape_id: id.clone(),
+                            num_id,
+                            stream_path: stream_path.clone(),
+                            constraint: plan.constraint,
+                            residual,
+                            out_cols: out_cols.clone(),
+                            seed: true,
+                            ready: ready_tx2,
+                        })
+                        .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
+                    let rec = ShapeRecord {
+                        id: id.clone(),
+                        table: table.to_string(),
+                        stream_path: stream_path.clone(),
+                        changes_only,
+                        where_json: where_.clone(),
+                        columns: col_names,
+                        family_key: None,
+                        is_subquery: false,
+                        aggregate: None,
+                    };
+                    st.shapes.insert(id.clone(), rec.clone());
+                    st.circuit_placement.insert(id.clone(), placement);
+                    let _ = self.catalog_tx.send(CatalogEvent::Created { rec: rec.clone(), sig: feed_sig.clone() });
+                    self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
+                    self.ensure_retention_sweeper();
+                    let (share_tx, share_rx) = tokio::sync::watch::channel(None);
+                    if let Some(sig) = feed_sig {
+                        st.feed_by_sig.insert(sig.clone(), id.clone());
+                        st.feed_shares.insert(id.clone(), FeedShare { sig, refcount: 1, ready: share_rx });
+                    }
+                    drop(st);
+                    return match ready_rx2
+                        .await
+                        .unwrap_or_else(|_| Err("sequencer dropped the ready channel".to_string()))
+                    {
+                        Ok(_seeded) => {
+                            let _ = share_tx.send(Some(true));
+                            trace_lifecycle(
+                                &self.trace_tx,
+                                crate::trace::GraphLifecycle::ShapeAdded {
+                                    shape: rec.id.clone(),
+                                    table: rec.table.clone(),
+                                },
+                            );
+                            crate::statsd::create_snapshot_task(created_at.elapsed());
+                            Ok(rec)
+                        }
+                        Err(e) => {
+                            let mut st = self.state.lock().await;
+                            st.shapes.remove(&id);
+                            st.circuit_placement.remove(&id);
+                            let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
+                            if let Some(share) = st.feed_shares.remove(&id) {
+                                st.feed_by_sig.remove(&share.sig);
+                            }
+                            if let Some(seq) = st.sequencer.as_ref() {
+                                let _ = seq.cmd_tx.send(SequencerCmd::RemoveShape {
+                                    table: rec.table.clone(),
+                                    shape_id: id.clone(),
+                                });
+                            }
+                            drop(st);
+                            let _ = share_tx.send(Some(false));
+                            let _ = self.ds.delete_stream(&rec.stream_path).await;
+                            bail!("shape '{id}' creation failed: {e}")
+                        }
+                    };
+                }
+            }
+        }
+
         let pred = Arc::new(CompiledPredicate::compile_opt(where_.as_ref(), &ts)?);
         // Family placement (for graph introspection): an equality template routes by these key columns
         // via a shared family; otherwise it's a standalone filter.
@@ -1347,6 +1518,92 @@ impl Engine {
         let stream_path = format!("shape/{id}");
         self.ds.ensure_stream(&stream_path).await?;
 
+        // Circuit-served path: a bare COUNT whose predicate decomposes over the table's counts
+        // pipeline is seeded by summing groups and updated from group deltas — no Postgres.
+        if matches!(func, AggFn::Count)
+            && col_idx.is_none()
+            && self.dbsp_serve.load(std::sync::atomic::Ordering::Acquire)
+        {
+            let arr = self.arrangements.lock().unwrap().clone();
+            if let Some(arr) = arr {
+                if let Some(gcols) = arr.counts_group_cols(table).map(|g| g.to_vec()) {
+                    if let Some(constraints) = plan_circuit_agg(where_.as_ref(), &ts, &gcols) {
+                        let cmd_tx = self.ensure_sequencer(&mut st).cmd_tx.clone();
+                        let (ready_tx2, ready_rx2) = tokio::sync::oneshot::channel();
+                        cmd_tx
+                            .send(SequencerCmd::CreateCircuitAgg {
+                                table: table.to_string(),
+                                shape_id: id.clone(),
+                                stream_path: stream_path.clone(),
+                                constraints,
+                                ready: ready_tx2,
+                            })
+                            .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
+                        let rec = ShapeRecord {
+                            id: id.clone(),
+                            table: table.to_string(),
+                            stream_path: stream_path.clone(),
+                            changes_only: false,
+                            where_json: where_,
+                            columns: None,
+                            family_key: None,
+                            is_subquery: false,
+                            aggregate: Some(AggInfo { func, col }),
+                        };
+                        st.shapes.insert(id.clone(), rec.clone());
+                        st.circuit_placement.insert(
+                            id.clone(),
+                            CircuitPlacement { label: "counts".into(), col: None, counts: true },
+                        );
+                        let _ = self
+                            .catalog_tx
+                            .send(CatalogEvent::Created { rec: rec.clone(), sig: Some(agg_sig.clone()) });
+                        self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
+                        self.ensure_retention_sweeper();
+                        let (share_tx, share_rx) = tokio::sync::watch::channel(None);
+                        st.feed_by_sig.insert(agg_sig.clone(), id.clone());
+                        st.feed_shares.insert(id.clone(), FeedShare { sig: agg_sig, refcount: 1, ready: share_rx });
+                        drop(st);
+                        return match ready_rx2
+                            .await
+                            .unwrap_or_else(|_| Err("sequencer dropped the ready channel".to_string()))
+                        {
+                            Ok(()) => {
+                                let _ = share_tx.send(Some(true));
+                                trace_lifecycle(
+                                    &self.trace_tx,
+                                    crate::trace::GraphLifecycle::ShapeAdded {
+                                        shape: rec.id.clone(),
+                                        table: rec.table.clone(),
+                                    },
+                                );
+                                Ok(rec)
+                            }
+                            Err(e) => {
+                                let mut st = self.state.lock().await;
+                                st.shapes.remove(&id);
+                                st.circuit_placement.remove(&id);
+                                let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
+                                if let Some(share) = st.feed_shares.remove(&id) {
+                                    st.feed_by_sig.remove(&share.sig);
+                                }
+                                if let Some(seq) = st.sequencer.as_ref() {
+                                    let _ = seq.cmd_tx.send(SequencerCmd::RemoveShape {
+                                        table: rec.table.clone(),
+                                        shape_id: id.clone(),
+                                    });
+                                }
+                                drop(st);
+                                let _ = share_tx.send(Some(false));
+                                let _ = self.ds.delete_stream(&rec.stream_path).await;
+                                bail!("aggregate '{id}' creation failed: {e}")
+                            }
+                        };
+                    }
+                }
+            }
+        }
+
         let cmd_tx = self.ensure_sequencer(&mut st).cmd_tx.clone();
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         cmd_tx
@@ -1421,7 +1678,7 @@ impl Engine {
     /// its routing placement (family key / standalone / subquery), the shared subquery node+edge DAG,
     /// and the exploded per-operator decomposition for the circuit view.
     pub async fn graph(&self) -> EngineGraph {
-        let (tables, shapes, schemas) = {
+        let (tables, shapes, schemas, placements) = {
             let st = self.state.lock().await;
             // Deterministic output: a consumer diffing consecutive snapshots (the visualizer's
             // "did the structure change" check) must see byte-identical output for an unchanged
@@ -1450,13 +1707,21 @@ impl Engine {
                     family_key: r.family_key.clone(),
                     is_subquery: r.is_subquery,
                     aggregate: r.aggregate.clone(),
+                    circuit: st.circuit_placement.get(&r.id).cloned(),
                     state: life_of(&r.id),
                 })
                 .collect();
             let mut shapes = shapes;
             shapes.sort_by_key(|s| s.id.strip_prefix('s').and_then(|n| n.parse::<u64>().ok()).unwrap_or(u64::MAX));
             let schemas: HashMap<String, TableSchema> = st.tables.clone();
-            (tables, shapes, schemas)
+            let placements: Vec<(String, String, CircuitPlacement)> = st
+                .circuit_placement
+                .iter()
+                .filter_map(|(id, p)| {
+                    st.shapes.get(id).map(|r| (id.clone(), r.table.clone(), p.clone()))
+                })
+                .collect();
+            (tables, shapes, schemas, placements)
         };
         let col_name = |table: &str, idx: usize| -> String {
             schemas
@@ -1521,7 +1786,7 @@ impl Engine {
             .lock()
             .unwrap()
             .clone()
-            .map(|arr| arrangement_graph(&arr, &dependents, &col_name));
+            .map(|arr| arrangement_graph(&arr, &dependents, &placements, &col_name));
         EngineGraph { tables, shapes, subquery_nodes, subquery_edges, operators, op_edges, arrangements }
     }
 
@@ -1568,6 +1833,7 @@ impl Engine {
             st.feed_by_sig.remove(&share.sig);
         }
         let removed = st.shapes.remove(id);
+        st.circuit_placement.remove(id);
         if removed.is_some() {
             let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.to_string() });
         }
@@ -1875,6 +2141,7 @@ impl Engine {
             st.feed_by_sig.remove(&share.sig);
         }
         let removed = st.shapes.remove(id);
+        st.circuit_placement.remove(id);
         if removed.is_some() {
             let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.to_string() });
         }
@@ -2137,6 +2404,90 @@ impl Engine {
             None => None,
         };
         let num_id: u64 = rec.id.trim_start_matches('s').parse().unwrap_or(0);
+        // Circuit-served restore: re-register with the sequencer, seed=false for plain shapes
+        // (the stream is already complete up to the resume offset; dynamic groups re-derive
+        // from the router snapshot, which the catch-up replay has brought to the same point).
+        // Aggregates re-seed from the counts snapshot (their fold is not persisted) — same
+        // fresh-value semantics as the legacy aggregate resume.
+        if self.dbsp_serve.load(std::sync::atomic::Ordering::Acquire) {
+            let arr = self.arrangements.lock().unwrap().clone();
+            if let Some(arr) = arr {
+                match &rec.aggregate {
+                    Some(a) if matches!(a.func, AggFn::Count) && a.col.is_none() => {
+                        if let Some(gcols) = arr.counts_group_cols(&rec.table).map(|g| g.to_vec()) {
+                            if let Some(constraints) = plan_circuit_agg(rec.where_json.as_ref(), ts, &gcols) {
+                                let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                                cmd_tx
+                                    .send(SequencerCmd::CreateCircuitAgg {
+                                        table: rec.table.clone(),
+                                        shape_id: rec.id.clone(),
+                                        stream_path: rec.stream_path.clone(),
+                                        constraints,
+                                        ready: ready_tx,
+                                    })
+                                    .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
+                                ready_rx
+                                    .await
+                                    .unwrap_or_else(|_| Err("sequencer dropped".to_string()))
+                                    .map_err(|e| anyhow::anyhow!(e))?;
+                                self.state.lock().await.circuit_placement.insert(
+                                    rec.id.clone(),
+                                    CircuitPlacement { label: "counts".into(), col: None, counts: true },
+                                );
+                                return Ok(());
+                            }
+                        }
+                    }
+                    None => {
+                        if let Some(plan) = {
+                            let st = self.state.lock().await;
+                            plan_circuit_shape(rec.where_json.as_ref(), ts, &st.tables, &arr)
+                        } {
+                            let residual = match plan.residual.as_ref() {
+                                Some(r) => Some(Arc::new(CompiledPredicate::compile(r, ts)?)),
+                                None => None,
+                            };
+                            let placement = match &plan.constraint {
+                                PlannedConstraint::All => {
+                                    CircuitPlacement { label: "all".into(), col: None, counts: false }
+                                }
+                                PlannedConstraint::Static { col, .. } => CircuitPlacement {
+                                    label: format!("static:{}", ts.columns[*col].0),
+                                    col: Some(*col),
+                                    counts: false,
+                                },
+                                PlannedConstraint::Dynamic { col, .. } => CircuitPlacement {
+                                    label: format!("dynamic:{}", ts.columns[*col].0),
+                                    col: Some(*col),
+                                    counts: false,
+                                },
+                            };
+                            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                            cmd_tx
+                                .send(SequencerCmd::CreateCircuitShape {
+                                    table: rec.table.clone(),
+                                    shape_id: rec.id.clone(),
+                                    num_id,
+                                    stream_path: rec.stream_path.clone(),
+                                    constraint: plan.constraint,
+                                    residual,
+                                    out_cols: out_cols.clone(),
+                                    seed: false,
+                                    ready: ready_tx,
+                                })
+                                .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
+                            ready_rx
+                                .await
+                                .unwrap_or_else(|_| Err("sequencer dropped".to_string()))
+                                .map_err(|e| anyhow::anyhow!(e))?;
+                            self.state.lock().await.circuit_placement.insert(rec.id.clone(), placement);
+                            return Ok(());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         let (kind, changes_only, is_aggregate) = match &rec.aggregate {
             Some(a) => {
                 let col = a.col.as_deref().map(|c| ts.column_index(c)).transpose()?;
@@ -2477,6 +2828,7 @@ fn circuit_ops(
 fn arrangement_graph(
     arr: &crate::arrangements::Arrangements,
     dependents: &[(&'static str, String, String, usize)],
+    placements: &[(String, String, CircuitPlacement)],
     col_name: &impl Fn(&str, usize) -> String,
 ) -> ArrangementGraph {
     let (served, fallback) = arr.counters();
@@ -2508,6 +2860,18 @@ fn arrangement_graph(
         })
         .collect();
 
+    let counts: Vec<ArrCounts> = arr
+        .count_specs()
+        .into_iter()
+        .map(|c| ArrCounts {
+            id: format!("arr:counts:{}", c.table),
+            input: input_id(&c.table),
+            table: c.table.clone(),
+            group_cols: c.group_cols.iter().map(|&g| col_name(&c.table, g)).collect(),
+            seeded: arr.is_seeded(&c.table),
+        })
+        .collect();
+
     let mut consumers: Vec<ArrConsumer> = dependents
         .iter()
         .filter(|(_, _, table, col)| arr.has_index(table, &[*col]))
@@ -2518,10 +2882,306 @@ fn arrangement_graph(
             connecting_col: col_name(table, *col),
         })
         .collect();
+    // Circuit-served shapes/aggregates: pipeline → shape edges tracking shape lifecycle.
+    for (id, table, p) in placements {
+        if p.counts {
+            consumers.push(ArrConsumer {
+                index: format!("arr:counts:{table}"),
+                dependent_kind: "circuit-agg".to_string(),
+                dependent_id: id.clone(),
+                connecting_col: String::new(),
+            });
+        } else {
+            let index = match p.col {
+                Some(col) if arr.has_index(table, &[col]) => index_id(table, &[col]),
+                _ => input_id(table), // `all`-constraint shapes hang off the table input
+            };
+            consumers.push(ArrConsumer {
+                index,
+                dependent_kind: "circuit-shape".to_string(),
+                dependent_id: id.clone(),
+                connecting_col: p.col.map(|c| col_name(table, c)).unwrap_or_default(),
+            });
+        }
+    }
     consumers.sort();
     consumers.dedup();
 
-    ArrangementGraph { served, fallback, inputs, indexes, consumers }
+    ArrangementGraph { served, fallback, inputs, indexes, counts, consumers }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Circuit-served shapes: the template tier. A shape whose predicate decomposes into
+// (cohort constraint over an arrangement-indexed column) ∧ (residual row predicate) is served
+// from the dbsp circuit: seeded from snapshots, updated by routing deltas, moved in/out by the
+// membership relation. Anything else stays on the dynamic path (standalone/family/registry).
+// ---------------------------------------------------------------------------------------------
+
+/// Where a circuit-served shape's data comes from, for the graph payload.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CircuitPlacement {
+    /// `all` | `static:<col>` | `dynamic:<col>` | `counts`.
+    pub label: String,
+    /// The arrangement column serving the cohort (absent for `all`/`counts`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub col: Option<usize>,
+    /// True for counts-served aggregates.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub counts: bool,
+}
+
+/// Planner output: the shape's cohort constraint (see [`CohortGroups`] for the live form).
+#[derive(Clone, Debug)]
+pub(crate) enum PlannedConstraint {
+    All,
+    Static { col: usize, keys: std::collections::HashSet<Value> },
+    Dynamic { col: usize, inner_table: String, inner_proj: usize, inner_col: usize, inner_key: Value },
+}
+
+pub(crate) struct CircuitPlan {
+    pub constraint: PlannedConstraint,
+    pub residual: Option<PredicateJson>,
+}
+
+/// Decompose `where_` into a cohort constraint plus a residual conjunction. Returns `None`
+/// when the predicate cannot be circuit-served (nested/negated/multiple subqueries, or a
+/// subquery whose columns are not arrangement-indexed) — those fall back to the registry.
+fn plan_circuit_shape(
+    where_: Option<&PredicateJson>,
+    ts: &TableSchema,
+    schemas: &HashMap<String, TableSchema>,
+    arr: &crate::arrangements::Arrangements,
+) -> Option<CircuitPlan> {
+    let Some(p) = where_ else {
+        return Some(CircuitPlan { constraint: PlannedConstraint::All, residual: None });
+    };
+    let children: Vec<PredicateJson> = match p {
+        PredicateJson::And { and } => and.clone(),
+        other => vec![other.clone()],
+    };
+    let mut constraint: Option<PlannedConstraint> = None;
+    let mut residual: Vec<PredicateJson> = Vec::new();
+    for child in children {
+        if constraint.is_none() {
+            if let Some(c) = as_cohort_constraint(&child, ts, schemas, arr) {
+                constraint = Some(c);
+                continue;
+            }
+        }
+        if predicate_has_subquery(&child) {
+            // A subquery leaf the constraint slot cannot take: only the registry can serve it.
+            return None;
+        }
+        residual.push(child);
+    }
+    let residual = match residual.len() {
+        0 => None,
+        1 => residual.into_iter().next(),
+        _ => Some(PredicateJson::And { and: residual }),
+    };
+    Some(CircuitPlan { constraint: constraint.unwrap_or(PlannedConstraint::All), residual })
+}
+
+/// Classify one AND-child as a cohort constraint, if its column(s) are arrangement-indexed:
+/// `col = lit`, an OR of same-column equalities (the IN-list form), or one non-negated
+/// single-level `col IN (SELECT proj FROM inner WHERE inner_col = lit)`.
+fn as_cohort_constraint(
+    p: &PredicateJson,
+    ts: &TableSchema,
+    schemas: &HashMap<String, TableSchema>,
+    arr: &crate::arrangements::Arrangements,
+) -> Option<PlannedConstraint> {
+    match p {
+        PredicateJson::Leaf { col, op: crate::predicate::LeafOp::Eq, value } => {
+            let idx = *ts.index.get(col)?;
+            if !arr.has_index(&ts.name, &[idx]) {
+                return None;
+            }
+            let v = Value::literal_from_json(value, ts.columns.get(idx)?.1).ok()?;
+            if v == Value::Null {
+                return None; // `col = NULL` never matches; leave it to the residual
+            }
+            Some(PlannedConstraint::Static { col: idx, keys: std::iter::once(v).collect() })
+        }
+        PredicateJson::Or { or } if !or.is_empty() => {
+            let mut keys = std::collections::HashSet::new();
+            let mut idx: Option<usize> = None;
+            for c in or {
+                let PredicateJson::Leaf { col, op: crate::predicate::LeafOp::Eq, value } = c else {
+                    return None;
+                };
+                let i = *ts.index.get(col)?;
+                if *idx.get_or_insert(i) != i {
+                    return None;
+                }
+                let v = Value::literal_from_json(value, ts.columns.get(i)?.1).ok()?;
+                if v == Value::Null {
+                    return None;
+                }
+                keys.insert(v);
+            }
+            let i = idx?;
+            if !arr.has_index(&ts.name, &[i]) {
+                return None;
+            }
+            Some(PlannedConstraint::Static { col: i, keys })
+        }
+        PredicateJson::In { col, subquery, negated: false } => {
+            let outer_idx = *ts.index.get(col)?;
+            if !arr.has_index(&ts.name, &[outer_idx]) {
+                return None;
+            }
+            let its = schemas.get(&subquery.table)?;
+            let proj = *its.index.get(&subquery.project)?;
+            // Single level only: the inner where must be one equality leaf on an indexed column.
+            let PredicateJson::Leaf { col: icol, op: crate::predicate::LeafOp::Eq, value } =
+                subquery.where_.as_deref()?
+            else {
+                return None;
+            };
+            let inner_idx = *its.index.get(icol)?;
+            if !arr.has_index(&subquery.table, &[inner_idx]) {
+                return None;
+            }
+            let key = Value::literal_from_json(value, its.columns.get(inner_idx)?.1).ok()?;
+            Some(PlannedConstraint::Dynamic {
+                col: outer_idx,
+                inner_table: subquery.table.clone(),
+                inner_proj: proj,
+                inner_col: inner_idx,
+                inner_key: key,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Decompose an aggregate's WHERE into per-group-column constraints over the table's counts
+/// pipeline: a conjunction of equalities / IN-lists over the group columns ONLY (any leftover
+/// conjunct would make group sums wrong). `None` = not servable from counts.
+fn plan_circuit_agg(
+    where_: Option<&PredicateJson>,
+    ts: &TableSchema,
+    group_cols: &[usize],
+) -> Option<Vec<Option<std::collections::HashSet<Value>>>> {
+    let mut constraints: Vec<Option<std::collections::HashSet<Value>>> = vec![None; group_cols.len()];
+    let Some(p) = where_ else { return Some(constraints) };
+    let children: Vec<&PredicateJson> = match p {
+        PredicateJson::And { and } => and.iter().collect(),
+        other => vec![other],
+    };
+    for child in children {
+        let (idx, keys) = match child {
+            PredicateJson::Leaf { col, op: crate::predicate::LeafOp::Eq, value } => {
+                let i = *ts.index.get(col)?;
+                let v = Value::literal_from_json(value, ts.columns.get(i)?.1).ok()?;
+                (i, std::iter::once(v).collect::<std::collections::HashSet<_>>())
+            }
+            PredicateJson::Or { or } if !or.is_empty() => {
+                let mut keys = std::collections::HashSet::new();
+                let mut idx: Option<usize> = None;
+                for c in or {
+                    let PredicateJson::Leaf { col, op: crate::predicate::LeafOp::Eq, value } = c
+                    else {
+                        return None;
+                    };
+                    let i = *ts.index.get(col)?;
+                    if *idx.get_or_insert(i) != i {
+                        return None;
+                    }
+                    keys.insert(Value::literal_from_json(value, ts.columns.get(i)?.1).ok()?);
+                }
+                (idx?, keys)
+            }
+            _ => return None,
+        };
+        let pos = group_cols.iter().position(|&g| g == idx)?;
+        if constraints[pos].is_some() {
+            return None;
+        }
+        constraints[pos] = Some(keys);
+    }
+    Some(constraints)
+}
+
+/// Live group membership of a circuit-served shape.
+enum CohortGroups {
+    All,
+    Static {
+        col: usize,
+        keys: std::collections::HashSet<Value>,
+    },
+    Dynamic {
+        col: usize,
+        inner_table: String,
+        inner_proj: usize,
+        inner_col: usize,
+        inner_key: Value,
+        /// Projected value → number of contributing inner rows (refcounted: two membership
+        /// rows yielding the same value must both leave before the group does).
+        groups: HashMap<Value, i64>,
+    },
+}
+
+impl CohortGroups {
+    /// Does `row` fall in this shape's groups? (`NULL` cohort values never match.)
+    fn admits(&self, row: &Row) -> bool {
+        match self {
+            CohortGroups::All => true,
+            CohortGroups::Static { col, keys } => {
+                row.0.get(*col).is_some_and(|v| v != &Value::Null && keys.contains(v))
+            }
+            CohortGroups::Dynamic { col, groups, .. } => {
+                row.0.get(*col).is_some_and(|v| v != &Value::Null && groups.contains_key(v))
+            }
+        }
+    }
+}
+
+/// A shape served from the circuit: seeded from arrangement snapshots, updated by routing each
+/// transaction's deltas through (cohort groups ∧ residual). No Postgres, no snapshot gate —
+/// consistency comes from creating/reading inside the sequencer, between transactions.
+struct CircuitShape {
+    num_id: u64,
+    stream_path: String,
+    groups: CohortGroups,
+    residual: Option<Arc<CompiledPredicate>>,
+    out_cols: Option<Arc<Vec<usize>>>,
+}
+
+impl CircuitShape {
+    fn matches(&self, row: &Row) -> bool {
+        self.groups.admits(row) && self.residual.as_ref().is_none_or(|p| p.matches(row))
+    }
+}
+
+/// A COUNT aggregate served from the counts pipeline: `value` = Σ counts of matching groups.
+struct CircuitAgg {
+    stream_path: String,
+    /// Aligned with the table's count group columns; `None` = unconstrained dimension.
+    constraints: Vec<Option<std::collections::HashSet<Value>>>,
+    value: i64,
+}
+
+impl CircuitAgg {
+    fn group_matches(&self, group: &Row) -> bool {
+        self.constraints.iter().enumerate().all(|(i, c)| match c {
+            None => true,
+            Some(keys) => group.0.get(i).is_some_and(|v| keys.contains(v)),
+        })
+    }
+
+    /// Same wire format as [`AggShape::envelope`]: one `"agg"` row `{value, n}`.
+    fn envelope(&self, table: &str, txid: Option<String>, lsn: Option<String>) -> Envelope {
+        Envelope {
+            type_: table.to_string(),
+            key: "agg".into(),
+            value: Some(serde_json::json!({ "value": self.value, "n": self.value })),
+            old: None,
+            headers: EnvelopeHeaders { operation: "upsert".into(), txid, offset: None, lsn, seq: None },
+        }
+    }
 }
 
 /// A non-shareable shape (range / OR / NOT / inequality / match-all). Its predicate is a stateless
@@ -2956,6 +3616,225 @@ async fn arrangements_catch_up(
     }
 }
 
+/// Sequencer-side creation of a circuit-served shape (see [`SequencerCmd::CreateCircuitShape`]).
+/// Runs between transactions, so the arrangement snapshots it reads are exactly at the
+/// sequencer's processed position — the seed needs no gate and the live routing no buffer.
+#[allow(clippy::too_many_arguments)]
+async fn create_circuit_shape(
+    ds: &DsClient,
+    arr: Option<&crate::arrangements::Arrangements>,
+    execs: &mut HashMap<String, TableExec>,
+    router_watch: &mut HashMap<String, Vec<(String, String)>>,
+    tables: &SharedTables,
+    table: &str,
+    shape_id: &str,
+    num_id: u64,
+    stream_path: &str,
+    constraint: PlannedConstraint,
+    residual: Option<Arc<CompiledPredicate>>,
+    out_cols: Option<Arc<Vec<usize>>>,
+    seed: bool,
+) -> Result<u64> {
+    let arr = arr.context("circuit shapes require the arrangement layer")?;
+    let exec = exec_for(execs, tables, table)
+        .with_context(|| format!("circuit shape: unknown table '{table}'"))?;
+    let groups = match constraint {
+        PlannedConstraint::All => CohortGroups::All,
+        PlannedConstraint::Static { col, keys } => CohortGroups::Static { col, keys },
+        PlannedConstraint::Dynamic { col, inner_table, inner_proj, inner_col, inner_key } => {
+            let rows = arr
+                .lookup(&inner_table, &[inner_col], &Row(vec![inner_key.clone()]))
+                .with_context(|| format!("arrangement not ready: {inner_table} router lookup"))?;
+            let mut groups: HashMap<Value, i64> = HashMap::new();
+            for r in &rows {
+                match r.0.get(inner_proj) {
+                    Some(Value::Null) | None => {}
+                    Some(v) => *groups.entry(v.clone()).or_insert(0) += 1,
+                }
+            }
+            router_watch
+                .entry(inner_table.clone())
+                .or_default()
+                .push((table.to_string(), shape_id.to_string()));
+            CohortGroups::Dynamic { col, inner_table, inner_proj, inner_col, inner_key, groups }
+        }
+    };
+    let shape = CircuitShape { num_id, stream_path: stream_path.to_string(), groups, residual, out_cols };
+    let mut seeded = 0u64;
+    if seed {
+        let rows = circuit_seed_rows(arr, &exec.ts.name, &shape)?;
+        let out: Vec<(Row, ZWeight)> =
+            rows.into_iter().filter(|r| shape.matches(r)).map(|r| (r, 1)).collect();
+        if !out.is_empty() {
+            let envs =
+                translate_output(&exec.ts, out, None, None, shape.out_cols.as_deref().map(Vec::as_slice));
+            ds.append(stream_path, &envs)
+                .await
+                .map_err(|e| anyhow::anyhow!("append snapshot: {e:#}"))?;
+            seeded = envs.len() as u64;
+        }
+    }
+    exec.circuit_shapes.insert(shape_id.to_string(), shape);
+    Ok(seeded)
+}
+
+/// The seed rows of a circuit-served shape: its cohort groups, read from the arrangements.
+fn circuit_seed_rows(
+    arr: &crate::arrangements::Arrangements,
+    table: &str,
+    shape: &CircuitShape,
+) -> Result<Vec<Row>> {
+    match &shape.groups {
+        CohortGroups::All => arr.scan(table).context("arrangement not ready: scan"),
+        CohortGroups::Static { col, keys } => {
+            let mut rows = Vec::new();
+            for k in keys {
+                rows.extend(
+                    arr.lookup(table, &[*col], &Row(vec![k.clone()]))
+                        .context("arrangement not ready: lookup")?,
+                );
+            }
+            Ok(rows)
+        }
+        CohortGroups::Dynamic { col, groups, .. } => {
+            let mut rows = Vec::new();
+            for k in groups.keys() {
+                rows.extend(
+                    arr.lookup(table, &[*col], &Row(vec![k.clone()]))
+                        .context("arrangement not ready: lookup")?,
+                );
+            }
+            Ok(rows)
+        }
+    }
+}
+
+/// Sequencer-side creation of a circuit-served COUNT aggregate: seed = Σ matching count groups
+/// from the counts snapshot (consistent with the processed offset), emitted immediately.
+async fn create_circuit_agg(
+    ds: &DsClient,
+    arr: Option<&crate::arrangements::Arrangements>,
+    execs: &mut HashMap<String, TableExec>,
+    tables: &SharedTables,
+    table: &str,
+    shape_id: &str,
+    stream_path: &str,
+    constraints: Vec<Option<std::collections::HashSet<Value>>>,
+) -> Result<()> {
+    let arr = arr.context("circuit aggregates require the arrangement layer")?;
+    let exec = exec_for(execs, tables, table)
+        .with_context(|| format!("circuit aggregate: unknown table '{table}'"))?;
+    let mut agg = CircuitAgg { stream_path: stream_path.to_string(), constraints, value: 0 };
+    let groups = arr.count_groups(table).context("counts pipeline not ready")?;
+    agg.value = groups.iter().filter(|(g, _)| agg.group_matches(g)).map(|(_, c)| c).sum();
+    let env = agg.envelope(&exec.ts.name, None, None);
+    ds.append(stream_path, &[env])
+        .await
+        .map_err(|e| anyhow::anyhow!("append initial aggregate: {e:#}"))?;
+    exec.circuit_aggs.insert(shape_id.to_string(), agg);
+    Ok(())
+}
+
+/// Apply one transaction's membership deltas to the dynamic circuit shapes watching them, and
+/// emit the resulting move-ins (absolute upserts) / move-outs (deletes) from the
+/// post-transaction arrangement snapshots. Absolute emission makes any overlap with the row
+/// loop idempotent for subscribers.
+fn process_router_deltas(
+    arr: &Option<crate::arrangements::Arrangements>,
+    execs: &mut HashMap<String, TableExec>,
+    router_watch: &HashMap<String, Vec<(String, String)>>,
+    member_deltas: Vec<(String, Vec<Tup2<Row, ZWeight>>)>,
+    txid: Option<String>,
+    lsn: Option<String>,
+    txn_pending: &mut HashMap<String, Vec<Envelope>>,
+) {
+    let Some(arr) = arr else { return };
+    for (inner_table, delta) in member_deltas {
+        let Some(watchers) = router_watch.get(&inner_table) else { continue };
+        for (outer_table, sid) in watchers {
+            let Some(exec) = execs.get_mut(outer_table) else { continue };
+            let ts = exec.ts.clone();
+            let Some(cs) = exec.circuit_shapes.get_mut(sid) else { continue };
+            let CohortGroups::Dynamic { col, inner_proj, inner_col, inner_key, groups, .. } =
+                &mut cs.groups
+            else {
+                continue;
+            };
+            let col = *col;
+            // Refcount the projected values contributed by this shape's router key.
+            let mut moved: Vec<(Value, ZWeight)> = Vec::new();
+            for Tup2(r, w) in &delta {
+                if r.0.get(*inner_col) != Some(&*inner_key) {
+                    continue;
+                }
+                let v = match r.0.get(*inner_proj) {
+                    Some(Value::Null) | None => continue,
+                    Some(v) => v.clone(),
+                };
+                let e = groups.entry(v.clone()).or_insert(0);
+                let was = *e;
+                *e += *w;
+                let now = *e;
+                if now <= 0 {
+                    groups.remove(&v);
+                }
+                if was <= 0 && now > 0 {
+                    moved.push((v, 1));
+                } else if was > 0 && now <= 0 {
+                    moved.push((v, -1));
+                }
+            }
+            for (v, dir) in moved {
+                let Some(rows) = arr.lookup(&ts.name, &[col], &Row(vec![v.clone()])) else {
+                    tracing::error!("circuit shape {sid}: move lookup unavailable for group {v:?}");
+                    continue;
+                };
+                let out: Vec<(Row, ZWeight)> = rows
+                    .into_iter()
+                    .filter(|r| cs.residual.as_ref().is_none_or(|p| p.matches(r)))
+                    .map(|r| (r, dir))
+                    .collect();
+                if out.is_empty() {
+                    continue;
+                }
+                let envs = translate_output(
+                    &ts, out, txid.clone(), lsn.clone(), cs.out_cols.as_deref().map(Vec::as_slice),
+                );
+                txn_pending.entry(cs.stream_path.clone()).or_default().extend(envs);
+            }
+        }
+    }
+}
+
+/// Fold one transaction's count-group deltas into the circuit-served aggregates and emit one
+/// updated `{value, n}` envelope per changed aggregate.
+fn apply_count_deltas(
+    execs: &mut HashMap<String, TableExec>,
+    deltas: Vec<crate::arrangements::CountDelta>,
+    txid: Option<String>,
+    lsn: Option<String>,
+    txn_pending: &mut HashMap<String, Vec<Envelope>>,
+) {
+    let mut changed: Vec<(String, String)> = Vec::new(); // (table, shape id)
+    for d in deltas {
+        let Some(exec) = execs.get_mut(&d.table) else { continue };
+        for (sid, agg) in exec.circuit_aggs.iter_mut() {
+            if agg.group_matches(&d.group) {
+                agg.value += d.delta;
+                if !changed.iter().any(|(_, s)| s == sid) {
+                    changed.push((d.table.clone(), sid.clone()));
+                }
+            }
+        }
+    }
+    for (table, sid) in changed {
+        let Some(exec) = execs.get(&table) else { continue };
+        let Some(agg) = exec.circuit_aggs.get(&sid) else { continue };
+        let env = agg.envelope(&exec.ts.name, txid.clone(), lsn.clone());
+        txn_pending.entry(agg.stream_path.clone()).or_default().push(env);
+    }
+}
+
 /// The graph/trace node id of a family router: `family:<table>:<col,col>` (column NAMES, matching
 /// the hop ids `process_envelope` emits and the ids the visualizer renders).
 fn family_node_id(ts: &TableSchema, key_cols: &[usize]) -> String {
@@ -2983,6 +3862,8 @@ fn build_node_states(
     families: &HashMap<Vec<usize>, KeyRouter>,
     family_of: &HashMap<String, (Vec<usize>, u64, Row)>,
     aggregates: &HashMap<String, AggShape>,
+    circuit_shapes: &HashMap<String, CircuitShape>,
+    circuit_aggs: &HashMap<String, CircuitAgg>,
     emitted: &HashMap<String, u64>,
 ) -> HashMap<String, NodeStateSummary> {
     let mut out = HashMap::new();
@@ -3016,6 +3897,21 @@ fn build_node_states(
                 count: agg.count,
                 nn_count: agg.nn_count,
                 multiset_len: agg.multiset.len(),
+            },
+        );
+    }
+    for (sid, cs) in circuit_shapes {
+        let n = emitted_of(&cs.stream_path);
+        out.insert(format!("shape:{sid}"), NodeStateSummary::Shape { emitted: n });
+    }
+    for (sid, agg) in circuit_aggs {
+        out.insert(
+            format!("shape:{sid}"),
+            NodeStateSummary::Aggregate {
+                value: serde_json::json!(agg.value),
+                count: agg.value,
+                nn_count: agg.value,
+                multiset_len: 0,
             },
         );
     }
@@ -3080,7 +3976,11 @@ fn stats_of(exec: &TableExec) -> TableStats {
         .map(|(k, f)| FamilyStat { key_cols: k.clone(), shapes: f.member_count() })
         .collect();
     fams.sort_by(|a, b| a.key_cols.cmp(&b.key_cols));
-    TableStats { families: fams, standalone: exec.shapes.len() }
+    TableStats {
+        families: fams,
+        standalone: exec.shapes.len(),
+        circuit: exec.circuit_shapes.len() + exec.circuit_aggs.len(),
+    }
 }
 
 /// Rebuild + publish the merged node-state map and per-table stats to the sequencer's shared
@@ -3107,6 +4007,8 @@ async fn publish_all(
             &exec.families,
             &exec.family_of,
             &exec.aggregates,
+            &exec.circuit_shapes,
+            &exec.circuit_aggs,
             emitted,
         ));
     }
@@ -3133,6 +4035,10 @@ struct TableExec {
     families: HashMap<Vec<usize>, KeyRouter>,
     family_of: HashMap<String, (Vec<usize>, u64, Row)>,
     aggregates: HashMap<String, AggShape>,
+    /// Circuit-served shapes on this table (see [`CircuitShape`]).
+    circuit_shapes: HashMap<String, CircuitShape>,
+    /// Circuit-served COUNT aggregates on this table (see [`CircuitAgg`]).
+    circuit_aggs: HashMap<String, CircuitAgg>,
     pending: HashMap<String, PendingShape>,
     envelopes_total: u64,
 }
@@ -3146,6 +4052,8 @@ impl TableExec {
             families: HashMap::new(),
             family_of: HashMap::new(),
             aggregates: HashMap::new(),
+            circuit_shapes: HashMap::new(),
+            circuit_aggs: HashMap::new(),
             pending: HashMap::new(),
             envelopes_total: 0,
         }
@@ -3210,6 +4118,9 @@ async fn sequencer_loop(
     // increasing on the single ordered log, so anything at/below the highwater has already been
     // applied and is skipped. Envelopes without both stamps (library mode) bypass this.
     let mut highwater: Option<(u64, u64)> = None;
+    // Dynamic circuit shapes watching a membership relation: inner table → [(outer table,
+    // shape id)]. A membership delta re-derives the watchers' groups (move-in/move-out).
+    let mut router_watch: HashMap<String, Vec<(String, String)>> = HashMap::new();
 
     // A restored arrangement checkpoint may trail the shape catalog's offset: replay the gap
     // into the arrangements before live processing (single feeder ⇒ in-order application).
@@ -3286,7 +4197,14 @@ async fn sequencer_loop(
                 Some(SequencerCmd::RemoveShape { table, shape_id }) => {
                     if let Some(exec) = execs.get_mut(&table) {
                         exec.pending.remove(&shape_id);
-                        if exec.aggregates.remove(&shape_id).is_some() {
+                        if exec.circuit_shapes.remove(&shape_id).is_some()
+                            || exec.circuit_aggs.remove(&shape_id).is_some()
+                        {
+                            // Circuit-served: drop any router watches pointing at it.
+                            for watchers in router_watch.values_mut() {
+                                watchers.retain(|(_, sid)| sid != &shape_id);
+                            }
+                        } else if exec.aggregates.remove(&shape_id).is_some() {
                             // an aggregation shape — nothing else to unwind
                         } else if exec.shapes.remove(&shape_id).map(|_| exec.shape_index.remove(&shape_id)).is_none()
                             && let Some((key_cols, num_id, key_tuple)) = exec.family_of.remove(&shape_id)
@@ -3306,6 +4224,33 @@ async fn sequencer_loop(
                         }
                     }
                     emitted.remove(&shape_id);
+                    publish_all(&execs, &offset, &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
+                }
+                Some(SequencerCmd::CreateCircuitShape {
+                    table, shape_id, num_id, stream_path, constraint, residual, out_cols, seed, ready,
+                }) => {
+                    let res = create_circuit_shape(
+                        &ds, arr.as_ref(), &mut execs, &mut router_watch, &tables,
+                        &table, &shape_id, num_id, &stream_path, constraint, residual, out_cols, seed,
+                    )
+                    .await;
+                    if let Ok(n) = &res {
+                        if *n > 0 {
+                            emitted.insert(shape_id.clone(), *n);
+                        }
+                    }
+                    let _ = ready.send(res.map_err(|e| format!("{e:#}")));
+                    publish_all(&execs, &offset, &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
+                }
+                Some(SequencerCmd::CreateCircuitAgg { table, shape_id, stream_path, constraints, ready }) => {
+                    let res = create_circuit_agg(
+                        &ds, arr.as_ref(), &mut execs, &tables, &table, &shape_id, &stream_path, constraints,
+                    )
+                    .await;
+                    if res.is_ok() {
+                        emitted.insert(shape_id.clone(), 1);
+                    }
+                    let _ = ready.send(res.map_err(|e| format!("{e:#}")));
                     publish_all(&execs, &offset, &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
                 }
                 Some(SequencerCmd::DumpNode { table, node_id, resp }) => {
@@ -3338,14 +4283,19 @@ async fn sequencer_loop(
                         // read-your-committed-writes guarantee a Postgres query-back gives).
                         // The arrangement layer re-checks its own (lsn, seq) highwater, so
                         // feeding pre-dedup envelopes is safe.
-                        if let Some(arr) = &arr {
+                        let txn_count_deltas = if let Some(arr) = &arr {
                             let deltas: Vec<_> = envs[i..j]
                                 .iter()
                                 .filter_map(|env| stamped_delta_for_arrangements(&tables, &arr_gates, env))
                                 .collect();
-                            arr.apply_batch(deltas, None).await;
-                        }
+                            arr.apply_batch(deltas, None).await
+                        } else {
+                            Vec::new()
+                        };
                         let mut txn_pending: HashMap<String, Vec<Envelope>> = HashMap::new();
+                        // Membership deltas collected during the row loop; processed after it
+                        // (move-ins/outs read post-transaction snapshots).
+                        let mut txn_member_deltas: Vec<(String, Vec<Tup2<Row, ZWeight>>)> = Vec::new();
                         for env in envs[i..j].iter() {
                             // Skip redelivered changes (see `highwater` above).
                             let pos = match (env.headers.lsn.as_deref(), env.headers.seq) {
@@ -3377,11 +4327,55 @@ async fn sequencer_loop(
                             {
                                 tracing::error!("process_envelope failed: {e:#}");
                             }
+                            // Circuit-served shapes: route the delta through (groups ∧ residual).
+                            // Dynamic groups are the OLD (pre-membership-change) set here; group
+                            // transitions themselves are handled after the row loop via move-in/out
+                            // reads of the post-transaction snapshot, so rows are never dropped or
+                            // double-emitted across a membership change within the transaction.
+                            if !exec.circuit_shapes.is_empty() {
+                                if let Ok((delta, txid_e, lsn_e)) = apply_envelope(&exec.ts, env) {
+                                    for cs in exec.circuit_shapes.values() {
+                                        let out: Vec<(Row, ZWeight)> = delta
+                                            .iter()
+                                            .filter(|Tup2(r, _)| cs.matches(r))
+                                            .map(|Tup2(r, w)| (r.clone(), *w))
+                                            .collect();
+                                        if !out.is_empty() {
+                                            let envs2 = translate_output(
+                                                &exec.ts, out, txid_e.clone(), lsn_e.clone(),
+                                                cs.out_cols.as_deref().map(Vec::as_slice),
+                                            );
+                                            txn_pending.entry(cs.stream_path.clone()).or_default().extend(envs2);
+                                        }
+                                    }
+                                }
+                            }
+                            if router_watch.contains_key(&env.type_) {
+                                if let Ok((delta, _, _)) = apply_envelope(&exec.ts, env) {
+                                    if !delta.is_empty() {
+                                        txn_member_deltas.push((env.type_.clone(), delta));
+                                    }
+                                }
+                            }
                             exec.envelopes_total += 1;
                             touched = true;
                             if let Some(p) = pos {
                                 highwater = Some(p);
                             }
+                        }
+                        // Membership-driven move-in/out for dynamic circuit shapes (reads the
+                        // post-transaction snapshots — the circuit stepped before the row loop).
+                        if !txn_member_deltas.is_empty() {
+                            process_router_deltas(
+                                &arr, &mut execs, &router_watch, txn_member_deltas,
+                                txid.clone(), lsn.clone(), &mut txn_pending,
+                            );
+                        }
+                        // Counts pipeline → circuit-served aggregates.
+                        if !txn_count_deltas.is_empty() {
+                            apply_count_deltas(
+                                &mut execs, txn_count_deltas, txid.clone(), lsn.clone(), &mut txn_pending,
+                            );
                         }
                         emit_storage_txn_metrics(&txn_pending);
                         for (path, envs) in &txn_pending {
@@ -4242,7 +5236,11 @@ mod tests {
         emitted.insert("s1".to_string(), 4u64);
         emitted.insert("s2".to_string(), 7u64);
 
-        let m = build_node_states(&ts, "12", 42, &shapes, &families, &family_of, &aggregates, &emitted);
+        let circuit_shapes = HashMap::new();
+        let circuit_aggs = HashMap::new();
+        let m = build_node_states(
+            &ts, "12", 42, &shapes, &families, &family_of, &aggregates, &circuit_shapes, &circuit_aggs, &emitted,
+        );
 
         assert_eq!(
             m["table:users"],
@@ -4268,6 +5266,7 @@ mod tests {
     #[test]
     fn circuit_ops_decompose_every_strategy() {
         let gs = |id: &str, table: &str, fam: Option<Vec<&str>>, sq: bool, agg: Option<AggFn>| GraphShape {
+            circuit: None,
             id: id.into(),
             table: table.into(),
             stream_path: format!("shape/{id}"),
@@ -4369,6 +5368,7 @@ mod tests {
                 crate::arrangements::IndexSpec { table: "users".into(), cols: vec![1] }, // pk (id)
                 crate::arrangements::IndexSpec { table: "users".into(), cols: vec![2] }, // name
             ],
+            vec![],
         )
         .unwrap();
 
@@ -4508,6 +5508,168 @@ mod tests {
         assert_eq!(v["multisetLen"], 2);
         assert_eq!(v["multiset"][0]["value"], 3);
         assert_eq!(v["multiset"][0]["weight"], 1);
+    }
+
+    /// Planner coverage: which predicates are circuit-servable, and how they decompose.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn circuit_shape_planner() {
+        let ts = users(); // columns sorted: active(0), id(1), name(2); pk = id
+        let members: TableSchema = {
+            let def: TableDef = serde_json::from_value(serde_json::json!({
+                "columns": { "id": {"type":"int"}, "user_id": {"type":"int"}, "proj": {"type":"int"} },
+                "primaryKey": "id"
+            }))
+            .unwrap();
+            TableSchema::from_def("members", &def).unwrap()
+        };
+        let dir = std::env::temp_dir().join(format!("plan-test-{}", uuid::Uuid::new_v4()));
+        let arr = crate::arrangements::Arrangements::start(
+            crate::arrangements::ArrangementsConfig {
+                dir: dir.clone(),
+                checkpoint_every: None,
+                ..crate::arrangements::ArrangementsConfig::default()
+            },
+            vec![
+                crate::arrangements::IndexSpec { table: "users".into(), cols: vec![1] }, // id (pk)
+                crate::arrangements::IndexSpec { table: "users".into(), cols: vec![2] }, // name
+                crate::arrangements::IndexSpec { table: "members".into(), cols: vec![ *members.index.get("user_id").unwrap() ] },
+            ],
+            vec![],
+        )
+        .unwrap();
+        let mut schemas = HashMap::new();
+        schemas.insert("users".to_string(), ts.clone());
+        schemas.insert("members".to_string(), members.clone());
+        let p = |j: serde_json::Value| -> PredicateJson { serde_json::from_value(j).unwrap() };
+
+        // match-all: All + no residual
+        let plan = plan_circuit_shape(None, &ts, &schemas, &arr).unwrap();
+        assert!(matches!(plan.constraint, PlannedConstraint::All));
+        assert!(plan.residual.is_none());
+
+        // eq on indexed column: Static
+        let plan = plan_circuit_shape(
+            Some(&p(serde_json::json!({"col":"name","op":"eq","value":"a"}))),
+            &ts, &schemas, &arr,
+        )
+        .unwrap();
+        match &plan.constraint {
+            PlannedConstraint::Static { col, keys } => {
+                assert_eq!(*col, 2);
+                assert!(keys.contains(&Value::Text("a".into())));
+            }
+            other => panic!("expected Static, got {other:?}"),
+        }
+
+        // eq on UNindexed column: All + residual (still circuit-served, seeded by scan)
+        let plan = plan_circuit_shape(
+            Some(&p(serde_json::json!({"col":"active","op":"eq","value":true}))),
+            &ts, &schemas, &arr,
+        )
+        .unwrap();
+        assert!(matches!(plan.constraint, PlannedConstraint::All));
+        assert!(plan.residual.is_some());
+
+        // AND of (OR-of-eq on name) + residual on active
+        let plan = plan_circuit_shape(
+            Some(&p(serde_json::json!({"and":[
+                {"or":[{"col":"name","op":"eq","value":"a"},{"col":"name","op":"eq","value":"b"}]},
+                {"col":"active","op":"eq","value":true}
+            ]}))),
+            &ts, &schemas, &arr,
+        )
+        .unwrap();
+        match &plan.constraint {
+            PlannedConstraint::Static { col, keys } => {
+                assert_eq!(*col, 2);
+                assert_eq!(keys.len(), 2);
+            }
+            other => panic!("expected Static, got {other:?}"),
+        }
+        assert!(plan.residual.is_some());
+
+        // single-level dynamic IN over indexed columns
+        let plan = plan_circuit_shape(
+            Some(&p(serde_json::json!({"col":"name","in":{"table":"members","project":"proj",
+                "where":{"col":"user_id","op":"eq","value":7}}}))),
+            &ts, &schemas, &arr,
+        )
+        .unwrap();
+        match &plan.constraint {
+            PlannedConstraint::Dynamic { col, inner_table, inner_key, .. } => {
+                assert_eq!(*col, 2);
+                assert_eq!(inner_table, "members");
+                assert_eq!(inner_key, &Value::Int(7));
+            }
+            other => panic!("expected Dynamic, got {other:?}"),
+        }
+
+        // negated IN → registry fallback
+        assert!(plan_circuit_shape(
+            Some(&p(serde_json::json!({"col":"name","negated":true,"in":{"table":"members","project":"proj",
+                "where":{"col":"user_id","op":"eq","value":7}}}))),
+            &ts, &schemas, &arr,
+        )
+        .is_none());
+
+        // nested IN (inner where is itself a subquery) → registry fallback
+        assert!(plan_circuit_shape(
+            Some(&p(serde_json::json!({"col":"name","in":{"table":"members","project":"proj",
+                "where":{"col":"proj","in":{"table":"members","project":"proj",
+                    "where":{"col":"user_id","op":"eq","value":1}}}}}))),
+            &ts, &schemas, &arr,
+        )
+        .is_none());
+
+        // two IN leaves → fallback (the constraint slot takes one; the second cannot be residual)
+        assert!(plan_circuit_shape(
+            Some(&p(serde_json::json!({"and":[
+                {"col":"name","in":{"table":"members","project":"proj","where":{"col":"user_id","op":"eq","value":1}}},
+                {"col":"name","in":{"table":"members","project":"proj","where":{"col":"user_id","op":"eq","value":2}}}
+            ]}))),
+            &ts, &schemas, &arr,
+        )
+        .is_none());
+
+        arr.shutdown().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn circuit_agg_planner() {
+        let ts = users(); // active(0), id(1), name(2)
+        let group_cols = vec![2usize, 0usize]; // (name, active)
+        let p = |j: serde_json::Value| -> PredicateJson { serde_json::from_value(j).unwrap() };
+
+        // unconstrained: all dims None
+        let c = plan_circuit_agg(None, &ts, &group_cols).unwrap();
+        assert_eq!(c, vec![None, None]);
+
+        // eq on one group col + IN-list on the other
+        let c = plan_circuit_agg(
+            Some(&p(serde_json::json!({"and":[
+                {"col":"active","op":"eq","value":true},
+                {"or":[{"col":"name","op":"eq","value":"a"},{"col":"name","op":"eq","value":"b"}]}
+            ]}))),
+            &ts, &group_cols,
+        )
+        .unwrap();
+        assert_eq!(c[0].as_ref().unwrap().len(), 2); // name ∈ {a,b}
+        assert!(c[1].as_ref().unwrap().contains(&Value::Bool(true)));
+
+        // a non-group column → not servable
+        assert!(plan_circuit_agg(
+            Some(&p(serde_json::json!({"col":"id","op":"eq","value":1}))),
+            &ts, &group_cols,
+        )
+        .is_none());
+
+        // a non-decomposable op → not servable
+        assert!(plan_circuit_agg(
+            Some(&p(serde_json::json!({"col":"name","op":"like","value":"a%"}))),
+            &ts, &group_cols,
+        )
+        .is_none());
     }
 
     fn users() -> TableSchema {

@@ -90,6 +90,13 @@ pub struct DbspConfig {
     /// Extra lookup indexes beyond the per-table primary key: `table.column[,table.column…]`
     /// (`ELECTRIC_IVM_DBSP_INDEXES`). Lookups against undeclared indexes fall back to Postgres.
     pub indexes: Vec<(String, String)>,
+    /// Counts pipelines: `table:col+col[,table:col…]` (`ELECTRIC_IVM_DBSP_COUNTS`). The circuit
+    /// maintains a live COUNT per distinct group projection; COUNT aggregates whose predicate
+    /// decomposes over these columns are served from the groups.
+    pub counts: Vec<(String, Vec<String>)>,
+    /// Serve template-matching shapes/aggregates from the circuit (`ELECTRIC_IVM_DBSP_SERVE=1`):
+    /// seeding and move-in/out come from arrangement snapshots instead of Postgres backfills.
+    pub serve: bool,
 }
 
 /// `ELECTRIC_*` vars the engine actually reads and acts on. Anything else matching `^ELECTRIC_`
@@ -265,6 +272,21 @@ impl Config {
                         Some((t.trim().to_string(), c.trim().to_string()))
                     })
                     .collect(),
+                counts: g("ELECTRIC_IVM_DBSP_COUNTS")
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter_map(|s| {
+                        let (t, cols) = s.trim().split_once(':')?;
+                        let cols: Vec<String> = cols
+                            .split('+')
+                            .map(|c| c.trim().to_string())
+                            .filter(|c| !c.is_empty())
+                            .collect();
+                        if cols.is_empty() { None } else { Some((t.trim().to_string(), cols)) }
+                    })
+                    .collect(),
+                serve: g("ELECTRIC_IVM_DBSP_SERVE")
+                    .is_some_and(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on")),
             });
 
         Config {
