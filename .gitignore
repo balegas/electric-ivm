@@ -25,3 +25,4 @@ memtest.txt
 *.db
 .beads-credential-key
 .beads/proxieddb/
+data/dbsp/

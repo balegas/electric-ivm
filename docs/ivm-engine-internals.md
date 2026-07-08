@@ -43,14 +43,19 @@ Baseline engine RSS is ~19 MiB whether the database has 1,000 or 100,000 rows
 ### What dbsp is, and isn't, here
 
 The repo is named after [`dbsp`](https://crates.io/crates/dbsp) and the data model borrows
-its vocabulary — rows carry signed weights and a change is a **Z-set delta**. But there is
-**no running dbsp circuit, no per-shape thread, and no dbsp dependency**: the delta value
-types (`Row`, a positional `Vec<Value>`; `Tup2<Row, ZWeight>`; and `ZWeight`, a signed `i64`
-multiplicity) are defined locally in `value.rs`. The live-maintenance path is plain Rust: key
-routing and stateless tri-valued predicate evaluation. (An earlier design did run a shared
+its vocabulary — rows carry signed weights and a change is a **Z-set delta** (`Row`, a
+positional `Vec<Value>`; `Tup2<Row, ZWeight>`; and `ZWeight`, a signed `i64` multiplicity).
+The **live-maintenance path runs no dbsp circuit and no per-shape thread**: it is plain Rust —
+key routing and stateless tri-valued predicate evaluation. (An earlier design did run a shared
 dbsp join per equality template; it was removed to drop the table-copy-per-template memory —
 a structural rejection made at defaults, before dbsp's storage spilling, shared circuits, or
 multi-worker tuning were exercised. See `reduce-engine-memory-design.md`.)
+
+dbsp is back as a dependency, though, in a deliberately different role: with
+`ELECTRIC_IVM_DBSP=1`, one shared storage-enabled circuit maintains **table arrangements**
+(pk + declared lookup columns) whose batches spill to disk as tables grow, serving subquery
+flip re-derivations from local snapshots instead of Postgres query-backs — with automatic
+Postgres fallback. See `ARCHITECTURE.md` §6b and `src/arrangements.rs`.
 
 ### A change is a Z-set delta
 

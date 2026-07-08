@@ -687,6 +687,19 @@ mod tests {
         total
     }
 
+    /// A per-row unique, LZ-resistant payload of `chars` hex characters, so Snappy-compressed
+    /// layer files stay comparable in size to the logical data (repetitive payloads would let
+    /// compression mask whether spilling really happened).
+    fn noise(mut seed: u64, chars: usize) -> String {
+        let mut s = String::with_capacity(chars);
+        while s.len() < chars {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s.push_str(&format!("{seed:016x}"));
+        }
+        s.truncate(chars);
+        s
+    }
+
     /// The 0.299 lesson, inverted: with chunked seeding + a zero spill threshold + a
     /// checkpoint, the table's data must actually land in layer files on disk — not stay
     /// resident. (The old memtest observed ~2 MB spilled of a ~570 MB resident trace.)
@@ -705,13 +718,12 @@ mod tests {
         )
         .unwrap();
 
-        // ~100k rows x ~80B of payload ≈ 8 MB of logical data, seeded in 10k-row chunks so the
-        // spine takes many level-0 batches and merges (the spill point) actually run.
-        let payload = "x".repeat(64);
+        // ~100k rows x 64B of unique payload ≈ 7 MB of logical data, seeded in 10k-row chunks
+        // so the spine takes many level-0 batches and merges (the spill point) actually run.
         let mut expect_bytes = 0u64;
-        for chunk_start in (0..100_000).step_by(10_000) {
+        for chunk_start in (0..100_000u64).step_by(10_000) {
             let rows: Vec<Row> = (chunk_start..chunk_start + 10_000)
-                .map(|i| Row(vec![Value::Int(i as i64), Value::Text(payload.clone())]))
+                .map(|i| Row(vec![Value::Int(i as i64), Value::Text(noise(i, 64))]))
                 .collect();
             expect_bytes += rows.len() as u64 * 72;
             arr.seed_chunk("t", rows).await.unwrap();
@@ -756,10 +768,9 @@ mod tests {
         )
         .unwrap();
 
-        let payload = "x".repeat(256);
         for chunk_start in (0..1_000_000u64).step_by(50_000) {
             let rows: Vec<Row> = (chunk_start..chunk_start + 50_000)
-                .map(|i| Row(vec![Value::Int(i as i64), Value::Text(payload.clone())]))
+                .map(|i| Row(vec![Value::Int(i as i64), Value::Text(noise(i, 256))]))
                 .collect();
             arr.seed_chunk("t", rows).await.unwrap();
         }
@@ -768,7 +779,7 @@ mod tests {
 
         let on_disk = dir_bytes(&dir);
         let rss = memory_stats::memory_stats().map(|m| m.physical_mem).unwrap_or(0);
-        println!("memtest: 1M rows (~300MB logical): on_disk={} MiB rss={} MiB", on_disk / (1 << 20), rss / (1 << 20));
+        println!("memtest: 1M rows (~280MB logical): on_disk={} MiB rss={} MiB", on_disk / (1 << 20), rss / (1 << 20));
         assert!(on_disk > 100 * (1 << 20), "expected >100 MiB on disk, got {on_disk}");
         assert_eq!(
             arr.lookup("t", &[0], &Row(vec![Value::Int(999_999)])).map(|v| v.len()),

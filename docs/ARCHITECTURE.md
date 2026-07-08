@@ -75,9 +75,11 @@ Three ideas carry the whole design:
 - **Z-set delta** — `Vec<Tup2<Row, ZWeight>>`, `ZWeight` a signed i64: insert = `(row,+1)`, delete =
   `(old,−1)`, update = `(old,−1),(new,+1)`. `old` comes from the replication envelope
   (`REPLICA IDENTITY FULL`), so no local table state is needed to retract a row. The delta algebra
-  is [`dbsp`](https://crates.io/crates/dbsp)'s, but the crate is no longer a dependency — `Tup2` and
-  `ZWeight` are defined locally in `value.rs`. **No dbsp circuit runs**; the live path is key
-  routing + stateless predicate evaluation (see internals doc §1).
+  is [`dbsp`](https://crates.io/crates/dbsp)'s, and the crate is a dependency again — `Tup2` and
+  `ZWeight` are dbsp's own, and `Value`/`Row` carry the `DBData` derive stack. The **hot path still
+  runs no dbsp circuit** (key routing + stateless predicate evaluation; internals doc §1); dbsp
+  powers the optional storage-backed arrangement layer (§6b) that replaces Postgres query-backs
+  with local, disk-spillable table indexes.
 - **Envelope** (`ds.rs`) — the unit on every stream:
   `{ type, key, value, old, headers{ operation, txid, offset, lsn, seq } }`. The ingestor stamps
   `lsn` (transaction **commit** LSN), `txid` (the Postgres **xid**), and `seq` (the change's position
@@ -252,6 +254,44 @@ sequencer feeds every table's deltas into:
 
 ---
 
+## 6b. dbsp arrangements (optional): disk-spillable table state
+
+`ELECTRIC_IVM_DBSP=1` (`arrangements.rs`) brings dbsp back — not as per-shape circuits (removed
+for cause; see the git history around `75488b6`/`c1aa075`) but as a **table-state layer**: one
+shared, storage-enabled circuit maintains per-table arrangements (primary key always, plus
+columns declared via `ELECTRIC_IVM_DBSP_INDEXES=table.col,…`). Subquery flip re-derivations and
+full re-derives read these local snapshots instead of querying Postgres back; a lookup against a
+missing/unseeded index returns `None` and the caller falls back to Postgres, so correctness never
+depends on the layer.
+
+- **Why**: the workload is small today but may not stay small. The engine's zero-state invariant
+  priced every flip as a Postgres round-trip; the arrangement layer keeps that state local with a
+  bounded RAM footprint — dbsp spills batches to Snappy-compressed layer files as tables grow
+  (`ELECTRIC_IVM_DBSP_MIN_STORAGE_KB`, default 1 MiB; block cache `ELECTRIC_IVM_DBSP_CACHE_MIB`;
+  memory-pressure spilling via `ELECTRIC_IVM_DBSP_MAX_RSS_MB`).
+- **Consistency**: the sequencer feeds each transaction into the circuit and steps it **before**
+  fanning the transaction out, so flip re-derivations enqueued by a txn observe post-txn state —
+  the same read-your-committed-writes guarantee the Postgres query-back gave. Fresh seeds read one
+  `REPEATABLE READ` snapshot per table (chunked), and the live feed is fenced by the seed's
+  `SnapshotGate` (xid visibility), exactly like shape backfills.
+- **Restart**: periodic checkpoints (`ELECTRIC_IVM_DBSP_CHECKPOINT_SECS`, default 60; plus at
+  shutdown) persist the circuit; `meta.json` records the change-log offset and the `(lsn, seq)`
+  de-duplication highwater. On boot the circuit restores and the sequencer replays the gap;
+  overlap is harmless because the arrangement layer re-checks the highwater (Z-set deltas are not
+  idempotent). An index-layout change discards state and reseeds. The default state dir is
+  slot-keyed (`<storage>/dbsp/<slot>`): dbsp state is only valid for the database identity it was
+  built from.
+- **The 0.299 lesson, addressed**: the earlier memtest (git `f5dab45`) found dbsp storage spilled
+  ~2 MB of a ~570 MB trace — because batches spill at **merge and checkpoint boundaries**, and a
+  static table seeded as one giant batch never merges. The layer therefore seeds in bounded chunks
+  (many level-0 batches ⇒ real merges) and checkpoints (persists every in-memory batch);
+  `spill_produces_layer_files` / `memtest_spill_large` in `arrangements.rs` pin this down.
+- **Limits (v1)**: indexes are fixed at boot (a dbsp circuit's structure is fixed at
+  construction) — new lookup columns need a restart, until circuit-rebuild-on-demand lands;
+  single worker; equality lookups and full scans only (no range seeks yet).
+
+---
+
 ## 7. Subset queries and client positioning
 
 A **subset query** is the non-materialized counterpart to a shape: one
@@ -394,6 +434,7 @@ predicate (which recreates the feed per click) — see AGENTS.md "gotchas".
 |------|------|
 | `apps/engine/src/engine.rs` | the LSN-ordered sequencer, delta computation, routing + standalone + aggregation fan-out, shape sharing/lifecycle, reliable per-txn flush |
 | `apps/engine/src/subquery.rs` | subquery registry: shared nodes, edges, flips, absolute emission, atomic create/rollback |
+| `apps/engine/src/arrangements.rs` | optional dbsp arrangement layer: storage-backed table indexes, checkpoints, snapshot lookups (§6b) |
 | `apps/engine/src/replication.rs` | ingestor: streaming pgoutput, per-txn buffering, (lsn, xid, seq) stamping, append-then-acknowledge |
 | `apps/engine/src/pg.rs` | connect/introspect, slot + REPLICA IDENTITY, backfill (+ `SnapshotGate`), subset query-back, value normalization |
 | `apps/engine/src/predicate.rs` | predicate compile, three-valued eval, equality templates, subquery signatures |
