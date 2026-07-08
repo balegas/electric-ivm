@@ -34,6 +34,42 @@ the project is growing toward).
 - `docs/shapes-and-subqueries-guide.md` — user/integrator guide.
 - `docs/deployment-postgres.md` — Postgres-as-source-of-record setup.
 - Each package has its own `README.md` (surface, commands, env knobs).
+- `docs/linearlite-circuit-design.md` — design study: one dbsp circuit for an entire app's
+  query set; source of the recipe below.
+
+## Designing dbsp circuits: pipelines vs shapes
+
+The load-bearing mental model: **pipelines are few and fixed; shapes are many and dynamic —
+and the fan-out between them lives outside the circuit.** A pipeline's output is keyed by
+*cohort groups* (project, (project, status), aggregate group, …). A shape is a selection or
+union over those groups, materialized as a per-shape stream at the delivery edge. Shape
+cardinality can vastly exceed pipeline cardinality: a subquery shape filtering issues exists
+per *combination* of projects a client asks for, yet every combination is fed from the same
+`issues_by_project` pipeline — the circuit never grows with shape count, only the routing
+table does. If a design makes the circuit's structure scale with shapes, users, or parameter
+combinations, it is wrong (that is the circuit-per-shape mistake this repo already made and
+removed; see the git history around `75488b6`/`c1aa075`).
+
+The recipe for capturing an app's query set in one circuit:
+
+1. **Enumerate call sites → collapse to templates.** Parameters become *data* (keys in the
+   output index, rows in an input relation) — never circuit structure.
+2. **Find the access cohort** (LinearLite: the project) and key every pipeline output by it,
+   never by user or shape. Per-shape work happens only at the fan-out edge: a shape = the set
+   of cohort groups its parameters select, unioned by delivery. Genuinely per-user predicates
+   (`username = $me`) get their own keyed feed — same pattern, cohort of size one.
+3. **Visibility relations become the delivery router**, not a join input: a membership feed's
+   deltas drive subscribe/unsubscribe to cohort feeds, and backfill = replaying the cohort
+   feed's own durable log (no Postgres snapshot, no xmin fencing, no flip query-backs).
+4. **Linear operators are free** (filter / project / `map_index`); **joins and aggregates
+   knowingly** — a join stores both inputs (acceptable with storage-backed spilling; see
+   `ARCHITECTURE.md` §6b), and `aggregate_linear` (COUNT/SUM) is cheap. Aggregate at the
+   finest useful group grain and let the reader sum groups, so one pipeline serves every
+   filter combination.
+5. **Structure ships with deploys.** New templates = circuit rebuild + reseed (layout
+   fingerprint) or `Mode::Persistent` bootstrap. Ad-hoc predicates that match no template fall
+   back to the dynamic-shape path (standalone evaluator / KeyRouter / registry) — the circuit
+   is an optimization tier, never a correctness dependency.
 
 ## Build & test
 
@@ -152,8 +188,10 @@ above** — the suites don't render a canvas or exercise the browser.
 
 ## Invariants (violate these and conformance will catch you — eventually)
 
-- **Postgres is the system of record; the engine holds no table copy.** Backfills read matching rows
-  in a `REPEATABLE READ` snapshot.
+- **Postgres is the system of record; the engine's hot path holds no table copy.** Backfills read
+  matching rows in a `REPEATABLE READ` snapshot. (The optional dbsp arrangement layer,
+  `ELECTRIC_IVM_DBSP=1`, holds disk-backed *derived* table indexes — rebuildable state with
+  Postgres fallback, never the record of truth; see `ARCHITECTURE.md` §6b.)
 - **Backfill↔live is fenced by xid visibility, NOT by LSN.** Every seeded structure carries a
   `pg::SnapshotGate` (from `pg_current_snapshot()`); a replicated change is skipped iff its xid was
   visible to that snapshot. `commit_lsn < seed_lsn` is only the fallback for changes without an xid.

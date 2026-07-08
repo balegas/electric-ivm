@@ -97,7 +97,12 @@ evaluator and KeyRouter remain for shapes that don't match a template.
 
 ## 4. The generalization
 
-The recipe that produced this circuit, applicable to any app on the engine:
+The recipe that produced this circuit, applicable to any app on the engine. The load-bearing
+separation: **pipelines are few and fixed; shapes are many and dynamic.** Shape cardinality —
+one shape per parameter combination clients ask for, e.g. an issues filter per combination of
+projects — can vastly exceed pipeline cardinality, because a shape is just a selection/union
+of cohort groups from one pipeline's keyed output, materialized at the delivery edge. The
+circuit never grows with shape count; only the routing table does.
 
 1. **Enumerate call sites** and collapse them to templates — parameters become data.
 2. **Find the access cohort** (here: project). Key every feed by cohort, never by user.
