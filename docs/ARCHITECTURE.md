@@ -13,14 +13,14 @@ The as-built system architecture. Companion documents:
 
 ```
   app ──ordinary SQL writes──▶ POSTGRES (system of record; wal_level=logical)
-                                  │ logical replication (test_decoding slot, REPLICA IDENTITY FULL)
+                                  │ logical replication (streaming pgoutput slot, REPLICA IDENTITY FULL)
                                   ▼
                                INGESTOR (replication.rs)
                                   │ decode commits → envelopes stamped (commit LSN, xid, seq)
-                                  │ append, then advance the slot (read-then-commit)
+                                  │ append, then acknowledge (append-then-acknowledge)
                                   ▼
-                               DURABLE STREAMS  table/<name>       (the change log)
-                                  │ tail (one tailer task per table; (lsn,seq) de-dup)
+                               DURABLE STREAMS  changes            (ONE ordered change log, commit order)
+                                  │ tail (single LSN-ordered sequencer; global (lsn,seq) de-dup)
                                   ▼
                                ENGINE (engine.rs)
                                   │ Z-set delta → key routing ⊕ stateless filters
@@ -74,9 +74,10 @@ Three ideas carry the whole design:
   logic). **`Row`** = positional `Vec<Value>`; the schema names the positions.
 - **Z-set delta** — `Vec<Tup2<Row, ZWeight>>`, `ZWeight` a signed i64: insert = `(row,+1)`, delete =
   `(old,−1)`, update = `(old,−1),(new,+1)`. `old` comes from the replication envelope
-  (`REPLICA IDENTITY FULL`), so no local table state is needed to retract a row. This is all that
-  remains of [`dbsp`](https://crates.io/crates/dbsp) here: the value types. **No dbsp circuit runs**;
-  the live path is key routing + stateless predicate evaluation (see internals doc §1).
+  (`REPLICA IDENTITY FULL`), so no local table state is needed to retract a row. The delta algebra
+  is [`dbsp`](https://crates.io/crates/dbsp)'s, but the crate is no longer a dependency — `Tup2` and
+  `ZWeight` are defined locally in `value.rs`. **No dbsp circuit runs**; the live path is key
+  routing + stateless predicate evaluation (see internals doc §1).
 - **Envelope** (`ds.rs`) — the unit on every stream:
   `{ type, key, value, old, headers{ operation, txid, offset, lsn, seq } }`. The ingestor stamps
   `lsn` (transaction **commit** LSN), `txid` (the Postgres **xid**), and `seq` (the change's position
@@ -86,20 +87,23 @@ Three ideas carry the whole design:
 
 ## 3. Ingest: logical replication, exactly-once effect
 
-`replication.rs` polls a `test_decoding` slot with a **capped, non-consuming peek**
-(`pg_logical_slot_peek_changes`, cap 5000, escalating only when a single transaction exceeds it). Each
-transaction's changes are buffered and stamped at its `COMMIT` record with `(commit LSN, xid, seq)`,
-appended to `table/<name>`, and only **then** is the slot advanced — a failed append re-reads rather
-than loses data.
+`replication.rs` **streams** a `pgoutput` slot over the walsender protocol (push delivery — no
+poll floor; the wire client is `pgwire-replication`, the message decoding is our `pgoutput.rs`).
+Each transaction's changes are buffered between `Begin` and `Commit`, stamped with
+`(commit LSN, xid, seq)`, appended to `table/<name>`, and only **then** acknowledged to Postgres
+(`confirmed_flush_lsn`) — a failed append tears the connection down unacknowledged, and the server
+resends from the confirmed position.
 
-Delivery to the table streams is therefore **at-least-once** (a crash between append and advance, or a
-partial multi-table append failure, re-appends whole batches). Deltas are *not* idempotent for
-aggregates and subquery contributor weights, so the consumer side restores exactly-once **effect**:
+Delivery to the table streams is therefore **at-least-once** (a partial multi-table append failure,
+or acknowledgements not yet flushed at a crash, re-deliver whole transactions). Deltas are *not*
+idempotent for aggregates and subquery contributor weights, so the consumer side restores
+exactly-once **effect**:
 
-- **Tailer de-duplication.** `(commit LSN, seq)` uniquely identifies a change and is strictly
-  increasing per table stream. Each tailer keeps a highwater mark and skips anything at or below it.
-- The drain-barrier sentinel (`__el_sync`) is published only after the slot actually advanced, so the
-  barrier can never claim "drained" while a batch is still due for re-append.
+- **Sequencer de-duplication.** `(commit LSN, seq)` uniquely identifies a change and is strictly
+  increasing on the single ordered log. The sequencer keeps a highwater mark and skips anything at
+  or below it.
+- The drain-barrier sentinel (`__el_sync`) is published only after its whole commit landed on the
+  streams, so the barrier can never claim "drained" while a transaction is still due for re-append.
 
 Degraded/unsupported forms are **loud, never silent**: an `UPDATE` without an old image or a `DELETE`
 without tuple data (REPLICA IDENTITY no longer FULL) and `TRUNCATE` log errors describing the staleness
@@ -129,7 +133,8 @@ aggregations, subquery nodes, subquery shapes — carries its own gate; `changes
 passthrough gate (no backfill ⇒ forward everything).
 
 The backfill row representation is normalized to match the live path: text-mapped columns are read
-with `::text` casts so a cell's value is Postgres's *text output* — the same form `test_decoding`
+with `::text` casts so a cell's value is Postgres's *text output* — the same form pgoutput's
+text-mode tuples
 prints — rather than `to_jsonb`'s (which would make the same timestamp compare unequal between a
 backfilled row and its first live update).
 
@@ -141,12 +146,21 @@ the page query-back to also return the snapshot's xid list. Engine-maintained st
 
 ## 5. The engine: fan-out, sharing, lifecycle
 
-### 5.1 Tailer model
+### 5.1 Sequencer model
 
-One tokio task per table. Processing is serial within a table (ordering and state are trivially
-correct); the only intra-batch parallelism is the append flush (bounded-concurrent, CAP=32). After a
-batch is fully fanned out **and every append has landed**, the tailer publishes its processed offset —
-the convergence barrier used by the conformance harness (`GET /tables/<t>/offset`).
+ONE tokio task consumes the single ordered change log for all tables — Electric's
+`ShapeLogCollector` pattern. Processing is serial in commit order (global ordering and state are
+trivially correct), and each source transaction's shape appends are flushed **before the next
+transaction is processed** — per-transaction atomic emission, across tables; the only intra-txn
+parallelism is the append flush (bounded-concurrent, CAP=32). After a batch is fully fanned out
+**and every append has landed**, the sequencer publishes its processed offset — the convergence
+barrier used by the conformance harness (`GET /tables/<t>/offset` reports the global offset).
+
+Shape creation is **two-phase** so a Postgres backfill never stalls the pipeline: `BeginShape`
+registers a pending shape that buffers its table's deltas; the creator runs the backfill on a
+pooled connection concurrently; `ActivateShape` replays the buffer through the shape's snapshot
+gate and goes live. The buffer is registered before the snapshot is taken, so no change can fall
+between them.
 
 ### 5.2 Three execution strategies
 
@@ -155,7 +169,9 @@ The shape of the predicate picks the strategy (full detail + cost model: interna
 - **Equality templates** (`a = 1 AND b = 2`) → **key routing**: one shared `KeyRouter` per key-column
   set; `key_tuple → {shapes}`. Routing is O(log N), independent of shape count; zero table rows held.
 - **Standalone** (ranges, OR, NOT, …) → a stateless three-valued filter evaluated directly on the
-  delta. No state; O(K) evals per change across the K standalone shapes on the table.
+  delta. No state. A necessary-conjunct index (`(column, op)` — equality hash buckets + ordered
+  range bounds) selects only the candidate shapes per change; predicates with no indexable
+  conjunct (OR/NOT/LIKE/`!=` at the top) fall back to a scan list.
 - **Subqueries** (`col [NOT] IN (SELECT …)`) → the cross-table registry (§6).
 
 **Aggregations** (electric-ivm extension, not part of the Electric-compatible API): a scalar
@@ -186,7 +202,7 @@ Any two **equal** shapes share one maintained stream, ref-counted:
 ### 5.4 Creation is atomic; failures never leave zombies
 
 `create_shape` returns `Ok` only after registration + backfill actually succeeded. On any failure —
-backfill error, subquery seeding error, append error — the shape record, share entries, tailer
+backfill error, subquery seeding error, append error — the shape record, share entries, sequencer
 registration, and (for subqueries) every node refcount/edge/pending-seed added by the attempt are
 rolled back, waiting joiners get the error, and the stream is deleted. This structurally excludes
 the "zombie shape" failure mode: a shape that is registered, streams nothing, and pins its
@@ -195,7 +211,7 @@ signature so all future identical creates silently join a dead feed.
 ### 5.5 Reliability: appends never drop silently
 
 A lost shape-stream append is a permanent divergence for every subscriber, so live-path appends use
-`append_reliable`: transient failures retry with capped backoff (backpressuring the tailer — the same
+`append_reliable`: transient failures retry with capped backoff (backpressuring the sequencer — the same
 stance as the ingestor's read-then-commit), and the only non-retried case is 404 (the shape was
 dropped mid-flush; discard is correct). Because shape envelopes are absolute per-pk
 (`upsert`/`delete` by key), an ambiguous-failure double-append is idempotent for readers.
@@ -206,22 +222,28 @@ dropped mid-flush; discard is correct). Because shape envelopes are absolute per
 
 (Cost model: internals doc §3.3.)
 
-A predicate leaf `col [NOT] IN (SELECT proj FROM inner WHERE …)` routes through a registry shared by
-all tailers:
+A predicate leaf `col [NOT] IN (SELECT proj FROM inner WHERE …)` routes through a registry the
+sequencer feeds every table's deltas into:
 
 - **Node** — one per distinct inner query (canonical signature), ref-counted: a map
   `projected value → set of contributing inner-row pks`. A value is in the set iff its contributor
   set is non-empty; tracking pks (not counts) makes maintenance reconcile-by-identity — idempotent
   and order-independent.
 - **Edges** — `node → dependent` (an outer shape, or a *parent node* for nested subqueries), labeled
-  with the connecting column. When a node **flips** a value (∅→non-empty or back), the registry
-  queries the dependent rows with `connecting_col = value` and re-evaluates them, recursing up the DAG.
-- **Absolute emission** — the correctness rule that makes cross-table ordering irrelevant: for each
+  with the connecting column. When a node **flips** a value (∅→non-empty or back), the dependent rows
+  with `connecting_col = value` are queried back and re-evaluated, recursing up the DAG. Flip
+  propagation runs on a dedicated engine task, **off the sequencer hot path**: the sequencer only
+  reconciles nodes in-memory and emits own-table deltas under the registry lock; the Postgres
+  query-backs never hold it. Membership evaluation and the resulting append stay atomic under the lock (a stale move
+  landing after a fresher emission would be permanent divergence), and the engine exposes the
+  in-flight flip count (`GET /replication/lsn` → `pendingFlips`) as the extra convergence-barrier term.
+- **Absolute emission** — the correctness rule that keeps deferred flips convergent: for each
   touched pk the registry emits the row's *current* membership (`upsert` if it matches now, else
-  `delete` by pk), never a history-dependent delta. Per-table tailers process tables out of global
-  commit order; a delta-based "delete only if the old row matched" would miss move-outs whenever the
-  inner set runs ahead. Absolute emission converges regardless of interleaving — which is why the
-  Electric-style LSN-buffering/tag protocol isn't needed here.
+  `delete` by pk), never a history-dependent delta. Flip propagation runs deferred (out of commit
+  order relative to the sequencer's own emissions); a delta-based "delete only if the old row
+  matched" would miss move-outs whenever the inner set runs ahead. Absolute emission converges
+  regardless of that timing — which is why the Electric-style LSN-buffering/tag protocol isn't
+  needed here.
 - **NULL sensitivity** — SQL: a NULL in the inner set makes `x NOT IN S` UNKNOWN. A NULL flip
   re-derives exactly the dependents that can change: those whose `IN` leaf is negated **or sits under
   any `Not{…}`** (with no negation above the leaf, NULL only moves the leaf between FALSE and
@@ -262,7 +284,8 @@ handle is the shared shape id), the shape stream is folded into the Electric mes
 (insert/update/delete + `up-to-date` control messages), and live requests long-poll. Handle state
 is evicted after an idle TTL (`ELECTRIC_HANDLE_TTL`); the backing shape + stream are **retained**
 and follow the engine's three-tier retention lifecycle (active / dormant / evicted — idle shapes
-drop their engine state but keep the stream, and any touch reactivates them by table-stream replay;
+drop their engine state but keep the stream, and any touch reactivates them by change-log replay
+from the captured resume offset (through the sequencer's two-phase pending-buffer handshake);
 see `apps/engine/src/retention.rs`). A request with an evicted handle gets `409 must-refetch`,
 which the Electric client handles by re-syncing onto the retained shape. Conformance against Electric's own oracle + integration tests lives in
 `electric-conformance/` (see its README for scope and known gaps — e.g. row `tags` are not emitted;
@@ -275,12 +298,13 @@ absolute membership emission makes them unnecessary for convergence).
 | seam | mechanism | guarantee |
 |---|---|---|
 | backfill ↔ live | `SnapshotGate` (xid visibility; LSN fallback) | each change counts exactly once per shape/aggregate/node |
-| ingestor → table streams | peek → append → advance + `(lsn,seq)` tailer de-dup | at-least-once delivery, exactly-once effect |
+| ingestor → change log | append → acknowledge + `(lsn,seq)` sequencer de-dup | at-least-once delivery, exactly-once effect |
 | engine → shape streams | `append_reliable` + offset published only after landing | no silently-lost deltas; barrier implies subscriber streams reflect the batch |
-| cross-table subquery order | absolute membership emission + flip query-backs | convergence independent of tailer interleaving |
+| cross-table subquery order | absolute membership emission + flip query-backs | convergence independent of deferred-flip timing |
 | shared shapes | signature + refcount + ready-watch + atomic rollback | joiners see a live, backfilled stream or an error; last drop tears everything down |
 | subset page ↔ live tail | per-pk LSN watermarks + delete tombstones | no double-count, no resurrections/ghosts across the seam (LSN-based; see §4 residual) |
 | client lifecycle | one-shot close, delete-with-retry | balanced create/drop; no refcount pinning or steal |
+| engine restart | durable shape catalog (`meta/catalog`: create/join/leave/drop + change-log offset checkpoints) | plain/routed shapes + aggregates restore without client re-registration (plain resume via replay + passthrough gates; aggregates re-seed with a fresh gate); subquery shapes are dropped loudly (inner-node state is not persisted) and recreated by clients |
 
 The invariant the conformance suite asserts end-to-end: *for any shape and any op stream, the
 client-materialized set equals the oracle's `SELECT … WHERE <predicate>`* — through the real API,
@@ -292,11 +316,12 @@ stream, and client, including live replication, batched mutations, NULLs, and co
 
 | unit | threads | notes |
 |------|---------|-------|
-| engine main | tokio multi-thread | tailers + flush run here |
-| tailer (per table) | 1 task | serial change processing |
+| engine main | tokio multi-thread | sequencer + flush run here |
+| sequencer (all tables) | 1 task | commit-ordered change processing; per-txn atomic flush |
 | shapes (any kind) | **0** | no per-shape thread or circuit |
-| replication ingestor | 1 task | peek/decode/append/advance |
-| subquery registry | 0 (a mutex) | every tailer calls into it |
+| replication ingestor | 1 task | stream pgoutput/decode/append/acknowledge |
+| subquery registry | 0 (a mutex) | the sequencer reconciles nodes + emits under it (in-memory + appends only) |
+| flip propagator | 1 task | deferred subquery query-backs; PG round-trips never hold the registry lock |
 
 Threads are flat in the number of shapes *and* in the number of equality templates.
 
@@ -328,15 +353,19 @@ is **storage throughput** (the single-process durable-streams test server), not 
 **Storage / append path (current ceiling)**
 1. Multi-stream append (one request, many streams) — fan-out to M streams is M HTTP requests today.
 2. HTTP/2 multiplexing / persistent pipelined connections to storage.
-3. Sharded tailers (partition a table's shapes/key-space across tasks).
+3. Shard the sequencer's fan-out (partition a table's shapes/key-space across tasks).
 4. A production durable-streams backend (the test server fsyncs per append when file-backed).
 
 **Standalone evaluation (O(K) per change)**
-5. Predicate indexing by `(column, op)` — interval trees turn O(K) into output-sensitive.
+5. ~~Predicate indexing by `(column, op)` — turn O(K) into output-sensitive.~~ Done: standalone
+   shapes are indexed by a necessary conjunct (equality → hash bucket, range bound → ordered
+   scan); only candidates are evaluated per change. Un-indexable predicates (OR/NOT/LIKE/`!=`)
+   remain on a fallback scan list.
 6. Widen the shared class beyond pure equality (e.g. single-column range templates).
 
 **Engine compute / representation**
-7. Backfill connection pooling for burst shape creation (the fleet benchmark's p99 driver).
+7. ~~Backfill connection pooling for burst shape creation (the fleet benchmark's p99 driver).~~
+   Done: backfills/query-backs/subset queries share a per-URL pool (`ELECTRIC_DB_POOL_SIZE`, default 20).
 8. Intern stream paths/txids; pack `Value` (smaller enum, interned strings).
 
 ---
@@ -363,9 +392,9 @@ predicate (which recreates the feed per click) — see AGENTS.md "gotchas".
 
 | path | role |
 |------|------|
-| `apps/engine/src/engine.rs` | tailers, delta computation, routing + standalone + aggregation fan-out, shape sharing/lifecycle, reliable flush |
+| `apps/engine/src/engine.rs` | the LSN-ordered sequencer, delta computation, routing + standalone + aggregation fan-out, shape sharing/lifecycle, reliable per-txn flush |
 | `apps/engine/src/subquery.rs` | subquery registry: shared nodes, edges, flips, absolute emission, atomic create/rollback |
-| `apps/engine/src/replication.rs` | ingestor: capped peek, per-txn buffering, (lsn, xid, seq) stamping, append-then-advance |
+| `apps/engine/src/replication.rs` | ingestor: streaming pgoutput, per-txn buffering, (lsn, xid, seq) stamping, append-then-acknowledge |
 | `apps/engine/src/pg.rs` | connect/introspect, slot + REPLICA IDENTITY, backfill (+ `SnapshotGate`), subset query-back, value normalization |
 | `apps/engine/src/predicate.rs` | predicate compile, three-valued eval, equality templates, subquery signatures |
 | `apps/engine/src/sql.rs` / `where_sql.rs` | predicate → SQL (pushdown) / SQL `WHERE` → predicate (Electric path) |

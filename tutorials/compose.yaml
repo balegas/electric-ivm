@@ -1,21 +1,21 @@
-# The whole electric-ivm server stack, containerized:
+# The tutorial-series stack — every service any episode needs, boots with episode 1's data:
 #
-#   postgres  — the system of record (wal_level=logical; the engine creates its replication slot)
-#   ds        — durable-streams server (the log: table/<name> in, shape/<id> out)
-#   engine    — the Rust engine: replication ingest, shape/subquery/aggregation maintenance,
-#               control-plane HTTP + the Electric-compatible GET /v1/shape (port 7010)
-#   api       — the extended tRPC API (shapes/subsets/aggregations for @electric-ivm/client, port 8790)
+#   postgres — system of record (wal_level=logical), auto-seeded from ./seed on first boot
+#   ds       — durable-streams server (the log)
+#   engine   — the Rust engine: replication ingest + shape maintenance + GET /v1/shape (7010)
+#   api      — the extended tRPC API (unused until episode 3, present so this file never changes)
+#   viz      — the pipeline visualizer (http://localhost:5180), proxying /engine/* to the engine
 #
-#   docker compose -f docker/compose.yaml up --build
+#   cd tutorials && docker compose up --build
 #
-# Then point an ElectricSQL client at http://localhost:7010/v1/shape, or @electric-ivm/client at
-# http://localhost:8790 (API) + http://localhost:8791 (streams).
+# Reset to episode 1's initial state from anywhere in the series:
+#   docker compose down -v && docker compose up
 #
-# Note: the engine introspects the table set at startup (ELECTRIC_IVM_PG_TABLES=* = every public
-# table with a primary key). Create your tables first — or `docker compose restart engine` after a
-# migration — for them to be picked up.
+# Later episodes change database state with SQL scripts (episodes/0N-…/setup.sql), not by
+# editing this file. The engine introspects the table set at startup — an episode script that
+# ADDS tables is always followed by `docker compose restart engine` in the episode text.
 
-name: electric-ivm
+name: electric-ivm-tutorials
 
 services:
   postgres:
@@ -28,6 +28,7 @@ services:
       - "${PG_PORT:-5432}:5432"
     volumes:
       - pg-data:/var/lib/postgresql/data
+      - ./seed:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d electric"]
       interval: 3s
@@ -59,21 +60,16 @@ services:
     environment:
       ELECTRIC_IVM_DS_URL: http://ds:8791
       ELECTRIC_IVM_PG_URL: postgres://postgres:password@postgres:5432/electric
-      ELECTRIC_IVM_PG_TABLES: "${ELECTRIC_IVM_PG_TABLES:-*}"
+      ELECTRIC_IVM_PG_TABLES: "*"
       ELECTRIC_IVM_BIND: 0.0.0.0:7010
-      # The ds data volume, mounted read-only below, so the engine's storage sampler
-      # (electric.storage.used.bytes) can `du` the actual stream data.
-      ELECTRIC_STORAGE_DIR: /ds-data
     ports:
       - "${ENGINE_PORT:-7010}:7010"
-    volumes:
-      - ds-data:/ds-data:ro
     depends_on:
       postgres:
         condition: service_healthy
       ds:
         condition: service_healthy
-    restart: unless-stopped # e.g. Postgres not ready with tables yet — retry via restart
+    restart: unless-stopped
 
   api:
     build:
@@ -89,6 +85,18 @@ services:
     depends_on:
       ds:
         condition: service_healthy
+      engine:
+        condition: service_started
+
+  viz:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.viz
+    environment:
+      ENGINE_UPSTREAM: engine:7010
+    ports:
+      - "${VIZ_PORT:-5180}:5180"
+    depends_on:
       engine:
         condition: service_started
 

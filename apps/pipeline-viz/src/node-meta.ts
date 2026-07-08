@@ -27,11 +27,12 @@ export const KIND_META: Record<NodeKind, KindMeta> = {
     formula: 'change → {(old,−1), (new,+1)}',
     stateful: false,
     inside:
-      'The replication source. Each committed change arrives as an envelope on the table stream; ' +
-      'the tailer turns it into a Z-set delta — insert (new,+1), delete (old,−1), update ' +
+      'The replication source. Each committed change arrives as an envelope on the single ordered ' +
+      '`changes` log (streaming pgoutput, whole commits in commit order); the sequencer dispatches ' +
+      'it here and turns it into a Z-set delta — insert (new,+1), delete (old,−1), update ' +
       '(old,−1)+(new,+1), with REPLICA IDENTITY FULL supplying the old row. That one delta is ' +
       'shared by every operator downstream. Nothing here stores table rows; the state chip counts ' +
-      'envelopes processed and the convergence offset.',
+      'envelopes processed and the global change-log convergence offset.',
   },
   filter: {
     color: '#b45309',
@@ -103,12 +104,15 @@ export const KIND_META: Record<NodeKind, KindMeta> = {
     color: '#334155',
     bg: '#e2e8f0',
     tag: 'SOURCE',
-    formula: 'tail(table/<t>)',
+    formula: 'sequencer · tail(changes) ⋉ <t>',
     stateful: false,
     inside:
-      'The per-table tailer task: long-polls the table’s durable stream, de-duplicates redelivered ' +
-      'changes by (commit LSN, seq), and publishes the processed offset after each batch is fully ' +
-      'fanned out — the convergence barrier its state chip shows.',
+      'The table’s slice of the engine’s single LSN-ordered sequencer: ONE task long-polls the ' +
+      'global `changes` log (whole commits, in commit order), de-duplicates redelivered changes by ' +
+      '(commit LSN, seq), dispatches each envelope to its table’s executor, and flushes every ' +
+      'transaction’s shape appends before the next transaction — atomic per-transaction emission, ' +
+      'cross-table. The processed offset its state chip shows is the global change-log position ' +
+      '(the convergence barrier).',
   },
   'op-delta': {
     color: '#c2410c',

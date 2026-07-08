@@ -13,22 +13,9 @@ name = "electric-ivm-engine"
 path = "src/main.rs"
 
 [dependencies]
-# Query engine. Version reqs kept at minor-level so cargo unifies our direct deps with
-# dbsp 0.299.0's own tree (so the rkyv/size-of/feldera-macros derive macros match dbsp's
-# expected rkyv 0.7). Pinning exact patches risks selecting a version dbsp didn't use.
-dbsp = "0.299"
-# default-features=false avoids rkyv's default `size_32`, which is mutually exclusive with
-# the `size_64` that dbsp selects (cargo unions features across dependents).
-rkyv = { version = "0.7", default-features = false, features = ["std", "size_64", "validation"] }
-# dbsp uses Feldera's fork of size-of (upstream size-of 0.1.5 fails on modern Rust/arm64
-# with E0570 on fn-pointer ABIs). The `SizeOf` derive emits hardcoded `size_of::` paths, so
-# the crate must be in scope under the name `size_of` (dbsp renames it the same way).
-# `ordered-float` feature pulls the SizeOf impl for OrderedFloat (used by our Float cell).
-size_of = { package = "feldera-size-of", version = "0.1.7", features = ["ordered-float"] }
-feldera-macros = "0.299"
-# Pin to 3.x to match feldera-size-of's ordered-float (its SizeOf impl targets v3's
-# OrderedFloat). rkyv_64 matches rkyv's size_64; rkyv_ck adds the validation/CheckBytes impl.
-ordered-float = { version = "3", features = ["rkyv_64", "rkyv_ck"] }
+# `OrderedFloat` gives `Value::Float` the `Eq`/`Ord`/`Hash` a bare f64 lacks (map keys:
+# aggregate multisets, routing indexes).
+ordered-float = "3"
 anyhow = "1"
 
 # Service layer: control-plane HTTP + durable-streams client + async runtime.
@@ -54,6 +41,8 @@ opentelemetry = "0.27"
 opentelemetry_sdk = { version = "0.27", features = ["metrics"] }
 opentelemetry-prometheus = "0.27"
 prometheus = "0.13"
+pgwire-replication = { version = "0.3.2", default-features = false, features = ["scram"] }
+url = "2"
 
 [dev-dependencies]
 # Drive the axum router in-process (Service::oneshot) for the /v1/health + endpoint tests.

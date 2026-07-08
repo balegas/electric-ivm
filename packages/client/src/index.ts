@@ -248,6 +248,10 @@ export function createClient(opts: {
             signal: ac.signal,
           })
           for await (const env of resp.jsonStream()) {
+            // A close() aborts the fetch, but a batch already yielded keeps iterating — without
+            // this guard its callbacks can land AFTER a replacement subscription's state and pin a
+            // stale value (observed as a frozen count badge on aggregate-definition churn).
+            if (ac.signal.aborted) break
             const v = env.value as { value?: number | null; n?: number } | undefined
             if (v && 'value' in v) {
               current = (v.value ?? null) as number | null

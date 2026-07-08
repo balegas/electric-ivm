@@ -23,6 +23,8 @@ pnpm bench:fleet          # from the repo root — auto-clones the fleet repo on
 | `FLEET_DIR` | `../benchmarking-fleet` | path to a benchmarking-fleet clone (auto-cloned when absent) |
 | `FLEET_REPO` | electric-sql/benchmarking-fleet | clone source |
 | `BENCH_OUT` | `docs/bench/electric-fleet-results.md` | report path |
+| `EXTERNAL_ELECTRIC_URL` | *(unset)* | run against an external Electric-compatible server instead of booting our stack (requires `EXTERNAL_DATABASE_URL`) |
+| `EXTERNAL_DATABASE_URL` | *(unset)* | the external target's Postgres; benchmark tables are dropped/recreated there |
 
 ## Shape-memory matrix (`src/shape-mem-matrix.ts`)
 

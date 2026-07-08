@@ -26,10 +26,12 @@ COPY --from=build /repo/target/release/electric-ivm-engine /usr/local/bin/electr
 #   ELECTRIC_IVM_PG_SLOT    slot name (default electric_ivm)
 #   ELECTRIC_IVM_BIND       bind address (default here 0.0.0.0:7010)
 #   ELECTRIC_IVM_LOG        tracing filter (default info)
+#   ELECTRIC_IVM_TRACE      0/false/off unregisters the visualizer introspection endpoints
+#                           (/trace /graph /state — unauthenticated when on; default on)
 ENV ELECTRIC_IVM_BIND=0.0.0.0:7010 \
     ELECTRIC_IVM_PG_TABLES=*
 
 EXPOSE 7010
 HEALTHCHECK --interval=5s --timeout=3s --retries=12 \
-  CMD ["/bin/sh", "-c", "exec 3<>/dev/tcp/127.0.0.1/7010 && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q 200"]
+  CMD ["/bin/bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/7010 && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q 200"]
 CMD ["electric-ivm-engine"]

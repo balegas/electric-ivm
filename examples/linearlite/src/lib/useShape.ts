@@ -167,7 +167,11 @@ export function useAggregate(def: AggregateDef | null): { value: number | null; 
       }
       sub = s
       setState({ value: s.value(), count: s.count() })
-      s.subscribe((v) => setState({ value: v, count: s.count() }))
+      // Guard against a stale closure: after cleanup this effect's subscription is closed, and a
+      // late callback must not overwrite the replacement definition's state.
+      s.subscribe((v) => {
+        if (!closed) setState({ value: v, count: s.count() })
+      })
     })
     return () => {
       closed = true

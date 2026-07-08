@@ -15,7 +15,7 @@ is no separate write API and no in-memory table copy to keep in sync — Postgre
 
 ## What you need
 
-- **Postgres 10+** with logical decoding (the built-in `test_decoding` plugin — no extensions to
+- **Postgres 10+** with logical decoding (the built-in `pgoutput` plugin — no extensions to
   install). Managed Postgres works if it allows `wal_level = logical` and a logical replication slot
   (RDS, Cloud SQL, Supabase, Neon, etc. all do).
 - **A durable-streams server** (the transport/persistence layer). Set its base URL in
@@ -39,7 +39,8 @@ The engine sets everything else up for you on startup, per configured table:
 
 - `ALTER TABLE <t> REPLICA IDENTITY FULL` — so an UPDATE/DELETE carries the **full old row** (needed to
   compute the exact delta). The role you connect with must own the tables (or be superuser) for this.
-- `pg_create_logical_replication_slot('<slot>', 'test_decoding')` — the replication slot, created once
+- `pg_create_logical_replication_slot('<slot>', 'pgoutput')` + `CREATE PUBLICATION <slot>_pub FOR
+  ALL TABLES` (superuser) — the replication slot and its publication, created once
   and reused.
 
 > **Each table needs a single-column primary key.** The engine introspects columns, types, and the pk
@@ -74,7 +75,7 @@ the replication ingestor, and begins serving the control API on `ELECTRIC_IVM_BI
 | `ELECTRIC_IVM_PG_URL`    | yes¹     | —                | Postgres connection string. Setting it enables Postgres mode. |
 | `ELECTRIC_IVM_PG_TABLES` | yes¹     | (empty)          | Comma-separated tables to watch (in schema `public`). |
 | `ELECTRIC_IVM_PG_SLOT`   | no       | `electric_ivm`  | Logical replication slot name (unique per engine). |
-| `ELECTRIC_IVM_PG_POLL_MS`| no       | `50`             | How often (ms) to poll the slot for new changes. |
+| `ELECTRIC_IVM_PG_POLL_MS`| no       | —                | Legacy; accepted but unused (the ingestor streams pgoutput, push delivery). |
 | `ELECTRIC_IVM_BIND`      | no       | `127.0.0.1:0`    | Address for the control/HTTP API. |
 | `ELECTRIC_IVM_LOG`       | no       | `info`           | Log filter (`error`, `warn`, `info`, `debug`). |
 
@@ -128,3 +129,10 @@ activeUsers.subscribe((rows) => render(rows))
   recreate shapes after one.
 - **Permissions:** the engine's Postgres role needs `SELECT` on the watched tables, ownership (for
   `ALTER TABLE … REPLICA IDENTITY`), and the `REPLICATION` attribute (to create/read the slot).
+- **Introspection surface:** the engine's control port also serves the pipeline-visualizer backend —
+  `/trace` (per-envelope SSE), `/graph`, `/state`, and the `/state/node` deep dumps, which expose row
+  data. These endpoints are **unauthenticated**; anyone who can reach the control port can read them.
+  The runtime cost is near zero while nobody subscribes (instrumentation is gated on subscriber
+  count), so leaving them on is fine when the port is private. If the control port is reachable
+  beyond your trust boundary, either front it with network policy or disable the surface outright
+  with `ELECTRIC_IVM_TRACE=0` (the routes are then never registered).

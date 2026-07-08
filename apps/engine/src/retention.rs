@@ -10,7 +10,7 @@
 //! - **Dormant** — after sitting idle (no engine-visible reads and refcount 0) for
 //!   [`RetentionConfig::idle_timeout`]: the tailer's routing state for the shape is dropped, while
 //!   the durable stream and the shape record are retained at zero engine cost. Any touch
-//!   reactivates by replaying the `table/<name>` stream from the captured resume offset — no
+//!   reactivates by replaying the global `changes` log from the captured resume offset — no
 //!   Postgres backfill (see `Engine::ensure_active`).
 //! - **Evicted** — stream and record deleted; a returning `/v1/shape` client gets `409
 //!   must-refetch` and re-snapshots, an extended-API client gets `404` and recreates.
@@ -31,7 +31,7 @@
 //! bumps a metric instead of evicting active shapes.
 //!
 //! Subquery and aggregate shapes are exempt from dormancy (their engine state — inner-set
-//! arrangements, running folds — cannot be rebuilt from a table-stream replay alone), so they stay
+//! arrangements, running folds — cannot be rebuilt from a change-log replay alone), so they stay
 //! active while retained. So that they cannot leak forever once unsubscribed, the TTL layer evicts
 //! them **straight from active** (full teardown) after the same total grace an eligible shape gets
 //! (idle timeout + dormancy TTL); like any evicted shape, a returning client recreates them.
@@ -39,7 +39,10 @@
 //! This module holds the configuration, the lifecycle state machine types, and the **pure** sweep
 //! planner ([`plan_sweep`]); `crate::engine` owns the state and executes plans. Persistence of the
 //! lifecycle (catalog, `last_read` flushes, restart recovery) is the follow-up catalog work (GH
-//! issue #8): today the lifecycle state is in-memory, so a restart forgets dormant shapes.
+//! issue #8). Dormancy IS durable: the engine's `meta/catalog` records `Dormant`/`Reactivated`
+//! events (with the resume offset + snapshot gate), so a restart restores dormant shapes as
+//! dormant — no re-registration, no backfill. Only the in-memory clocks reset (dormancy age
+//! restarts at boot, so the TTL is conservative across restarts).
 
 use std::time::{Duration, Instant};
 
@@ -107,12 +110,12 @@ pub enum LifeState {
     /// The active → dormant transition is in flight (the tailer is unregistering the shape and
     /// capturing the resume state). A touch waits for it to finish, then reactivates.
     Deactivating { done: tokio::sync::watch::Receiver<bool> },
-    /// Engine state dropped; stream + record retained. `resume_offset` is the table-stream offset
+    /// Engine state dropped; stream + record retained. `resume_offset` is the change-log offset
     /// up to which the shape's stream is complete; `gate` is the shape's original
     /// backfill-snapshot fence (still needed if the shape went dormant with pre-backfill changes
     /// in flight).
     Dormant { since: Instant, resume_offset: String, gate: SnapshotGate },
-    /// A touch is replaying the table stream to bring the shape back. Concurrent touches await
+    /// A touch is replaying the change log to bring the shape back. Concurrent touches await
     /// the same outcome (`Some(true)` = active again, `Some(false)` = reactivation failed).
     Reactivating { done: tokio::sync::watch::Receiver<Option<bool>> },
 }

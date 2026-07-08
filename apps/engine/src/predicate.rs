@@ -1,5 +1,5 @@
 //! Predicate AST (deserialized from the control-plane JSON, mirroring `@electric-ivm/protocol`)
-//! compiled to a positional evaluator captured by a dbsp `filter` closure.
+//! compiled to a positional evaluator applied directly to each Z-set delta.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -132,6 +132,17 @@ impl SubqueryEval for PanicEval {
     }
 }
 
+/// A necessary conjunct extracted from a predicate — see [`CompiledPredicate::access_leaf`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum AccessLeaf {
+    /// `col = value` (value non-NULL).
+    Eq { col: usize, value: Value },
+    /// `col > value` (`strict`) or `col >= value`.
+    Lower { col: usize, value: Value, strict: bool },
+    /// `col < value` (`strict`) or `col <= value`.
+    Upper { col: usize, value: Value, strict: bool },
+}
+
 /// Compiled predicate over positional columns. `MatchAll` is used when a shape has no `where`.
 #[derive(Debug, Clone)]
 pub enum CompiledPredicate {
@@ -239,6 +250,57 @@ impl CompiledPredicate {
             return None; // duplicate column — degenerate, not a shareable single key
         }
         Some(acc)
+    }
+
+    /// A single **necessary conjunct** for this predicate: a leaf the predicate implies, so a row on
+    /// which the leaf is not TRUE can never match. Used to index standalone shapes by `(column, op)` —
+    /// a change then only visits shapes whose necessary conjunct it satisfies, instead of every shape.
+    ///
+    /// Extraction walks the top-level `AND` chain (recursively through nested `AND`s — a conjunct of a
+    /// conjunct is still necessary) and prefers an equality leaf (hash lookup) over a range bound
+    /// (ordered scan). Returns `None` for predicates with no such leaf (`OR`/`NOT` at the top,
+    /// `LIKE`, `!=`, `IS NULL`, `MatchAll`, subqueries, or a NULL literal — `cmp` with NULL is never
+    /// TRUE, so such shapes match nothing anyway); those shapes stay on the fallback scan list.
+    pub fn access_leaf(&self) -> Option<AccessLeaf> {
+        fn leaf_of(p: &CompiledPredicate) -> Option<AccessLeaf> {
+            let CompiledPredicate::Cmp { col, op, value } = p else { return None };
+            if matches!(value, Value::Null) {
+                return None;
+            }
+            match op {
+                LeafOp::Eq => Some(AccessLeaf::Eq { col: *col, value: value.clone() }),
+                LeafOp::Gt => Some(AccessLeaf::Lower { col: *col, value: value.clone(), strict: true }),
+                LeafOp::Gte => Some(AccessLeaf::Lower { col: *col, value: value.clone(), strict: false }),
+                LeafOp::Lt => Some(AccessLeaf::Upper { col: *col, value: value.clone(), strict: true }),
+                LeafOp::Lte => Some(AccessLeaf::Upper { col: *col, value: value.clone(), strict: false }),
+                LeafOp::Neq | LeafOp::Like => None,
+            }
+        }
+        fn collect(p: &CompiledPredicate, best: &mut Option<AccessLeaf>) {
+            match p {
+                CompiledPredicate::And(ps) => {
+                    for q in ps {
+                        collect(q, best);
+                    }
+                }
+                _ => {
+                    if let Some(l) = leaf_of(p) {
+                        let better = match (&best, &l) {
+                            (None, _) => true,
+                            (Some(AccessLeaf::Eq { .. }), _) => false,
+                            (Some(_), AccessLeaf::Eq { .. }) => true,
+                            _ => false,
+                        };
+                        if better {
+                            *best = Some(l);
+                        }
+                    }
+                }
+            }
+        }
+        let mut best = None;
+        collect(self, &mut best);
+        best
     }
 
     /// Filter membership under SQL `WHERE` semantics: a row is included iff the predicate is TRUE.
@@ -423,6 +485,49 @@ mod tests {
 
     fn row(ts: &TableSchema, j: serde_json::Value) -> Row {
         ts.row_from_json(j.as_object().unwrap()).unwrap()
+    }
+
+    // The access leaf is a conjunct the predicate implies — an equality when one exists (hash
+    // lookup), else a range bound, else None (fallback scan): the standalone index depends on
+    // "leaf not TRUE on a row ⇒ predicate not TRUE on that row".
+    #[test]
+    fn access_leaf_extraction() {
+        let ts = users();
+        let compile = |j: serde_json::Value| {
+            CompiledPredicate::compile(&serde_json::from_value::<PredicateJson>(j).unwrap(), &ts).unwrap()
+        };
+        let name_idx = ts.column_index("name").unwrap();
+        let age_idx = ts.column_index("age").unwrap();
+
+        // A bare equality leaf, and an equality preferred over a range inside a conjunction —
+        // including a nested AND (a conjunct of a conjunct is still necessary).
+        assert_eq!(
+            compile(serde_json::json!({"col":"name","op":"eq","value":"a"})).access_leaf(),
+            Some(AccessLeaf::Eq { col: name_idx, value: Value::Text("a".into()) })
+        );
+        assert_eq!(
+            compile(serde_json::json!({"and":[
+                {"col":"age","op":"gt","value":18},
+                {"and":[{"col":"name","op":"eq","value":"a"}, {"col":"name","op":"like","value":"a%"}]}
+            ]}))
+            .access_leaf(),
+            Some(AccessLeaf::Eq { col: name_idx, value: Value::Text("a".into()) })
+        );
+        // Range-only conjunction -> a bound.
+        assert_eq!(
+            compile(serde_json::json!({"col":"age","op":"gte","value":21})).access_leaf(),
+            Some(AccessLeaf::Lower { col: age_idx, value: Value::Int(21), strict: false })
+        );
+        // OR / NOT / LIKE / != / match-all have no necessary leaf.
+        assert_eq!(
+            compile(serde_json::json!({"or":[
+                {"col":"age","op":"gt","value":18}, {"col":"name","op":"eq","value":"a"}
+            ]}))
+            .access_leaf(),
+            None
+        );
+        assert_eq!(compile(serde_json::json!({"col":"name","op":"neq","value":"a"})).access_leaf(), None);
+        assert_eq!(CompiledPredicate::MatchAll.access_leaf(), None);
     }
 
     // Substituted `$N` param values arrive as quoted string literals; a leaf literal coerces to the

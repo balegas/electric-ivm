@@ -50,6 +50,8 @@ export interface VizNodeData extends Record<string, unknown> {
   highlight?: boolean
   /** `GET /state` key whose live chips this node shows (absent = no state row). */
   stateId?: string
+  /** Retention lifecycle of a shape node — `dormant`/`deactivating`/`reactivating` render parked. */
+  life?: string | null
   ref: NodeRef
   selected?: boolean
   dimmed?: boolean
@@ -112,6 +114,7 @@ function buildFull(g: EngineGraph): { nodes: Map<string, RawNode>; edges: RawEdg
         kind: 'agg',
         label: `${fn}(${s.aggregate.col ?? '*'})`,
         sub: predicateLabel(s.where),
+        life: s.state,
         ref: { kind: 'aggshape', shapeId: s.id },
       })
       edge(tableId(s.table), shapeId, 'flow', predicateLabel(s.where) === 'match all' ? undefined : 'filter')
@@ -125,6 +128,7 @@ function buildFull(g: EngineGraph): { nodes: Map<string, RawNode>; edges: RawEdg
       label: predicateLabel(s.where),
       idTag: s.id,
       highlight: true,
+      life: s.state,
       ref: { kind: 'shape', shapeId: s.id },
     })
 
@@ -241,6 +245,13 @@ export interface BuildOpts {
   /** Force all replication-source nodes into one rank (one aligned column). Done inside dagre via
    *  a hidden root, so downstream placement still avoids node/edge overlaps. */
   alignSources?: boolean
+  /** Sticky positions across publishes (keyed by node id): a node already in the map keeps its
+   *  coordinates — adding/removing shapes never shifts the rest of the canvas. Only genuinely
+   *  new nodes are placed, anchored to their already-placed neighbours (their fresh-dagre offset
+   *  relative to a neighbour is applied to that neighbour's sticky position, averaged), so they
+   *  appear in the right slot of the STABLE frame instead of the re-ranked one. Final positions
+   *  are written back. Clear the map to re-tidy the whole layout (the refresh button). */
+  positions?: Map<string, { x: number; y: number }>
 }
 
 export function layout(
@@ -267,6 +278,45 @@ export function layout(
   }
   dagre.layout(g)
 
+  // Sticky placement: `placed` starts as the caller's cache and grows as this pass assigns
+  // positions, so a chain of new nodes (table → new family → new shape) anchors transitively.
+  const sticky = opts?.positions
+  const placed = new Map(sticky)
+  const dagrePos = (id: string): { x: number; y: number } => {
+    const p = g.node(id)
+    const s = sizeOf(raw.nodes.get(id)!)
+    return { x: p.x - s.w / 2, y: p.y - s.h / 2 }
+  }
+  const neighbours = new Map<string, string[]>()
+  if (sticky) {
+    for (const e of raw.edges) {
+      neighbours.set(e.source, [...(neighbours.get(e.source) ?? []), e.target])
+      neighbours.set(e.target, [...(neighbours.get(e.target) ?? []), e.source])
+    }
+  }
+  const positionOf = (id: string): { x: number; y: number } => {
+    if (!sticky) return dagrePos(id)
+    const hit = placed.get(id)
+    if (hit) return hit
+    const base = dagrePos(id)
+    const anchors = (neighbours.get(id) ?? []).filter((o) => placed.has(o) && raw.nodes.has(o))
+    let pos = base
+    if (anchors.length) {
+      let dx = 0
+      let dy = 0
+      for (const o of anchors) {
+        const op = dagrePos(o)
+        const cp = placed.get(o)!
+        dx += cp.x - op.x
+        dy += cp.y - op.y
+      }
+      pos = { x: base.x + dx / anchors.length, y: base.y + dy / anchors.length }
+    }
+    placed.set(id, pos)
+    sticky.set(id, pos)
+    return pos
+  }
+
   // Connection highlight: when a node is focused, neighbours stay lit and the rest dims.
   let lit: Set<string> | null = null
   if (focus && raw.nodes.has(focus)) {
@@ -278,12 +328,11 @@ export function layout(
   }
 
   const nodes: Node[] = [...raw.nodes.values()].map((n) => {
-    const p = g.node(n.id)
     const s = sizeOf(n)
     return {
       id: n.id,
       type: 'pipeline',
-      position: { x: p.x - s.w / 2, y: p.y - s.h / 2 },
+      position: positionOf(n.id),
       data: { ...n.data, selected: n.id === focus, dimmed: lit ? !lit.has(n.id) : false },
       width: s.w,
       height: s.h,

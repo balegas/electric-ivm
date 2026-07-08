@@ -83,9 +83,10 @@ function chips(s: NodeStateSummary): React.ReactNode {
 export function PipelineNode({ data }: NodeProps) {
   const d = data as VizNodeData
   const meta = KIND_META[d.kind]
+  const parked = d.life === 'dormant' || d.life === 'deactivating' || d.life === 'reactivating'
   return (
     <div
-      className={`pnode pnode-${d.kind}${d.selected ? ' pnode-selected' : ''}${d.dimmed ? ' pnode-dimmed' : ''}`}
+      className={`pnode pnode-${d.kind}${d.selected ? ' pnode-selected' : ''}${d.dimmed ? ' pnode-dimmed' : ''}${parked ? ' pnode-parked' : ''}`}
       style={{ borderColor: meta.color, background: meta.bg }}
     >
       <Handle type="target" position={Position.Left} />
@@ -95,6 +96,7 @@ export function PipelineNode({ data }: NodeProps) {
           {d.idTag ? <span className="pnode-idtag">{d.idTag}</span> : null}
         </span>
         <span className="pnode-tag-r">
+          {parked ? <span className={`pnode-life pnode-life-${d.life}`}>{d.life}</span> : null}
           {d.shared && d.shared > 1 ? <span className="pnode-shared">shared ×{d.shared}</span> : null}
         </span>
       </div>

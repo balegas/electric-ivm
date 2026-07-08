@@ -216,9 +216,9 @@ export interface ChangeEvent {
   row?: Row
 }
 
-export function tableStreamPath(table: string): string {
-  return `table/${table}`
-}
+/** The single ordered change log every table write rides on (replication and library mode). */
+export const CHANGES_STREAM = 'changes'
+
 
 export function shapeStreamPath(shapeId: string): string {
   return `shape/${shapeId}`

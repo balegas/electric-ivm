@@ -159,12 +159,17 @@ export default function App() {
     return () => clearInterval(t)
   }, [load])
 
+  // Sticky node positions across graph publishes: adding/removing shapes places only the new
+  // nodes — everything else keeps its coordinates (and the viewport stays put). The refresh
+  // button clears this for a full re-tidy. Logical and circuit node ids are disjoint, so one map
+  // serves both views (positions also survive view toggles and select-mode filtering).
+  const stickyPositions = useRef(new Map<string, { x: number; y: number }>())
   const { nodes, edges } = useMemo<{ nodes: Node[]; edges: Edge[] }>(() => {
     if (!graph) return { nodes: [], edges: [] }
     if (mode === 'select' && selected.size === 0) return { nodes: [], edges: [] }
     const sel = mode === 'all' ? 'all' : selected
     // alignSources pins every replication-source node into the leftmost rank.
-    const opts = { alignSources: true }
+    const opts = { alignSources: true, positions: stickyPositions.current }
     return view === 'circuit' ? buildCircuit(graph, sel, focus?.id ?? null, opts) : buildGraph(graph, sel, focus?.id ?? null, opts)
   }, [graph, mode, selected, focus, view])
 
@@ -440,7 +445,14 @@ export default function App() {
           </button>
         </div>
         <div className="toolbar">
-          <button className="btn btn-icon" title="Refresh" onClick={() => void load()}>
+          <button
+            className="btn btn-icon"
+            title="Refresh + re-tidy the layout (node positions are otherwise sticky)"
+            onClick={() => {
+              stickyPositions.current.clear()
+              void load()
+            }}
+          >
             ↻
           </button>
           <button
@@ -497,6 +509,9 @@ export default function App() {
                       <span className="shape-id">{s.id}</span>
                       <span className={`badge ${k.cls}`}>{k.label}</span>
                       {s.changesOnly ? <span className="badge k-feed">feed</span> : null}
+                      {s.state && s.state !== 'active' ? (
+                        <span className={`badge k-life k-life-${s.state}`}>{s.state}</span>
+                      ) : null}
                       <span
                         className="shape-del"
                         role="button"

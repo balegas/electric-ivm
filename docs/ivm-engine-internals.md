@@ -17,7 +17,7 @@ Three layers, one idea — *maintain query results incrementally as the database
 
 ```
   app ──writes──▶ POSTGRES (system of record)
-                     │  logical replication (test_decoding slot, REPLICA IDENTITY FULL)
+                     │  logical replication (streaming pgoutput slot, REPLICA IDENTITY FULL)
                      ▼
                   INGESTOR (replication.rs) ── decode commits → envelopes (old+new, commit LSN)
                      │  append
@@ -42,14 +42,15 @@ Baseline engine RSS is ~19 MiB whether the database has 1,000 or 100,000 rows
 
 ### What dbsp is, and isn't, here
 
-The crate is named after [`dbsp`](https://crates.io/crates/dbsp) and the data model borrows
+The repo is named after [`dbsp`](https://crates.io/crates/dbsp) and the data model borrows
 its vocabulary — rows carry signed weights and a change is a **Z-set delta**. But there is
-**no running dbsp circuit and no per-shape thread**. dbsp survives only as the *value types*
-for deltas: `Row` (a positional `Vec<Value>`), `Tup2<Row, ZWeight>`, and `ZWeight` (a signed
-`i64` multiplicity) in `value.rs`. The live-maintenance path is plain Rust: key routing and
-stateless tri-valued predicate evaluation. (An earlier design did run a shared dbsp join per
-equality template; it was removed to drop the table-copy-per-template memory. See
-`reduce-engine-memory-design.md`.)
+**no running dbsp circuit, no per-shape thread, and no dbsp dependency**: the delta value
+types (`Row`, a positional `Vec<Value>`; `Tup2<Row, ZWeight>`; and `ZWeight`, a signed `i64`
+multiplicity) are defined locally in `value.rs`. The live-maintenance path is plain Rust: key
+routing and stateless tri-valued predicate evaluation. (An earlier design did run a shared
+dbsp join per equality template; it was removed to drop the table-copy-per-template memory —
+a structural rejection made at defaults, before dbsp's storage spilling, shared circuits, or
+multi-worker tuning were exercised. See `reduce-engine-memory-design.md`.)
 
 ### A change is a Z-set delta
 
@@ -70,12 +71,13 @@ prior tuple), so no local table state is needed to retract a row.
 
 ### 2.1 Ingest (`replication.rs`)
 
-The engine creates a `test_decoding` logical-replication slot and **peeks** it
-(`pg_logical_slot_peek_changes`, non-consuming). It buffers each transaction and stamps every
-change with its transaction's **COMMIT LSN** (taken from the `COMMIT` record, not the
-per-change record LSN). It appends the resulting `Envelope`s (with `old` + `new`) to the
-`table/<name>` durable stream, and only **then** advances the slot. A failed append re-reads
-rather than loses data (read-then-commit).
+The engine creates a `pgoutput` logical-replication slot (+ a `<slot>_pub` publication) and
+**streams** it over the walsender protocol (push delivery — no poll interval). It buffers each
+transaction between `Begin` and `Commit` and stamps every change with its transaction's
+**COMMIT LSN** (not the per-change record LSN). It appends the resulting `Envelope`s (with
+`old` + `new`) to the `table/<name>` durable stream, and only **then** acknowledges the commit
+to Postgres (`confirmed_flush_lsn`). A failed append tears the connection down unacknowledged;
+the server resends from the confirmed position (append-then-acknowledge).
 
 The `Envelope` (`ds.rs`) is the unit on every stream:
 
@@ -88,7 +90,7 @@ Envelope { type, key, value, old, headers { operation, txid, offset, lsn } }
 When a shape is created, its initial rows are read from Postgres in a single `REPEATABLE READ`
 snapshot (`pg.rs::backfill`), with the predicate **pushed into the `SELECT`**. Text-mapped
 columns are read with `::text` casts (`row_json_expr`) so backfilled values are byte-identical
-to what `test_decoding` prints on the live path (timestamps, uuids, jsonb — a representation
+to what pgoutput's text-mode tuples carry on the live path (timestamps, uuids, jsonb — a representation
 mismatch breaks retractions, key routing, and MIN/MAX multisets).
 
 Live and backfill are reconciled by **transaction visibility** (`pg::SnapshotGate`), so every
@@ -106,12 +108,12 @@ duplicates at the exact boundary; the xid gate decides both cases. Guarded by
 
 ### 2.3 Tail and fan-out (`engine.rs`)
 
-There is **one tailer task per table** (`tailer_loop`). It long-polls `table/<name>`, and for
-each change:
+There is **one sequencer task for all tables** (`sequencer_loop`) — the LSN-ordered executor.
+It long-polls the single `changes` log (whole commits, in commit order) and for each change:
 
-1. **de-duplicate**: skip if the envelope's `(commit lsn, seq)` is at/below the tailer's
-   highwater — the ingestor's delivery is at-least-once (re-appends after a partial failure or
-   a crash before the slot advance), and deltas are not idempotent for aggregates/subquery
+1. **de-duplicate**: skip if the envelope's `(commit lsn, seq)` is at/below the sequencer's
+   global highwater — the ingestor's delivery is at-least-once (unacknowledged commits
+   re-deliver after a reconnect), and deltas are not idempotent for aggregates/subquery
    weights;
 2. build the delta (`apply_envelope`);
 3. skip per shape via its `SnapshotGate` (§2.2);
@@ -120,7 +122,7 @@ each change:
 5. stage output envelopes in `pending: HashMap<stream_path, Vec<Envelope>>`;
 6. `flush_pending` appends them, bounded-concurrently (CAP=32) across streams, with
    **`append_reliable`** — transient storage failures retry with capped backoff
-   (backpressuring the tailer) rather than dropping; the only non-retried case is 404 (the
+   (backpressuring the sequencer) rather than dropping; the only non-retried case is 404 (the
    shape was dropped mid-flush). A dropped shape append would be a permanent divergence for
    every subscriber, so the batch is not "processed" until every append lands.
 
@@ -129,10 +131,13 @@ envelope (the row entered or updated the result), a purely negative pk → a `de
 Each envelope keeps its originating `txid` (`awaitTxId`) and its commit `lsn` (subset
 positioning).
 
-Processing is **serial within a table** (one task), which makes ordering and state trivially
-correct; the only intra-batch parallelism is the append flush. After a batch is fully fanned
-out **and every append has landed**, the tailer publishes its processed offset as a sound
-convergence barrier.
+Processing is **serial in commit order across all tables** (one task), which makes global
+ordering and state trivially correct, and each source transaction's appends are flushed before
+the next transaction is processed — **per-transaction atomic emission**; the only intra-txn
+parallelism is the append flush. After a batch is fully fanned out **and every append has
+landed**, the sequencer publishes its processed offset as a sound convergence barrier. Shape
+creation is two-phase (pending buffer → concurrent pooled backfill → gated activation) so a
+backfill never stalls the pipeline.
 
 ---
 
@@ -188,17 +193,17 @@ delta.iter().filter(|t| pred.matches(&t.0)).cloned().collect()
 UNKNOWN, AND/OR follow SQL truth tables, `NOT UNKNOWN = UNKNOWN`, and a row is included only
 when the predicate is TRUE. Backfill pushes the same predicate into the `SELECT`.
 
-State retained: **none**. Cost: `O(K)` predicate evaluations per change for `K` standalone
-shapes on that table — every standalone shape is tested on every change (no pruning). This is
-the one strategy whose *per-change compute* grows with shape count; it is CPU-bound and cheap
-per eval, but it is the scaling watch-item (see §4.4 and the predicate-indexing idea in
-`ARCHITECTURE.md` §9).
+State retained: **none**. Cost: output-sensitive — a **necessary-conjunct index** maps each
+change to the candidate shapes whose indexed conjunct (an equality, or a range bound) it
+satisfies; only candidates are evaluated. Predicates with no indexable conjunct (top-level
+OR/NOT, `LIKE`, `!=`, `IS NULL`, match-all) stay on a fallback scan list and are evaluated on
+every change, so a deployment leaning on many such shapes still degrades linearly (see §4.4).
 
 ### 3.3 Subqueries → shared inner-set nodes (`subquery.rs`)
 
 A subquery shape's `WHERE` contains `col [NOT] IN (SELECT proj FROM inner WHERE …)`, possibly
 nested. Subqueries are inherently cross-table (a change to `inner` moves rows of the outer
-table), so they route through one shared `Arc<Mutex<SubqueryRegistry>>` that every tailer calls.
+table), so they route through one shared `Arc<Mutex<SubqueryRegistry>>` the sequencer calls.
 
 **Node — the shared, maintained inner set.** A `SubqueryNode` materializes
 `SELECT proj FROM inner WHERE pred` as a value set, keyed by a canonical signature
@@ -226,13 +231,17 @@ subqueries).
    record per-value **flips** (`∅→nonempty` = *enter*, `nonempty→∅` = *leave*).
 2. **For each flipped value `v` of node `N`:** for every edge on `N`, the affected dependent
    rows are exactly those with `col = v`. Query them (`SELECT … WHERE col = v`) and either
-   reconcile a parent node (recurse) or re-evaluate the outer shape predicate.
+   reconcile a parent node (recurse) or re-evaluate the outer shape predicate. This propagation
+   runs **deferred, on the engine's single flip-propagator task** — the sequencer only collects the
+   flips; the query-backs neither block it nor hold the registry lock (evaluation and the
+   resulting append still happen atomically under it). The in-flight flip count is the extra
+   convergence-barrier term (`GET /replication/lsn` → `pendingFlips`).
 3. **`table` is a SubqueryShape's outer table:** evaluate the shape filter on the delta with
    `matches_ctx` (subquery leaves consult node sets) — the normal enter/leave/update path.
 
 **The critical correctness rule:** outer membership is emitted **absolutely**, not as a delta
 — `emit_shape_delta` emits each touched pk's *current* membership (`upsert` if it now matches,
-else idempotent `delete` by pk). Because per-table tailers process out of global commit order,
+else idempotent `delete` by pk). Because deferred flip propagation runs out of commit order,
 a delta-based "delete only if the old row matched" would miss move-outs. Absolute emission
 converges regardless of cross-table order, which is why we don't need Electric's LSN-buffering /
 row-tag streaming protocol — our conformance asserts *convergence after drain*, not a control-
@@ -249,7 +258,7 @@ fetched by a keyed query-back on flip.
 | Predicate | `a=1 AND b=2` | ranges, OR, NOT, ≠ | `col [NOT] IN (SELECT …)` |
 | State retained | `O(#shapes)` routing entries | none | `O(inner-set)` pks, **shared** |
 | Shared across shapes? | yes — 1 router / template | no (but no state to share) | yes — 1 node / `sig` |
-| Per-change compute | `O(log N)` routed | `O(K)` evals (all standalone shapes) | node reconcile + keyed query-back per flipped value |
+| Per-change compute | `O(log N)` routed | output-sensitive via conjunct index (`O(K)` fallback for un-indexable predicates) | node reconcile + keyed query-back per flipped value |
 | Table copies | 0 | 0 | 0 |
 
 ### 3.5 Full shape de-duplication (the sharing layer above the strategies)
@@ -361,11 +370,10 @@ For one table change:
 
 - **Routed (equality):** `O(log N)` to find the shapes on the changed key, then one append per
   matched shape. Independent of shapes on other keys.
-- **Standalone:** `O(K)` predicate evaluations, `K` = standalone shapes on that table. This is
-  the term that grows with shape count on the live path. Each eval is cheap (a compiled
-  predicate tree over a positional row), but there is no pruning. If a deployment leans on many
-  distinct *range* shapes, this is the first thing to index (`ARCHITECTURE.md` §9: index
-  standalone predicates by `(column, op)` to turn `O(K)` into output-sensitive).
+- **Standalone:** output-sensitive. The necessary-conjunct index prunes to candidates by
+  equality hash lookup / ordered range-bound scan; each candidate then pays one full predicate
+  eval. Only shapes with no indexable conjunct (top-level OR/NOT, `LIKE`, `!=`) are evaluated
+  on every change — that fallback list is the remaining `O(K)` term to watch.
 - **Subquery:** an inner change reconciles the node (`O(1)` per changed inner row) and, per
   *flipped value*, runs one keyed `SELECT … WHERE col = v` per dependent edge plus a re-eval.
   An outer change is `matches_ctx` = `O(1)` node lookups per subquery leaf. The pathological
@@ -381,9 +389,19 @@ dominate.
 
 The engine does **not** page state to disk, and does not need to: there is no table-scale
 resident state to spill. Per-shape routing metadata, subquery contributor sets, and running
-aggregates are the only retained structures, and they are small (§4.2). If a future workload
-ever demands disk-backed metadata, the natural path is an embedded KV (redb/lmdb/sled) under
-the engine's own structures — not a query-engine storage subsystem.
+aggregates are the only retained structures, and they are small (§4.2).
+
+What IS durable is the **shape catalog** (`meta/catalog`, an append-only durable stream of
+create/join/leave/drop events plus change-log offset checkpoints): at boot the engine replays
+it and re-registers its shapes itself, so a restart is not a client re-registration storm.
+Plain/routed shapes resume with passthrough gates and replay the change log from the persisted
+offset (crash-window re-emission is idempotent absolute upserts); aggregates re-seed their fold
+from a fresh Postgres snapshot whose gate then skips the replayed history. Subquery shapes are
+deliberately NOT restored — their inner-node contributor state is not persisted, and a
+fresh-seeded node cannot detect flips that happened while the engine was down (stale move-outs
+would persist forever) — so they are dropped loudly and clients recreate them. The catalog
+stream is never compacted (append-only); if event volume ever matters, snapshot+truncate or an
+embedded KV (redb/lmdb/sled) is the natural next step.
 
 In short: **disk is not a tuning lever; the memory story is "keep nothing big resident," and
 the engine does.**
@@ -416,14 +434,14 @@ see only issues in projects they're a member of. That is a subquery shape:
 
 **Live cost (membership changes — user added to a project):**
 
-1. Insert into `project_members` lands on that table's tailer → registry reconciles the node →
+1. Insert into `project_members` reaches the sequencer → registry reconciles the node →
    value `project_id = P` flips **enter** (its contributor set went `∅→{pk}`).
 2. For the edge, the engine queries the outer rows that could change:
    `SELECT … FROM issues WHERE project_id = P`, re-evaluates the shape predicate, and emits
    `upsert` for each now-visible issue → appended to `shape/<id>`.
 3. The client's TanStack DB collection receives the upserts; the board updates live.
 
-**Live cost (an issue moves projects):** lands on the `issues` tailer → `matches_ctx` checks
+**Live cost (an issue moves projects):** reaches the sequencer → `matches_ctx` checks
 `new.project_id ∈ node` and `old.project_id ∈ node` → emits `upsert`/`delete` accordingly.
 `O(1)` node lookups, no inner-table query.
 
@@ -451,9 +469,9 @@ bounded keyset range query folded into the `WHERE`, so the engine never holds a 
 
 | path | role |
 |---|---|
-| `apps/engine/src/engine.rs` | tailers (+ (lsn,seq) de-dup), delta computation, key routing + standalone + aggregation fan-out, shape sharing/lifecycle, reliable flush |
+| `apps/engine/src/engine.rs` | the LSN-ordered sequencer (+ global (lsn,seq) de-dup), delta computation, key routing + standalone + aggregation fan-out, shape sharing/lifecycle, per-txn reliable flush |
 | `apps/engine/src/subquery.rs` | cross-table subquery registry: shared nodes, edges, flips, absolute emission, atomic create/rollback |
-| `apps/engine/src/replication.rs` | Postgres logical-replication ingestor (capped peek, buffer per-txn, stamp commit LSN + xid + seq, append, advance) |
+| `apps/engine/src/replication.rs` | Postgres logical-replication ingestor (streaming pgoutput, buffer per-txn, stamp commit LSN + xid + seq, append, acknowledge) |
 | `apps/engine/src/pg.rs` | connect/introspect, `REPLICA IDENTITY FULL`, slot create, predicate-pushdown backfill + `SnapshotGate`, subset query-back |
 | `apps/engine/src/predicate.rs` | predicate compile, three-valued `matches`/`matches_ctx`, `equality_template`, subquery signatures |
 | `apps/engine/src/sql.rs` / `where_sql.rs` | predicate → SQL (backfill pushdown); SQL `WHERE` → predicate (Electric path) |

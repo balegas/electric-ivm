@@ -40,7 +40,8 @@ pub struct Config {
     pub slot: String,
     /// Tables to replicate (`ELECTRIC_IVM_PG_TABLES`); empty / `["*"]` = introspect all.
     pub tables: Vec<String>,
-    /// Replication-slot poll interval (ms).
+    /// Legacy replication poll interval (ms). Unused since the ingestor streams pgoutput (push
+    /// delivery); still parsed so existing `ELECTRIC_IVM_PG_POLL_MS` settings are accepted.
     pub poll_ms: u64,
     /// This instance's id — tags every StatsD metric.
     pub instance_id: String,
@@ -56,6 +57,13 @@ pub struct Config {
     pub storage_dir: Option<String>,
     /// Optional second listener serving Prometheus text (`ELECTRIC_PROMETHEUS_PORT`).
     pub prometheus_port: Option<u16>,
+    /// Max pooled Postgres connections for backfills/query-backs (`ELECTRIC_DB_POOL_SIZE`, default 20).
+    pub db_pool_size: usize,
+    /// Register the introspection surface (`/trace` SSE + `/graph`(`/node`) + `/state`(`/node`) —
+    /// the pipeline-visualizer backend). `ELECTRIC_IVM_TRACE=0|false|off` disables it: the routes
+    /// are never registered, so nothing can subscribe and the hot-path trace gating stays on its
+    /// zero-subscriber fast path. Default on. Note: the surface is unauthenticated either way.
+    pub trace: bool,
     /// Unknown/unimplemented `ELECTRIC_*` vars, accepted as no-ops and logged once at boot.
     pub noop_vars: Vec<String>,
 }
@@ -75,6 +83,7 @@ const HANDLED: &[&str] = &[
     "ELECTRIC_LIVE_TIMEOUT_MS",
     "ELECTRIC_HANDLE_TTL",
     "ELECTRIC_PROMETHEUS_PORT",
+    "ELECTRIC_DB_POOL_SIZE",
 ];
 
 fn nonempty(s: Option<String>) -> Option<String> {
@@ -185,6 +194,14 @@ impl Config {
 
         let storage_dir = g("ELECTRIC_STORAGE_DIR");
         let prometheus_port = g("ELECTRIC_PROMETHEUS_PORT").and_then(|s| s.trim().parse().ok());
+        let db_pool_size = g("ELECTRIC_DB_POOL_SIZE")
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(20);
+
+        let trace = g("ELECTRIC_IVM_TRACE")
+            .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+            .unwrap_or(true);
 
         Config {
             pg_url,
@@ -201,6 +218,8 @@ impl Config {
             secret,
             storage_dir,
             prometheus_port,
+            db_pool_size,
+            trace,
             noop_vars: Vec::new(),
         }
     }
@@ -220,7 +239,7 @@ impl Config {
     pub fn redacted(&self) -> String {
         format!(
             "bind={} pg_url={} ds_url={} slot={} instance_id={} stack_id={} statsd={} metrics_period={:?} \
-             secret={} storage_dir={} prometheus_port={:?} log={}",
+             secret={} storage_dir={} prometheus_port={:?} trace={} log={}",
             self.bind,
             self.pg_url.as_deref().map(redact_url).unwrap_or_else(|| "<none>".into()),
             self.ds_url.as_deref().unwrap_or("<none>"),
@@ -232,6 +251,7 @@ impl Config {
             if self.secret.is_some() { "<redacted>" } else { "<none>" },
             self.storage_dir.as_deref().unwrap_or("<none>"),
             self.prometheus_port,
+            self.trace,
             self.log_filter,
         )
     }
@@ -417,10 +437,20 @@ mod tests {
     }
 
     #[test]
+    fn trace_flag() {
+        assert!(cfg(&[]).trace, "introspection defaults on");
+        assert!(!cfg(&[("ELECTRIC_IVM_TRACE", "0")]).trace);
+        assert!(!cfg(&[("ELECTRIC_IVM_TRACE", "false")]).trace);
+        assert!(!cfg(&[("ELECTRIC_IVM_TRACE", "off")]).trace);
+        assert!(cfg(&[("ELECTRIC_IVM_TRACE", "1")]).trace);
+        assert!(cfg(&[("ELECTRIC_IVM_TRACE", "true")]).trace);
+    }
+
+    #[test]
     fn noop_var_detection() {
         assert!(is_noop_var("ELECTRIC_CACHE_MAX_AGE"));
         assert!(is_noop_var("ELECTRIC_OTLP_ENDPOINT"));
-        assert!(is_noop_var("ELECTRIC_DB_POOL_SIZE"));
+        assert!(!is_noop_var("ELECTRIC_DB_POOL_SIZE")); // handled: sizes the backfill pool
         assert!(!is_noop_var("ELECTRIC_PORT")); // handled
         assert!(!is_noop_var("ELECTRIC_IVM_PG_URL")); // internal
         assert!(!is_noop_var("DATABASE_URL")); // not an ELECTRIC_ var

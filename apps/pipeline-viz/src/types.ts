@@ -26,6 +26,8 @@ export interface GraphShape {
   isSubquery: boolean
   /** Present iff this shape is a scalar aggregation (COUNT/SUM/AVG/MIN/MAX over `where`). */
   aggregate: { func: string; col: string | null } | null
+  /** Retention lifecycle: a dormant shape keeps its stream + record but holds no routing state. */
+  state: 'active' | 'deactivating' | 'dormant' | 'reactivating' | null
 }
 
 export interface GraphNode {
