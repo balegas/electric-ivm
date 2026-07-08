@@ -1213,6 +1213,106 @@ impl Engine {
         let stream_path = format!("shape/{id}");
         self.ds.ensure_stream(&stream_path).await?;
 
+        // Circuit-served path: when serving is enabled and the predicate decomposes over the
+        // compiled arrangements, the shape is seeded from snapshots inside the sequencer — no
+        // Postgres backfill, no gate. Bookkeeping (catalog/sharing/lives) matches the legacy
+        // path exactly. `changes_only` feeds stay on the legacy (passthrough) path.
+        if !changes_only && self.dbsp_serve.load(std::sync::atomic::Ordering::Acquire) {
+            let arr = self.arrangements.lock().unwrap().clone();
+            if let Some(arr) = arr {
+                if let Some(plan) = plan_circuit_shape(where_.as_ref(), &ts, &st.tables, &arr) {
+                    let residual = match plan.residual.as_ref() {
+                        Some(r) => Some(Arc::new(CompiledPredicate::compile(r, &ts)?)),
+                        None => None,
+                    };
+                    let placement = match &plan.constraint {
+                        PlannedConstraint::All => CircuitPlacement { label: "all".into(), col: None, counts: false },
+                        PlannedConstraint::Static { col, .. } => CircuitPlacement {
+                            label: format!("static:{}", ts.columns[*col].0), col: Some(*col), counts: false,
+                        },
+                        PlannedConstraint::Dynamic { col, .. } => CircuitPlacement {
+                            label: format!("dynamic:{}", ts.columns[*col].0), col: Some(*col), counts: false,
+                        },
+                    };
+                    let cmd_tx = self.ensure_sequencer(&mut st).cmd_tx.clone();
+                    let (ready_tx2, ready_rx2) = tokio::sync::oneshot::channel();
+                    cmd_tx
+                        .send(SequencerCmd::CreateCircuitShape {
+                            table: table.to_string(),
+                            shape_id: id.clone(),
+                            num_id,
+                            stream_path: stream_path.clone(),
+                            constraint: plan.constraint,
+                            residual,
+                            out_cols: out_cols.clone(),
+                            seed: true,
+                            ready: ready_tx2,
+                        })
+                        .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
+                    let rec = ShapeRecord {
+                        id: id.clone(),
+                        table: table.to_string(),
+                        stream_path: stream_path.clone(),
+                        changes_only,
+                        where_json: where_.clone(),
+                        columns: col_names,
+                        family_key: None,
+                        // Truthful metadata: the field describes the predicate, not the
+                        // executor — a circuit-served membership shape is still a subquery.
+                        is_subquery: where_.as_ref().is_some_and(predicate_has_subquery),
+                        aggregate: None,
+                    };
+                    st.shapes.insert(id.clone(), rec.clone());
+                    st.circuit_placement.insert(id.clone(), placement);
+                    let _ = self.catalog_tx.send(CatalogEvent::Created { rec: rec.clone(), sig: feed_sig.clone() });
+                    self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
+                    self.ensure_retention_sweeper();
+                    let (share_tx, share_rx) = tokio::sync::watch::channel(None);
+                    if let Some(sig) = feed_sig {
+                        st.feed_by_sig.insert(sig.clone(), id.clone());
+                        st.feed_shares.insert(id.clone(), FeedShare { sig, refcount: 1, ready: share_rx });
+                    }
+                    drop(st);
+                    return match ready_rx2
+                        .await
+                        .unwrap_or_else(|_| Err("sequencer dropped the ready channel".to_string()))
+                    {
+                        Ok(_seeded) => {
+                            let _ = share_tx.send(Some(true));
+                            trace_lifecycle(
+                                &self.trace_tx,
+                                crate::trace::GraphLifecycle::ShapeAdded {
+                                    shape: rec.id.clone(),
+                                    table: rec.table.clone(),
+                                },
+                            );
+                            crate::statsd::create_snapshot_task(created_at.elapsed());
+                            Ok(rec)
+                        }
+                        Err(e) => {
+                            let mut st = self.state.lock().await;
+                            st.shapes.remove(&id);
+                            st.circuit_placement.remove(&id);
+                            let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
+                            if let Some(share) = st.feed_shares.remove(&id) {
+                                st.feed_by_sig.remove(&share.sig);
+                            }
+                            if let Some(seq) = st.sequencer.as_ref() {
+                                let _ = seq.cmd_tx.send(SequencerCmd::RemoveShape {
+                                    table: rec.table.clone(),
+                                    shape_id: id.clone(),
+                                });
+                            }
+                            drop(st);
+                            let _ = share_tx.send(Some(false));
+                            let _ = self.ds.delete_stream(&rec.stream_path).await;
+                            bail!("shape '{id}' creation failed: {e}")
+                        }
+                    };
+                }
+            }
+        }
+
         // Subquery shapes (`col IN (SELECT …)`) are maintained by the cross-table registry, not by a
         // tailer's local routing. Ensure a tailer exists for the outer table AND every referenced inner
         // table (so their deltas reach the registry), then register + backfill via the registry.
@@ -1283,104 +1383,6 @@ impl Engine {
                     let _ = ready_tx.send(Some(false));
                     let _ = self.ds.delete_stream(&stream_path).await;
                     return Err(e);
-                }
-            }
-        }
-
-        // Circuit-served path: when serving is enabled and the predicate decomposes over the
-        // compiled arrangements, the shape is seeded from snapshots inside the sequencer — no
-        // Postgres backfill, no gate. Bookkeeping (catalog/sharing/lives) matches the legacy
-        // path exactly. `changes_only` feeds stay on the legacy (passthrough) path.
-        if !changes_only && self.dbsp_serve.load(std::sync::atomic::Ordering::Acquire) {
-            let arr = self.arrangements.lock().unwrap().clone();
-            if let Some(arr) = arr {
-                if let Some(plan) = plan_circuit_shape(where_.as_ref(), &ts, &st.tables, &arr) {
-                    let residual = match plan.residual.as_ref() {
-                        Some(r) => Some(Arc::new(CompiledPredicate::compile(r, &ts)?)),
-                        None => None,
-                    };
-                    let placement = match &plan.constraint {
-                        PlannedConstraint::All => CircuitPlacement { label: "all".into(), col: None, counts: false },
-                        PlannedConstraint::Static { col, .. } => CircuitPlacement {
-                            label: format!("static:{}", ts.columns[*col].0), col: Some(*col), counts: false,
-                        },
-                        PlannedConstraint::Dynamic { col, .. } => CircuitPlacement {
-                            label: format!("dynamic:{}", ts.columns[*col].0), col: Some(*col), counts: false,
-                        },
-                    };
-                    let cmd_tx = self.ensure_sequencer(&mut st).cmd_tx.clone();
-                    let (ready_tx2, ready_rx2) = tokio::sync::oneshot::channel();
-                    cmd_tx
-                        .send(SequencerCmd::CreateCircuitShape {
-                            table: table.to_string(),
-                            shape_id: id.clone(),
-                            num_id,
-                            stream_path: stream_path.clone(),
-                            constraint: plan.constraint,
-                            residual,
-                            out_cols: out_cols.clone(),
-                            seed: true,
-                            ready: ready_tx2,
-                        })
-                        .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
-                    let rec = ShapeRecord {
-                        id: id.clone(),
-                        table: table.to_string(),
-                        stream_path: stream_path.clone(),
-                        changes_only,
-                        where_json: where_.clone(),
-                        columns: col_names,
-                        family_key: None,
-                        is_subquery: false,
-                        aggregate: None,
-                    };
-                    st.shapes.insert(id.clone(), rec.clone());
-                    st.circuit_placement.insert(id.clone(), placement);
-                    let _ = self.catalog_tx.send(CatalogEvent::Created { rec: rec.clone(), sig: feed_sig.clone() });
-                    self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
-                    self.ensure_retention_sweeper();
-                    let (share_tx, share_rx) = tokio::sync::watch::channel(None);
-                    if let Some(sig) = feed_sig {
-                        st.feed_by_sig.insert(sig.clone(), id.clone());
-                        st.feed_shares.insert(id.clone(), FeedShare { sig, refcount: 1, ready: share_rx });
-                    }
-                    drop(st);
-                    return match ready_rx2
-                        .await
-                        .unwrap_or_else(|_| Err("sequencer dropped the ready channel".to_string()))
-                    {
-                        Ok(_seeded) => {
-                            let _ = share_tx.send(Some(true));
-                            trace_lifecycle(
-                                &self.trace_tx,
-                                crate::trace::GraphLifecycle::ShapeAdded {
-                                    shape: rec.id.clone(),
-                                    table: rec.table.clone(),
-                                },
-                            );
-                            crate::statsd::create_snapshot_task(created_at.elapsed());
-                            Ok(rec)
-                        }
-                        Err(e) => {
-                            let mut st = self.state.lock().await;
-                            st.shapes.remove(&id);
-                            st.circuit_placement.remove(&id);
-                            let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
-                            if let Some(share) = st.feed_shares.remove(&id) {
-                                st.feed_by_sig.remove(&share.sig);
-                            }
-                            if let Some(seq) = st.sequencer.as_ref() {
-                                let _ = seq.cmd_tx.send(SequencerCmd::RemoveShape {
-                                    table: rec.table.clone(),
-                                    shape_id: id.clone(),
-                                });
-                            }
-                            drop(st);
-                            let _ = share_tx.send(Some(false));
-                            let _ = self.ds.delete_stream(&rec.stream_path).await;
-                            bail!("shape '{id}' creation failed: {e}")
-                        }
-                    };
                 }
             }
         }
@@ -2316,12 +2318,23 @@ impl Engine {
                     st.next_shape_id = st.next_shape_id.max(num + 1);
                 }
                 if rec.is_subquery {
-                    tracing::warn!(
-                        "restore: dropping subquery shape {id} (inner-node state is not persisted);                          subscribers observe the deleted stream and recreate"
-                    );
-                    let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
-                    dead_streams.push(rec.stream_path.clone());
-                    continue;
+                    // Circuit-served subquery shapes need no registry state: they re-register
+                    // against the arrangements (seed=false) like any other circuit shape.
+                    let circuit_ok = self.dbsp_serve.load(std::sync::atomic::Ordering::Acquire)
+                        && self.arrangements.lock().unwrap().clone().is_some_and(|arr| {
+                            compiled.get(&rec.table).is_some_and(|ts| {
+                                plan_circuit_shape(rec.where_json.as_ref(), ts, compiled, &arr)
+                                    .is_some()
+                            })
+                        });
+                    if !circuit_ok {
+                        tracing::warn!(
+                            "restore: dropping subquery shape {id} (inner-node state is not persisted);                          subscribers observe the deleted stream and recreate"
+                        );
+                        let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
+                        dead_streams.push(rec.stream_path.clone());
+                        continue;
+                    }
                 }
                 st.shapes.insert(id.clone(), rec.clone());
                 if let Some(sig) = sig {
@@ -2395,7 +2408,6 @@ impl Engine {
         let ts = compiled
             .get(&rec.table)
             .with_context(|| format!("table '{}' no longer exists", rec.table))?;
-        let pred = Arc::new(CompiledPredicate::compile_opt(rec.where_json.as_ref(), ts)?);
         let out_cols: Option<Arc<Vec<usize>>> = match &rec.columns {
             Some(names) => {
                 let idx: Result<Vec<usize>> = names.iter().map(|n| ts.column_index(n)).collect();
@@ -2488,6 +2500,9 @@ impl Engine {
                 }
             }
         }
+        // Compiled lazily, after the circuit branch: a circuit-served subquery record never
+        // needs (and could not build) a registry-free compiled predicate.
+        let pred = Arc::new(CompiledPredicate::compile_opt(rec.where_json.as_ref(), ts)?);
         let (kind, changes_only, is_aggregate) = match &rec.aggregate {
             Some(a) => {
                 let col = a.col.as_deref().map(|c| ts.column_index(c)).transpose()?;
@@ -2932,7 +2947,11 @@ pub struct CircuitPlacement {
 }
 
 /// Planner output: the shape's cohort constraint (see [`CohortGroups`] for the live form).
+/// `All`/`Static` are classified (so a cohort leaf is recognized and kept out of the
+/// residual) but currently never planned — the legacy tiers route those by index; they are
+/// the seams for a future group-indexed static tier.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub(crate) enum PlannedConstraint {
     All,
     Static { col: usize, keys: std::collections::HashSet<Value> },
@@ -2944,18 +2963,20 @@ pub(crate) struct CircuitPlan {
     pub residual: Option<PredicateJson>,
 }
 
-/// Decompose `where_` into a cohort constraint plus a residual conjunction. Returns `None`
-/// when the predicate cannot be circuit-served (nested/negated/multiple subqueries, or a
-/// subquery whose columns are not arrangement-indexed) — those fall back to the registry.
+/// Decompose `where_` into a cohort constraint plus a residual conjunction. Returns a plan
+/// only for **dynamic** (membership-subquery) constraints: static equality and match-all
+/// shapes stay on the KeyRouter/standalone tiers, whose routing indexes make them
+/// output-sensitive — serving them from the circuit would replace an indexed route with a
+/// linear per-delta scan. `None` therefore means "serve on the legacy tier" (which for
+/// unplannable subqueries — nested/negated/multiple, or unindexed columns — is the registry).
 fn plan_circuit_shape(
     where_: Option<&PredicateJson>,
     ts: &TableSchema,
     schemas: &HashMap<String, TableSchema>,
     arr: &crate::arrangements::Arrangements,
 ) -> Option<CircuitPlan> {
-    let Some(p) = where_ else {
-        return Some(CircuitPlan { constraint: PlannedConstraint::All, residual: None });
-    };
+    // Match-all shapes are already optimal on the legacy tier (a bare fan-out, no state).
+    let p = where_?;
     let children: Vec<PredicateJson> = match p {
         PredicateJson::And { and } => and.clone(),
         other => vec![other.clone()],
@@ -2975,12 +2996,19 @@ fn plan_circuit_shape(
         }
         residual.push(child);
     }
+    let constraint = match constraint {
+        Some(c @ PlannedConstraint::Dynamic { .. }) => c,
+        // Static/match-all shapes: the legacy tiers already route them by index; a circuit
+        // shape would be a linear scan per delta. Put any classified leaf back in the
+        // residual conceptually by declining the plan altogether.
+        _ => return None,
+    };
     let residual = match residual.len() {
         0 => None,
         1 => residual.into_iter().next(),
         _ => Some(PredicateJson::And { and: residual }),
     };
-    Some(CircuitPlan { constraint: constraint.unwrap_or(PlannedConstraint::All), residual })
+    Some(CircuitPlan { constraint, residual })
 }
 
 /// Classify one AND-child as a cohort constraint, if its column(s) are arrangement-indexed:
@@ -3105,7 +3133,9 @@ fn plan_circuit_agg(
     Some(constraints)
 }
 
-/// Live group membership of a circuit-served shape.
+/// Live group membership of a circuit-served shape. (`All`/`Static` mirror the planner's
+/// reserved variants; `inner_table` is kept for dumps/introspection.)
+#[allow(dead_code)]
 enum CohortGroups {
     All,
     Static {
@@ -3143,6 +3173,7 @@ impl CohortGroups {
 /// transaction's deltas through (cohort groups ∧ residual). No Postgres, no snapshot gate —
 /// consistency comes from creating/reading inside the sequencer, between transactions.
 struct CircuitShape {
+    #[allow(dead_code)] // kept for dumps/introspection parity with the other executors
     num_id: u64,
     stream_path: String,
     groups: CohortGroups,
@@ -3674,6 +3705,9 @@ async fn create_circuit_shape(
             seeded = envs.len() as u64;
         }
     }
+    tracing::info!(
+        "circuit shape {shape_id}: serving '{table}' from the pipeline (seeded {seeded} envelopes)"
+    );
     exec.circuit_shapes.insert(shape_id.to_string(), shape);
     Ok(seeded)
 }
@@ -3731,6 +3765,7 @@ async fn create_circuit_agg(
     ds.append(stream_path, &[env])
         .await
         .map_err(|e| anyhow::anyhow!("append initial aggregate: {e:#}"))?;
+    tracing::info!("circuit aggregate {shape_id}: serving COUNT('{table}') from the counts pipeline (initial {})", agg.value);
     exec.circuit_aggs.insert(shape_id.to_string(), agg);
     Ok(())
 }
@@ -5542,51 +5577,22 @@ mod tests {
         schemas.insert("members".to_string(), members.clone());
         let p = |j: serde_json::Value| -> PredicateJson { serde_json::from_value(j).unwrap() };
 
-        // match-all: All + no residual
-        let plan = plan_circuit_shape(None, &ts, &schemas, &arr).unwrap();
-        assert!(matches!(plan.constraint, PlannedConstraint::All));
-        assert!(plan.residual.is_none());
-
-        // eq on indexed column: Static
-        let plan = plan_circuit_shape(
+        // match-all and static equality stay on the legacy tiers (KeyRouter/standalone route
+        // them by index; a circuit shape would scan linearly per delta): no plan.
+        assert!(plan_circuit_shape(None, &ts, &schemas, &arr).is_none());
+        assert!(plan_circuit_shape(
             Some(&p(serde_json::json!({"col":"name","op":"eq","value":"a"}))),
             &ts, &schemas, &arr,
         )
-        .unwrap();
-        match &plan.constraint {
-            PlannedConstraint::Static { col, keys } => {
-                assert_eq!(*col, 2);
-                assert!(keys.contains(&Value::Text("a".into())));
-            }
-            other => panic!("expected Static, got {other:?}"),
-        }
-
-        // eq on UNindexed column: All + residual (still circuit-served, seeded by scan)
-        let plan = plan_circuit_shape(
-            Some(&p(serde_json::json!({"col":"active","op":"eq","value":true}))),
-            &ts, &schemas, &arr,
-        )
-        .unwrap();
-        assert!(matches!(plan.constraint, PlannedConstraint::All));
-        assert!(plan.residual.is_some());
-
-        // AND of (OR-of-eq on name) + residual on active
-        let plan = plan_circuit_shape(
+        .is_none());
+        assert!(plan_circuit_shape(
             Some(&p(serde_json::json!({"and":[
                 {"or":[{"col":"name","op":"eq","value":"a"},{"col":"name","op":"eq","value":"b"}]},
                 {"col":"active","op":"eq","value":true}
             ]}))),
             &ts, &schemas, &arr,
         )
-        .unwrap();
-        match &plan.constraint {
-            PlannedConstraint::Static { col, keys } => {
-                assert_eq!(*col, 2);
-                assert_eq!(keys.len(), 2);
-            }
-            other => panic!("expected Static, got {other:?}"),
-        }
-        assert!(plan.residual.is_some());
+        .is_none());
 
         // single-level dynamic IN over indexed columns
         let plan = plan_circuit_shape(
@@ -5603,6 +5609,19 @@ mod tests {
             }
             other => panic!("expected Dynamic, got {other:?}"),
         }
+
+        // dynamic IN + residual conjuncts (the board/search template): Dynamic + residual
+        let plan = plan_circuit_shape(
+            Some(&p(serde_json::json!({"and":[
+                {"col":"name","in":{"table":"members","project":"proj",
+                    "where":{"col":"user_id","op":"eq","value":7}}},
+                {"col":"active","op":"eq","value":true}
+            ]}))),
+            &ts, &schemas, &arr,
+        )
+        .unwrap();
+        assert!(matches!(plan.constraint, PlannedConstraint::Dynamic { .. }));
+        assert!(plan.residual.is_some());
 
         // negated IN → registry fallback
         assert!(plan_circuit_shape(
