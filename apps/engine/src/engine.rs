@@ -391,6 +391,9 @@ pub struct TableColumnInfo {
     pub pg_type: Option<String>,
     /// Whether this column is part of the primary key.
     pub pk: bool,
+    /// Whether Postgres auto-supplies the value when omitted (IDENTITY or `DEFAULT`) — the add-row
+    /// form treats such columns as optional. Always `false` in library mode.
+    pub has_default: bool,
 }
 
 /// A table's column list + primary key (`GET /table/{name}/schema`).
@@ -800,6 +803,7 @@ impl Engine {
                 ty: col_type_str(*ty),
                 pg_type: ts.pg_types.get(i).cloned().flatten(),
                 pk: pk_set.contains(&i),
+                has_default: ts.has_defaults.get(i).copied().unwrap_or(false),
             })
             .collect();
         let primary_key = ts.pk_cols.iter().map(|&i| ts.columns[i].0.clone()).collect();
