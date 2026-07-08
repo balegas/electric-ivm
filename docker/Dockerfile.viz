@@ -14,4 +14,4 @@ RUN pnpm --filter @electric-ivm/pipeline-viz build
 FROM caddy:2-alpine
 COPY docker/viz.Caddyfile /etc/caddy/Caddyfile
 COPY --from=build /repo/apps/pipeline-viz/dist /srv
-EXPOSE 5180
+EXPOSE 5180 5443

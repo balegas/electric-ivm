@@ -217,6 +217,17 @@ fn canon_where(where_: &Option<PredicateJson>) -> String {
     where_.as_ref().map(crate::predicate::canonical_pred).unwrap_or_default()
 }
 
+/// The coarse engine column type as a stable string for the schema endpoint's JSON.
+fn col_type_str(ty: crate::schema::ColumnType) -> &'static str {
+    use crate::schema::ColumnType::*;
+    match ty {
+        Int => "int",
+        Text => "text",
+        Bool => "bool",
+        Float => "float",
+    }
+}
+
 fn canon_cols(out_cols: &Option<Arc<Vec<usize>>>) -> String {
     out_cols
         .as_ref()
@@ -365,6 +376,33 @@ pub struct EngineGraph {
     pub subquery_edges: Vec<GraphEdge>,
     pub operators: Vec<OpNode>,
     pub op_edges: Vec<OpEdge>,
+}
+
+/// One column of a table's schema, as surfaced to the visualizer (`GET /table/{name}/schema`) so it
+/// can render one input per column (with the pk flagged) in the add-row form.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableColumnInfo {
+    pub name: String,
+    /// Coarse engine type: `int` | `text` | `bool` | `float`.
+    #[serde(rename = "type")]
+    pub ty: &'static str,
+    /// Raw Postgres type name (`udt_name`, e.g. `int4`, `uuid`, `timestamptz`); `null` in library mode.
+    pub pg_type: Option<String>,
+    /// Whether this column is part of the primary key.
+    pub pk: bool,
+    /// Whether Postgres auto-supplies the value when omitted (IDENTITY or `DEFAULT`) — the add-row
+    /// form treats such columns as optional. Always `false` in library mode.
+    pub has_default: bool,
+}
+
+/// A table's column list + primary key (`GET /table/{name}/schema`).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableSchemaInfo {
+    pub table: String,
+    pub columns: Vec<TableColumnInfo>,
+    pub primary_key: Vec<String>,
 }
 
 /// One entry of a subquery node's live inner-set index.
@@ -746,6 +784,92 @@ impl Engine {
         let proj = out_cols.as_deref().map(Vec::as_slice);
         let rows = sq.rows.iter().map(|r| ts.row_to_json_cols(r, proj)).collect();
         Ok((rows, sq.lsn))
+    }
+
+    /// The column list + primary key of a replicated table, for the visualizer's add-row form. Reads the
+    /// in-memory `TableSchema` (introspected at startup) — no Postgres round-trip.
+    pub async fn table_schema_info(&self, table: &str) -> Result<TableSchemaInfo> {
+        let ts = {
+            let st = self.state.lock().await;
+            st.tables.get(table).cloned().ok_or_else(|| anyhow::anyhow!("unknown table '{table}'"))?
+        };
+        let pk_set: HashSet<usize> = ts.pk_cols.iter().copied().collect();
+        let columns = ts
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, (name, ty))| TableColumnInfo {
+                name: name.clone(),
+                ty: col_type_str(*ty),
+                pg_type: ts.pg_types.get(i).cloned().flatten(),
+                pk: pk_set.contains(&i),
+                has_default: ts.has_defaults.get(i).copied().unwrap_or(false),
+            })
+            .collect();
+        let primary_key = ts.pk_cols.iter().map(|&i| ts.columns[i].0.clone()).collect();
+        Ok(TableSchemaInfo { table: ts.name.clone(), columns, primary_key })
+    }
+
+    /// Insert one row into a replicated table's Postgres relation, so the change is captured by logical
+    /// replication and flows through the pipeline (backing the visualizer's add-row action). `values`
+    /// maps column name → value; only known columns are accepted (unknown ⇒ error), omitted columns take
+    /// their Postgres default / NULL. Identifiers are quoted and values are **bound parameters** cast to
+    /// each column's native type — no string-concatenated SQL.
+    pub async fn insert_row(
+        &self,
+        table: &str,
+        values: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        let ts = {
+            let st = self.state.lock().await;
+            st.tables.get(table).cloned().ok_or_else(|| anyhow::anyhow!("unknown table '{table}'"))?
+        };
+        if values.is_empty() {
+            bail!("no columns provided");
+        }
+        let mut cols: Vec<String> = Vec::with_capacity(values.len());
+        let mut placeholders: Vec<String> = Vec::with_capacity(values.len());
+        let mut params: Vec<String> = Vec::new();
+        for (col, val) in values {
+            // Reject unknown columns (also closes the identifier-injection surface: only catalog columns
+            // are ever emitted, each independently quoted).
+            if !ts.index.contains_key(col) {
+                bail!("unknown column '{col}' on table '{table}'");
+            }
+            cols.push(crate::pg::quote_ident(col));
+            if val.is_null() {
+                placeholders.push("NULL".to_string());
+                continue;
+            }
+            // Bind the value as a text parameter, then cast it to the column's native Postgres type
+            // (uuid/int8/bool/timestamptz/…). The leading `::text` pins the parameter's inferred type to
+            // text so any value serializes as a string; the second cast converts it to the column type
+            // (a bare `$n::int8` would instead make Postgres infer the param itself as int8 and reject a
+            // String). A JSON string binds its contents; other scalars bind their compact text form.
+            let n = params.len() + 1;
+            let placeholder = match ts.pg_type_of(col) {
+                Some(t) => format!("${n}::text::{}", crate::pg::quote_ident(t)),
+                None => format!("${n}::text"),
+            };
+            placeholders.push(placeholder);
+            let s = match val {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            params.push(s);
+        }
+        let sql = format!(
+            "insert into {} ({}) values ({})",
+            crate::pg::quote_ident(table),
+            cols.join(", "),
+            placeholders.join(", "),
+        );
+        let url = self.pg_url.clone().context("insert_row requires postgres mode")?;
+        let client = crate::pg::pool_for(&url).get().await?;
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+        let n = client.execute(&sql, &param_refs).await.with_context(|| format!("insert into {table}"))?;
+        Ok(serde_json::json!({ "ok": true, "inserted": n }))
     }
 
     /// `share`: when true, an identical existing shape (same table, canonical predicate, and columns) is

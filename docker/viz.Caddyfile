@@ -1,7 +1,17 @@
 # Serves the built pipeline visualizer and proxies /engine/* to the engine's control plane —
 # the same URL contract as the app's Vite dev server (vite.config.ts), so the app code is
 # identical in dev and in the container. ENGINE_UPSTREAM overrides the target (host:port).
-:5180 {
+#
+# Two listeners share one config via a snippet:
+#   :5180  plain HTTP  — fine for curl and scripts
+#   :5443  HTTPS/HTTP-2 (Caddy internal CA) — for browser use. The visualizer holds many
+#          concurrent live streams (the /trace SSE + engine polling); over plain HTTP/1.1 a
+#          browser hits its ~6-connection-per-host cap and the page freezes silently. HTTP/2
+#          multiplexes them all over one connection. The internal CA is minted on first TLS
+#          use and persisted in the viz-caddy-data volume (see tutorials/compose.yaml), so it
+#          survives rebuilds; click through the browser warning once, or trust the extracted
+#          root CA (tutorials/README.md → "Trusting the visualizer's certificate").
+(viz) {
 	handle_path /engine/* {
 		reverse_proxy {$ENGINE_UPSTREAM:engine:7010}
 	}
@@ -10,4 +20,13 @@
 		try_files {path} /index.html
 		file_server
 	}
+}
+
+:5180 {
+	import viz
+}
+
+localhost:5443 {
+	tls internal
+	import viz
 }

@@ -946,6 +946,14 @@ body,
   color: #334155;
 }
 
+/* Z-set delta on a Δ change operator (detail panel): weighted rows +1 / −1 */
+.dp-zw {
+  width: 26px;
+  white-space: nowrap;
+}
+.dp-zset .dp-op-ins .dp-log-op { color: #16a34a; }
+.dp-zset .dp-op-del .dp-log-op { color: #dc2626; }
+
 /* table data browser (detail panel) */
 .dp-browse-nav {
   display: flex;
@@ -1013,6 +1021,20 @@ body,
   border-color: rgba(13, 148, 136, 0.4);
   background: rgba(204, 251, 241, 0.9);
   font-size: 10.5px;
+}
+/* Δ change operator inline Z-set peek: the latest change's weights (+1 / −1) */
+.pnode-zw {
+  font-variant-numeric: tabular-nums;
+}
+.pnode-zw-pos {
+  color: #16a34a;
+  border-color: rgba(22, 163, 74, 0.4);
+  background: rgba(220, 252, 231, 0.9);
+}
+.pnode-zw-neg {
+  color: #dc2626;
+  border-color: rgba(220, 38, 38, 0.4);
+  background: rgba(254, 226, 226, 0.9);
 }
 
 /* "Inside this operator" explainer in the detail panel */
@@ -1117,5 +1139,250 @@ body,
   color: #64748b;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Add-row form — table-source detail panel (Feature 1) */
+/* Inline add-row (embedded in the data browser) */
+.dp-addrow-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+.dp-addrow-open {
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  color: #0369a1;
+  background: #e0f2fe;
+  border: 1px solid #bae6fd;
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.dp-addrow-open:hover:not(:disabled) {
+  background: #bae6fd;
+}
+.dp-addrow-open:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.dp-addrow-ok {
+  font-size: 11px;
+  font-weight: 600;
+  color: #15803d;
+}
+/* The editable row inside the browser table — inputs line up with the data columns. */
+.dp-addrow-tr td {
+  padding: 2px 4px;
+  background: #f0f9ff;
+}
+.dp-cell-i {
+  width: 100%;
+  min-width: 70px;
+  box-sizing: border-box;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  padding: 3px 5px;
+  border: 1px solid #7dd3fc;
+  border-radius: 4px;
+  background: #fff;
+  outline: none;
+}
+.dp-cell-i:focus {
+  border-color: #0ea5e9;
+}
+.dp-cell-i:disabled {
+  opacity: 0.6;
+}
+
+/* New-shape form — sidebar (Feature 2) */
+.newshape {
+  padding: 0 12px 6px;
+}
+.newshape-open {
+  width: 100%;
+  font-weight: 600;
+}
+.newshape-form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 8px;
+  margin: 0 12px 6px;
+  background: #f8fafc;
+}
+.newshape-sel,
+.newshape-where {
+  width: 100%;
+  font-family: inherit;
+  font-size: 12px;
+  padding: 6px 8px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  outline: none;
+  box-sizing: border-box;
+}
+.newshape-sel:focus,
+.newshape-where:focus {
+  border-color: #0ea5e9;
+}
+.newshape-actions {
+  display: flex;
+  gap: 6px;
+}
+.newshape-err {
+  margin: 0;
+}
+
+/* Smart WHERE editor — a transparent-text textarea over a scroll-synced highlight overlay, with a
+   schema-aware autocomplete dropdown below it. */
+.whereed {
+  position: relative;
+}
+.whereed-box {
+  position: relative;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #fff;
+  overflow: hidden;
+}
+.whereed-box:focus-within {
+  border-color: #0ea5e9;
+}
+/* The textarea and the overlay MUST share identical box metrics so characters line up exactly. */
+.whereed-hl,
+.whereed-input {
+  margin: 0;
+  padding: 6px 8px;
+  border: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  letter-spacing: normal;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: break-word;
+  tab-size: 2;
+}
+.whereed-hl {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  color: #0f172a;
+  pointer-events: none;
+  z-index: 0;
+}
+.whereed-input {
+  position: relative;
+  display: block;
+  width: 100%;
+  min-height: 44px;
+  max-height: 160px;
+  resize: vertical;
+  background: transparent;
+  color: transparent;
+  caret-color: #0f172a;
+  outline: none;
+  overflow-y: auto;
+  z-index: 1;
+}
+.whereed-input::placeholder {
+  color: #94a3b8;
+}
+/* token colors */
+.we-column {
+  color: #0369a1;
+  font-weight: 600;
+}
+.we-table {
+  color: #7e22ce;
+  font-weight: 600;
+}
+.we-ident {
+  color: #dc2626;
+  text-decoration: underline dotted #f87171;
+  text-underline-offset: 2px;
+}
+.we-keyword {
+  color: #9333ea;
+  font-weight: 700;
+}
+.we-literal {
+  color: #b45309;
+  font-weight: 600;
+}
+.we-op {
+  color: #0f766e;
+  font-weight: 600;
+}
+.we-string {
+  color: #15803d;
+}
+.we-number {
+  color: #c2410c;
+}
+.we-punct {
+  color: #475569;
+}
+.we-unknown {
+  color: #dc2626;
+}
+
+/* autocomplete dropdown */
+.whereed-menu {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(100% + 3px);
+  z-index: 30;
+  margin: 0;
+  padding: 3px;
+  list-style: none;
+  max-height: 190px;
+  overflow-y: auto;
+  background: #fff;
+  border: 1px solid #cbd5e1;
+  border-radius: 7px;
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.14);
+}
+.whereed-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.whereed-item-on {
+  background: #e0f2fe;
+}
+.whereed-item-l {
+  font-family: ui-monospace, monospace;
+  font-weight: 600;
+}
+.we-item-column {
+  color: #0369a1;
+}
+.we-item-keyword {
+  color: #9333ea;
+}
+.we-item-op {
+  color: #0f766e;
+}
+.we-item-literal {
+  color: #b45309;
+}
+.we-item-snippet {
+  color: #475569;
+}
+.whereed-item-d {
+  font-size: 10px;
+  color: #94a3b8;
   white-space: nowrap;
 }

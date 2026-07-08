@@ -28,6 +28,11 @@ pub struct ColumnDef {
     /// comparisons stay index-eligible (see `sql.rs`).
     #[serde(default, skip)]
     pub pg_type: Option<String>,
+    /// Whether Postgres auto-supplies this column's value when omitted — i.e. it's an IDENTITY column
+    /// or carries a `DEFAULT`. Captured at introspection; `false` in library mode. Lets the visualizer
+    /// mark the column optional in its add-row form.
+    #[serde(default, skip)]
+    pub has_default: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -74,6 +79,10 @@ pub struct TableSchema {
     /// Raw Postgres type name per column (parallel to [`Self::columns`]); `None` in library mode. Used
     /// to cast bound text params to the native type in backfill SQL (index-eligible comparisons).
     pub pg_types: Vec<Option<String>>,
+    /// Whether each column is auto-defaulted (IDENTITY or `DEFAULT`), parallel to [`Self::columns`];
+    /// all `false` in library mode. Surfaced by `GET /table/{name}/schema` so the add-row form can
+    /// treat these columns as optional.
+    pub has_defaults: Vec<bool>,
 }
 
 /// Separator joining composite-key column values into the durable-stream `key` string. Chosen to not
@@ -85,6 +94,7 @@ impl TableSchema {
         let columns: Vec<(String, ColumnType)> =
             def.columns.iter().map(|(c, d)| (c.clone(), d.ty)).collect();
         let pg_types: Vec<Option<String>> = def.columns.values().map(|d| d.pg_type.clone()).collect();
+        let has_defaults: Vec<bool> = def.columns.values().map(|d| d.has_default).collect();
         let index: HashMap<String, usize> =
             columns.iter().enumerate().map(|(i, (c, _))| (c.clone(), i)).collect();
         if def.primary_key.is_empty() {
@@ -106,6 +116,7 @@ impl TableSchema {
             pk_type,
             pk_cols,
             pg_types,
+            has_defaults,
         })
     }
 

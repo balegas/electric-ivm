@@ -422,9 +422,9 @@ mod tests {
 
     fn users() -> HashMap<String, TableSchema> {
         let mut columns = BTreeMap::new();
-        columns.insert("id".to_string(), ColumnDef { ty: ColumnType::Int, pg_type: None });
-        columns.insert("tenant".to_string(), ColumnDef { ty: ColumnType::Int, pg_type: None });
-        columns.insert("name".to_string(), ColumnDef { ty: ColumnType::Text, pg_type: None });
+        columns.insert("id".to_string(), ColumnDef { ty: ColumnType::Int, pg_type: None, has_default: false });
+        columns.insert("tenant".to_string(), ColumnDef { ty: ColumnType::Int, pg_type: None, has_default: false });
+        columns.insert("name".to_string(), ColumnDef { ty: ColumnType::Text, pg_type: None, has_default: false });
         let def = TableDef { columns, primary_key: vec!["id".to_string()] };
         let mut m = HashMap::new();
         m.insert("users".to_string(), TableSchema::from_def("users", &def).unwrap());
@@ -564,7 +564,7 @@ mod tests {
     #[test]
     fn float_pk_key_is_canonicalized() {
         let mut columns = BTreeMap::new();
-        columns.insert("id".to_string(), ColumnDef { ty: ColumnType::Float, pg_type: None });
+        columns.insert("id".to_string(), ColumnDef { ty: ColumnType::Float, pg_type: None, has_default: false });
         let def = TableDef { columns, primary_key: vec!["id".to_string()] };
         let mut tables = HashMap::new();
         tables.insert("f".to_string(), TableSchema::from_def("f", &def).unwrap());

@@ -7,7 +7,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use crate::engine::{Engine, ShapeRecord, TableStats};
+use crate::engine::{Engine, ShapeRecord, TableSchemaInfo, TableStats};
 use crate::predicate::PredicateJson;
 use crate::schema::Schema;
 
@@ -34,6 +34,11 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
         .route("/query", post(query_subset))
         .route("/tables/{name}/offset", get(table_offset))
         .route("/tables/{name}/families", get(table_families))
+        // Table schema (columns + pk) and a parameterized single-row INSERT — the visualizer's
+        // add-row action. The INSERT goes to Postgres so the change is captured by logical
+        // replication and flows through the pipeline like any other write.
+        .route("/table/{table}/schema", get(get_table_schema))
+        .route("/table/{table}/rows", post(insert_table_row))
         .route("/subqueries", get(subquery_stats))
         .route("/replication/lsn", get(replication_lsn))
         .route("/metrics", get(get_metrics))
@@ -423,6 +428,43 @@ async fn table_families(
     match engine.table_stats(&name).await {
         Some(stats) => Ok(Json(stats)),
         None => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("no tailer for table {name}") }),
+    }
+}
+
+/// `GET /table/{table}/schema` — the table's columns (+ coarse/native types, pk flag) and primary key,
+/// so the visualizer can render one input per column in its add-row form.
+async fn get_table_schema(
+    State(engine): State<Engine>,
+    Path(table): Path<String>,
+) -> Result<Json<TableSchemaInfo>, AppError> {
+    match engine.table_schema_info(&table).await {
+        Ok(info) => Ok(Json(info)),
+        Err(e) => Err(AppError { status: StatusCode::NOT_FOUND, msg: format!("{e:#}") }),
+    }
+}
+
+/// Body of `POST /table/{table}/rows`: the new row as `column → value`, under either `columns` or
+/// `values`. Omitted columns take their Postgres default / NULL.
+#[derive(Deserialize)]
+struct InsertRowReq {
+    #[serde(default)]
+    columns: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default)]
+    values: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// `POST /table/{table}/rows` — insert one row into the table's Postgres relation (parameterized,
+/// identifier-quoted). The write is captured by logical replication and flows through the pipeline, so
+/// the visualizer sees the change animate. Bad input (unknown column, type mismatch) is a 400.
+async fn insert_table_row(
+    State(engine): State<Engine>,
+    Path(table): Path<String>,
+    Json(req): Json<InsertRowReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let values = req.columns.or(req.values).unwrap_or_default();
+    match engine.insert_row(&table, &values).await {
+        Ok(v) => Ok(Json(v)),
+        Err(e) => Err(AppError { status: StatusCode::BAD_REQUEST, msg: format!("{e:#}") }),
     }
 }
 

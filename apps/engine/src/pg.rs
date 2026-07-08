@@ -160,7 +160,9 @@ pub async fn list_tables(client: &Client) -> Result<Vec<String>> {
 pub async fn introspect(client: &Client, table: &str) -> Result<TableDef> {
     let col_rows = client
         .query(
-            "select column_name, data_type, udt_name from information_schema.columns \
+            "select column_name, data_type, udt_name, \
+                    (is_identity = 'YES' or column_default is not null) as has_default \
+             from information_schema.columns \
              where table_schema = 'public' and table_name = $1 order by ordinal_position",
             &[&table],
         )
@@ -176,7 +178,9 @@ pub async fn introspect(client: &Client, table: &str) -> Result<TableDef> {
         // udt_name (pg_type.typname, e.g. `uuid`, `int4`, `timestamptz`) is the canonical, always-castable
         // type name — used to cast bound text params to the native type in backfill SQL.
         let udt: String = r.get(2);
-        columns.insert(name, ColumnDef { ty: map_pg_type(&dt), pg_type: Some(udt) });
+        // Auto-defaulted (IDENTITY or DEFAULT) → the add-row form can treat it as optional.
+        let has_default: bool = r.get(3);
+        columns.insert(name, ColumnDef { ty: map_pg_type(&dt), pg_type: Some(udt), has_default });
     }
 
     // Composite primary keys are supported (e.g. Electric's `*_tags` tables); columns are ordered by
