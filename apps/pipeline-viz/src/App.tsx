@@ -3,12 +3,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { buildCircuit, hopIndex } from './build-circuit'
 import { buildGraph, type NodeRef, type VizNodeData } from './build-graph'
+import { clearDeltas, recordDelta } from './delta-store'
 import { DetailPanel } from './DetailPanel'
 import { edgeTypes, type PulseEdgeData } from './edges'
 import { PipelineNode } from './nodes'
 import { predicateLabel } from './predicate-label'
 import { shapeSql } from './shape-sql'
-import { applyState, seedState } from './state-store'
+import { applyStateStaggered, seedState } from './state-store'
 import { eventDecor, mergeDecor, type Decor, type FlashKind } from './trace-anim'
 import type { EngineGraph, GraphShape, TraceEvent, TraceMessage } from './types'
 import { useTrace } from './useTrace'
@@ -89,6 +90,92 @@ function kindOf(s: GraphShape): { label: string; cls: string } {
   if (s.isSubquery) return { label: 'subquery', cls: 'k-sq' }
   if (s.familyKey) return { label: `family(${s.familyKey.join(',')})`, cls: 'k-fam' }
   return { label: 'standalone', cls: 'k-std' }
+}
+
+/** Create a shape from the sidebar: pick a table + type an optional SQL WHERE clause, then call the
+ *  engine's Electric-compatible create (`GET /engine/v1/shape?table=&offset=-1&where=`) — no new
+ *  endpoint. On success the new node shows up on the next graph refresh (which `onCreated` triggers,
+ *  and which the shapeAdded lifecycle event also drives). A bad predicate returns a 4xx whose message
+ *  is surfaced inline. */
+function NewShapeForm({ tables, onCreated }: { tables: string[]; onCreated: () => void }) {
+  const [open, setOpen] = useState(false)
+  const [table, setTable] = useState('')
+  const [where, setWhere] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  // Default the selector to the first table once the list is known.
+  useEffect(() => {
+    if (open && !table && tables.length) setTable(tables[0]!)
+  }, [open, tables, table])
+
+  const create = async () => {
+    if (!table) return
+    setBusy(true)
+    setError(null)
+    const params = new URLSearchParams({ table, offset: '-1' })
+    if (where.trim()) params.set('where', where.trim())
+    try {
+      const r = await fetch(`/engine/v1/shape?${params.toString()}`)
+      if (!r.ok) {
+        const body = (await r.json().catch(() => null)) as { message?: string; error?: string } | null
+        throw new Error(body?.message ?? body?.error ?? `create → ${r.status}`)
+      }
+      setWhere('')
+      setOpen(false)
+      onCreated()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (!open) {
+    return (
+      <div className="newshape">
+        <button className="btn newshape-open" onClick={() => setOpen(true)} disabled={tables.length === 0}>
+          + new shape
+        </button>
+      </div>
+    )
+  }
+  return (
+    <div className="newshape newshape-form">
+      <select className="newshape-sel" value={table} onChange={(e) => setTable(e.target.value)}>
+        {tables.map((t) => (
+          <option key={t} value={t}>
+            {t}
+          </option>
+        ))}
+      </select>
+      <input
+        className="newshape-where"
+        placeholder="WHERE clause (optional) — e.g. status <> 'done'"
+        value={where}
+        onChange={(e) => setWhere(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') void create()
+        }}
+      />
+      {error ? <div className="err newshape-err">{error}</div> : null}
+      <div className="newshape-actions">
+        <button className="btn btn-on" disabled={busy || !table} onClick={() => void create()}>
+          {busy ? 'creating…' : 'Create'}
+        </button>
+        <button
+          className="btn"
+          disabled={busy}
+          onClick={() => {
+            setOpen(false)
+            setError(null)
+          }}
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+  )
 }
 
 export default function App() {
@@ -193,11 +280,35 @@ export default function App() {
   const presentRef = useRef(new Set<string>())
   presentRef.current = useMemo(() => new Set(nodes.map((n) => n.id)), [nodes])
 
+  // rendered node id → state-summary id (identity in the logical view; the stateful operator's
+  // `stateId` in the circuit view). Lets a trace event's per-node animation timing translate into
+  // per-state-id reveal delays.
+  const stateIdOfNode = useRef(new Map<string, string>())
+  stateIdOfNode.current = useMemo(() => {
+    const m = new Map<string, string>()
+    for (const n of nodes) {
+      const sid = (n.data as VizNodeData).stateId
+      if (sid) m.set(n.id, sid)
+    }
+    return m
+  }, [nodes])
+  // state-summary id → absolute time (ms) the travelling dot reaches its node, set by the most
+  // recent trace event. The state event that follows a change reveals each node's new count then,
+  // so the chip ticks up in step with the animation. Stale entries sit in the past → reveal now.
+  const arrivalRef = useRef(new Map<string, number>())
+
   // Apply one trace event's staged decoration against the CURRENT render (used by both the live
   // stream and activity-log replays). The decor stays up for the whole staged run + a tail.
   const applyEventDecor = useCallback((ev: TraceEvent) => {
     const d = eventDecor(ev, edgesRef.current, presentRef.current, expandRef.current)
     if (d.nodes.size === 0 && d.edges.size === 0) return
+    // Record when the dot reaches each node (rank delay == arrival), keyed by the node's state-summary
+    // id. The state event that immediately follows this delta reveals those chips on that schedule.
+    const now = Date.now()
+    for (const [nodeId, flash] of d.nodes) {
+      const sid = stateIdOfNode.current.get(nodeId)
+      if (sid) arrivalRef.current.set(sid, now + flash.delayMs)
+    }
     setDecor((prev) => mergeDecor(prev, d))
     if (decorTimer.current) clearTimeout(decorTimer.current)
     decorTimer.current = setTimeout(() => setDecor(null), d.totalMs + DECOR_TTL_MS)
@@ -215,7 +326,14 @@ export default function App() {
       if ('type' in ev) {
         if (ev.type === 'state') {
           // Per-node state push — feed the store; subscribed chips re-render, the graph doesn't.
-          applyState(ev.nodes)
+          // Reveal each node's new count only when the change's dot reaches it (arrival recorded by
+          // the delta event that just fired). A node the animation didn't touch — or whose arrival
+          // is already past (an unrelated/older event) — reveals immediately (delay 0).
+          const now = Date.now()
+          applyStateStaggered(ev.nodes, (id) => {
+            const at = arrivalRef.current.get(id)
+            return at === undefined ? 0 : Math.max(0, at - now)
+          })
           return
         }
         // Structure changed (shape created/dropped) — refresh once the churn settles instead of
@@ -231,6 +349,9 @@ export default function App() {
         return
       }
       setLog((prev) => [{ key: logSeq.current++, at: Date.now(), ev }, ...prev].slice(0, LOG_CAP))
+      // Capture this change's Z-set as the latest delta for its table — the Δ change operator's
+      // panel (and its inline peek) reconstruct the weighted rows from it.
+      recordDelta(ev)
       applyEventDecor(ev)
     },
     [load, applyEventDecor],
@@ -361,6 +482,7 @@ export default function App() {
     setSelected(new Set())
     setMode('all')
     setFocus(null)
+    clearDeltas()
   }, [])
 
   const toggle = (id: string, additive: boolean) => {
@@ -479,6 +601,8 @@ export default function App() {
           value={search}
           onChange={(e) => setSearch(e.target.value)}
         />
+
+        <NewShapeForm tables={graph?.tables ?? []} onCreated={() => void load()} />
 
         <div className="list">
           {shapesByTable.map(([table, shapes]) => (

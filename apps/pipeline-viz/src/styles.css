@@ -946,6 +946,14 @@ body,
   color: #334155;
 }
 
+/* Z-set delta on a Δ change operator (detail panel): weighted rows +1 / −1 */
+.dp-zw {
+  width: 26px;
+  white-space: nowrap;
+}
+.dp-zset .dp-op-ins .dp-log-op { color: #16a34a; }
+.dp-zset .dp-op-del .dp-log-op { color: #dc2626; }
+
 /* table data browser (detail panel) */
 .dp-browse-nav {
   display: flex;
@@ -1013,6 +1021,20 @@ body,
   border-color: rgba(13, 148, 136, 0.4);
   background: rgba(204, 251, 241, 0.9);
   font-size: 10.5px;
+}
+/* Δ change operator inline Z-set peek: the latest change's weights (+1 / −1) */
+.pnode-zw {
+  font-variant-numeric: tabular-nums;
+}
+.pnode-zw-pos {
+  color: #16a34a;
+  border-color: rgba(22, 163, 74, 0.4);
+  background: rgba(220, 252, 231, 0.9);
+}
+.pnode-zw-neg {
+  color: #dc2626;
+  border-color: rgba(220, 38, 38, 0.4);
+  background: rgba(254, 226, 226, 0.9);
 }
 
 /* "Inside this operator" explainer in the detail panel */
@@ -1118,4 +1140,124 @@ body,
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Add-row form — table-source detail panel (Feature 1) */
+.dp-addrow {
+  margin-top: 12px;
+}
+.dp-addrow-open {
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  color: #0369a1;
+  background: #e0f2fe;
+  border: 1px solid #bae6fd;
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.dp-addrow-open:hover {
+  background: #bae6fd;
+}
+.dp-addrow-ok {
+  margin-left: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #15803d;
+}
+.dp-addrow-form {
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: #f8fafc;
+}
+.dp-addrow-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.dp-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.dp-field-l {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: #475569;
+}
+.dp-field-pk {
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: #a16207;
+  background: #fef9c3;
+  border-radius: 3px;
+  padding: 0 4px;
+}
+.dp-field-t {
+  font-family: ui-monospace, monospace;
+  font-size: 9.5px;
+  color: #94a3b8;
+}
+.dp-field-i {
+  font-family: inherit;
+  font-size: 12px;
+  padding: 5px 7px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  outline: none;
+}
+.dp-field-i:focus {
+  border-color: #0ea5e9;
+}
+.dp-addrow-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+/* New-shape form — sidebar (Feature 2) */
+.newshape {
+  padding: 0 12px 6px;
+}
+.newshape-open {
+  width: 100%;
+  font-weight: 600;
+}
+.newshape-form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 8px;
+  margin: 0 12px 6px;
+  background: #f8fafc;
+}
+.newshape-sel,
+.newshape-where {
+  width: 100%;
+  font-family: inherit;
+  font-size: 12px;
+  padding: 6px 8px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  outline: none;
+  box-sizing: border-box;
+}
+.newshape-sel:focus,
+.newshape-where:focus {
+  border-color: #0ea5e9;
+}
+.newshape-actions {
+  display: flex;
+  gap: 6px;
+}
+.newshape-err {
+  margin: 0;
 }

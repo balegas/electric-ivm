@@ -1,9 +1,27 @@
 import { Handle, Position, type NodeProps } from '@xyflow/react'
 
 import type { VizNodeData } from './build-graph'
+import { useLatestDelta } from './delta-store'
 import { KIND_META, fmtScalar } from './node-meta'
 import { useNodeState } from './state-store'
 import type { NodeStateSummary } from './types'
+
+/** Inline Z-set peek on a Δ change operator: the weights of the most recent change on its table
+ *  (`+1` / `−1`, colored), a compact echo of what the detail panel spells out in full. Empty
+ *  until the first change on the table. */
+function DeltaPeek({ table }: { table: string }) {
+  const cap = useLatestDelta(table)
+  if (!cap) return <div className="pnode-state pnode-state-empty">—</div>
+  return (
+    <div className="pnode-state pnode-delta" title="most recent Z-set delta (weights)">
+      {cap.rows.map((r, i) => (
+        <span key={i} className={`chip pnode-zw ${r.w > 0 ? 'pnode-zw-pos' : 'pnode-zw-neg'}`}>
+          {r.w > 0 ? `+${r.w}` : `−${Math.abs(r.w)}`}
+        </span>
+      ))}
+    </div>
+  )
+}
 
 /** The live state row of one node card. Chips come straight from the engine's state summaries
  *  (seeded by `GET /state`, updated by SSE `state` events) — each card subscribes to its own node
@@ -80,7 +98,7 @@ function chips(s: NodeStateSummary): React.ReactNode {
   }
 }
 
-export function PipelineNode({ data }: NodeProps) {
+export function PipelineNode({ id, data }: NodeProps) {
   const d = data as VizNodeData
   const meta = KIND_META[d.kind]
   const parked = d.life === 'dormant' || d.life === 'deactivating' || d.life === 'reactivating'
@@ -110,6 +128,8 @@ export function PipelineNode({ data }: NodeProps) {
         </div>
       ) : null}
       {d.stateId ? <StateChips id={d.stateId} /> : null}
+      {/* The Δ change operator (d:<t>) holds no state chip — show its latest Z-set delta instead. */}
+      {d.kind === 'op-delta' && id.startsWith('d:') ? <DeltaPeek table={id.slice('d:'.length)} /> : null}
       <Handle type="source" position={Position.Right} />
     </div>
   )

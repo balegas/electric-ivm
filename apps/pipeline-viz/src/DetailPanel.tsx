@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 
 import type { NodeKind, NodeRef } from './build-graph'
+import { useLatestDelta } from './delta-store'
 import { KIND_META, fmtScalar } from './node-meta'
 import { predicateLabel } from './predicate-label'
 import { nodeInnerSql, shapeSql } from './shape-sql'
@@ -421,6 +422,194 @@ function AggInternalsView({ nodeId }: { nodeId: string }) {
   )
 }
 
+interface TableColumn {
+  name: string
+  type: string
+  pgType: string | null
+  pk: boolean
+}
+interface TableSchemaInfo {
+  table: string
+  columns: TableColumn[]
+  primaryKey: string[]
+}
+
+/** Add-row affordance for a table-source node: a `+` reveals one input per column; submitting inserts a
+ *  new row into Postgres via the engine (`POST /engine/table/{table}/rows`). The write is captured by
+ *  logical replication and flows through the pipeline, so the change animates and the chips advance on
+ *  their own — no manual refresh. Blank fields are omitted (column default / NULL). */
+function AddRowForm({ table }: { table: string }) {
+  const [open, setOpen] = useState(false)
+  const [schema, setSchema] = useState<TableSchemaInfo | null>(null)
+  const [schemaErr, setSchemaErr] = useState<string | null>(null)
+  const [values, setValues] = useState<Record<string, string>>({})
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [okFlash, setOkFlash] = useState(false)
+
+  // Fetch the column list when the form opens (re-fetches if the table changes).
+  useEffect(() => {
+    if (!open) return
+    let alive = true
+    setSchema(null)
+    setSchemaErr(null)
+    void (async () => {
+      try {
+        const r = await fetch(`/engine/table/${encodeURIComponent(table)}/schema`)
+        if (!r.ok) throw new Error(`schema → ${r.status}`)
+        const s = (await r.json()) as TableSchemaInfo
+        if (alive) setSchema(s)
+      } catch (e) {
+        if (alive) setSchemaErr(String(e))
+      }
+    })()
+    return () => {
+      alive = false
+    }
+  }, [open, table])
+
+  const reset = () => {
+    setValues({})
+    setError(null)
+  }
+
+  const submit = async () => {
+    setBusy(true)
+    setError(null)
+    // Only send filled-in fields; blank inputs fall through to the column default / NULL.
+    const columns: Record<string, string> = {}
+    for (const [k, v] of Object.entries(values)) if (v !== '') columns[k] = v
+    try {
+      const r = await fetch(`/engine/table/${encodeURIComponent(table)}/rows`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ columns }),
+      })
+      if (!r.ok) {
+        const body = (await r.json().catch(() => null)) as { error?: string } | null
+        throw new Error(body?.error ?? `insert → ${r.status}`)
+      }
+      reset()
+      setOkFlash(true)
+      setTimeout(() => setOkFlash(false), 1600)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (!open) {
+    return (
+      <div className="dp-addrow">
+        <button className="dp-addrow-open" onClick={() => setOpen(true)}>
+          + add row
+        </button>
+        {okFlash ? <span className="dp-addrow-ok">✓ inserted</span> : null}
+      </div>
+    )
+  }
+  return (
+    <div className="dp-addrow dp-addrow-form">
+      <div className="dp-sec">new row → {table}</div>
+      {schemaErr ? <div className="dp-err">{schemaErr}</div> : null}
+      {!schema && !schemaErr ? <div className="dp-note">loading columns…</div> : null}
+      {schema ? (
+        <>
+          <div className="dp-addrow-fields">
+            {schema.columns.map((c) => (
+              <label key={c.name} className="dp-field">
+                <span className="dp-field-l">
+                  {c.name}
+                  {c.pk ? (
+                    <span className="dp-field-pk" title="primary key">
+                      pk
+                    </span>
+                  ) : null}
+                  <span className="dp-field-t">{c.pgType ?? c.type}</span>
+                </span>
+                <input
+                  className="dp-field-i"
+                  value={values[c.name] ?? ''}
+                  placeholder={c.pk ? 'required' : 'default / null'}
+                  onChange={(e) => setValues((v) => ({ ...v, [c.name]: e.target.value }))}
+                />
+              </label>
+            ))}
+          </div>
+          {error ? <div className="dp-err">{error}</div> : null}
+          <div className="dp-addrow-actions">
+            <button className="dp-copy" disabled={busy} onClick={() => void submit()}>
+              {busy ? 'inserting…' : '✓ insert'}
+            </button>
+            <button
+              className="dp-copy"
+              disabled={busy}
+              onClick={() => {
+                setOpen(false)
+                reset()
+              }}
+            >
+              cancel
+            </button>
+          </div>
+        </>
+      ) : null}
+    </div>
+  )
+}
+
+/** Format a Z-set weight with its sign (`+1`, `−1`, `+2`) using the app's unicode minus. */
+function fmtWeight(w: number): string {
+  return w > 0 ? `+${w}` : `−${Math.abs(w)}`
+}
+
+/** The reconstructed Z-set delta on a Δ change operator: the most-recent change for this table as
+ *  weighted rows — insert (row,+1), delete (row,−1), update (old,−1)+(new,+1). The old row of an
+ *  update strikes through (it is retracted). Captured client-side from the `/trace` data event the
+ *  animation already consumes — no engine call. Empty until the first change on this table. */
+function DeltaView({ table }: { table: string }) {
+  const cap = useLatestDelta(table)
+  const op = useMemo(() => {
+    if (!cap) return null
+    const w = cap.rows.reduce((a, r) => a + r.w, 0)
+    return cap.rows.length > 1 && w === 0 ? 'update' : w > 0 ? 'insert' : w < 0 ? 'delete' : 'no-op'
+  }, [cap])
+  return (
+    <div className="dp-contents">
+      <div className="dp-sec dp-contents-h">
+        <span>latest Z-set delta</span>
+        {cap ? <span className="dp-contents-n">{op}</span> : null}
+      </div>
+      <div className="dp-note">
+        The weighted rows this change becomes — insert (new,+1), delete (old,−1), update
+        (old,−1)+(new,+1). This one Z-set is shared by every operator downstream.
+      </div>
+      {!cap ? (
+        <div className="dp-empty-idx">no change seen yet — write to {table} and its delta lands here.</div>
+      ) : (
+        <>
+          <div className="dp-table-wrap">
+            <table className="dp-table dp-log dp-zset">
+              <tbody>
+                {cap.rows.map((r, i) => (
+                  <tr key={i} className={r.w > 0 ? 'dp-op-ins' : 'dp-op-del'}>
+                    <td className="dp-log-op dp-zw">{fmtWeight(r.w)}</td>
+                    <td className="dp-log-row" title={JSON.stringify(r.row)}>
+                      {fmtLogRow(r.row)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="dp-note">captured {new Date(cap.at).toLocaleTimeString()}</div>
+        </>
+      )}
+    </div>
+  )
+}
+
 export function DetailPanel({
   node,
   graph,
@@ -507,6 +696,7 @@ export function DetailPanel({
             </div>
           ))}
         </div>
+        <AddRowForm table={node.name} />
         <TableBrowser table={node.name} />
       </>
     )
@@ -599,6 +789,9 @@ export function DetailPanel({
   } else if (node.kind === 'op') {
     const meta = KIND_META[node.opKind]
     title = `Operator · ${node.label}`
+    // Both the source (src:<t>) and Δ change (d:<t>) operators animate under the `table:<t>` hop,
+    // so the table name is the hop's suffix — used to wire the add-row form and the Z-set view.
+    const opTable = node.hop.startsWith('table:') ? node.hop.slice('table:'.length) : null
     body = (
       <>
         <Row k="operator" v={<code>{meta.tag}</code>} />
@@ -631,6 +824,15 @@ export function DetailPanel({
           </>
         ) : null}
         <InsideNote kind={node.opKind} />
+        {/* Source operator: same write + browse affordances as the logical table node. */}
+        {node.opKind === 'op-source' && opTable ? (
+          <>
+            <AddRowForm table={opTable} />
+            <TableBrowser table={opTable} />
+          </>
+        ) : null}
+        {/* Δ change operator: the reconstructed Z-set of the most recent change on this table. */}
+        {node.opKind === 'op-delta' && opTable ? <DeltaView table={opTable} /> : null}
       </>
     )
   } else if (node.kind === 'aggshape') {
