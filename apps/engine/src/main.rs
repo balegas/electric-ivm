@@ -61,6 +61,10 @@ async fn main() -> Result<()> {
     let engine = match &config.pg_url {
         Some(url) if !url.is_empty() => {
             let engine = Engine::new_pg(DsClient::new(ds_url.clone()), url.clone());
+            if let Some(dbsp) = &config.dbsp {
+                tracing::info!("dbsp arrangements enabled: dir {}", dbsp.dir.display());
+                engine.set_dbsp_config(dbsp.clone());
+            }
             engine
                 .setup_postgres(&config.tables, &config.slot)
                 .await

@@ -1,14 +1,17 @@
 //! electric-ivm query engine.
 //!
 //! Takes change events from per-table durable streams and fans each change out to registered shapes.
-//! The engine holds **no table data** — only per-shape metadata: equality shapes are routed by key
+//! The hot path holds **no table data** — only per-shape metadata: equality shapes are routed by key
 //! (a `key -> shapes` index per template, each shape backfilled directly from Postgres), while
 //! non-shareable shapes (ranges / OR / NOT / inequality) are stateless filters evaluated directly on
 //! each delta. Matching deltas are appended (as State-Protocol envelopes) to per-shape durable
 //! streams. The Z-set element is a dynamically-typed [`value::Row`] (positional `Vec<Value>`); the
-//! schema gives names to the positions. See `docs/ARCHITECTURE.md` and
-//! `docs/ivm-engine-internals.md` for the system design.
+//! schema gives names to the positions. Optionally (`ELECTRIC_IVM_DBSP=1`), a dbsp-backed
+//! [`arrangements`] layer maintains disk-spillable table indexes that serve point lookups
+//! (subquery re-derivations) locally instead of querying Postgres back. See `docs/ARCHITECTURE.md`
+//! and `docs/ivm-engine-internals.md` for the system design.
 
+pub mod arrangements;
 pub mod config;
 pub mod ds;
 pub mod electric;

@@ -215,6 +215,9 @@ pub struct SubqueryRegistry {
     ds: DsClient,
     pg_url: Option<String>,
     schemas: SchemaMap,
+    /// Optional dbsp arrangement layer: flip re-derivations are served from local indexed
+    /// snapshots when the needed index exists, falling back to Postgres otherwise.
+    arrangements: Option<crate::arrangements::Arrangements>,
 }
 
 impl SubqueryRegistry {
@@ -228,7 +231,12 @@ impl SubqueryRegistry {
             ds,
             pg_url,
             schemas: Arc::new(HashMap::new()),
+            arrangements: None,
         }
+    }
+
+    pub fn set_arrangements(&mut self, arrangements: crate::arrangements::Arrangements) {
+        self.arrangements = Some(arrangements);
     }
 
     /// Check out a pooled Postgres connection. All subquery PG access funnels through the shared
@@ -760,12 +768,12 @@ async fn move_shape_for_value(
     txid: Option<String>,
 ) -> Result<Option<(String, String)>> {
     // Brief lock: snapshot what the query-back needs.
-    let (ts, pg_url) = {
+    let (ts, pg_url, arr) = {
         let reg = registry.lock().await;
         let Some(shape) = reg.shapes.get(shape_id) else { return Ok(None) };
-        (reg.snapshot_for_table(&shape.outer_table)?, reg.pg_url.clone())
+        (reg.snapshot_for_table(&shape.outer_table)?, reg.pg_url.clone(), reg.arrangements.clone())
     };
-    let rows = query_candidates(&pg_url, &ts, connecting_col, value).await?;
+    let rows = query_candidates(&arr, &pg_url, &ts, connecting_col, value).await?;
     if rows.is_empty() {
         return Ok(None);
     }
@@ -799,12 +807,12 @@ async fn reconcile_parent_for_value(
     connecting_col: usize,
     value: &Value,
 ) -> Result<Option<(String, Vec<Flip>)>> {
-    let (ts, pg_url) = {
+    let (ts, pg_url, arr) = {
         let reg = registry.lock().await;
         let Some(n) = reg.nodes.get(parent_sig) else { return Ok(None) };
-        (reg.snapshot_for_table(&n.inner_table)?, reg.pg_url.clone())
+        (reg.snapshot_for_table(&n.inner_table)?, reg.pg_url.clone(), reg.arrangements.clone())
     };
-    let rows = query_candidates(&pg_url, &ts, connecting_col, value).await?;
+    let rows = query_candidates(&arr, &pg_url, &ts, connecting_col, value).await?;
     let mut reg = registry.lock().await;
     let (pred, proj) = match reg.nodes.get(parent_sig) {
         Some(n) => (n.pred.clone(), n.proj_col),
@@ -835,12 +843,12 @@ async fn rederive_dependent(
 ) -> Result<()> {
     match &edge.dependent {
         Dependent::Shape(id) => {
-            let (ts, pg_url) = {
+            let (ts, pg_url, arr) = {
                 let reg = registry.lock().await;
                 let Some(s) = reg.shapes.get(id) else { return Ok(()) };
-                (reg.snapshot_for_table(&s.outer_table)?, reg.pg_url.clone())
+                (reg.snapshot_for_table(&s.outer_table)?, reg.pg_url.clone(), reg.arrangements.clone())
             };
-            let rows = query_all(&pg_url, &ts).await?;
+            let rows = query_all(&arr, &pg_url, &ts).await?;
             // Eval + append atomically under the lock (see the module comment).
             let reg = registry.lock().await;
             let Some(s) = reg.shapes.get(id) else { return Ok(()) };
@@ -860,12 +868,12 @@ async fn rederive_dependent(
             reg.ds.append_reliable(&s.stream_path, &envs).await;
         }
         Dependent::Node(parent_sig) => {
-            let (ts, pg_url) = {
+            let (ts, pg_url, arr) = {
                 let reg = registry.lock().await;
                 let Some(n) = reg.nodes.get(parent_sig) else { return Ok(()) };
-                (reg.snapshot_for_table(&n.inner_table)?, reg.pg_url.clone())
+                (reg.snapshot_for_table(&n.inner_table)?, reg.pg_url.clone(), reg.arrangements.clone())
             };
-            let rows = query_all(&pg_url, &ts).await?;
+            let rows = query_all(&arr, &pg_url, &ts).await?;
             let mut reg = registry.lock().await;
             let (pred, proj) = match reg.nodes.get(parent_sig) {
                 Some(n) => (n.pred.clone(), n.proj_col),
@@ -891,21 +899,39 @@ async fn rederive_dependent(
     Ok(())
 }
 
-/// Query candidate rows where `col = value` on a pooled connection (no registry lock held).
+/// Query candidate rows where `col = value`: from the dbsp arrangement snapshot when a
+/// `(table, [col])` index exists (no I/O beyond dbsp's own storage), else from Postgres on a
+/// pooled connection (no registry lock held).
 async fn query_candidates(
+    arr: &Option<crate::arrangements::Arrangements>,
     pg_url: &Option<String>,
     ts: &TableSchema,
     col: usize,
     value: &Value,
 ) -> Result<Vec<Row>> {
+    if let Some(a) = arr {
+        if let Some(rows) = a.lookup(&ts.name, &[col], &Row(vec![value.clone()])) {
+            return Ok(rows);
+        }
+    }
     let url = pg_url.as_deref().context("subquery work requires postgres")?;
     let client = crate::pg::pool_for(url).get().await?;
     let where_sql = value_eq_sql(&ts.columns[col].0, value, ts.pg_types.get(col).and_then(|o| o.as_deref()));
     Ok(crate::pg::backfill_where(&client, ts, Some(where_sql)).await?.rows)
 }
 
-/// Query all rows of `ts` (full re-derive) on a pooled connection (no registry lock held).
-async fn query_all(pg_url: &Option<String>, ts: &TableSchema) -> Result<Vec<Row>> {
+/// Query all rows of `ts` (full re-derive): from the dbsp arrangement scan when available,
+/// else from Postgres on a pooled connection (no registry lock held).
+async fn query_all(
+    arr: &Option<crate::arrangements::Arrangements>,
+    pg_url: &Option<String>,
+    ts: &TableSchema,
+) -> Result<Vec<Row>> {
+    if let Some(a) = arr {
+        if let Some(rows) = a.scan(&ts.name) {
+            return Ok(rows);
+        }
+    }
     let url = pg_url.as_deref().context("subquery work requires postgres")?;
     let client = crate::pg::pool_for(url).get().await?;
     Ok(crate::pg::backfill_where(&client, ts, None).await?.rows)

@@ -1,21 +1,33 @@
 //! The dynamically-typed Z-set element types: scalar `Value`, positional `Row`,
 //! and the weighted-delta pair `Tup2<Row, ZWeight>`.
+//!
+//! `Tup2`/`ZWeight` are dbsp's own (re-exported), and `Value`/`Row` carry the full
+//! `dbsp::DBData` derive stack (rkyv archive + SizeOf + IsNone) so they can be keys and
+//! values in the storage-backed arrangements (`src/arrangements.rs`). The engine's hand
+//! rolled executors keep using them as plain Rust values; only the arrangement layer
+//! exercises the archive impls (batches serialized to layer files).
 
 use anyhow::{Context, Result, bail};
+use feldera_macros::IsNone;
 use ordered_float::OrderedFloat;
+use rkyv::{Archive, Deserialize, Serialize};
+use size_of::SizeOf;
 
 use crate::schema::ColumnType;
 
 /// Signed multiplicity of a Z-set element: `+1` insert, `-1` delete.
-pub type ZWeight = i64;
+pub use dbsp::ZWeight;
 
 /// A weighted pair, the element of a Z-set delta (`Tup2(row, weight)`).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Tup2<A, B>(pub A, pub B);
+pub use dbsp::utils::Tup2;
 
 /// A scalar cell value. `Float` wraps `OrderedFloat` because a bare `f64` is not
 /// `Eq`/`Ord`/`Hash` and so could not be a map key (aggregate multisets, routing indexes).
-#[derive(Clone, Default, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(
+    Clone, Default, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, SizeOf, Archive, Serialize,
+    Deserialize, IsNone,
+)]
+#[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd, Hash))]
 pub enum Value {
     #[default]
     Null,
@@ -95,7 +107,11 @@ impl Value {
 }
 
 /// A row is a positional vector of cell values; the schema gives names to the positions.
-#[derive(Clone, Default, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(
+    Clone, Default, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, SizeOf, Archive, Serialize,
+    Deserialize, IsNone,
+)]
+#[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd, Hash))]
 pub struct Row(pub Vec<Value>);
 
 impl Row {

@@ -72,6 +72,13 @@ pub struct Engine {
     retention: Arc<RetentionConfig>,
     /// Set once the background retention sweeper has been spawned (lazy, idempotent).
     retention_started: Arc<std::sync::atomic::AtomicBool>,
+    /// dbsp arrangement settings (`ELECTRIC_IVM_DBSP*`), set before `setup_postgres`.
+    dbsp_cfg: Arc<std::sync::Mutex<Option<crate::config::DbspConfig>>>,
+    /// The dbsp arrangement layer, once started (see [`crate::arrangements`]).
+    arrangements: Arc<std::sync::Mutex<Option<crate::arrangements::Arrangements>>>,
+    /// Per-table seed-snapshot gates fencing the arrangement feed (fresh seeds only; empty
+    /// after a checkpoint restore, where the highwater does the fencing instead).
+    arr_gates: Arc<std::sync::RwLock<HashMap<String, crate::pg::SnapshotGate>>>,
 }
 
 /// One tailer envelope's worth of deferred subquery flips (see [`Engine::flip_tx`]).
@@ -599,7 +606,71 @@ impl Engine {
             lives: Arc::new(std::sync::Mutex::new(HashMap::new())),
             retention: Arc::new(RetentionConfig::from_env()),
             retention_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            dbsp_cfg: Arc::new(std::sync::Mutex::new(None)),
+            arrangements: Arc::new(std::sync::Mutex::new(None)),
+            arr_gates: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Enable the dbsp arrangement layer (call before [`setup_postgres`](Self::setup_postgres)).
+    pub fn set_dbsp_config(&self, cfg: crate::config::DbspConfig) {
+        *self.dbsp_cfg.lock().unwrap() = Some(cfg);
+    }
+
+    /// The arrangement layer's lookup counters (served, fallback), if it is running.
+    pub fn arrangement_counters(&self) -> Option<(u64, u64)> {
+        self.arrangements.lock().unwrap().as_ref().map(|a| a.counters())
+    }
+
+    /// Start the dbsp arrangement layer and seed it, when configured. Fresh state seeds every
+    /// table from one Postgres snapshot per table (capturing the gate that fences the live
+    /// feed); restored state skips seeding — the sequencer replays the change-log gap instead.
+    async fn maybe_start_arrangements(&self, schemas: &HashMap<String, TableSchema>) -> Result<()> {
+        let Some(cfg) = self.dbsp_cfg.lock().unwrap().clone() else { return Ok(()) };
+        let mut specs: Vec<crate::arrangements::IndexSpec> = schemas
+            .values()
+            .map(|ts| crate::arrangements::IndexSpec { table: ts.name.clone(), cols: vec![ts.pk_index] })
+            .collect();
+        for (t, c) in &cfg.indexes {
+            match schemas.get(t).and_then(|ts| ts.index.get(c)) {
+                Some(&i) => specs.push(crate::arrangements::IndexSpec { table: t.clone(), cols: vec![i] }),
+                None => tracing::warn!("ELECTRIC_IVM_DBSP_INDEXES: unknown column {t}.{c}; skipping"),
+            }
+        }
+        let arr_cfg = crate::arrangements::ArrangementsConfig {
+            dir: cfg.dir.clone(),
+            cache_mib: cfg.cache_mib,
+            min_storage_bytes: cfg.min_storage_bytes,
+            max_rss_bytes: cfg.max_rss_bytes,
+            checkpoint_every: cfg.checkpoint_every,
+            ..crate::arrangements::ArrangementsConfig::default()
+        };
+        let chunk = arr_cfg.seed_chunk_rows;
+        let arr = crate::arrangements::Arrangements::start(arr_cfg, specs)?;
+        if arr.restored_offset().is_none() {
+            let url = self.pg_url.clone().context("arrangements need a pg_url to seed")?;
+            let client = crate::pg::connect(&url).await?;
+            let mut gates = HashMap::new();
+            for ts in schemas.values() {
+                let bf = crate::pg::backfill(&client, ts, None).await?;
+                let total = bf.rows.len();
+                for rows in bf.rows.chunks(chunk) {
+                    arr.seed_chunk(&ts.name, rows.to_vec()).await?;
+                }
+                gates.insert(ts.name.clone(), bf.gate);
+                arr.finish_seed(&ts.name);
+                tracing::info!("arrangements: seeded '{}' ({total} rows)", ts.name);
+            }
+            *self.arr_gates.write().unwrap() = gates;
+        } else {
+            tracing::info!(
+                "arrangements: restored from checkpoint; replaying change log from {:?}",
+                arr.restored_offset()
+            );
+        }
+        self.subqueries.lock().await.set_arrangements(arr.clone());
+        *self.arrangements.lock().unwrap() = Some(arr);
+        Ok(())
     }
 
     /// Sender for the per-envelope trace broadcast — subscribe via `.subscribe()` (used by the
@@ -632,6 +703,8 @@ impl Engine {
                 self.catalog_tx.clone(),
                 self.subquery_handle(),
                 self.trace_tx.clone(),
+                self.arrangements.lock().unwrap().clone(),
+                self.arr_gates.read().unwrap().clone(),
             ));
         }
         st.sequencer.as_ref().expect("sequencer just spawned")
@@ -688,6 +761,12 @@ impl Engine {
         // routing sees every replayed change.
         if let Err(e) = self.restore_catalog(&compiled).await {
             tracing::error!("catalog restore failed (continuing empty): {e:#}");
+        }
+        // Start (and seed or restore) the dbsp arrangement layer BEFORE the sequencer spawns:
+        // the sequencer captures the handle + seed gates at spawn time. A failure here degrades
+        // to Postgres query-backs (the engine still runs), it does not abort boot.
+        if let Err(e) = self.maybe_start_arrangements(&compiled).await {
+            tracing::error!("dbsp arrangements failed to start (falling back to Postgres): {e:#}");
         }
         {
             let mut st = self.state.lock().await;
@@ -2581,6 +2660,7 @@ fn trace_lifecycle(tx: &tokio::sync::broadcast::Sender<Arc<String>>, ev: crate::
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_sequencer(
     ds: DsClient,
     tables: SharedTables,
@@ -2588,6 +2668,8 @@ fn spawn_sequencer(
     catalog_tx: mpsc::UnboundedSender<CatalogEvent>,
     subq: SubqueryHandle,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
+    arr: Option<crate::arrangements::Arrangements>,
+    arr_gates: HashMap<String, crate::pg::SnapshotGate>,
 ) -> SequencerHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let processed = Arc::new(std::sync::Mutex::new(start_offset.clone()));
@@ -2604,8 +2686,76 @@ fn spawn_sequencer(
         node_states.clone(),
         subq,
         trace_tx,
+        arr,
+        arr_gates,
     ));
     SequencerHandle { cmd_tx, processed, stats, node_states }
+}
+
+/// Convert one change-log envelope into a gate-fenced, stamped arrangement delta.
+/// `None` = not applicable (unknown table, empty delta, or fenced out by the seed gate).
+fn stamped_delta_for_arrangements(
+    tables: &SharedTables,
+    arr_gates: &HashMap<String, crate::pg::SnapshotGate>,
+    env: &Envelope,
+) -> Option<crate::arrangements::StampedDelta> {
+    let ts = tables.read().unwrap().get(&env.type_).cloned()?;
+    let (delta, txid, lsn) = apply_envelope(&ts, env).ok()?;
+    if delta.is_empty() {
+        return None;
+    }
+    let lsn_u = lsn.as_deref().map(crate::pg::lsn_to_u64);
+    let xid_u = txid.as_deref().and_then(|t| t.parse::<u64>().ok());
+    // Fresh-seed fence: skip changes the seed snapshot already contains (Z-set deltas are not
+    // idempotent, so a double-apply would corrupt weights).
+    if let Some(gate) = arr_gates.get(&env.type_) {
+        if gate.should_skip(lsn_u.unwrap_or(0), xid_u) {
+            return None;
+        }
+    }
+    Some(crate::arrangements::StampedDelta {
+        table: env.type_.clone(),
+        delta,
+        lsn: lsn_u,
+        seq: env.headers.seq,
+    })
+}
+
+/// Catch the restored arrangement state up to the change-log tail before live processing:
+/// read from the checkpoint's recorded offset and feed only the arrangements (shapes replay
+/// through their own path). Overlap with the live loop is harmless — the arrangement layer
+/// de-duplicates by `(lsn, seq)` highwater.
+async fn arrangements_catch_up(
+    ds: &DsClient,
+    tables: &SharedTables,
+    arr: &crate::arrangements::Arrangements,
+    arr_gates: &HashMap<String, crate::pg::SnapshotGate>,
+) {
+    let Some(mut off) = arr.restored_offset().map(str::to_string) else { return };
+    tracing::info!("arrangements: catch-up replay from {off}");
+    loop {
+        match ds.read(crate::CHANGES_STREAM, &off, false).await {
+            Ok(rr) => {
+                if rr.envelopes.is_empty() {
+                    break;
+                }
+                let deltas: Vec<_> = rr
+                    .envelopes
+                    .iter()
+                    .filter_map(|env| stamped_delta_for_arrangements(tables, arr_gates, env))
+                    .collect();
+                arr.apply_batch(deltas, rr.next_offset.clone()).await;
+                match rr.next_offset {
+                    Some(n) => off = n,
+                    None => break,
+                }
+            }
+            Err(e) => {
+                tracing::warn!("arrangements catch-up read error: {e:#}; backing off");
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    }
 }
 
 /// The graph/trace node id of a family router: `family:<table>:<col,col>` (column NAMES, matching
@@ -2845,6 +2995,8 @@ async fn sequencer_loop(
     node_states: Arc<std::sync::Mutex<HashMap<String, NodeStateSummary>>>,
     subq: SubqueryHandle,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
+    arr: Option<crate::arrangements::Arrangements>,
+    arr_gates: HashMap<String, crate::pg::SnapshotGate>,
 ) {
     let mut execs: HashMap<String, TableExec> = HashMap::new();
     let mut offset = start_offset;
@@ -2860,6 +3012,12 @@ async fn sequencer_loop(
     // increasing on the single ordered log, so anything at/below the highwater has already been
     // applied and is skipped. Envelopes without both stamps (library mode) bypass this.
     let mut highwater: Option<(u64, u64)> = None;
+
+    // A restored arrangement checkpoint may trail the shape catalog's offset: replay the gap
+    // into the arrangements before live processing (single feeder ⇒ in-order application).
+    if let Some(arr) = &arr {
+        arrangements_catch_up(&ds, &tables, arr, &arr_gates).await;
+    }
 
     loop {
         let off = offset.clone();
@@ -2976,6 +3134,19 @@ async fn sequencer_loop(
                         while j < envs.len() && envs[j].headers.txid == txid && envs[j].headers.lsn == lsn {
                             j += 1;
                         }
+                        // Feed this transaction into the dbsp arrangements and step the circuit
+                        // BEFORE fanning it out: flip re-derivations enqueued by this txn's
+                        // subquery reconciliation must observe post-txn table state (the same
+                        // read-your-committed-writes guarantee a Postgres query-back gives).
+                        // The arrangement layer re-checks its own (lsn, seq) highwater, so
+                        // feeding pre-dedup envelopes is safe.
+                        if let Some(arr) = &arr {
+                            let deltas: Vec<_> = envs[i..j]
+                                .iter()
+                                .filter_map(|env| stamped_delta_for_arrangements(&tables, &arr_gates, env))
+                                .collect();
+                            arr.apply_batch(deltas, None).await;
+                        }
                         let mut txn_pending: HashMap<String, Vec<Envelope>> = HashMap::new();
                         for env in envs[i..j].iter() {
                             // Skip redelivered changes (see `highwater` above).
@@ -3025,6 +3196,11 @@ async fn sequencer_loop(
                     }
                     // Publish the processed offset only after the whole batch is fanned out + flushed.
                     if let Some(n) = next {
+                        // Record the batch-boundary offset for arrangement checkpoints (deltas
+                        // were already applied per transaction above).
+                        if let Some(arr) = &arr {
+                            arr.apply_batch(Vec::new(), Some(n.clone())).await;
+                        }
                         *processed.lock().unwrap() = n.clone();
                         if n != ckpt_offset && last_ckpt.elapsed() >= std::time::Duration::from_secs(2) {
                             ckpt_offset = n.clone();

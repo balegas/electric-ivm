@@ -64,8 +64,32 @@ pub struct Config {
     /// are never registered, so nothing can subscribe and the hot-path trace gating stays on its
     /// zero-subscriber fast path. Default on. Note: the surface is unauthenticated either way.
     pub trace: bool,
+    /// dbsp-backed table arrangements (`ELECTRIC_IVM_DBSP=1`; see `arrangements.rs`), or `None`.
+    pub dbsp: Option<DbspConfig>,
     /// Unknown/unimplemented `ELECTRIC_*` vars, accepted as no-ops and logged once at boot.
     pub noop_vars: Vec<String>,
+}
+
+/// Settings for the dbsp arrangement layer (all under `ELECTRIC_IVM_DBSP*`).
+#[derive(Clone, Debug)]
+pub struct DbspConfig {
+    /// State directory (`ELECTRIC_IVM_DBSP_DIR`; default
+    /// `<ELECTRIC_STORAGE_DIR|./data>/dbsp/<slot>` — slot-keyed so parallel engines and
+    /// different source databases never share dbsp state).
+    pub dir: std::path::PathBuf,
+    /// Storage-cache budget in MiB (`ELECTRIC_IVM_DBSP_CACHE_MIB`).
+    pub cache_mib: Option<usize>,
+    /// Spill threshold in KiB (`ELECTRIC_IVM_DBSP_MIN_STORAGE_KB`; default 1024 = 1 MiB;
+    /// 0 spills everything eligible).
+    pub min_storage_bytes: Option<usize>,
+    /// Memory ceiling in MiB driving dbsp's pressure-based spilling (`ELECTRIC_IVM_DBSP_MAX_RSS_MB`).
+    pub max_rss_bytes: Option<u64>,
+    /// Checkpoint cadence in seconds (`ELECTRIC_IVM_DBSP_CHECKPOINT_SECS`; default 60; 0 = only
+    /// at shutdown).
+    pub checkpoint_every: Option<Duration>,
+    /// Extra lookup indexes beyond the per-table primary key: `table.column[,table.column…]`
+    /// (`ELECTRIC_IVM_DBSP_INDEXES`). Lookups against undeclared indexes fall back to Postgres.
+    pub indexes: Vec<(String, String)>,
 }
 
 /// `ELECTRIC_*` vars the engine actually reads and acts on. Anything else matching `^ELECTRIC_`
@@ -203,6 +227,46 @@ impl Config {
             .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
             .unwrap_or(true);
 
+        let dbsp = g("ELECTRIC_IVM_DBSP")
+            .filter(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"))
+            .map(|_| DbspConfig {
+                // Default dir is keyed by the replication slot: dbsp state is only valid for
+                // the database identity it was built from, and parallel engines (conformance
+                // harnesses) get disjoint state dirs for free.
+                dir: g("ELECTRIC_IVM_DBSP_DIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| {
+                        std::path::Path::new(storage_dir.as_deref().unwrap_or("./data"))
+                            .join("dbsp")
+                            .join(&slot)
+                    }),
+                cache_mib: g("ELECTRIC_IVM_DBSP_CACHE_MIB").and_then(|s| s.trim().parse().ok()),
+                min_storage_bytes: Some(
+                    g("ELECTRIC_IVM_DBSP_MIN_STORAGE_KB")
+                        .and_then(|s| s.trim().parse::<usize>().ok())
+                        .unwrap_or(1024)
+                        * 1024,
+                ),
+                max_rss_bytes: g("ELECTRIC_IVM_DBSP_MAX_RSS_MB")
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .map(|mb| mb * 1024 * 1024),
+                checkpoint_every: match g("ELECTRIC_IVM_DBSP_CHECKPOINT_SECS")
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                {
+                    Some(0) => None,
+                    Some(s) => Some(Duration::from_secs(s)),
+                    None => Some(Duration::from_secs(60)),
+                },
+                indexes: g("ELECTRIC_IVM_DBSP_INDEXES")
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter_map(|s| {
+                        let (t, c) = s.trim().split_once('.')?;
+                        Some((t.trim().to_string(), c.trim().to_string()))
+                    })
+                    .collect(),
+            });
+
         Config {
             pg_url,
             ds_url,
@@ -220,6 +284,7 @@ impl Config {
             prometheus_port,
             db_pool_size,
             trace,
+            dbsp,
             noop_vars: Vec::new(),
         }
     }
