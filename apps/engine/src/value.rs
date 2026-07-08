@@ -1,20 +1,21 @@
-//! The dynamically-typed Z-set element used by dbsp circuits.
+//! The dynamically-typed Z-set element types: scalar `Value`, positional `Row`,
+//! and the weighted-delta pair `Tup2<Row, ZWeight>`.
 
 use anyhow::{Context, Result, bail};
-use feldera_macros::IsNone;
 use ordered_float::OrderedFloat;
-use rkyv::{Archive, Deserialize, Serialize};
-use size_of::SizeOf;
 
 use crate::schema::ColumnType;
 
+/// Signed multiplicity of a Z-set element: `+1` insert, `-1` delete.
+pub type ZWeight = i64;
+
+/// A weighted pair, the element of a Z-set delta (`Tup2(row, weight)`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Tup2<A, B>(pub A, pub B);
+
 /// A scalar cell value. `Float` wraps `OrderedFloat` because a bare `f64` is not
-/// `Eq`/`Ord`/`Hash` and so cannot be part of a `dbsp::DBData` key.
-#[derive(
-    Clone, Default, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, SizeOf, Archive, Serialize,
-    Deserialize, IsNone,
-)]
-#[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd, Hash))]
+/// `Eq`/`Ord`/`Hash` and so could not be a map key (aggregate multisets, routing indexes).
+#[derive(Clone, Default, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum Value {
     #[default]
     Null,
@@ -94,11 +95,7 @@ impl Value {
 }
 
 /// A row is a positional vector of cell values; the schema gives names to the positions.
-#[derive(
-    Clone, Default, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, SizeOf, Archive, Serialize,
-    Deserialize, IsNone,
-)]
-#[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd, Hash))]
+#[derive(Clone, Default, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Row(pub Vec<Value>);
 
 impl Row {
@@ -111,6 +108,6 @@ impl Row {
 pub fn ensure_object(j: &serde_json::Value) -> Result<&serde_json::Map<String, serde_json::Value>> {
     match j.as_object() {
         Some(m) => Ok(m),
-        None => bail!("expected a JSON object, got {j}"),
+        None => bail!("expected a JSON object, got {j}")
     }
 }

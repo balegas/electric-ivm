@@ -3,7 +3,8 @@
 //! current data lives in Postgres and is read back on demand (shape backfill), while ongoing changes
 //! arrive via logical replication (see `replication.rs`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use tokio_postgres::{Client, NoTls};
@@ -13,6 +14,9 @@ use crate::schema::{ColumnDef, ColumnType, TableDef, TableSchema};
 use crate::value::Row;
 
 /// Connect and drive the connection on a background task. Returns the query `Client`.
+/// For per-request work (backfills, query-backs, subset queries) prefer [`pool_for`] — a fresh
+/// TCP+auth handshake per shape creation is the fleet benchmark's p99 driver, and thousands of
+/// concurrent creations exhaust ephemeral ports.
 pub async fn connect(url: &str) -> Result<Client> {
     let (client, conn) = tokio_postgres::connect(url, NoTls).await.context("connect postgres")?;
     tokio::spawn(async move {
@@ -21,6 +25,102 @@ pub async fn connect(url: &str) -> Result<Client> {
         }
     });
     Ok(client)
+}
+
+/// Maximum connections per [`Pool`], set once at boot from `ELECTRIC_DB_POOL_SIZE` (default 20).
+static POOL_SIZE: OnceLock<usize> = OnceLock::new();
+
+/// One shared pool per distinct URL for the process lifetime.
+static POOLS: OnceLock<std::sync::Mutex<HashMap<String, Pool>>> = OnceLock::new();
+
+/// Set the per-URL pool capacity. Call once at boot, before the first [`pool_for`].
+pub fn set_pool_size(size: usize) {
+    let _ = POOL_SIZE.set(size.max(1));
+}
+
+/// The shared connection pool for `url` (created on first use).
+pub fn pool_for(url: &str) -> Pool {
+    let pools = POOLS.get_or_init(Default::default);
+    let mut pools = pools.lock().unwrap();
+    pools
+        .entry(url.to_string())
+        .or_insert_with(|| Pool::new(url.to_string(), *POOL_SIZE.get_or_init(|| 20)))
+        .clone()
+}
+
+/// A small connection pool: at most `size` concurrent checkouts, idle connections reused.
+/// Backfills/query-backs are self-contained `BEGIN … COMMIT` units with no session state, so
+/// checkin only has to clear a possibly-aborted transaction (`ROLLBACK`, a no-op warning on a
+/// clean session) before the connection is reusable.
+#[derive(Clone)]
+pub struct Pool {
+    inner: Arc<PoolInner>,
+}
+
+struct PoolInner {
+    url: String,
+    idle: std::sync::Mutex<Vec<Client>>,
+    sem: Arc<tokio::sync::Semaphore>,
+}
+
+impl Pool {
+    pub fn new(url: String, size: usize) -> Pool {
+        Pool {
+            inner: Arc::new(PoolInner {
+                url,
+                idle: std::sync::Mutex::new(Vec::new()),
+                sem: Arc::new(tokio::sync::Semaphore::new(size.max(1))),
+            }),
+        }
+    }
+
+    /// Check out a connection; waits if all `size` are in use. The checkout is returned to the
+    /// pool (or discarded, if broken) when the guard drops.
+    pub async fn get(&self) -> Result<PooledClient> {
+        let permit =
+            self.inner.sem.clone().acquire_owned().await.context("pg pool closed")?;
+        // Reuse an idle connection if it is still healthy; otherwise dial a new one.
+        let reused = self.inner.idle.lock().unwrap().pop().filter(|c| !c.is_closed());
+        let client = match reused {
+            Some(c) => c,
+            None => connect(&self.inner.url).await?,
+        };
+        Ok(PooledClient { client: Some(client), inner: self.inner.clone(), permit: Some(permit) })
+    }
+}
+
+/// A pooled connection checkout. Derefs to `tokio_postgres::Client`.
+pub struct PooledClient {
+    client: Option<Client>,
+    inner: Arc<PoolInner>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl std::ops::Deref for PooledClient {
+    type Target = Client;
+    fn deref(&self) -> &Client {
+        self.client.as_ref().expect("client present until drop")
+    }
+}
+
+impl Drop for PooledClient {
+    fn drop(&mut self) {
+        let Some(client) = self.client.take() else { return };
+        let permit = self.permit.take();
+        if client.is_closed() {
+            return; // permit drops here, freeing the slot
+        }
+        let inner = self.inner.clone();
+        // Clear any transaction the caller left open/aborted, then check the connection back in.
+        // The permit is held until the connection is actually idle again, so live connections
+        // never exceed the pool size.
+        tokio::spawn(async move {
+            if client.batch_execute("ROLLBACK").await.is_ok() {
+                inner.idle.lock().unwrap().push(client);
+            }
+            drop(permit);
+        });
+    }
 }
 
 /// Double-quote a Postgres identifier.
@@ -106,17 +206,45 @@ pub async fn ensure_replica_identity_full(client: &Client, table: &str) -> Resul
         .with_context(|| format!("set REPLICA IDENTITY FULL on {table}"))
 }
 
-/// Create the logical replication slot (test_decoding) if it does not exist.
+/// Create the logical replication slot (`pgoutput`) if it does not exist. A leftover slot with a
+/// different output plugin (e.g. `test_decoding` from an earlier engine version) is dropped and
+/// recreated — the plugin cannot be changed in place.
 pub async fn ensure_slot(client: &Client, slot: &str) -> Result<()> {
-    let exists = client
-        .query("select 1 from pg_replication_slots where slot_name = $1", &[&slot])
+    let existing = client
+        .query("select plugin from pg_replication_slots where slot_name = $1", &[&slot])
         .await
         .context("check slot")?;
+    if let Some(row) = existing.first() {
+        let plugin: String = row.get(0);
+        if plugin == "pgoutput" {
+            return Ok(());
+        }
+        tracing::warn!("slot '{slot}' uses plugin '{plugin}'; dropping and recreating with pgoutput");
+        client
+            .execute("select pg_drop_replication_slot($1)", &[&slot])
+            .await
+            .context("drop stale slot")?;
+    }
+    client
+        .execute("select pg_create_logical_replication_slot($1, 'pgoutput')", &[&slot])
+        .await
+        .context("create slot")?;
+    Ok(())
+}
+
+/// Create the publication the pgoutput stream filters on, if it does not exist. `FOR ALL TABLES`
+/// (requires superuser): the ingestor drops changes for untracked relations itself, and the set of
+/// tracked tables can grow via introspect-all restarts without publication surgery.
+pub async fn ensure_publication(client: &Client, publication: &str) -> Result<()> {
+    let exists = client
+        .query("select 1 from pg_publication where pubname = $1", &[&publication])
+        .await
+        .context("check publication")?;
     if exists.is_empty() {
         client
-            .execute("select pg_create_logical_replication_slot($1, 'test_decoding')", &[&slot])
+            .execute(&format!("create publication {} for all tables", quote_ident(publication)), &[])
             .await
-            .context("create slot")?;
+            .context("create publication")?;
     }
     Ok(())
 }
@@ -151,7 +279,7 @@ pub struct Backfill {
 ///
 /// When a change carries no parseable xid (library mode / non-PG sources), the gate falls back to
 /// the LSN comparison, and with neither it never skips.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotGate {
     /// `pg_current_wal_lsn()` at the snapshot (numeric) — the fallback fence + subset positioning.
     pub lsn: u64,

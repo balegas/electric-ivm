@@ -40,7 +40,8 @@ pub struct Config {
     pub slot: String,
     /// Tables to replicate (`ELECTRIC_IVM_PG_TABLES`); empty / `["*"]` = introspect all.
     pub tables: Vec<String>,
-    /// Replication-slot poll interval (ms).
+    /// Legacy replication poll interval (ms). Unused since the ingestor streams pgoutput (push
+    /// delivery); still parsed so existing `ELECTRIC_IVM_PG_POLL_MS` settings are accepted.
     pub poll_ms: u64,
     /// This instance's id — tags every StatsD metric.
     pub instance_id: String,
@@ -56,6 +57,8 @@ pub struct Config {
     pub storage_dir: Option<String>,
     /// Optional second listener serving Prometheus text (`ELECTRIC_PROMETHEUS_PORT`).
     pub prometheus_port: Option<u16>,
+    /// Max pooled Postgres connections for backfills/query-backs (`ELECTRIC_DB_POOL_SIZE`, default 20).
+    pub db_pool_size: usize,
     /// Unknown/unimplemented `ELECTRIC_*` vars, accepted as no-ops and logged once at boot.
     pub noop_vars: Vec<String>,
 }
@@ -75,6 +78,7 @@ const HANDLED: &[&str] = &[
     "ELECTRIC_LIVE_TIMEOUT_MS",
     "ELECTRIC_HANDLE_TTL",
     "ELECTRIC_PROMETHEUS_PORT",
+    "ELECTRIC_DB_POOL_SIZE",
 ];
 
 fn nonempty(s: Option<String>) -> Option<String> {
@@ -185,6 +189,10 @@ impl Config {
 
         let storage_dir = g("ELECTRIC_STORAGE_DIR");
         let prometheus_port = g("ELECTRIC_PROMETHEUS_PORT").and_then(|s| s.trim().parse().ok());
+        let db_pool_size = g("ELECTRIC_DB_POOL_SIZE")
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(20);
 
         Config {
             pg_url,
@@ -201,6 +209,7 @@ impl Config {
             secret,
             storage_dir,
             prometheus_port,
+            db_pool_size,
             noop_vars: Vec::new(),
         }
     }
@@ -420,7 +429,7 @@ mod tests {
     fn noop_var_detection() {
         assert!(is_noop_var("ELECTRIC_CACHE_MAX_AGE"));
         assert!(is_noop_var("ELECTRIC_OTLP_ENDPOINT"));
-        assert!(is_noop_var("ELECTRIC_DB_POOL_SIZE"));
+        assert!(!is_noop_var("ELECTRIC_DB_POOL_SIZE")); // handled: sizes the backfill pool
         assert!(!is_noop_var("ELECTRIC_PORT")); // handled
         assert!(!is_noop_var("ELECTRIC_IVM_PG_URL")); // internal
         assert!(!is_noop_var("DATABASE_URL")); // not an ELECTRIC_ var

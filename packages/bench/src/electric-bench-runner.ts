@@ -10,6 +10,17 @@
 //      FLEET_DIR (path to a clone of electric-sql/benchmarking-fleet; auto-cloned from FLEET_REPO
 //      when absent), FLEET_REPO (default https://github.com/electric-sql/benchmarking-fleet),
 //      BENCH_OUT (report path).
+//
+// External-target mode — run the same fleet benchmarks against ANY Electric-compatible server
+// (e.g. a stock `electricsql/electric` container) instead of booting our stack:
+//
+//   EXTERNAL_ELECTRIC_URL=http://localhost:3000 \
+//   EXTERNAL_DATABASE_URL=postgresql://postgres:password@localhost:54321/electric \
+//   pnpm bench:fleet
+//
+// The runner then seeds the benchmark schemas into EXTERNAL_DATABASE_URL (dropping/recreating the
+// benchmark tables) and points the unmodified `.exs` scripts at EXTERNAL_ELECTRIC_URL. Both vars
+// are required together. Compare reports by setting a distinct BENCH_OUT per target.
 
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
 import dgram from 'node:dgram'
@@ -45,6 +56,11 @@ function ensureFleet(): void {
   }
   console.log(`cloning ${FLEET_REPO} -> ${FLEET_DIR}`)
   execFileSync('git', ['clone', '--depth', '1', FLEET_REPO, FLEET_DIR], { stdio: 'inherit' })
+}
+const EXTERNAL_URL = process.env.EXTERNAL_ELECTRIC_URL
+const EXTERNAL_DB = process.env.EXTERNAL_DATABASE_URL
+if ((EXTERNAL_URL ? 1 : 0) + (EXTERNAL_DB ? 1 : 0) === 1) {
+  throw new Error('EXTERNAL_ELECTRIC_URL and EXTERNAL_DATABASE_URL must be set together')
 }
 const SCALE = num('BENCH_SCALE', 1)
 const STATSD_PORT = num('BENCH_STATSD_PORT', 8125)
@@ -180,11 +196,14 @@ interface Bench {
 }
 
 const usersSeed = (n: number) => async (c: pgpkg.Client) => {
+  await c.query(`DROP TABLE IF EXISTS public.users CASCADE`) // external targets reuse a database
   await c.query(`CREATE TABLE public.users (id UUID PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL)`)
   await c.query(`INSERT INTO public.users SELECT gen_random_uuid(), 'u'||g, 'u'||g||'@x.com' FROM generate_series(1,$1) g`, [n])
   return `${n.toLocaleString()} users`
 }
 const parentChildSeed = (groups: number, perGroup: number, childrenPer: number) => async (c: pgpkg.Client) => {
+  await c.query(`DROP TABLE IF EXISTS public.child CASCADE`)
+  await c.query(`DROP TABLE IF EXISTS public.parent CASCADE`)
   await c.query(`CREATE TABLE public.parent (id UUID PRIMARY KEY, group_id INT NOT NULL, name TEXT)`)
   await c.query(`CREATE TABLE public.child (id UUID PRIMARY KEY, parent_id UUID NOT NULL REFERENCES public.parent(id), name TEXT)`)
   const parents = groups * perGroup
@@ -247,6 +266,16 @@ function specEnvFilter(only?: string) {
 
 async function runBench(b: Bench, sink: Sink): Promise<{ label: string; specStr: string; durationMs: number; byMetric: Record<string, ReturnType<typeof stats>> }> {
   process.stdout.write(`\n=== ${b.name} (scale ${SCALE}) ===\n`)
+  if (EXTERNAL_URL && EXTERNAL_DB) {
+    // External-target mode: nothing to boot or tear down; the target owns its own lifecycle.
+    const stack: Stack = {
+      pgUrl: EXTERNAL_DB,
+      proc: undefined as unknown as ChildProcess,
+      stop: async () => {},
+      waitAdapter: async () => EXTERNAL_URL,
+    }
+    return await runBenchOnStack(b, sink, stack)
+  }
   const stack = await bootStack(b.waitTable, b.tables)
   try {
     return await runBenchOnStack(b, sink, stack)
@@ -276,7 +305,7 @@ async function runBenchOnStack(
     TELEMETRY_SERVER: `127.0.0.1:${STATSD_PORT}`,
     ELECTRIC_SERVER: hostPort,
     TEST_SPEC: JSON.stringify(spec),
-    TEST_DATABASE_URL: b.needsDb ? dbUrl(stack.pgUrl) : 'unused',
+    TEST_DATABASE_URL: b.needsDb ? (EXTERNAL_DB ?? dbUrl(stack.pgUrl)) : 'unused',
   }
   process.stdout.write(`  running elixir ${b.name}.exs  spec=${JSON.stringify(spec)}\n`)
   const t0 = Date.now()
@@ -306,7 +335,7 @@ async function main() {
     console.error(`benchmarking-fleet not found at ${FLEET_DIR}. Set FLEET_DIR=/path/to/benchmarking-fleet`)
     process.exit(1)
   }
-  if (!existsSync(join(repoRoot(), 'target', 'release', 'electric-ivm-engine'))) {
+  if (!EXTERNAL_URL && !existsSync(join(repoRoot(), 'target', 'release', 'electric-ivm-engine'))) {
     console.log('building the release engine (cargo build --release -p electric-ivm-engine)…')
     execFileSync('cargo', ['build', '--release', '-p', 'electric-ivm-engine'], {
       cwd: repoRoot(),
@@ -320,7 +349,7 @@ async function main() {
     lines.push(s)
     process.stdout.write(`${s}\n`)
   }
-  log(`# Electric benchmarking-fleet — results vs electric-ivm`)
+  log(`# Electric benchmarking-fleet — results vs ${EXTERNAL_URL ? `external Electric at ${EXTERNAL_URL}` : 'electric-ivm'}`)
   log('')
   log(`Generated ${new Date().toISOString()} on ${process.platform}/${process.arch}. Scale ${SCALE}.`)
   log(`Each row runs the unmodified ElectricSQL \`byo_electric\` benchmark \`.exs\` against our \`/v1/shape\``)

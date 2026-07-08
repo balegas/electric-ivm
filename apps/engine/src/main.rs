@@ -1,4 +1,5 @@
-//! electric-ivm engine binary: a durable-streams client that runs dbsp filter circuits per shape.
+//! electric-ivm engine binary: a durable-streams client that incrementally maintains shapes
+//! (key routing + stateless predicate evaluation over Z-set deltas).
 //!
 //! Boot configuration is resolved from the environment by [`electric_ivm_engine::config`], which maps
 //! the benchmarking-fleet's `ELECTRIC_*` / `DATABASE_URL` surface onto the engine's `ELECTRIC_IVM_*`
@@ -53,17 +54,20 @@ async fn main() -> Result<()> {
         tracing::warn!("ELECTRIC_IVM_FAULT active: {:?}", electric_ivm_engine::fault::active());
     }
 
+    // Size the shared Postgres pool (backfills, query-backs, subset queries) before first use.
+    electric_ivm_engine::pg::set_pool_size(config.db_pool_size);
+
     // Postgres mode: data lives in Postgres, ingested via logical replication and read back for
     // backfill. Enabled by a resolved pg_url (ELECTRIC_IVM_PG_URL or DATABASE_URL).
     let engine = match &config.pg_url {
         Some(url) if !url.is_empty() => {
             let engine = Engine::new_pg(DsClient::new(ds_url.clone()), url.clone());
             engine
-                .setup_postgres(&config.tables, &config.slot, config.poll_ms)
+                .setup_postgres(&config.tables, &config.slot)
                 .await
                 .context("postgres setup (introspect, REPLICA IDENTITY FULL, create slot)")?;
             let tables = engine.table_count().await;
-            tracing::info!("postgres mode: {tables} table(s), slot '{}', poll {}ms", config.slot, config.poll_ms);
+            tracing::info!("postgres mode: {tables} table(s), slot '{}', streaming pgoutput", config.slot);
             statsd::consumers_ready(tables as u64);
             // Replication-slot WAL gauges (own ~10s cadence, single pooled PG connection).
             statsd::spawn_replication_slot_sampler(url.clone(), config.slot.clone());

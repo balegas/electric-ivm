@@ -120,6 +120,53 @@ impl DsClient {
     }
 
     /// Append envelopes as a JSON array (the server flattens one array level into N messages).
+    /// Append raw JSON events (non-envelope streams, e.g. the shape catalog).
+    pub async fn append_json(&self, path: &str, events: &[serde_json::Value]) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let res = self
+            .http
+            .post(self.stream_url(path))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(events)
+            .send()
+            .await
+            .with_context(|| format!("POST {path}"))?;
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            bail!("POST {path} -> {status}: {body}");
+        }
+        Ok(())
+    }
+
+    /// Read raw JSON events (non-envelope streams). Returns `(events, next_offset, up_to_date)`.
+    pub async fn read_json(
+        &self,
+        path: &str,
+        offset: &str,
+    ) -> Result<(Vec<serde_json::Value>, Option<String>, bool)> {
+        let url = format!("{}?offset={}", self.stream_url(path), offset);
+        let res = self.http.get(url).send().await.with_context(|| format!("GET {path}"))?;
+        let status = res.status();
+        let next_offset = header(&res, "stream-next-offset");
+        let up_to_date = res.headers().get("stream-up-to-date").is_some();
+        if status.as_u16() == 204 || status.as_u16() == 404 {
+            return Ok((Vec::new(), next_offset, true));
+        }
+        if !status.is_success() {
+            bail!("GET {path} -> {status}");
+        }
+        let body = res.text().await?;
+        let events: Vec<serde_json::Value> = if body.trim().is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_str(&body).with_context(|| format!("parsing stream body: {body}"))?
+        };
+        Ok((events, next_offset, up_to_date))
+    }
+
     pub async fn append(&self, path: &str, envelopes: &[Envelope]) -> Result<()> {
         match self.append_once(path, envelopes).await {
             Ok(()) => Ok(()),

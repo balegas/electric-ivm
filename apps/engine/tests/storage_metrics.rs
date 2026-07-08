@@ -2,7 +2,7 @@
 //! (`electric.storage.transaction_stored.*` + `electric.shape_log_collector.transaction.affected_shape_count`)
 //! — the docker agent observed replication metrics advancing during an insert burst but did not see
 //! these in its capture window. Drives a real engine (library mode) + tailer against a fake ds server
-//! that delivers one insert on the table stream, with StatsD pointed at a local UDP listener.
+//! that delivers one insert on the change log, with StatsD pointed at a local UDP listener.
 
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,16 +18,20 @@ use electric_ivm_engine::engine::Engine;
 use electric_ivm_engine::schema::Schema;
 use electric_ivm_engine::statsd;
 
-/// Whether the single insert on `table/t` has been delivered yet (deliver once, then park).
-static DELIVERED: AtomicBool = AtomicBool::new(false);
+/// The sequencer starts consuming at `define_schema` — hold delivery until the shape is live so
+/// the insert actually fans out to it. Delivery is keyed on the read offset (serve the insert to
+/// every read at `-1`, park reads past it) so a select-cancelled long-poll can't swallow it; the
+/// sequencer's (lsn, seq) highwater de-duplicates any double delivery.
+static READY: AtomicBool = AtomicBool::new(false);
 
 async fn ds_handler(req: Request) -> Response {
     let path = req.uri().path().to_string();
     let is_long_poll = req.uri().query().unwrap_or("").split('&').any(|kv| kv == "live=long-poll");
     match *req.method() {
         Method::PUT | Method::POST | Method::DELETE => StatusCode::OK.into_response(),
-        Method::GET if path.contains("/table/") && is_long_poll => {
-            if !DELIVERED.swap(true, Ordering::SeqCst) {
+        Method::GET if path.contains("/changes") && is_long_poll => {
+            let at_start = req.uri().query().unwrap_or("").contains("offset=-1");
+            if READY.load(Ordering::SeqCst) && at_start {
                 // One committed insert (txid 100) matching the match-all shape.
                 (
                     [("stream-next-offset", "01")],
@@ -35,9 +39,10 @@ async fn ds_handler(req: Request) -> Response {
                 )
                     .into_response()
             } else {
-                // Idle afterwards: park like a real long-poll so the tailer doesn't spin.
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                (StatusCode::NO_CONTENT, [("stream-next-offset", "01")]).into_response()
+                // Not ready yet, or already past the insert: park briefly like a real long-poll.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                (StatusCode::NO_CONTENT, [("stream-next-offset", if at_start { "-1" } else { "01" })])
+                    .into_response()
             }
         }
         Method::GET => {
@@ -90,8 +95,10 @@ async fn live_append_emits_storage_txn_metrics() {
     .unwrap();
     engine.define_schema(&schema).await.unwrap();
     engine.create_shape("t", None, None, false, false).await.unwrap();
+    READY.store(true, Ordering::SeqCst);
 
-    // Let the tailer read table/t, process the insert, append to the shape, and emit storage_txn.
+    // Let the sequencer read the change log, process the insert, append to the shape, and emit
+    // storage_txn.
     let lines = tokio::task::spawn_blocking(move || collect(sock, Duration::from_secs(2))).await.unwrap();
     let names: Vec<&str> = lines.iter().filter_map(|l| l.split(':').next()).collect();
 

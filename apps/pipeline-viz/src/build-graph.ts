@@ -50,6 +50,8 @@ export interface VizNodeData extends Record<string, unknown> {
   highlight?: boolean
   /** `GET /state` key whose live chips this node shows (absent = no state row). */
   stateId?: string
+  /** Retention lifecycle of a shape node — `dormant`/`deactivating`/`reactivating` render parked. */
+  life?: string | null
   ref: NodeRef
   selected?: boolean
   dimmed?: boolean
@@ -112,6 +114,7 @@ function buildFull(g: EngineGraph): { nodes: Map<string, RawNode>; edges: RawEdg
         kind: 'agg',
         label: `${fn}(${s.aggregate.col ?? '*'})`,
         sub: predicateLabel(s.where),
+        life: s.state,
         ref: { kind: 'aggshape', shapeId: s.id },
       })
       edge(tableId(s.table), shapeId, 'flow', predicateLabel(s.where) === 'match all' ? undefined : 'filter')
@@ -125,6 +128,7 @@ function buildFull(g: EngineGraph): { nodes: Map<string, RawNode>; edges: RawEdg
       label: predicateLabel(s.where),
       idTag: s.id,
       highlight: true,
+      life: s.state,
       ref: { kind: 'shape', shapeId: s.id },
     })
 

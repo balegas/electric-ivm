@@ -108,7 +108,8 @@ DS_URL=http://127.0.0.1:8791 ENGINE_URL=http://127.0.0.1:7010 API_PORT=8790 \
 `ELECTRIC_IVM_PG_TABLES="*"` (or empty) means *introspect every public table that has a primary
 key*. On boot, per table, the engine: introspects columns/types/pk, sets
 `REPLICA IDENTITY FULL`, ensures a `table/<name>` durable stream, creates the logical
-replication slot (`test_decoding`, name from `ELECTRIC_IVM_PG_SLOT`, default `electric_ivm`),
+replication slot (`pgoutput` + a `<slot>_pub` publication, name from `ELECTRIC_IVM_PG_SLOT`,
+default `electric_ivm`),
 and starts the ingestor. Nothing else to migrate or install in the database.
 
 Check it's up:

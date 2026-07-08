@@ -112,6 +112,13 @@ export interface Harness {
   pgUrl: string
   /** Everything the engine has written to stderr so far — for asserting on/absence of engine log lines. */
   engineStderr(): string
+  /**
+   * Kill the engine (SIGKILL — simulating a crash) and boot a fresh process against the same
+   * durable streams, Postgres, and slot. Returns once the new process is listening; `engineUrl`
+   * is updated in place. The new engine restores its shapes from the durable catalog — nothing
+   * re-registers them.
+   */
+  restartEngine(): Promise<void>
   shutdown(): Promise<void>
 }
 
@@ -221,7 +228,7 @@ export async function bootHarness(schema: Schema, opts: BootOptions = {}): Promi
     server = new DurableStreamTestServer({ port: 0 })
     const dsUrl = await server.start()
     const tables = Object.keys(schema.tables)
-    const spawned = await spawnEngine(dsUrl, pgUrl, tables, slot, opts.fault, opts.engineEnv)
+    let spawned = await spawnEngine(dsUrl, pgUrl, tables, slot, opts.fault, opts.engineEnv)
     proc = spawned.proc
     const engineUrl = spawned.url
     api = await createApiServer({ dsUrl, engineUrl })
@@ -229,7 +236,7 @@ export async function bootHarness(schema: Schema, opts: BootOptions = {}): Promi
     client = createClient({ apiUrl: api.url, schema })
     // No client.defineSchema: in Postgres mode the engine self-configures from introspection.
 
-    return {
+    const h: Harness = {
       dsUrl,
       engineUrl,
       apiUrl: api.url,
@@ -238,9 +245,19 @@ export async function bootHarness(schema: Schema, opts: BootOptions = {}): Promi
       oracle,
       schema,
       pgUrl,
-      engineStderr: spawned.stderr,
+      engineStderr: () => spawned.stderr(),
+      restartEngine: async () => {
+        proc?.kill('SIGKILL')
+        await new Promise((r) => proc?.once('exit', r))
+        spawned = await spawnEngine(dsUrl, pgUrl, tables, slot, opts.fault, opts.engineEnv)
+        proc = spawned.proc
+        h.engineUrl = spawned.url
+        // NOTE: the API server keeps pointing at the dead engine; restart tests exercise the
+        // engine + streams directly (the catalog restore is engine state, not API state).
+      },
       shutdown: teardown,
     }
+    return h
   } catch (e) {
     await teardown()
     throw e
@@ -252,16 +269,17 @@ export async function applyOp(h: Harness, table: string, ev: ChangeEvent): Promi
   await h.oracle.applyChange(table, ev)
 }
 
-async function tableTail(dsUrl: string, table: string): Promise<string | null> {
-  const res = await fetch(`${dsUrl}/table/${table}`, { method: 'HEAD' })
+async function changesTail(dsUrl: string): Promise<string | null> {
+  const res = await fetch(`${dsUrl}/changes`, { method: 'HEAD' })
   if (!res.ok) return null
   return res.headers.get('stream-next-offset')
 }
 
-async function engineTableOffset(engineUrl: string, table: string): Promise<string | null> {
-  const res = await fetch(`${engineUrl}/tables/${encodeURIComponent(table)}/offset`)
+async function engineChangesOffset(engineUrl: string): Promise<string | null> {
+  // The per-table route reports the sequencer's global change-log offset (same for every table).
+  const res = await fetch(`${engineUrl}/tables/_any/offset`)
   if (res.status === 404) return null
-  if (!res.ok) throw new Error(`engine offset ${table} -> ${res.status}`)
+  if (!res.ok) throw new Error(`engine change-log offset -> ${res.status}`)
   return ((await res.json()) as { offset: string }).offset
 }
 
@@ -271,8 +289,14 @@ async function engineReplicationSync(engineUrl: string): Promise<number> {
   return Number(((await res.json()) as { sync: number }).sync)
 }
 
+async function enginePendingFlips(engineUrl: string): Promise<number> {
+  const res = await fetch(`${engineUrl}/replication/lsn`)
+  if (!res.ok) throw new Error(`engine replication status -> ${res.status}`)
+  return Number(((await res.json()) as { pendingFlips?: number }).pendingFlips ?? 0)
+}
+
 /**
- * Convergence barrier (Postgres mode), in two stages:
+ * Convergence barrier (Postgres mode), in three stages:
  *  1. bump the per-database `__el_sync` sentinel counter, then wait until the engine reports having
  *     decoded-and-appended at least that value. The sentinel UPDATE commits AFTER every prior data
  *     write has committed (drainEngine runs once all applyOp() awaits have resolved), so its commit
@@ -306,22 +330,38 @@ export async function drainEngine(h: Harness, timeoutMs = 20000): Promise<void> 
   if (!synced) {
     throw new Error(`drainEngine: replication did not reach sentinel ${target} within ${timeoutMs}ms`)
   }
-  // Stage 2: engine processed each table stream up to its tail.
-  for (const table of Object.keys(h.schema.tables)) {
-    const tail = await tableTail(h.dsUrl, table)
-    if (!tail) continue
-    let reached = false
-    while (Date.now() < deadline) {
-      const off = await engineTableOffset(h.engineUrl, table)
-      if (off === null || off >= tail) {
-        reached = true
-        break
+  // Stage 2: the sequencer processed the single ordered change log up to its tail.
+  {
+    const tail = await changesTail(h.dsUrl)
+    if (tail) {
+      let reached = false
+      while (Date.now() < deadline) {
+        const off = await engineChangesOffset(h.engineUrl)
+        if (off === null || off >= tail) {
+          reached = true
+          break
+        }
+        await sleep(20)
       }
-      await sleep(20)
+      if (!reached) {
+        throw new Error(`drainEngine: engine did not reach change-log tail ${tail} within ${timeoutMs}ms`)
+      }
     }
-    if (!reached) {
-      throw new Error(`drainEngine: engine did not reach tail ${tail} for table ${table} within ${timeoutMs}ms`)
+  }
+  // Stage 3: deferred subquery flip propagation drained. Flip query-backs run on a separate engine
+  // task (off the sequencer hot path), so "log at tail" no longer implies subquery move-in/move-out
+  // envelopes have been appended; the engine exposes its in-flight flip count for exactly this.
+  // No new flips can be enqueued after stages 1-2 (all envelopes processed, no concurrent writers).
+  let flipsDrained = false
+  while (Date.now() < deadline) {
+    if ((await enginePendingFlips(h.engineUrl)) === 0) {
+      flipsDrained = true
+      break
     }
+    await sleep(15)
+  }
+  if (!flipsDrained) {
+    throw new Error(`drainEngine: subquery flip propagation did not drain within ${timeoutMs}ms`)
   }
 }
 

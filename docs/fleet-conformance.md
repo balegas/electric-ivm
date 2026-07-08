@@ -46,7 +46,7 @@ engine internals happens in the engine itself (preferred) or the entrypoint.
 | `ELECTRIC_STORAGE` | `MEMORY` → in-memory durable-streams; `FAST_FILE` (default) → file-backed under `$ELECTRIC_STORAGE_DIR/shapes`. |
 | `ELECTRIC_LOG_LEVEL` | error/warning/info/debug → engine log filter (default info). |
 | `ELECTRIC_REPLICATION_STREAM_ID` | Suffix for slot name: `electric_slot_<id>` (default `default`). |
-| `ELECTRIC_DB_POOL_SIZE` | Accepted; sizes the engine's backfill connection pool if applicable. |
+| `ELECTRIC_DB_POOL_SIZE` | Sizes the engine's shared Postgres pool (backfills, query-backs, subset queries; default 20). |
 | `ELECTRIC_LIVE_TIMEOUT_MS` (ours) / long-poll default | 20000 ms, matches Electric. |
 | Others (`ELECTRIC_CACHE_MAX_AGE`, `ELECTRIC_OTLP_ENDPOINT`, `ELECTRIC_USAGE_REPORTING`, ...) | Accept and log "accepted (no-op)" once at boot — never crash on unknown `ELECTRIC_*`. |
 

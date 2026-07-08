@@ -11,7 +11,7 @@ the project is growing toward).
 
 | Path | What |
 |---|---|
-| `apps/engine` | Rust engine. Key files: `engine.rs` (tailers, routing, shape sharing/lifecycle, aggregations), `subquery.rs` (cross-table registry: shared inner-set nodes, flips, absolute emission), `replication.rs` (ingestor), `pg.rs` (backfill + `SnapshotGate`), `electric.rs` (`/v1/shape`), `where_sql.rs`/`sql.rs` (SQL⇄predicate), `ds.rs` (streams client incl. `append_reliable`). |
+| `apps/engine` | Rust engine. Key files: `engine.rs` (the LSN-ordered sequencer, routing, shape sharing/lifecycle, aggregations), `subquery.rs` (cross-table registry: shared inner-set nodes, flips, absolute emission), `replication.rs` (streaming pgoutput ingestor) + `pgoutput.rs` (message decoder), `pg.rs` (backfill + `SnapshotGate`), `electric.rs` (`/v1/shape`), `where_sql.rs`/`sql.rs` (SQL⇄predicate), `ds.rs` (streams client incl. `append_reliable`). |
 | `apps/api` | tRPC API (`router.ts`) over the engine + durable-streams (`core.ts`). |
 | `packages/protocol` | Shared types + the change-event envelope (`types.ts`, `envelope.ts`). |
 | `packages/client` | Browser client: `shape()`, `subset()` (see `subset.ts` — LSN watermarks + tombstones), `aggregate()`. All lifecycles tracked; `close()` is one-shot and deletes server-side with retry. |
@@ -47,6 +47,25 @@ pnpm demo:linearlite       # LinearLite demo (ephemeral PG + engine + ds + api +
 pnpm bench:fleet           # ElectricSQL benchmarking-fleet vs our /v1/shape (auto-clones)
 pnpm docker:up             # containerized stack
 ```
+
+**Benchmarking against other Electric versions.** The fleet runner also drives any
+Electric-compatible server instead of our stack — use this to baseline stock Electric releases
+against the same workloads:
+
+```bash
+# 1. Boot the target, e.g. stock Electric:
+docker run -d --name electric-baseline -p 3000:3000 \
+  -e DATABASE_URL=postgresql://postgres:password@host.docker.internal:54321/electric \
+  -e ELECTRIC_INSECURE=true electricsql/electric:latest
+
+# 2. Point the fleet at it (both vars required together; tables are dropped/recreated in that DB):
+EXTERNAL_ELECTRIC_URL=http://localhost:3000 \
+EXTERNAL_DATABASE_URL=postgresql://postgres:password@localhost:54321/electric \
+BENCH_OUT=docs/bench/electric-fleet-results-baseline.md pnpm bench:fleet
+```
+
+Use a distinct `BENCH_OUT` per target and diff the reports; `BENCH_ONLY`/`BENCH_SCALE` apply the
+same way. (Our own image can also be the target — `pnpm docker:up`, then point at port 7010.)
 
 **There is no `tsc` typecheck gate** — CI is vitest (esbuild, transpile-only). To check TS: run
 `pnpm test`, or transpile-load a module with `npx tsx -e "import(...)"`. Always run
@@ -137,13 +156,16 @@ above** — the suites don't render a canvas or exercise the browser.
   If you add a read path, use the gate. (Why: a commit's WAL record exists before it becomes
   snapshot-visible; LSN comparison drops rows in that window and duplicates at the boundary.)
 - **Ingest is at-least-once; consumers restore exactly-once effect.** The ingestor stamps
-  `(commit lsn, xid, seq)`; tailers de-duplicate by `(lsn, seq)`. Aggregates and subquery contributor
+  `(commit lsn, xid, seq)`; the sequencer de-duplicates by `(lsn, seq)`. Aggregates and subquery contributor
   weights are NOT idempotent under duplicates — never bypass the highwater.
 - **Live shape appends must not drop.** Use `ds.append_reliable` (retry/backoff; 404 = shape dropped,
-  discard). The tailer's processed offset is published only after the whole batch landed.
+  discard). The sequencer's processed offset is published only after the whole batch landed, and
+  each source transaction's appends are flushed before the next transaction is processed
+  (per-transaction atomic emission).
 - **Subqueries: emit outer membership *absolutely*** — per touched pk, `upsert` if the row matches
-  *now* else idempotent `delete`. Per-table tailers interleave arbitrarily; delta-based emission
-  misses move-outs. Symptom when wrong: op-by-op converges, *batched* mutations diverge.
+  *now* else idempotent `delete`. Flip-driven query-backs run deferred on the flip-propagator task
+  (out of commit order relative to the sequencer), so delta-based emission would miss move-outs.
+  Symptom when wrong: op-by-op converges, *batched* mutations diverge.
 - **NULL flips re-derive any dependent whose `IN` leaf is negated OR under a `Not{…}`** (edge
   `null_sensitive`). Plain-`IN` dependents can't change (monotonicity over FALSE<UNKNOWN<TRUE).
 - **Shape creation is atomic.** On any failure, everything (record, share entries, registry
@@ -172,12 +194,13 @@ above** — the suites don't render a canvas or exercise the browser.
   (`engine/src/retention.rs`). A leaked refcount (double create, missed release) DOES still pin a
   shape active forever — releases must stay paired one-to-one with creates.
 - **Backfill and replication must produce byte-identical text values.** `to_jsonb(t)` renders
-  timestamps ISO-`T`-style; `test_decoding` uses Postgres text output. Same cell, different string →
+  timestamps ISO-`T`-style; pgoutput text-mode tuples use Postgres text output. Same cell, different string →
   broken retractions/routing/MIN-MAX. Backfill casts text-mapped columns with `::text`
   (`pg.rs::row_json_expr`). If you add a read path, match it.
-- **test_decoding array types nest brackets** (`tags[integer[]]:`) — the type-name skip in
-  `parse_cols` is bracket-depth aware; keep it that way (a first-`]` scan reads every later column
-  in the row as NULL).
+- **Ingest is streaming pgoutput** (walsender protocol via `pgwire-replication` + our own
+  `pgoutput.rs` decoder, text-mode tuples, never the `binary` option — binary values would break
+  the byte-identity above). The slot is `pgoutput`-plugin; a publication `<slot>_pub` (FOR ALL
+  TABLES, needs superuser) is created at setup.
 - **Read raw stream envelopes, not stream-db's reconciled view, when you need every delta.** A
   subset's live feed must apply *move-outs*; stream-db no-ops a delete for a key it never inserted.
   (`packages/client/subset.ts` reads raw `StreamEnvelope`s.)
@@ -197,7 +220,10 @@ above** — the suites don't render a canvas or exercise the browser.
   scope kills by port (`ps -o ppid= -p $(lsof -ti :<httpsPort>)`) — a SIGKILL mid-shutdown leaks
   the ephemeral Postgres.
 - **Vite binds IPv6 `[::1]` only** — prefer the `https://localhost:8443` Caddy proxy (HTTP/2 also
-  dodges the browser's ~6-connection HTTP/1.1 cap that freezes multi-stream apps).
+  dodges the browser's ~6-connection HTTP/1.1 cap that freezes multi-stream apps). **The pipeline
+  visualizer needs its Caddy front too** (`https://localhost:5443`, auto-started by the demo): its
+  `/trace` SSE + engine polling compete for the same connection budget, so open it over HTTPS in a
+  browser — plain `http://localhost:5180` is for `curl` only. See `.claude/skills/run-linearlite`.
 - **Under load the durable-streams *test server* is the ceiling, not the engine** (fsync per append
   file-backed; `ECONNRESET` under burst). `DS_MEMORY=1` + staggered ramps; a production
   durable-streams backend lifts the ceiling.

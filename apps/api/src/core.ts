@@ -83,12 +83,14 @@ export function createCore(opts: CoreOptions): ElectricCore {
     async write(input) {
       const txid = input.txid ?? genTxid()
       const env = toTableEnvelope(input.table, input.op, input.pk, input.row, txid)
-      const res = await doFetch(`${dsUrl}/table/${input.table}`, {
+      // Library-mode writes go on the single ordered change log (the envelope's `type` carries
+      // the table) — same stream the replication ingestor feeds in Postgres mode.
+      const res = await doFetch(`${dsUrl}/changes`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify([env]),
       })
-      if (!res.ok) throw new Error(`append table/${input.table} -> ${res.status}: ${await res.text()}`)
+      if (!res.ok) throw new Error(`append changes -> ${res.status}: ${await res.text()}`)
       return { txid }
     },
 

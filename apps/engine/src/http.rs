@@ -470,7 +470,13 @@ async fn subquery_stats(State(engine): State<Engine>) -> Json<serde_json::Value>
 }
 
 async fn replication_lsn(State(engine): State<Engine>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "lsn": engine.replication_lsn(), "sync": engine.replication_sync() }))
+    Json(serde_json::json!({
+        "lsn": engine.replication_lsn(),
+        "sync": engine.replication_sync(),
+        // Deferred subquery flip batches not yet propagated. Convergence barrier = sync caught up
+        // + per-table offsets at tail + pendingFlips == 0.
+        "pendingFlips": engine.pending_flips(),
+    }))
 }
 
 async fn get_metrics() -> Json<serde_json::Value> {

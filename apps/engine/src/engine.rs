@@ -5,11 +5,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use dbsp::ZWeight;
-use dbsp::utils::Tup2;
+use crate::value::{Tup2, ZWeight};
 use tokio::sync::{Mutex, mpsc};
 
 use std::sync::atomic::Ordering;
@@ -17,8 +15,8 @@ use std::sync::atomic::Ordering;
 use crate::ds::{DsClient, Envelope, EnvelopeHeaders};
 use crate::metrics::{Timer, metrics};
 use crate::predicate::{CompiledPredicate, PredicateJson};
-use crate::retention::{EvictReason, LifeState, RetentionConfig, ShapeLife, SweepShape};
 use crate::schema::{Schema, TableSchema, compile_schema};
+use crate::retention::{EvictReason, LifeState, RetentionConfig, ShapeLife, SweepShape};
 use crate::subquery::{SubqueryRegistry, predicate_has_subquery, referenced_tables};
 use crate::value::{Row, Value};
 
@@ -53,19 +51,125 @@ pub struct Engine {
     /// Best-effort per-envelope trace broadcast (see [`crate::trace`]). Events are serialized once
     /// and only when someone is subscribed; slow subscribers lag and drop.
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
-    /// Per-shape retention lifecycle (active / dormant / transitioning) + `last_read`. A separate
-    /// sync mutex (not `EngineState`) so hot read paths can touch it without the async engine
-    /// lock. Lock order: when both are held, `state` first, then `lives`; never across `.await`.
+    /// Sender to the single flip-propagator task: inner-set flips detected by a tailer are handed
+    /// off here so their Postgres query-backs run off the tailer hot path (see
+    /// [`crate::subquery::propagate_flips`]).
+    flip_tx: mpsc::UnboundedSender<FlipWork>,
+    /// Flip batches enqueued but not yet fully propagated. Part of the convergence barrier:
+    /// drained change log + `pending_flips == 0` ⇒ all subquery effects have landed.
+    pending_flips: Arc<std::sync::atomic::AtomicI64>,
+    /// Table schemas shared with the sequencer task (updated on `setup_postgres`/`define_schema`).
+    tables_shared: SharedTables,
+    /// Ordered writer for the durable shape catalog (see [`CATALOG_STREAM`]).
+    catalog_tx: mpsc::UnboundedSender<CatalogEvent>,
+    /// Change-log offset the sequencer starts from (set by catalog restore before the spawn).
+    seq_start: Arc<std::sync::Mutex<String>>,
+    /// Per-shape retention lifecycle + last-read instant. A separate sync mutex (not
+    /// `EngineState`) so hot read paths can touch it without the async engine lock. Lock order:
+    /// when both are held, `state` first, then `lives`; never across `.await`.
     lives: Arc<std::sync::Mutex<HashMap<String, ShapeLife>>>,
-    /// Retention tuning (read from the environment at construction; see [`RetentionConfig`]).
+    /// Retention policy knobs (see `crate::retention`).
     retention: Arc<RetentionConfig>,
-    /// Set once the background retention sweeper has been spawned (idempotent lazy start).
+    /// Set once the background retention sweeper has been spawned (lazy, idempotent).
     retention_started: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// One tailer envelope's worth of deferred subquery flips (see [`Engine::flip_tx`]).
+pub(crate) struct FlipWork {
+    work: std::collections::VecDeque<(crate::predicate::SubquerySig, crate::subquery::Flip)>,
+    txid: Option<String>,
+}
+
+/// Everything a tailer needs to route deltas through the subquery layer: the shared registry for
+/// the synchronous node-reconcile + outer-emission phases, and the deferral channel + pending
+/// counter for flip propagation.
+#[derive(Clone)]
+struct SubqueryHandle {
+    registry: Arc<Mutex<SubqueryRegistry>>,
+    flip_tx: mpsc::UnboundedSender<FlipWork>,
+    pending_flips: Arc<std::sync::atomic::AtomicI64>,
+}
+
+/// Spawn the engine's single flip-propagator task (one per engine: propagation order and
+/// eval+append atomicity are what keep deferred moves convergent — see `subquery.rs`).
+fn spawn_flip_propagator(
+    registry: Arc<Mutex<SubqueryRegistry>>,
+    mut rx: mpsc::UnboundedReceiver<FlipWork>,
+    pending: Arc<std::sync::atomic::AtomicI64>,
+    trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
+) {
+    tokio::spawn(async move {
+        while let Some(fw) = rx.recv().await {
+            if let Err(e) = crate::subquery::propagate_flips(&registry, fw.work, fw.txid, &trace_tx).await {
+                tracing::error!("subquery flip propagation failed: {e:#}");
+            }
+            pending.fetch_sub(1, Ordering::SeqCst);
+        }
+    });
+}
+
+/// The engine's durable **shape catalog**: an append-only event stream replayed at boot so a
+/// restart re-registers every shape itself instead of requiring a client re-registration storm.
+/// Plain/routed shapes resume with passthrough gates (the change log replays everything after the
+/// persisted offset; re-emission across the crash window is idempotent absolute upserts);
+/// aggregates re-seed their fold from a fresh Postgres snapshot (their fresh gate then skips the
+/// replayed history). Subquery shapes are NOT restorable without persisted inner-node state (a
+/// fresh-seeded node cannot detect downtime flips, which would leave stale move-outs forever) —
+/// they are dropped loudly at restore for clients to recreate.
+const CATALOG_STREAM: &str = "meta/catalog";
+
+/// One catalog event. `Offset` checkpoints the sequencer's processed change-log position (the
+/// replay start after a restart), appended at most every ~2s.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "t", rename_all = "camelCase")]
+enum CatalogEvent {
+    Created { rec: ShapeRecord, sig: Option<String> },
+    /// A subscriber joined a shared feed (refcount +1).
+    Joined { id: String },
+    /// A subscriber left a shared feed (refcount −1). With retention, reaching refcount 0 keeps
+    /// the shape (it goes dormant later), so `Left` never implies teardown.
+    Left { id: String },
+    /// The shape went dormant: routing state dropped, stream + record retained. `resume_offset`
+    /// is the change-log position its stream is complete up to; `gate` is its original
+    /// backfill-snapshot fence. Restores as dormant (an improvement over the in-memory-only
+    /// lifecycle: a restart no longer forgets dormant shapes).
+    Dormant { id: String, resume_offset: String, gate: crate::pg::SnapshotGate },
+    /// A dormant shape was reactivated (replayed + re-registered).
+    Reactivated { id: String },
+    Dropped { id: String },
+    Offset { offset: String },
+}
+
+/// Spawn the single catalog writer: events are appended strictly in send order (senders enqueue
+/// while holding the engine-state lock, so the log order matches the state-mutation order).
+fn spawn_catalog_writer(ds: DsClient, mut rx: mpsc::UnboundedReceiver<CatalogEvent>) {
+    tokio::spawn(async move {
+        let mut ensured = false;
+        while let Some(ev) = rx.recv().await {
+            if !ensured {
+                ensured = self::ensure_catalog(&ds).await;
+            }
+            let Ok(json) = serde_json::to_value(&ev) else { continue };
+            if let Err(e) = ds.append_json(CATALOG_STREAM, &[json]) .await {
+                tracing::error!("catalog append failed (event lost; restart may under-restore): {e:#}");
+            }
+        }
+    });
+}
+
+async fn ensure_catalog(ds: &DsClient) -> bool {
+    match ds.ensure_stream(CATALOG_STREAM).await {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!("catalog stream create failed: {e:#}");
+            false
+        }
+    }
 }
 
 struct EngineState {
     tables: HashMap<String, TableSchema>,
-    tailers: HashMap<String, TailerHandle>,
+    sequencer: Option<SequencerHandle>,
     shapes: HashMap<String, ShapeRecord>,
     next_shape_id: u64,
     /// Shape sharing. Any two **equal** shapes — same kind and definition (see `shape_signature` /
@@ -143,7 +247,7 @@ fn agg_signature(table: &str, where_: &Option<PredicateJson>, func: &AggFn, col_
     format!("agg\u{1f}{table}\u{1f}{}\u{1f}{:?}\u{1f}{:?}", canon_where(where_), func, col_idx)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ShapeRecord {
     pub id: String,
     pub table: String,
@@ -166,7 +270,7 @@ pub struct ShapeRecord {
 }
 
 /// Aggregation descriptor carried on a shape record + `GET /graph` (for the visualizer).
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AggInfo {
     pub func: AggFn,
@@ -191,6 +295,10 @@ pub struct GraphShape {
     pub is_subquery: bool,
     /// Present iff this shape is a scalar aggregation (COUNT/SUM/…).
     pub aggregate: Option<AggInfo>,
+    /// Retention lifecycle: `active` | `deactivating` | `dormant` | `reactivating` (`None` while
+    /// the record is mid-create). A dormant shape keeps its stream + record but holds no routing
+    /// state — the visualizer renders it parked instead of live.
+    pub state: Option<&'static str>,
 }
 
 /// A shared maintained inner-set node (`SELECT proj FROM inner WHERE …`), one per distinct subquery.
@@ -215,7 +323,7 @@ pub struct GraphEdge {
     pub negated: bool,
 }
 
-/// One operator of the exploded dbsp-circuit view: the engine's own decomposition of what it
+/// One operator of the exploded circuit view: the engine's own decomposition of what it
 /// executes per node, so the visualizer renders operators the engine declares instead of guessing.
 /// `hop` binds the operator to the trace-hop id whose outcomes animate it; `state` (when present)
 /// binds it to the state-summary id whose live chips it shows — the operator that actually holds
@@ -245,7 +353,7 @@ pub struct OpEdge {
     pub label: Option<String>,
 }
 
-/// The whole maintained dbsp pipeline at an instant: tables, shapes (with their routing placement),
+/// The whole maintained pipeline at an instant: tables, shapes (with their routing placement),
 /// the shared subquery node/edge DAG, and the exploded operator decomposition (`operators` /
 /// `opEdges`) the circuit view renders. The visualizer derives family + subquery sharing from this.
 #[derive(serde::Serialize)]
@@ -312,19 +420,26 @@ pub struct StateSnapshot {
     pub nodes: HashMap<String, NodeStateSummary>,
 }
 
-struct TailerHandle {
-    cmd_tx: mpsc::UnboundedSender<TailerCmd>,
-    /// Offset up to which all table-stream envelopes have been processed AND fanned to every
-    /// shape. Published after a batch is fully processed; a harness can poll this to know the
-    /// engine has caught up to the stream tail (a sound convergence barrier).
+/// Handle to the engine's single **sequencer** task — the LSN-ordered executor consuming the
+/// global `changes` stream (Electric's `ShapeLogCollector` pattern): one task processes every
+/// table's changes in commit order and flushes each transaction's shape appends before the next
+/// transaction, restoring per-transaction atomic emission across tables.
+struct SequencerHandle {
+    cmd_tx: mpsc::UnboundedSender<SequencerCmd>,
+    /// Change-log offset up to which every envelope has been processed AND fanned to every shape
+    /// (appends landed). A harness polls this against the change log's tail as the convergence
+    /// barrier.
     processed: Arc<std::sync::Mutex<String>>,
-    /// Current circuit topology (shared families + standalone count), for tests/observability.
-    stats: Arc<std::sync::Mutex<TableStats>>,
-    /// Live per-node state summaries for every node this tailer owns (its table, standalone
-    /// filters, family routers, shape sinks, aggregates), keyed by graph node id. Republished
-    /// after every processed batch and on shape add/remove; read by `GET /state`.
+    /// Per-table circuit topology (shared families + standalone count), for tests/observability.
+    stats: Arc<std::sync::Mutex<HashMap<String, TableStats>>>,
+    /// Live per-node state summaries, merged across all tables, keyed by graph node id.
+    /// Republished after every processed batch and on shape add/remove; read by `GET /state`.
     node_states: Arc<std::sync::Mutex<HashMap<String, NodeStateSummary>>>,
 }
+
+/// The tables the sequencer can decode, shared with the `Engine` (which updates it on
+/// `setup_postgres` / `define_schema`). A std lock: reads are brief and never held across awaits.
+type SharedTables = Arc<std::sync::RwLock<HashMap<String, TableSchema>>>;
 
 /// Per-table circuit topology: the shared family circuits (one per equality template) and the
 /// count of standalone per-shape circuits. Exposed via `GET /tables/{name}/families` so a test can
@@ -341,84 +456,108 @@ pub struct FamilyStat {
     pub shapes: usize,
 }
 
-enum TailerCmd {
-    AddShape {
+enum SequencerCmd {
+    /// Phase 1 of shape creation: register a PENDING shape that buffers this table's deltas while
+    /// the creator runs the Postgres backfill concurrently — the sequencer itself never blocks on
+    /// Postgres, so one slow backfill cannot stall the whole change pipeline. Buffer registration
+    /// is acknowledged BEFORE the creator takes its snapshot, so no change can fall between the
+    /// snapshot and activation.
+    BeginShape {
+        table: String,
         shape_id: String,
         num_id: u64,
         stream_path: String,
         pred: Arc<CompiledPredicate>,
         /// Output projection (column indices to emit), or `None` for the full row.
         out_cols: Option<Arc<Vec<usize>>>,
-        /// Skip the Postgres backfill and emit only future matching changes (a non-materialized live
-        /// "tail" feed). Used by subset queries: the page rows come from a `query_subset`, and this
-        /// feed carries just the live deltas the client re-checks against the loaded view.
-        changes_only: bool,
-        /// Signalled once the shape is registered AND its backfill has been appended to the stream —
-        /// `Ok(())` on success, `Err(reason)` if backfill/registration failed — so `create_shape` can
-        /// return only after the snapshot is readable (the Electric adapter folds the stream
-        /// immediately on create) and can propagate a failure instead of leaving a zombie shape.
-        ready: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+        kind: CreateKind,
+        ack: tokio::sync::oneshot::Sender<()>,
     },
-    /// Register a scalar aggregation (COUNT/SUM/AVG/MIN/MAX) over `pred`, maintained incrementally.
-    AddAggregate {
+    /// Phase 2: the creator's backfill snapshot is appended (plain) or carried as `agg_seed`
+    /// (aggregates); drain the buffered deltas through the shape's snapshot gate and go live.
+    /// `ready` mirrors the old add-shape handshake: `Ok(())` once the shape is live and its
+    /// snapshot + gated buffer are on the stream, `Err(reason)` otherwise.
+    ActivateShape {
+        table: String,
         shape_id: String,
-        stream_path: String,
-        pred: Arc<CompiledPredicate>,
-        func: AggFn,
-        col: Option<usize>,
+        gate: crate::pg::SnapshotGate,
+        /// Backfill rows for seeding an aggregate's fold (empty for plain shapes — the creator
+        /// already appended their snapshot envelopes).
+        agg_seed: Vec<Row>,
+        /// Snapshot envelopes the creator appended (seeds the shape's emit counter).
+        emitted_seed: u64,
         ready: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     },
-    RemoveShape { shape_id: String },
-    /// Retention: unregister a plain row shape (standalone or family-routed) and hand back its
-    /// resume state — the tailer's current table-stream offset (everything at/below it has been
-    /// fanned to the shape's stream) and the shape's backfill-snapshot gate. `None` if the shape
-    /// is unknown to this tailer or is an aggregate (aggregates cannot go dormant — their fold
-    /// state is not rebuildable from a bounded replay).
+    /// Creation failed after `BeginShape`: drop the pending buffer.
+    AbortShape { table: String, shape_id: String },
+    /// Retention: unregister a plain row shape's routing and hand back its resume state — the
+    /// sequencer's fully-processed change-log offset (the batch preceding this command was fully
+    /// fanned out + flushed, so the shape's stream is complete up to here) and the shape's
+    /// backfill-snapshot gate. `None` if the shape is unknown (or an aggregate — not parkable).
     DeactivateShape {
+        table: String,
         shape_id: String,
         resp: tokio::sync::oneshot::Sender<Option<(String, crate::pg::SnapshotGate)>>,
     },
-    /// Retention: reactivate a dormant shape — replay `table/<name>` from `resume_offset`,
-    /// append the shape's matching deltas to its retained stream (no Postgres backfill), then
-    /// re-register it for live routing. Runs inline in the tailer loop, so no live envelope can
-    /// interleave with the replay.
-    ResumeShape {
-        shape_id: String,
-        num_id: u64,
-        stream_path: String,
-        pred: Arc<CompiledPredicate>,
-        out_cols: Option<Arc<Vec<usize>>>,
-        resume_offset: String,
-        gate: crate::pg::SnapshotGate,
-        ready: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
-    },
-    /// Dump the full internal state of one node this tailer owns (`family:<t>:<cols>` → the
-    /// routing index contents; an aggregate `shape:<sid>` → the fold internals incl. the MIN/MAX
-    /// multiset). `None` if the node id is unknown to this tailer. Serves `GET /state/node`.
-    DumpNode { node_id: String, resp: tokio::sync::oneshot::Sender<Option<serde_json::Value>> },
+    RemoveShape { table: String, shape_id: String },
+    /// Dump the full internal state of one node (`family:<t>:<cols>` → the routing index
+    /// contents; an aggregate `shape:<sid>` → the fold internals incl. the MIN/MAX multiset).
+    /// `None` if the node id is unknown. Serves `GET /state/node`.
+    DumpNode { table: String, node_id: String, resp: tokio::sync::oneshot::Sender<Option<serde_json::Value>> },
+}
+
+/// What kind of shape a pending creation becomes at activation.
+#[derive(Clone)]
+enum CreateKind {
+    Plain,
+    Aggregate { func: AggFn, col: Option<usize> },
 }
 
 impl Engine {
     pub fn new(ds: DsClient) -> Self {
-        let subqueries = Arc::new(Mutex::new(SubqueryRegistry::new(ds.clone(), None)));
+        Self::new_inner(ds, None)
+    }
+
+    /// Engine in Postgres mode: data lives in Postgres, ingested via logical replication and read
+    /// back for backfill. Call [`setup_postgres`](Self::setup_postgres) before serving.
+    pub fn new_pg(ds: DsClient, pg_url: String) -> Self {
+        let e = Self::new_inner(ds, Some(pg_url));
+        // Postgres mode starts `waiting` until the connection + introspection + slot + ingest are up.
+        e.health.store(HEALTH_WAITING, std::sync::atomic::Ordering::Relaxed);
+        e
+    }
+
+    fn new_inner(ds: DsClient, pg_url: Option<String>) -> Self {
+        let subqueries = Arc::new(Mutex::new(SubqueryRegistry::new(ds.clone(), pg_url.clone())));
+        let trace_tx = tokio::sync::broadcast::channel(crate::trace::CHANNEL_CAP).0;
+        let (flip_tx, flip_rx) = mpsc::unbounded_channel();
+        let pending_flips = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        spawn_flip_propagator(subqueries.clone(), flip_rx, pending_flips.clone(), trace_tx.clone());
+        let (catalog_tx, catalog_rx) = mpsc::unbounded_channel();
+        spawn_catalog_writer(ds.clone(), catalog_rx);
         Engine {
             ds,
             state: Arc::new(Mutex::new(EngineState {
                 tables: HashMap::new(),
-                tailers: HashMap::new(),
+                sequencer: None,
                 shapes: HashMap::new(),
                 next_shape_id: 1,
                 feed_by_sig: HashMap::new(),
                 feed_shares: HashMap::new(),
             })),
-            pg_url: None,
+            pg_url,
             repl_lsn: Arc::new(std::sync::Mutex::new("0/0".to_string())),
             repl_sync: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             replicator_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // Library mode: no Postgres to wait on, so report `active` immediately.
             health: Arc::new(std::sync::atomic::AtomicU8::new(HEALTH_ACTIVE)),
             subqueries,
-            trace_tx: tokio::sync::broadcast::channel(crate::trace::CHANNEL_CAP).0,
+            trace_tx,
+            flip_tx,
+            pending_flips,
+            tables_shared: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            catalog_tx,
+            seq_start: Arc::new(std::sync::Mutex::new("-1".to_string())),
             lives: Arc::new(std::sync::Mutex::new(HashMap::new())),
             retention: Arc::new(RetentionConfig::from_env()),
             retention_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -431,15 +570,33 @@ impl Engine {
         self.trace_tx.clone()
     }
 
-    /// Engine in Postgres mode: data lives in Postgres, ingested via logical replication and read
-    /// back for backfill. Call [`setup_postgres`](Self::setup_postgres) before serving.
-    pub fn new_pg(ds: DsClient, pg_url: String) -> Self {
-        let mut e = Self::new(ds.clone());
-        e.pg_url = Some(pg_url.clone());
-        e.subqueries = Arc::new(Mutex::new(SubqueryRegistry::new(ds, Some(pg_url))));
-        // Postgres mode starts `waiting` until the connection + introspection + slot + ingest are up.
-        e.health.store(HEALTH_WAITING, std::sync::atomic::Ordering::Relaxed);
-        e
+    /// Flip batches enqueued but not yet propagated (convergence-barrier term; see `flip_tx`).
+    pub fn pending_flips(&self) -> i64 {
+        self.pending_flips.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn subquery_handle(&self) -> SubqueryHandle {
+        SubqueryHandle {
+            registry: self.subqueries.clone(),
+            flip_tx: self.flip_tx.clone(),
+            pending_flips: self.pending_flips.clone(),
+        }
+    }
+
+    /// Get (or spawn) the single sequencer task consuming the global change log.
+    fn ensure_sequencer<'a>(&self, st: &'a mut EngineState) -> &'a SequencerHandle {
+        if st.sequencer.is_none() {
+            let start = self.seq_start.lock().unwrap().clone();
+            st.sequencer = Some(spawn_sequencer(
+                self.ds.clone(),
+                self.tables_shared.clone(),
+                start,
+                self.catalog_tx.clone(),
+                self.subquery_handle(),
+                self.trace_tx.clone(),
+            ));
+        }
+        st.sequencer.as_ref().expect("sequencer just spawned")
     }
 
     /// Number of tables with a known schema (tables being tailed) — for the boot `consumers_ready` metric.
@@ -459,7 +616,7 @@ impl Engine {
     /// Introspect the configured tables from Postgres, set `REPLICA IDENTITY FULL`, create the
     /// replication slot, register the schema, and start the replication ingestor. Idempotent: a second
     /// call re-introspects but will NOT spawn a second ingestor (two ingestors would fight for the slot).
-    pub async fn setup_postgres(&self, tables: &[String], slot: &str, poll_ms: u64) -> Result<()> {
+    pub async fn setup_postgres(&self, tables: &[String], slot: &str) -> Result<()> {
         let url = self.pg_url.clone().context("setup_postgres called without a pg_url")?;
         let client = crate::pg::connect(&url).await?;
         // Postgres connection established: leave `waiting`, enter `starting` (introspection + slot +
@@ -479,12 +636,25 @@ impl Engine {
             let def = crate::pg::introspect(&client, t).await?;
             let ts = TableSchema::from_def(t, &def)?;
             crate::pg::ensure_replica_identity_full(&client, t).await?;
-            self.ds.ensure_stream(&format!("table/{t}")).await?;
             compiled.insert(t.clone(), ts);
         }
         crate::pg::ensure_slot(&client, slot).await?;
+        let publication = format!("{slot}_pub");
+        crate::pg::ensure_publication(&client, &publication).await?;
+        self.ds.ensure_stream(crate::CHANGES_STREAM).await?;
+        *self.tables_shared.write().unwrap() = compiled.clone();
         self.state.lock().await.tables = compiled.clone();
         self.subqueries.lock().await.set_schemas(Arc::new(compiled.clone()));
+        // Replay the durable shape catalog (restores shapes + the change-log replay offset), then
+        // start the sequencer from the restored position. Runs before the ingestor so the restored
+        // routing sees every replayed change.
+        if let Err(e) = self.restore_catalog(&compiled).await {
+            tracing::error!("catalog restore failed (continuing empty): {e:#}");
+        }
+        {
+            let mut st = self.state.lock().await;
+            self.ensure_sequencer(&mut st);
+        }
         // Spawn the ingestor at most once, even if setup_postgres is called again.
         if self.replicator_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
             tracing::warn!("setup_postgres called again; ingestor already running, not spawning another");
@@ -494,7 +664,7 @@ impl Engine {
         tokio::spawn(crate::replication::run(
             url,
             slot.to_string(),
-            poll_ms,
+            publication,
             self.ds.clone(),
             Arc::new(compiled),
             self.repl_lsn.clone(),
@@ -521,11 +691,14 @@ impl Engine {
 
     pub async fn define_schema(&self, schema: &Schema) -> Result<()> {
         let compiled = compile_schema(schema)?;
-        for name in compiled.keys() {
-            self.ds.ensure_stream(&format!("table/{name}")).await?;
-        }
+        self.ds.ensure_stream(crate::CHANGES_STREAM).await?;
         self.subqueries.lock().await.set_schemas(Arc::new(compiled.clone()));
-        self.state.lock().await.tables = compiled;
+        *self.tables_shared.write().unwrap() = compiled.clone();
+        {
+            let mut st = self.state.lock().await;
+            st.tables = compiled;
+            self.ensure_sequencer(&mut st);
+        }
         Ok(())
     }
 
@@ -568,7 +741,7 @@ impl Engine {
             None => None,
         };
         let url = self.pg_url.clone().context("query_subset requires postgres mode")?;
-        let client = crate::pg::connect(&url).await?;
+        let client = crate::pg::pool_for(&url).get().await?;
         let sq = crate::pg::query_subset_where(&client, &ts, where_sql, order, limit, offset).await?;
         let proj = out_cols.as_deref().map(Vec::as_slice);
         let rows = sq.rows.iter().map(|r| ts.row_to_json_cols(r, proj)).collect();
@@ -591,7 +764,6 @@ impl Engine {
         // Whole shape-creation timer (backfill + registration); emitted by the creator on success only
         // (joiners return early before this fires) as `create_snapshot_task.stop.duration`.
         let created_at = std::time::Instant::now();
-        self.ensure_retention_sweeper();
         let mut st = self.state.lock().await;
         let ts = match st.tables.get(table) {
             Some(ts) => ts.clone(),
@@ -610,6 +782,7 @@ impl Engine {
                 if let Some(rec) = st.shapes.get(&existing_id).cloned() {
                     let share = st.feed_shares.get_mut(&existing_id).expect("share entry for live feed");
                     share.refcount += 1;
+                let _ = self.catalog_tx.send(CatalogEvent::Joined { id: existing_id.clone() });
                     let ready = share.ready.clone();
                     // Release the lock, then wait for the creator's backfill to land: a joiner must not
                     // see a stream whose snapshot isn't readable yet, and must surface (not mask) a
@@ -620,7 +793,7 @@ impl Engine {
                         return Err(e);
                     }
                     // A rejoin is a touch: if the shape went dormant since the last subscriber
-                    // left, reactivate it (table-stream replay) before handing out the stream.
+                    // left, reactivate it (change-log replay) before handing out the stream.
                     if let Err(e) = self.ensure_active(&existing_id).await {
                         // Roll the failed join back so the dead subscription doesn't pin the shape.
                         self.release_shape(&existing_id).await;
@@ -645,17 +818,12 @@ impl Engine {
             let mut tables = referenced_tables(&where_json);
             tables.push(table.to_string());
             for t in &tables {
-                if !st.tailers.contains_key(t) {
-                    let tts = st
-                        .tables
-                        .get(t)
-                        .cloned()
-                        .ok_or_else(|| anyhow::anyhow!("unknown table '{t}' referenced by subquery"))?;
-                    let handle =
-                        spawn_tailer(self.ds.clone(), tts, self.pg_url.clone(), self.subqueries.clone(), self.trace_tx.clone());
-                    st.tailers.insert(t.clone(), handle);
+                if !st.tables.contains_key(t) {
+                    bail!("unknown table '{t}' referenced by subquery");
                 }
             }
+            // The sequencer feeds every table's deltas to the registry; just make sure it runs.
+            self.ensure_sequencer(&mut st);
             let rec = ShapeRecord {
                 id: id.clone(),
                 table: table.to_string(),
@@ -668,7 +836,9 @@ impl Engine {
                 aggregate: None,
             };
             st.shapes.insert(id.clone(), rec.clone());
+            let _ = self.catalog_tx.send(CatalogEvent::Created { rec: rec.clone(), sig: feed_sig.clone() });
             self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
+            self.ensure_retention_sweeper();
             // Register this (first) subquery shape so later identical ones join it by ref-count.
             // Joiners wait on `ready_tx` — the shape isn't live until the registry has seeded its
             // nodes and backfilled the stream.
@@ -702,7 +872,7 @@ impl Engine {
                     // wake any joiners with the failure.
                     let mut st = self.state.lock().await;
                     st.shapes.remove(&id);
-                    self.lives.lock().unwrap().remove(&id);
+                    let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
                     if let Some(share) = st.feed_shares.remove(&id) {
                         st.feed_by_sig.remove(&share.sig);
                     }
@@ -721,24 +891,20 @@ impl Engine {
             .equality_template()
             .map(|pairs| pairs.iter().map(|(i, _)| ts.columns[*i].0.clone()).collect::<Vec<_>>());
 
-        if !st.tailers.contains_key(table) {
-            let handle = spawn_tailer(self.ds.clone(), ts.clone(), self.pg_url.clone(), self.subqueries.clone(), self.trace_tx.clone());
-            st.tailers.insert(table.to_string(), handle);
-        }
-        let tailer = st.tailers.get(table).expect("tailer just inserted");
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        tailer
-            .cmd_tx
-            .send(TailerCmd::AddShape {
+        let cmd_tx = self.ensure_sequencer(&mut st).cmd_tx.clone();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(SequencerCmd::BeginShape {
+                table: table.to_string(),
                 shape_id: id.clone(),
                 num_id,
                 stream_path: stream_path.clone(),
-                pred,
-                out_cols,
-                changes_only,
-                ready: ready_tx,
+                pred: pred.clone(),
+                out_cols: out_cols.clone(),
+                kind: CreateKind::Plain,
+                ack: ack_tx,
             })
-            .map_err(|_| anyhow::anyhow!("tailer for '{table}' is gone"))?;
+            .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
 
         let rec = ShapeRecord {
             id: id.clone(),
@@ -752,7 +918,9 @@ impl Engine {
             aggregate: None,
         };
         st.shapes.insert(id.clone(), rec.clone());
+        let _ = self.catalog_tx.send(CatalogEvent::Created { rec: rec.clone(), sig: feed_sig.clone() });
         self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
+        self.ensure_retention_sweeper();
         // Register the (first) shared feed so later identical subset feeds join it. Joiners wait on
         // `share_tx` for the backfill outcome.
         let (share_tx, share_rx) = tokio::sync::watch::channel(None);
@@ -760,10 +928,15 @@ impl Engine {
             st.feed_by_sig.insert(sig.clone(), id.clone());
             st.feed_shares.insert(id.clone(), FeedShare { sig, refcount: 1, ready: share_rx });
         }
-        // Release the engine-state lock, then wait for the tailer to finish the backfill so the shape's
+        // Release the engine-state lock, then run the two-phase backfill+activate so the shape's
         // snapshot is readable when we return (the Electric adapter folds the stream immediately).
+        // The sequencer keeps processing all tables meanwhile, buffering this shape's deltas.
         drop(st);
-        let outcome = ready_rx.await.unwrap_or_else(|_| Err("tailer dropped the ready channel".to_string()));
+        let outcome = backfill_and_activate(
+            &self.ds, &self.pg_url, &cmd_tx, &ts, table, &id, &rec.stream_path, &pred,
+            out_cols.as_ref(), changes_only, false, ack_rx,
+        )
+        .await;
         match outcome {
             Ok(()) => {
                 let _ = share_tx.send(Some(true));
@@ -779,12 +952,14 @@ impl Engine {
                 // later identical create would join) and surface the error to the caller.
                 let mut st = self.state.lock().await;
                 st.shapes.remove(&id);
-                self.lives.lock().unwrap().remove(&id);
+                let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
                 if let Some(share) = st.feed_shares.remove(&id) {
                     st.feed_by_sig.remove(&share.sig);
                 }
-                if let Some(t) = st.tailers.get(&rec.table) {
-                    let _ = t.cmd_tx.send(TailerCmd::RemoveShape { shape_id: id.clone() });
+                if let Some(seq) = st.sequencer.as_ref() {
+                    let _ = seq
+                        .cmd_tx
+                        .send(SequencerCmd::RemoveShape { table: rec.table.clone(), shape_id: id.clone() });
                 }
                 drop(st);
                 let _ = share_tx.send(Some(false));
@@ -804,7 +979,6 @@ impl Engine {
         func: AggFn,
         col: Option<String>,
     ) -> Result<ShapeRecord> {
-        self.ensure_retention_sweeper();
         let mut st = self.state.lock().await;
         let ts = st.tables.get(table).cloned().ok_or_else(|| anyhow::anyhow!("unknown table '{table}'"))?;
         if where_.as_ref().is_some_and(predicate_has_subquery) {
@@ -826,10 +1000,11 @@ impl Engine {
             if let Some(rec) = st.shapes.get(&existing_id).cloned() {
                 let share = st.feed_shares.get_mut(&existing_id).expect("share entry for aggregate");
                 share.refcount += 1;
+                let _ = self.catalog_tx.send(CatalogEvent::Joined { id: existing_id.clone() });
                 let ready = share.ready.clone();
                 drop(st);
                 await_share_ready(ready, &existing_id).await?;
-                self.touch_shape(&existing_id); // aggregates never go dormant; a join is still a read
+                self.touch_shape(&existing_id); // aggregates never park, but the read is a touch
                 return Ok(rec);
             }
         }
@@ -842,24 +1017,22 @@ impl Engine {
         let stream_path = format!("shape/{id}");
         self.ds.ensure_stream(&stream_path).await?;
 
-        if !st.tailers.contains_key(table) {
-            let handle = spawn_tailer(self.ds.clone(), ts.clone(), self.pg_url.clone(), self.subqueries.clone(), self.trace_tx.clone());
-            st.tailers.insert(table.to_string(), handle);
-        }
-        let tailer = st.tailers.get(table).expect("tailer just inserted");
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        tailer
-            .cmd_tx
-            .send(TailerCmd::AddAggregate {
+        let cmd_tx = self.ensure_sequencer(&mut st).cmd_tx.clone();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(SequencerCmd::BeginShape {
+                table: table.to_string(),
                 shape_id: id.clone(),
+                num_id,
                 stream_path: stream_path.clone(),
-                pred,
-                func,
-                col: col_idx,
-                ready: ready_tx,
+                pred: pred.clone(),
+                out_cols: None,
+                kind: CreateKind::Aggregate { func, col: col_idx },
+                ack: ack_tx,
             })
-            .map_err(|_| anyhow::anyhow!("tailer for '{table}' is gone"))?;
+            .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
 
+        let stream_path_c = stream_path.clone();
         let rec = ShapeRecord {
             id: id.clone(),
             table: table.to_string(),
@@ -872,13 +1045,19 @@ impl Engine {
             aggregate: Some(AggInfo { func, col }),
         };
         st.shapes.insert(id.clone(), rec.clone());
+        let _ = self.catalog_tx.send(CatalogEvent::Created { rec: rec.clone(), sig: Some(agg_sig.clone()) });
         self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
+        self.ensure_retention_sweeper();
         // Register this (first) aggregate so later identical ones join it by ref-count.
         let (share_tx, share_rx) = tokio::sync::watch::channel(None);
         st.feed_by_sig.insert(agg_sig.clone(), id.clone());
         st.feed_shares.insert(id.clone(), FeedShare { sig: agg_sig, refcount: 1, ready: share_rx });
         drop(st);
-        let outcome = ready_rx.await.unwrap_or_else(|_| Err("tailer dropped the ready channel".to_string()));
+        let outcome = backfill_and_activate(
+            &self.ds, &self.pg_url, &cmd_tx, &ts, table, &id, &stream_path_c, &pred,
+            None, false, true, ack_rx,
+        )
+        .await;
         match outcome {
             Ok(()) => {
                 let _ = share_tx.send(Some(true));
@@ -891,12 +1070,14 @@ impl Engine {
             Err(e) => {
                 let mut st = self.state.lock().await;
                 st.shapes.remove(&id);
-                self.lives.lock().unwrap().remove(&id);
+                let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
                 if let Some(share) = st.feed_shares.remove(&id) {
                     st.feed_by_sig.remove(&share.sig);
                 }
-                if let Some(t) = st.tailers.get(&rec.table) {
-                    let _ = t.cmd_tx.send(TailerCmd::RemoveShape { shape_id: id.clone() });
+                if let Some(seq) = st.sequencer.as_ref() {
+                    let _ = seq
+                        .cmd_tx
+                        .send(SequencerCmd::RemoveShape { table: rec.table.clone(), shape_id: id.clone() });
                 }
                 drop(st);
                 let _ = share_tx.send(Some(false));
@@ -908,16 +1089,25 @@ impl Engine {
 
     /// Snapshot the whole maintained pipeline for the visualizer: tables, every registered shape with
     /// its routing placement (family key / standalone / subquery), the shared subquery node+edge DAG,
-    /// and the exploded per-operator decomposition for the circuit view. Deterministically ordered
-    /// (tables by name, shapes by numeric id, nodes/edges by signature): the maps behind it iterate
-    /// in random order, and a consumer diffing consecutive snapshots (the visualizer's "did the
-    /// structure change" check) must see byte-identical output for an unchanged pipeline.
+    /// and the exploded per-operator decomposition for the circuit view.
     pub async fn graph(&self) -> EngineGraph {
         let (tables, shapes, schemas) = {
             let st = self.state.lock().await;
+            // Deterministic output: a consumer diffing consecutive snapshots (the visualizer's
+            // "did the structure change" check) must see byte-identical output for an unchanged
+            // pipeline.
             let mut tables: Vec<String> = st.tables.keys().cloned().collect();
             tables.sort();
-            let mut shapes: Vec<GraphShape> = st
+            let lives = self.lives.lock().unwrap();
+            let life_of = |id: &str| -> Option<&'static str> {
+                lives.get(id).map(|l| match l.state {
+                    LifeState::Active => "active",
+                    LifeState::Deactivating { .. } => "deactivating",
+                    LifeState::Dormant { .. } => "dormant",
+                    LifeState::Reactivating { .. } => "reactivating",
+                })
+            };
+            let shapes: Vec<GraphShape> = st
                 .shapes
                 .values()
                 .map(|r| GraphShape {
@@ -930,8 +1120,10 @@ impl Engine {
                     family_key: r.family_key.clone(),
                     is_subquery: r.is_subquery,
                     aggregate: r.aggregate.clone(),
+                    state: life_of(&r.id),
                 })
                 .collect();
+            let mut shapes = shapes;
             shapes.sort_by_key(|s| s.id.strip_prefix('s').and_then(|n| n.parse::<u64>().ok()).unwrap_or(u64::MAX));
             let schemas: HashMap<String, TableSchema> = st.tables.clone();
             (tables, shapes, schemas)
@@ -956,7 +1148,7 @@ impl Engine {
             })
             .collect();
         subquery_nodes.sort_by(|a, b| a.sig.cmp(&b.sig));
-        let mut subquery_edges: Vec<GraphEdge> = reg
+        let subquery_edges: Vec<GraphEdge> = reg
             .edges
             .iter()
             .map(|e| {
@@ -981,6 +1173,7 @@ impl Engine {
                 }
             })
             .collect();
+        let mut subquery_edges = subquery_edges;
         subquery_edges
             .sort_by(|a, b| (&a.node_sig, &a.dependent_kind, &a.dependent_id).cmp(&(&b.node_sig, &b.dependent_kind, &b.dependent_id)));
         let (operators, op_edges) = circuit_ops(&tables, &shapes, &subquery_nodes, &subquery_edges);
@@ -1002,25 +1195,25 @@ impl Engine {
     }
 
     /// Release one subscription on a shape (extended-API `DELETE /shapes/{id}`, `/v1/shape` handle
-    /// eviction). Refcount-0 does **not** tear the shape down anymore: the shape stays active (a
-    /// brief reconnect rejoins it warm), goes dormant after the retention idle timeout, and is
-    /// eventually evicted by the layered retention policy — see [`crate::retention`]. Releasing is
-    /// also a touch (it resets the idle timer), so the idle countdown starts at the disconnect.
-    /// Infallible: it only adjusts in-memory counters.
+    /// eviction). Refcount-0 does **not** tear the shape down: it stays active (a brief reconnect
+    /// rejoins it warm), goes dormant after the retention idle timeout, and is eventually evicted
+    /// by the layered policy (see `crate::retention`). Releasing is also a touch, so the idle
+    /// countdown starts at the disconnect. Infallible: it only adjusts in-memory counters.
     pub async fn release_shape(&self, id: &str) {
         let mut st = self.state.lock().await;
         if let Some(share) = st.feed_shares.get_mut(id) {
             share.refcount = share.refcount.saturating_sub(1);
+            let _ = self.catalog_tx.send(CatalogEvent::Left { id: id.to_string() });
         }
         drop(st);
         self.touch_shape(id);
     }
 
     /// Force-drop a shape NOW, bypassing the retention lifecycle: full teardown (record, share
-    /// entries, lifecycle entry, tailer routing, subquery-registry entry, durable stream)
+    /// entries, lifecycle entry, sequencer routing, subquery-registry entry, durable stream)
     /// regardless of refcount or lifecycle state. An admin/debug operation (`DELETE
     /// /shapes/{id}?purge=true`, the visualizer's trash button) — subscribed clients see their
-    /// stream vanish and recreate via the normal 404 / must-refetch path. The tailer command
+    /// stream vanish and recreate via the normal 404 / must-refetch path. The sequencer command
     /// queue is FIFO, so a purge ordered after an in-flight resume removes whatever the resume
     /// registered.
     pub async fn purge_shape(&self, id: &str) -> Result<()> {
@@ -1030,9 +1223,14 @@ impl Engine {
             st.feed_by_sig.remove(&share.sig);
         }
         let removed = st.shapes.remove(id);
+        if removed.is_some() {
+            let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.to_string() });
+        }
         if let Some(rec) = &removed {
-            if let Some(t) = st.tailers.get(&rec.table) {
-                let _ = t.cmd_tx.send(TailerCmd::RemoveShape { shape_id: id.to_string() });
+            if let Some(seq) = st.sequencer.as_ref() {
+                let _ = seq
+                    .cmd_tx
+                    .send(SequencerCmd::RemoveShape { table: rec.table.clone(), shape_id: id.to_string() });
             }
         }
         drop(st);
@@ -1051,7 +1249,7 @@ impl Engine {
     /// Record an engine-visible read of a shape (drives the retention idle timer + LRU order).
     fn touch_shape(&self, id: &str) {
         if let Some(life) = self.lives.lock().unwrap().get_mut(id) {
-            life.last_read = Instant::now();
+            life.last_read = std::time::Instant::now();
         }
     }
 
@@ -1066,7 +1264,7 @@ impl Engine {
     }
 
     /// Make sure a shape is active, reactivating it from dormancy if needed ("any touch
-    /// reactivates"): replay `table/<name>` from the shape's resume offset through its predicate
+    /// reactivates"): replay the change log from the shape's resume offset through its predicate
     /// onto the retained stream — no Postgres backfill — then re-register it for live routing.
     /// Concurrent touches coalesce onto one replay; a touch during deactivation waits for the
     /// transition to settle first. Also refreshes `last_read`.
@@ -1084,7 +1282,7 @@ impl Engine {
                     // the caller's own record lookup decides between 404 and normal service.
                     None => Step::Done,
                     Some(life) => {
-                        life.last_read = Instant::now();
+                        life.last_read = std::time::Instant::now();
                         match &life.state {
                             LifeState::Active => Step::Done,
                             LifeState::Deactivating { done } => Step::WaitDeactivate(done.clone()),
@@ -1094,9 +1292,8 @@ impl Engine {
                                 // are dropped when an HTTP client disconnects, and a cancelled
                                 // in-place replay would strand the shape in `Reactivating`. The
                                 // task always settles the lifecycle state and publishes the
-                                // outcome; this caller then awaits THIS attempt's channel (so a
-                                // deterministic failure surfaces once — it never respawns in a
-                                // loop), like any concurrent toucher.
+                                // outcome; this caller then awaits THIS attempt's channel like any
+                                // concurrent toucher.
                                 let resume_offset = resume_offset.clone();
                                 let gate = gate.clone();
                                 let (tx, rx) = tokio::sync::watch::channel(None);
@@ -1110,16 +1307,19 @@ impl Engine {
                                         Ok(()) => {
                                             if let Some(life) = lives.get_mut(&id) {
                                                 life.state = LifeState::Active;
-                                                life.last_read = Instant::now();
+                                                life.last_read = std::time::Instant::now();
                                             }
                                             let _ = tx.send(Some(true));
                                         }
                                         Err(e) => {
                                             tracing::warn!("reactivating shape {id} failed: {e:#}");
-                                            // Restore the dormant resume state so a later touch can retry.
+                                            // Restore the dormant resume state so a later touch retries.
                                             if let Some(life) = lives.get_mut(&id) {
-                                                life.state =
-                                                    LifeState::Dormant { since: Instant::now(), resume_offset, gate };
+                                                life.state = LifeState::Dormant {
+                                                    since: std::time::Instant::now(),
+                                                    resume_offset,
+                                                    gate,
+                                                };
                                             }
                                             let _ = tx.send(Some(false));
                                         }
@@ -1157,42 +1357,76 @@ impl Engine {
         }
     }
 
-    /// The replay half of a reactivation: hand the dormant shape's resume state to its table's
-    /// tailer, which replays the table stream and re-registers the shape (see
-    /// [`TailerCmd::ResumeShape`]). Split from [`ensure_active`] so the lifecycle bookkeeping
-    /// around it stays in one place.
+    /// The replay half of a reactivation: re-register the shape through the sequencer's two-phase
+    /// pending-buffer handshake, but replay the change log from the dormant resume offset instead
+    /// of taking a Postgres snapshot. Live deltas arriving during the replay buffer in the pending
+    /// shape and drain through the same gate at activation; any overlap between the replay and the
+    /// buffer double-applies only absolute per-pk upserts/deletes — idempotent for stream readers.
+    /// Split from [`ensure_active`] so the lifecycle bookkeeping stays in one place.
     async fn resume_dormant(&self, id: &str, resume_offset: String, gate: crate::pg::SnapshotGate) -> Result<()> {
-        let mut st = self.state.lock().await;
-        let rec = st.shapes.get(id).cloned().with_context(|| format!("shape '{id}' vanished during reactivation"))?;
-        let ts = st.tables.get(&rec.table).cloned().with_context(|| format!("unknown table '{}'", rec.table))?;
-        let pred = Arc::new(CompiledPredicate::compile_opt(rec.where_json.as_ref(), &ts)?);
-        let out_cols = resolve_columns(&ts, rec.columns.clone())?;
-        let num_id: u64 = id.strip_prefix('s').and_then(|n| n.parse().ok()).context("unparseable shape id")?;
-        if !st.tailers.contains_key(&rec.table) {
-            let handle =
-                spawn_tailer(self.ds.clone(), ts.clone(), self.pg_url.clone(), self.subqueries.clone(), self.trace_tx.clone());
-            st.tailers.insert(rec.table.clone(), handle);
-        }
-        let tailer = st.tailers.get(&rec.table).expect("tailer just ensured");
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        tailer
-            .cmd_tx
-            .send(TailerCmd::ResumeShape {
+        let (rec, ts, pred, out_cols, num_id, cmd_tx) = {
+            let mut st = self.state.lock().await;
+            let rec =
+                st.shapes.get(id).cloned().with_context(|| format!("shape '{id}' vanished during reactivation"))?;
+            let ts =
+                st.tables.get(&rec.table).cloned().with_context(|| format!("unknown table '{}'", rec.table))?;
+            let pred = Arc::new(CompiledPredicate::compile_opt(rec.where_json.as_ref(), &ts)?);
+            let out_cols = resolve_columns(&ts, rec.columns.clone())?;
+            let num_id: u64 =
+                id.strip_prefix('s').and_then(|n| n.parse().ok()).context("unparseable shape id")?;
+            let cmd_tx = self.ensure_sequencer(&mut st).cmd_tx.clone();
+            (rec, ts, pred, out_cols, num_id, cmd_tx)
+        };
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(SequencerCmd::BeginShape {
+                table: rec.table.clone(),
                 shape_id: id.to_string(),
                 num_id,
                 stream_path: rec.stream_path.clone(),
-                pred,
-                out_cols,
-                resume_offset,
+                pred: pred.clone(),
+                out_cols: out_cols.clone(),
+                kind: CreateKind::Plain,
+                ack: ack_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
+        ack_rx.await.map_err(|_| anyhow::anyhow!("sequencer dropped the begin-shape ack"))?;
+        // Replay everything the retained stream is missing (buffering live deltas meanwhile).
+        let emitted = match replay_changes_for_shape(
+            &self.ds,
+            &ts,
+            &rec.table,
+            &pred,
+            out_cols.as_ref(),
+            &gate,
+            &rec.stream_path,
+            &resume_offset,
+        )
+        .await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = cmd_tx
+                    .send(SequencerCmd::AbortShape { table: rec.table.clone(), shape_id: id.to_string() });
+                return Err(e.context(format!("shape '{id}' reactivation replay failed")));
+            }
+        };
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(SequencerCmd::ActivateShape {
+                table: rec.table.clone(),
+                shape_id: id.to_string(),
                 gate,
+                agg_seed: Vec::new(),
+                emitted_seed: emitted,
                 ready: ready_tx,
             })
-            .map_err(|_| anyhow::anyhow!("tailer for '{}' is gone", rec.table))?;
-        drop(st);
+            .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
         ready_rx
             .await
-            .unwrap_or_else(|_| Err("tailer dropped the ready channel".to_string()))
+            .unwrap_or_else(|_| Err("sequencer dropped the ready channel".to_string()))
             .map_err(|e| anyhow::anyhow!("shape '{id}' reactivation failed: {e}"))?;
+        let _ = self.catalog_tx.send(CatalogEvent::Reactivated { id: id.to_string() });
         metrics().shapes_reactivated.fetch_add(1, Ordering::Relaxed);
         trace_lifecycle(
             &self.trace_tx,
@@ -1202,9 +1436,10 @@ impl Engine {
         Ok(())
     }
 
-    /// Move an idle refcount-0 shape from active to dormant: the tailer unregisters it and hands
-    /// back the resume state (table-stream offset + snapshot gate); the stream and record are
-    /// retained. Rechecks eligibility under the locks — a touch or rejoin racing the sweep wins.
+    /// Move an idle refcount-0 shape from active to dormant: the sequencer unregisters its
+    /// routing and hands back the resume state (fully-processed change-log offset + the shape's
+    /// snapshot gate); the stream and record are retained. Rechecks eligibility under the locks —
+    /// a touch or rejoin racing the sweep wins.
     async fn deactivate_shape(&self, id: &str) -> Result<()> {
         let st = self.state.lock().await;
         let Some(rec) = st.shapes.get(id).cloned() else { return Ok(()) }; // already gone
@@ -1214,7 +1449,7 @@ impl Engine {
         if st.feed_shares.get(id).is_some_and(|s| s.refcount > 0) {
             return Ok(()); // resubscribed since the sweep snapshot
         }
-        let Some(tailer_tx) = st.tailers.get(&rec.table).map(|t| t.cmd_tx.clone()) else { return Ok(()) };
+        let Some(cmd_tx) = st.sequencer.as_ref().map(|s| s.cmd_tx.clone()) else { return Ok(()) };
         let (done_tx, done_rx) = tokio::sync::watch::channel(false);
         {
             let mut lives = self.lives.lock().unwrap();
@@ -1229,26 +1464,33 @@ impl Engine {
         drop(st);
 
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        let sent = tailer_tx.send(TailerCmd::DeactivateShape { shape_id: id.to_string(), resp: resp_tx }).is_ok();
+        let sent = cmd_tx
+            .send(SequencerCmd::DeactivateShape { table: rec.table.clone(), shape_id: id.to_string(), resp: resp_tx })
+            .is_ok();
         let resume = if sent { resp_rx.await.ok().flatten() } else { None };
         let mut lives = self.lives.lock().unwrap();
         let Some(life) = lives.get_mut(id) else { return Ok(()) };
         match resume {
             Some((resume_offset, gate)) => {
-                life.state = LifeState::Dormant { since: Instant::now(), resume_offset, gate };
+                life.state = LifeState::Dormant {
+                    since: std::time::Instant::now(),
+                    resume_offset: resume_offset.clone(),
+                    gate: gate.clone(),
+                };
                 drop(lives);
+                let _ = self.catalog_tx.send(CatalogEvent::Dormant { id: id.to_string(), resume_offset, gate });
                 metrics().shapes_dormanted.fetch_add(1, Ordering::Relaxed);
                 trace_lifecycle(&self.trace_tx, crate::trace::GraphLifecycle::ShapeDormant { shape: id.to_string() });
                 tracing::debug!("shape {id} went dormant (idle)");
             }
             None => {
-                // The tailer didn't know the shape (or is gone): leave it active. Reset the idle
-                // clock so the sweep backs off a full idle window instead of re-attempting (and
-                // re-warning) every sweep.
+                // The sequencer didn't know the shape (or is gone): leave it active. Reset the
+                // idle clock so the sweep backs off a full idle window instead of re-attempting
+                // (and re-warning) every sweep.
                 life.state = LifeState::Active;
-                life.last_read = Instant::now();
+                life.last_read = std::time::Instant::now();
                 drop(lives);
-                tracing::warn!("deactivating shape {id}: tailer returned no resume state; left active");
+                tracing::warn!("deactivating shape {id}: sequencer returned no resume state; left active");
             }
         }
         let _ = done_tx.send(true);
@@ -1288,11 +1530,16 @@ impl Engine {
             st.feed_by_sig.remove(&share.sig);
         }
         let removed = st.shapes.remove(id);
-        // A dormant shape is already unregistered from its tailer; a non-parkable one is still
-        // live and needs the full teardown (tailer routing for aggregates, registry for subqueries).
+        if removed.is_some() {
+            let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.to_string() });
+        }
+        // A dormant shape is already unregistered from the sequencer; a non-parkable one is still
+        // live and needs the full teardown (sequencer routing for aggregates, registry for subqueries).
         if !parkable {
-            if let Some(t) = st.tailers.get(&rec.table) {
-                let _ = t.cmd_tx.send(TailerCmd::RemoveShape { shape_id: id.to_string() });
+            if let Some(seq) = st.sequencer.as_ref() {
+                let _ = seq
+                    .cmd_tx
+                    .send(SequencerCmd::RemoveShape { table: rec.table.clone(), shape_id: id.to_string() });
             }
         }
         drop(st);
@@ -1376,7 +1623,7 @@ impl Engine {
     }
 
     /// Spawn (once) the background retention sweeper. Started lazily from the shape-create paths
-    /// so library users that never create shapes never run it.
+    /// (and after a catalog restore) so library users that never create shapes never run it.
     fn ensure_retention_sweeper(&self) {
         if self.retention_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
@@ -1391,6 +1638,196 @@ impl Engine {
                 engine.retention_sweep().await;
             }
         });
+    }
+
+    /// Replay the durable shape catalog and re-register every restorable shape with the (not yet
+    /// spawned) sequencer — see [`CATALOG_STREAM`] for the restore semantics per shape kind.
+    async fn restore_catalog(&self, compiled: &HashMap<String, TableSchema>) -> Result<()> {
+        // 1. Fold the event log.
+        // (rec, sig, refcount, dormant resume state). The last Dormant/Reactivated event wins.
+        type Restored = (ShapeRecord, Option<String>, usize, Option<(String, crate::pg::SnapshotGate)>);
+        let mut recs: HashMap<String, Restored> = HashMap::new();
+        let mut start_offset = "-1".to_string();
+        let mut off = "-1".to_string();
+        loop {
+            let (events, next, up_to_date) = self.ds.read_json(CATALOG_STREAM, &off).await?;
+            for ev in events {
+                let Ok(ev) = serde_json::from_value::<CatalogEvent>(ev) else { continue };
+                match ev {
+                    CatalogEvent::Created { rec, sig } => {
+                        recs.insert(rec.id.clone(), (rec, sig, 1, None));
+                    }
+                    CatalogEvent::Joined { id } => {
+                        if let Some(e) = recs.get_mut(&id) {
+                            e.2 += 1;
+                        }
+                    }
+                    CatalogEvent::Left { id } => {
+                        if let Some(e) = recs.get_mut(&id) {
+                            e.2 = e.2.saturating_sub(1);
+                        }
+                    }
+                    CatalogEvent::Dormant { id, resume_offset, gate } => {
+                        if let Some(e) = recs.get_mut(&id) {
+                            e.3 = Some((resume_offset, gate));
+                        }
+                    }
+                    CatalogEvent::Reactivated { id } => {
+                        if let Some(e) = recs.get_mut(&id) {
+                            e.3 = None;
+                        }
+                    }
+                    CatalogEvent::Dropped { id } => {
+                        recs.remove(&id);
+                    }
+                    CatalogEvent::Offset { offset } => start_offset = offset,
+                }
+            }
+            match next {
+                Some(n) if !up_to_date && n != off => off = n,
+                _ => break,
+            }
+        }
+        if recs.is_empty() && start_offset == "-1" {
+            return Ok(());
+        }
+        tracing::info!("catalog restore: {} shape(s), change-log replay from {start_offset}", recs.len());
+        *self.seq_start.lock().unwrap() = start_offset;
+
+        // 2. Restore records + shares; subquery shapes are dropped (see CATALOG_STREAM docs).
+        let mut resume: Vec<ShapeRecord> = Vec::new();
+        let mut dead_streams: Vec<String> = Vec::new();
+        {
+            let mut st = self.state.lock().await;
+            for (id, (rec, sig, refcount, dormant)) in recs {
+                if let Ok(num) = id.trim_start_matches('s').parse::<u64>() {
+                    st.next_shape_id = st.next_shape_id.max(num + 1);
+                }
+                if rec.is_subquery {
+                    tracing::warn!(
+                        "restore: dropping subquery shape {id} (inner-node state is not persisted);                          subscribers observe the deleted stream and recreate"
+                    );
+                    let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
+                    dead_streams.push(rec.stream_path.clone());
+                    continue;
+                }
+                st.shapes.insert(id.clone(), rec.clone());
+                if let Some(sig) = sig {
+                    // Restored feeds are live immediately (their streams already hold data).
+                    let (ready_tx, ready_rx) = tokio::sync::watch::channel(Some(true));
+                    drop(ready_tx); // receivers keep observing Some(true)
+                    st.feed_by_sig.insert(sig.clone(), id.clone());
+                    st.feed_shares.insert(id.clone(), FeedShare { sig, refcount, ready: ready_rx });
+                }
+                match dormant {
+                    // A dormant shape restores AS dormant: record + stream retained, no routing,
+                    // no replay at boot — the first touch reactivates it from its own resume
+                    // offset. (Dormancy age restarts at boot; the TTL clock is conservative.)
+                    Some((resume_offset, gate)) => {
+                        self.lives.lock().unwrap().insert(
+                            id.clone(),
+                            ShapeLife {
+                                last_read: std::time::Instant::now(),
+                                state: LifeState::Dormant {
+                                    since: std::time::Instant::now(),
+                                    resume_offset,
+                                    gate,
+                                },
+                            },
+                        );
+                    }
+                    None => {
+                        self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
+                        resume.push(rec);
+                    }
+                }
+            }
+            self.ensure_sequencer(&mut st);
+        }
+        // Restored dormant shapes still need the TTL/eviction layers running.
+        self.ensure_retention_sweeper();
+        for path in dead_streams {
+            let _ = self.ds.delete_stream(&path).await;
+        }
+
+        // 3. Re-register with the sequencer. Plain/routed shapes resume without a backfill and
+        // with a passthrough gate (`changes_only = true` path): everything after the restored
+        // offset replays, and re-emission across the crash window is idempotent. Aggregates
+        // re-seed their fold from a fresh snapshot (fresh gate skips the replayed history).
+        let cmd_tx = {
+            let st = self.state.lock().await;
+            st.sequencer.as_ref().expect("sequencer spawned above").cmd_tx.clone()
+        };
+        for rec in resume {
+            let outcome = self.resume_shape(&cmd_tx, &rec, compiled).await;
+            if let Err(e) = outcome {
+                tracing::error!("restore: shape {} failed to resume ({e:#}); dropping it", rec.id);
+                let mut st = self.state.lock().await;
+                st.shapes.remove(&rec.id);
+                let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: rec.id.clone() });
+                if let Some(share) = st.feed_shares.remove(&rec.id) {
+                    st.feed_by_sig.remove(&share.sig);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-register one restored shape with the sequencer (the resume half of `restore_catalog`).
+    async fn resume_shape(
+        &self,
+        cmd_tx: &mpsc::UnboundedSender<SequencerCmd>,
+        rec: &ShapeRecord,
+        compiled: &HashMap<String, TableSchema>,
+    ) -> Result<()> {
+        let ts = compiled
+            .get(&rec.table)
+            .with_context(|| format!("table '{}' no longer exists", rec.table))?;
+        let pred = Arc::new(CompiledPredicate::compile_opt(rec.where_json.as_ref(), ts)?);
+        let out_cols: Option<Arc<Vec<usize>>> = match &rec.columns {
+            Some(names) => {
+                let idx: Result<Vec<usize>> = names.iter().map(|n| ts.column_index(n)).collect();
+                Some(Arc::new(idx?))
+            }
+            None => None,
+        };
+        let num_id: u64 = rec.id.trim_start_matches('s').parse().unwrap_or(0);
+        let (kind, changes_only, is_aggregate) = match &rec.aggregate {
+            Some(a) => {
+                let col = a.col.as_deref().map(|c| ts.column_index(c)).transpose()?;
+                (CreateKind::Aggregate { func: a.func, col }, false, true)
+            }
+            None => (CreateKind::Plain, true, false),
+        };
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(SequencerCmd::BeginShape {
+                table: rec.table.clone(),
+                shape_id: rec.id.clone(),
+                num_id,
+                stream_path: rec.stream_path.clone(),
+                pred: pred.clone(),
+                out_cols: out_cols.clone(),
+                kind,
+                ack: ack_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
+        backfill_and_activate(
+            &self.ds,
+            &self.pg_url,
+            cmd_tx,
+            ts,
+            &rec.table,
+            &rec.id,
+            &rec.stream_path,
+            &pred,
+            out_cols.as_ref(),
+            changes_only,
+            is_aggregate,
+            ack_rx,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!(e))
     }
 
     /// Number of maintained subquery nodes (for the sharing-topology introspection endpoint).
@@ -1410,11 +1847,11 @@ impl Engine {
     }
 
     /// Read a shape's durable stream (catch-up or long-poll live) — used by the Electric adapter to turn
-    /// the engine's shape output into Electric `/v1/shape` change messages. A data read is a full
-    /// retention touch: it reactivates a dormant shape before reading (so a parked stream is never
-    /// served stale) and refreshes `last_read`. `ensure_active` is a cheap lifecycle-map check when
-    /// the shape is active (the common case) or the path is not a shape stream.
+    /// the engine's shape output into Electric `/v1/shape` change messages.
     pub async fn read_shape_stream(&self, path: &str, offset: &str, live: bool) -> Result<crate::ds::ReadResult> {
+        // A data read is a full retention touch: reactivate a dormant shape before reading (so a
+        // parked stream is never served stale) and refresh `last_read`. `ensure_active` is a cheap
+        // lifecycle-map check when the shape is active (the common case).
         self.ensure_active(sid_of_path(path)).await?;
         self.ds.read(path, offset, live).await
     }
@@ -1429,14 +1866,18 @@ impl Engine {
             let mut families = 0usize;
             let mut family_shapes = 0usize;
             let mut standalone = 0usize;
-            for h in st.tailers.values() {
-                if let Ok(s) = h.stats.lock() {
+            let mut tables_with_execs = 0usize;
+            if let Some(seq) = st.sequencer.as_ref()
+                && let Ok(per_table) = seq.stats.lock()
+            {
+                tables_with_execs = per_table.len();
+                for s in per_table.values() {
                     families += s.families.len();
                     family_shapes += s.families.iter().map(|f| f.shapes).sum::<usize>();
                     standalone += s.standalone;
                 }
             }
-            (st.shapes.len(), st.tailers.len(), st.tables.len(), families, family_shapes, standalone)
+            (st.shapes.len(), tables_with_execs, st.tables.len(), families, family_shapes, standalone)
         };
         let (sq_nodes, sq_contributors, sq_distinct, sq_shapes, sq_edges) =
             self.subqueries.lock().await.mem_totals();
@@ -1463,25 +1904,22 @@ impl Engine {
         }
     }
 
-    /// Look up a shape record. Deliberately NOT a retention touch: this is a metadata lookup
-    /// (the visualizer and harnesses poll it), not a read of the shape's data — counting it
-    /// would keep observed shapes active forever.
     pub async fn get_shape(&self, id: &str) -> Option<ShapeRecord> {
         self.state.lock().await.shapes.get(id).cloned()
     }
 
-    /// The offset up to which the table's tailer has processed, or `None` if no tailer exists
-    /// (no shape registered on the table yet).
-    pub async fn table_offset(&self, table: &str) -> Option<String> {
+    /// The change-log offset up to which the sequencer has processed (global — all tables share
+    /// the single ordered log), or `None` if the sequencer is not running yet.
+    pub async fn table_offset(&self, _table: &str) -> Option<String> {
         let st = self.state.lock().await;
-        st.tailers.get(table).map(|t| t.processed.lock().unwrap().clone())
+        st.sequencer.as_ref().map(|s| s.processed.lock().unwrap().clone())
     }
 
     /// The table's current circuit topology (shared families + standalone count), or `None` if no
     /// tailer exists.
     pub async fn table_stats(&self, table: &str) -> Option<TableStats> {
         let st = self.state.lock().await;
-        st.tailers.get(table).map(|t| t.stats.lock().unwrap().clone())
+        st.sequencer.as_ref().and_then(|s| s.stats.lock().unwrap().get(table).cloned())
     }
 
     /// Full per-node state snapshot (`GET /state`): every tailer's published node map merged with
@@ -1497,11 +1935,11 @@ impl Engine {
                     NodeStateSummary::Table { processed_offset: "-1".to_string(), envelopes: 0 },
                 );
             }
-            for h in st.tailers.values() {
-                if let Ok(m) = h.node_states.lock() {
-                    for (k, v) in m.iter() {
-                        nodes.insert(k.clone(), v.clone());
-                    }
+            if let Some(seq) = st.sequencer.as_ref()
+                && let Ok(m) = seq.node_states.lock()
+            {
+                for (k, v) in m.iter() {
+                    nodes.insert(k.clone(), v.clone());
                 }
             }
         }
@@ -1550,10 +1988,10 @@ impl Engine {
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
             let st = self.state.lock().await;
-            st.tailers
-                .get(&table)?
+            st.sequencer
+                .as_ref()?
                 .cmd_tx
-                .send(TailerCmd::DumpNode { node_id: id.to_string(), resp: tx })
+                .send(SequencerCmd::DumpNode { table, node_id: id.to_string(), resp: tx })
                 .ok()?;
         }
         rx.await.ok().flatten()
@@ -1686,7 +2124,7 @@ fn circuit_ops(
 }
 
 /// A non-shareable shape (range / OR / NOT / inequality / match-all). Its predicate is a stateless
-/// filter, so it needs no dbsp circuit or OS thread — it is evaluated directly on each delta. This
+/// filter, so it needs no incremental state or OS thread — it is evaluated directly on each delta. This
 /// is what lets standalone shapes scale far past the old one-thread-per-shape ceiling.
 struct StandaloneShape {
     pred: Arc<CompiledPredicate>,
@@ -1699,15 +2137,143 @@ struct StandaloneShape {
 }
 
 /// Evaluate a stateless WHERE filter directly on a Z-set delta. A filter has no incremental state
-/// (unlike a join), so running it in dbsp would only add a thread + channel round-trip + a per-shape
-/// clone of the delta. `translate_output` downstream groups by primary key, so emitting the matching
-/// `(row, weight)` pairs here is equivalent to what the old per-shape filter circuit produced.
+/// (unlike a join), so wrapping it in a dataflow circuit would only add a thread + channel round-trip
+/// + a per-shape clone of the delta. `translate_output` downstream groups by primary key, so emitting
+/// the matching `(row, weight)` pairs here is equivalent to what the old per-shape filter circuit produced.
 fn eval_standalone(pred: &CompiledPredicate, delta: &[Tup2<Row, ZWeight>]) -> Vec<(Row, ZWeight)> {
     delta
         .iter()
         .filter(|t| pred.matches(&t.0))
         .map(|t| (t.0.clone(), t.1))
         .collect()
+}
+
+/// Index over standalone shapes by a **necessary conjunct** (`(column, op)` — see
+/// [`CompiledPredicate::access_leaf`]): a change row can only match a shape if the shape's
+/// necessary conjunct holds on that row, so per-change candidate lookup replaces the O(K)
+/// scan over all standalone shapes with hash lookups (equality conjuncts) + ordered bound
+/// scans (range conjuncts), both output-sensitive. Shapes with no indexable conjunct
+/// (top-level OR/NOT, LIKE, !=, IS NULL, match-all) stay on the `scan` fallback list.
+#[derive(Default)]
+struct StandaloneIndex {
+    /// `col = v` conjuncts: column -> literal -> shape ids.
+    eq: HashMap<usize, HashMap<Value, Vec<String>>>,
+    /// `col >/>= v` conjuncts: column -> bound -> (shape id, strict). A row value `x` satisfies
+    /// bounds `< x` (any) and `== x` (non-strict only) — an ordered prefix scan.
+    lower: HashMap<usize, std::collections::BTreeMap<Value, Vec<(String, bool)>>>,
+    /// `col </<= v` conjuncts, mirrored.
+    upper: HashMap<usize, std::collections::BTreeMap<Value, Vec<(String, bool)>>>,
+    /// Shapes with no indexable conjunct — always candidates.
+    scan: Vec<String>,
+    /// Where each shape was placed, for removal.
+    placed: HashMap<String, Option<crate::predicate::AccessLeaf>>,
+}
+
+impl StandaloneIndex {
+    fn insert(&mut self, sid: &str, pred: &CompiledPredicate) {
+        use crate::predicate::AccessLeaf;
+        let leaf = pred.access_leaf();
+        match &leaf {
+            Some(AccessLeaf::Eq { col, value }) => {
+                self.eq.entry(*col).or_default().entry(value.clone()).or_default().push(sid.to_string());
+            }
+            Some(AccessLeaf::Lower { col, value, strict }) => {
+                self.lower.entry(*col).or_default().entry(value.clone()).or_default().push((sid.to_string(), *strict));
+            }
+            Some(AccessLeaf::Upper { col, value, strict }) => {
+                self.upper.entry(*col).or_default().entry(value.clone()).or_default().push((sid.to_string(), *strict));
+            }
+            None => self.scan.push(sid.to_string()),
+        }
+        self.placed.insert(sid.to_string(), leaf);
+    }
+
+    fn remove(&mut self, sid: &str) {
+        use crate::predicate::AccessLeaf;
+        let Some(leaf) = self.placed.remove(sid) else { return };
+        match leaf {
+            Some(AccessLeaf::Eq { col, value }) => {
+                if let Some(by_val) = self.eq.get_mut(&col)
+                    && let Some(sids) = by_val.get_mut(&value)
+                {
+                    sids.retain(|s| s != sid);
+                    if sids.is_empty() {
+                        by_val.remove(&value);
+                        if by_val.is_empty() {
+                            self.eq.remove(&col);
+                        }
+                    }
+                }
+            }
+            Some(AccessLeaf::Lower { col, value, .. }) => {
+                Self::remove_bound(&mut self.lower, col, &value, sid);
+            }
+            Some(AccessLeaf::Upper { col, value, .. }) => {
+                Self::remove_bound(&mut self.upper, col, &value, sid);
+            }
+            None => self.scan.retain(|s| s != sid),
+        }
+    }
+
+    fn remove_bound(
+        m: &mut HashMap<usize, std::collections::BTreeMap<Value, Vec<(String, bool)>>>,
+        col: usize,
+        value: &Value,
+        sid: &str,
+    ) {
+        if let Some(by_val) = m.get_mut(&col)
+            && let Some(sids) = by_val.get_mut(value)
+        {
+            sids.retain(|(s, _)| s != sid);
+            if sids.is_empty() {
+                by_val.remove(value);
+                if by_val.is_empty() {
+                    m.remove(&col);
+                }
+            }
+        }
+    }
+
+    /// Shape ids whose necessary conjunct is satisfied by at least one row in `delta`, plus the
+    /// unconditional `scan` shapes. A superset of the shapes that can match any delta row (each
+    /// candidate is still fully evaluated); every non-candidate is guaranteed not to match.
+    fn candidates(&self, delta: &[Tup2<Row, ZWeight>]) -> Vec<String> {
+        let mut out: HashSet<&str> = self.scan.iter().map(String::as_str).collect();
+        for Tup2(row, _) in delta {
+            for (col, by_val) in &self.eq {
+                if let Some(cell) = row.0.get(*col)
+                    && let Some(sids) = by_val.get(cell)
+                {
+                    out.extend(sids.iter().map(String::as_str));
+                }
+            }
+            for (col, bounds) in &self.lower {
+                let Some(cell) = row.0.get(*col) else { continue };
+                if matches!(cell, Value::Null) {
+                    continue; // cmp with a NULL cell is never TRUE
+                }
+                for (bound, sids) in bounds.range(..=cell) {
+                    let at_bound = bound == cell;
+                    out.extend(
+                        sids.iter().filter(|(_, strict)| !(at_bound && *strict)).map(|(s, _)| s.as_str()),
+                    );
+                }
+            }
+            for (col, bounds) in &self.upper {
+                let Some(cell) = row.0.get(*col) else { continue };
+                if matches!(cell, Value::Null) {
+                    continue;
+                }
+                for (bound, sids) in bounds.range(cell..) {
+                    let at_bound = bound == cell;
+                    out.extend(
+                        sids.iter().filter(|(_, strict)| !(at_bound && *strict)).map(|(s, _)| s.as_str()),
+                    );
+                }
+            }
+        }
+        out.into_iter().map(str::to_string).collect()
+    }
 }
 
 /// One shape registered on an equality template, backfilled from Postgres and routed by key.
@@ -1762,7 +2328,7 @@ fn value_f64(v: &Value) -> f64 {
     }
 }
 
-/// A scalar aggregation maintained **incrementally** over the rows matching `pred` — the dbsp fold over
+/// A scalar aggregation maintained **incrementally** over the rows matching `pred` — a running fold over
 /// the Z-set of matching changes. Holds only the running aggregate, never the rows: COUNT is a sum of
 /// weights, SUM/AVG add `value·weight`, MIN/MAX keep a `value → net-weight` multiset. O(1) per change
 /// (plus a log-factor for MIN/MAX). Evaluated on the delta like a standalone filter, for any
@@ -1891,29 +2457,31 @@ fn trace_lifecycle(tx: &tokio::sync::broadcast::Sender<Arc<String>>, ev: crate::
     }
 }
 
-fn spawn_tailer(
+fn spawn_sequencer(
     ds: DsClient,
-    ts: TableSchema,
-    pg_url: Option<String>,
-    subqueries: Arc<Mutex<SubqueryRegistry>>,
+    tables: SharedTables,
+    start_offset: String,
+    catalog_tx: mpsc::UnboundedSender<CatalogEvent>,
+    subq: SubqueryHandle,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
-) -> TailerHandle {
+) -> SequencerHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    let processed = Arc::new(std::sync::Mutex::new("-1".to_string()));
-    let stats = Arc::new(std::sync::Mutex::new(TableStats::default()));
+    let processed = Arc::new(std::sync::Mutex::new(start_offset.clone()));
+    let stats = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let node_states = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    tokio::spawn(tailer_loop(
+    tokio::spawn(sequencer_loop(
         ds,
-        ts,
-        pg_url,
+        tables,
+        start_offset,
+        catalog_tx,
         cmd_rx,
         processed.clone(),
         stats.clone(),
         node_states.clone(),
-        subqueries,
+        subq,
         trace_tx,
     ));
-    TailerHandle { cmd_tx, processed, stats, node_states }
+    SequencerHandle { cmd_tx, processed, stats, node_states }
 }
 
 /// The graph/trace node id of a family router: `family:<table>:<col,col>` (column NAMES, matching
@@ -2033,87 +2601,140 @@ fn dump_aggregate_json(sid: &str, agg: &AggShape) -> serde_json::Value {
     })
 }
 
-fn publish_stats(
-    stats: &std::sync::Mutex<TableStats>,
-    shapes: &HashMap<String, StandaloneShape>,
-    families: &HashMap<Vec<usize>, KeyRouter>,
-) {
-    let mut fams: Vec<FamilyStat> = families
+fn stats_of(exec: &TableExec) -> TableStats {
+    let mut fams: Vec<FamilyStat> = exec
+        .families
         .iter()
         .map(|(k, f)| FamilyStat { key_cols: k.clone(), shapes: f.member_count() })
         .collect();
     fams.sort_by(|a, b| a.key_cols.cmp(&b.key_cols));
-    *stats.lock().unwrap() = TableStats { families: fams, standalone: shapes.len() };
+    TableStats { families: fams, standalone: exec.shapes.len() }
 }
 
-/// Publish the tailer's rebuilt node-state map to its shared handle and, when anyone is
-/// subscribed to `/trace`, broadcast it as a `{"type":"state"}` event — merged with the subquery
-/// registry's summaries when this table participates in subqueries (their state changes on the
-/// same batch).
-#[allow(clippy::too_many_arguments)]
-async fn publish_node_states(
-    ts: &TableSchema,
+/// Rebuild + publish the merged node-state map and per-table stats to the sequencer's shared
+/// handles and, when anyone is subscribed to `/trace`, broadcast the merged map (plus the
+/// subquery registry's summaries) as a `{"type":"state"}` event.
+async fn publish_all(
+    execs: &HashMap<String, TableExec>,
     offset: &str,
-    envelopes: u64,
-    shapes: &HashMap<String, StandaloneShape>,
-    families: &HashMap<Vec<usize>, KeyRouter>,
-    family_of: &HashMap<String, (Vec<usize>, u64, Row)>,
-    aggregates: &HashMap<String, AggShape>,
     emitted: &HashMap<String, u64>,
+    stats: &std::sync::Mutex<HashMap<String, TableStats>>,
     node_states: &std::sync::Mutex<HashMap<String, NodeStateSummary>>,
     subqueries: &Arc<Mutex<SubqueryRegistry>>,
     trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
 ) {
-    let map = build_node_states(ts, offset, envelopes, shapes, families, family_of, aggregates, emitted);
-    *node_states.lock().unwrap() = map.clone();
+    let mut stats_map = HashMap::new();
+    let mut merged: HashMap<String, NodeStateSummary> = HashMap::new();
+    for (t, exec) in execs {
+        stats_map.insert(t.clone(), stats_of(exec));
+        merged.extend(build_node_states(
+            &exec.ts,
+            offset,
+            exec.envelopes_total,
+            &exec.shapes,
+            &exec.families,
+            &exec.family_of,
+            &exec.aggregates,
+            emitted,
+        ));
+    }
+    *stats.lock().unwrap() = stats_map;
+    *node_states.lock().unwrap() = merged.clone();
     if trace_tx.receiver_count() == 0 {
         return;
     }
-    let mut ev_nodes = map;
-    {
-        let reg = subqueries.lock().await;
-        if reg.touches(&ts.name) {
-            for (id, s) in reg.state_summaries() {
-                ev_nodes.insert(id, s);
-            }
-        }
+    let mut ev_nodes = merged;
+    for (id, s) in subqueries.lock().await.state_summaries() {
+        ev_nodes.insert(id, s);
     }
     if let Ok(json) = serde_json::to_string(&crate::trace::StateEvent::new(ev_nodes)) {
         let _ = trace_tx.send(Arc::new(json));
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn tailer_loop(
-    ds: DsClient,
+/// Per-table executor state owned by the sequencer: the routing structures a table's changes fan
+/// out through, plus any in-flight (pending) shape creations buffering deltas.
+struct TableExec {
     ts: TableSchema,
-    pg_url: Option<String>,
-    mut cmd_rx: mpsc::UnboundedReceiver<TailerCmd>,
+    shapes: HashMap<String, StandaloneShape>,
+    shape_index: StandaloneIndex,
+    families: HashMap<Vec<usize>, KeyRouter>,
+    family_of: HashMap<String, (Vec<usize>, u64, Row)>,
+    aggregates: HashMap<String, AggShape>,
+    pending: HashMap<String, PendingShape>,
+    envelopes_total: u64,
+}
+
+impl TableExec {
+    fn new(ts: TableSchema) -> TableExec {
+        TableExec {
+            ts,
+            shapes: HashMap::new(),
+            shape_index: StandaloneIndex::default(),
+            families: HashMap::new(),
+            family_of: HashMap::new(),
+            aggregates: HashMap::new(),
+            pending: HashMap::new(),
+            envelopes_total: 0,
+        }
+    }
+}
+
+/// A shape between `BeginShape` and `ActivateShape`: buffers every processed delta of its table so
+/// activation can replay exactly what the backfill snapshot did not see (through the gate).
+struct PendingShape {
+    num_id: u64,
+    stream_path: String,
+    pred: Arc<CompiledPredicate>,
+    out_cols: Option<Arc<Vec<usize>>>,
+    kind: CreateKind,
+    buffered: Vec<Envelope>,
+}
+
+/// Get (or lazily create) the executor for `table`; `None` if the table has no known schema.
+fn exec_for<'a>(
+    execs: &'a mut HashMap<String, TableExec>,
+    tables: &SharedTables,
+    table: &str,
+) -> Option<&'a mut TableExec> {
+    if !execs.contains_key(table) {
+        let ts = tables.read().unwrap().get(table).cloned()?;
+        execs.insert(table.to_string(), TableExec::new(ts));
+    }
+    execs.get_mut(table)
+}
+
+/// The engine's single LSN-ordered executor: consumes the global `changes` stream in commit order
+/// and dispatches each envelope to its table's executor. Each transaction's shape appends are
+/// flushed **before the next transaction is processed**, so every shape stream reflects source
+/// transactions atomically and in commit order — cross-table included (Electric's
+/// `ShapeLogCollector` pattern; the property the old per-table tailers lost).
+#[allow(clippy::too_many_arguments)]
+async fn sequencer_loop(
+    ds: DsClient,
+    tables: SharedTables,
+    start_offset: String,
+    catalog_tx: mpsc::UnboundedSender<CatalogEvent>,
+    mut cmd_rx: mpsc::UnboundedReceiver<SequencerCmd>,
     processed: Arc<std::sync::Mutex<String>>,
-    stats: Arc<std::sync::Mutex<TableStats>>,
+    stats: Arc<std::sync::Mutex<HashMap<String, TableStats>>>,
     node_states: Arc<std::sync::Mutex<HashMap<String, NodeStateSummary>>>,
-    subqueries: Arc<Mutex<SubqueryRegistry>>,
+    subq: SubqueryHandle,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
 ) {
-    let table_path = format!("table/{}", ts.name);
-    let mut offset = "-1".to_string();
-    // Envelopes this tailer has processed since start + envelopes emitted per shape id — the
-    // counters behind the per-node state summaries (`GET /state` / SSE `state` events).
-    let mut envelopes_total: u64 = 0;
+    let mut execs: HashMap<String, TableExec> = HashMap::new();
+    let mut offset = start_offset;
+    // Offset checkpointing: persist the processed position (the restart replay start) at most
+    // every ~2s of change.
+    let mut last_ckpt = std::time::Instant::now();
+    let mut ckpt_offset = offset.clone();
+    // Envelopes appended per shape id — the counters behind the per-node state summaries.
     let mut emitted: HashMap<String, u64> = HashMap::new();
-    // Standalone per-shape filter circuits (non-equality predicates), keyed by shape id.
-    let mut shapes: HashMap<String, StandaloneShape> = HashMap::new();
-    // Shared family circuits, keyed by the equality template's (sorted) column indices.
-    let mut families: HashMap<Vec<usize>, KeyRouter> = HashMap::new();
-    // Reverse lookup for removal: shape id -> (template key cols, numeric id, key tuple).
-    let mut family_of: HashMap<String, (Vec<usize>, u64, Row)> = HashMap::new();
-    // Scalar aggregations maintained incrementally over a filter predicate, keyed by shape id.
-    let mut aggregates: HashMap<String, AggShape> = HashMap::new();
-    // De-duplication highwater: the ingestor's delivery is at-least-once (re-peek after a partial
-    // append failure or a crash before the slot advance re-appends whole batches), and deltas are NOT
-    // idempotent for aggregates/subquery weights. Every ingestor envelope carries (commit lsn, seq =
-    // position in txn), strictly increasing per table stream, so anything at/below the highwater has
-    // already been applied and is skipped. Envelopes without both stamps (library mode) bypass this.
+    // De-duplication highwater: the ingestor's delivery is at-least-once (unacknowledged commits
+    // re-deliver after a reconnect), and deltas are NOT idempotent for aggregates/subquery
+    // weights. Every ingestor envelope carries (commit lsn, seq = position in txn), strictly
+    // increasing on the single ordered log, so anything at/below the highwater has already been
+    // applied and is skipped. Envelopes without both stamps (library mode) bypass this.
     let mut highwater: Option<(u64, u64)> = None;
 
     loop {
@@ -2121,214 +2742,178 @@ async fn tailer_loop(
         tokio::select! {
             biased;
             cmd = cmd_rx.recv() => match cmd {
-                Some(TailerCmd::AddShape { shape_id, num_id, stream_path, pred, out_cols, changes_only, ready }) => {
-                    let res = add_shape_routed(
-                        &ds, &ts, &pg_url, &mut shapes, &mut families, &mut family_of, &mut emitted,
-                        shape_id, num_id, stream_path, pred, out_cols, changes_only,
-                    ).await;
-                    if let Err(e) = &res {
-                        tracing::error!("add_shape failed: {e:#}");
-                    }
-                    // Unblock create_shape with the outcome; a failure propagates so the caller can
-                    // remove the shape record instead of leaving a zombie.
-                    let _ = ready.send(res.map_err(|e| format!("{e:#}")));
-                    publish_stats(&stats, &shapes, &families);
-                    publish_node_states(
-                        &ts, &offset, envelopes_total, &shapes, &families, &family_of, &aggregates,
-                        &emitted, &node_states, &subqueries, &trace_tx,
-                    ).await;
-                }
-                Some(TailerCmd::AddAggregate { shape_id, stream_path, pred, func, col, ready }) => {
-                    let res = add_aggregate(
-                        &ds, &ts, &pg_url, &mut aggregates, shape_id, stream_path, pred, func, col,
-                    ).await;
-                    if let Err(e) = &res {
-                        tracing::error!("add_aggregate failed: {e:#}");
-                    }
-                    let _ = ready.send(res.map_err(|e| format!("{e:#}")));
-                    publish_node_states(
-                        &ts, &offset, envelopes_total, &shapes, &families, &family_of, &aggregates,
-                        &emitted, &node_states, &subqueries, &trace_tx,
-                    ).await;
-                }
-                Some(TailerCmd::DumpNode { node_id, resp }) => {
-                    let val = if node_id.starts_with("family:") {
-                        families
-                            .values()
-                            .find(|r| family_node_id(&ts, &r.key_cols) == node_id)
-                            .map(|r| dump_family_json(&ts, r))
-                    } else if let Some(sid) =
-                        node_id.strip_prefix("shape:").or_else(|| node_id.strip_prefix("filter:"))
-                    {
-                        if let Some(agg) = aggregates.get(sid) {
-                            Some(dump_aggregate_json(sid, agg))
-                        } else if shapes.contains_key(sid) || family_of.contains_key(sid) {
-                            Some(serde_json::json!({
-                                "kind": if node_id.starts_with("filter:") { "filter" } else { "shape" },
-                                "node": node_id,
-                                "emitted": emitted.get(sid).copied().unwrap_or(0),
-                            }))
-                        } else {
-                            None
+                Some(SequencerCmd::BeginShape { table, shape_id, num_id, stream_path, pred, out_cols, kind, ack }) => {
+                    match exec_for(&mut execs, &tables, &table) {
+                        Some(exec) => {
+                            exec.pending.insert(
+                                shape_id,
+                                PendingShape { num_id, stream_path, pred, out_cols, kind, buffered: Vec::new() },
+                            );
                         }
-                    } else if node_id == format!("table:{}", ts.name) {
-                        Some(serde_json::json!({
-                            "kind": "table",
-                            "node": node_id,
-                            "processedOffset": offset.as_str(),
-                            "envelopes": envelopes_total,
-                        }))
-                    } else {
-                        None
-                    };
-                    let _ = resp.send(val);
-                }
-                Some(TailerCmd::RemoveShape { shape_id }) => {
-                    if aggregates.remove(&shape_id).is_none() {
-                        unregister_shape_routing(&mut shapes, &mut families, &mut family_of, &shape_id);
+                        None => tracing::error!("begin_shape: unknown table '{table}'"),
                     }
-                    emitted.remove(&shape_id);
-                    publish_stats(&stats, &shapes, &families);
-                    publish_node_states(
-                        &ts, &offset, envelopes_total, &shapes, &families, &family_of, &aggregates,
-                        &emitted, &node_states, &subqueries, &trace_tx,
-                    ).await;
+                    let _ = ack.send(());
                 }
-                Some(TailerCmd::DeactivateShape { shape_id, resp }) => {
-                    // Unregister like RemoveShape, but capture the shape's snapshot gate and hand
-                    // back the resume state. The batch preceding this command was fully fanned out
-                    // + flushed (commands and reads are one serialized select loop), so the current
-                    // `offset` is exactly "the shape's stream is complete up to here". Aggregates
-                    // are not deactivatable (their fold state is not replayable) — `None`.
-                    let gate = if aggregates.contains_key(&shape_id) {
-                        None
-                    } else {
-                        unregister_shape_routing(&mut shapes, &mut families, &mut family_of, &shape_id)
-                    };
-                    emitted.remove(&shape_id);
-                    let _ = resp.send(gate.map(|g| (offset.clone(), g)));
-                    publish_stats(&stats, &shapes, &families);
-                    publish_node_states(
-                        &ts, &offset, envelopes_total, &shapes, &families, &family_of, &aggregates,
-                        &emitted, &node_states, &subqueries, &trace_tx,
-                    ).await;
-                }
-                Some(TailerCmd::ResumeShape {
-                    shape_id, num_id, stream_path, pred, out_cols, resume_offset, gate, ready,
-                }) => {
-                    let res = resume_shape_routed(
-                        &ds, &ts, &table_path, &mut shapes, &mut families, &mut family_of, &mut emitted,
-                        shape_id, num_id, stream_path, pred, out_cols, resume_offset, gate,
+                Some(SequencerCmd::ActivateShape { table, shape_id, gate, agg_seed, emitted_seed, ready }) => {
+                    let res = activate_shape(
+                        &ds, &mut execs, &table, &shape_id, gate, agg_seed, emitted_seed, &mut emitted,
                     ).await;
                     if let Err(e) = &res {
-                        tracing::error!("resume_shape failed: {e:#}");
+                        tracing::error!("activate_shape failed: {e:#}");
                     }
                     let _ = ready.send(res.map_err(|e| format!("{e:#}")));
-                    publish_stats(&stats, &shapes, &families);
-                    publish_node_states(
-                        &ts, &offset, envelopes_total, &shapes, &families, &family_of, &aggregates,
-                        &emitted, &node_states, &subqueries, &trace_tx,
-                    ).await;
+                    publish_all(&execs, &offset, &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
+                }
+                Some(SequencerCmd::AbortShape { table, shape_id }) => {
+                    if let Some(exec) = execs.get_mut(&table) {
+                        exec.pending.remove(&shape_id);
+                    }
+                }
+                Some(SequencerCmd::DeactivateShape { table, shape_id, resp }) => {
+                    // Capture-and-unregister is atomic w.r.t. envelope processing (commands run
+                    // between fully-flushed transactions), so `offset` is exactly "the shape's
+                    // stream is complete up to here".
+                    let gate = execs.get_mut(&table).and_then(|exec| {
+                        if let Some(shape) = exec.shapes.remove(&shape_id) {
+                            exec.shape_index.remove(&shape_id);
+                            Some(shape.gate)
+                        } else if let Some((key_cols, num_id, key_tuple)) = exec.family_of.remove(&shape_id) {
+                            let mut gate = None;
+                            if let Some(router) = exec.families.get_mut(&key_cols) {
+                                if let Some(routed) = router.index.get_mut(&key_tuple) {
+                                    if let Some(pos) = routed.iter().position(|rs| rs.num_id == num_id) {
+                                        gate = Some(routed.remove(pos).gate);
+                                    }
+                                    if routed.is_empty() {
+                                        router.index.remove(&key_tuple);
+                                    }
+                                }
+                                if router.index.is_empty() {
+                                    exec.families.remove(&key_cols);
+                                }
+                            }
+                            gate
+                        } else {
+                            None // unknown, pending, or an aggregate — not parkable from here
+                        }
+                    });
+                    if gate.is_some() {
+                        emitted.remove(&shape_id);
+                    }
+                    let _ = resp.send(gate.map(|g| (offset.clone(), g)));
+                    publish_all(&execs, &offset, &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
+                }
+                Some(SequencerCmd::RemoveShape { table, shape_id }) => {
+                    if let Some(exec) = execs.get_mut(&table) {
+                        exec.pending.remove(&shape_id);
+                        if exec.aggregates.remove(&shape_id).is_some() {
+                            // an aggregation shape — nothing else to unwind
+                        } else if exec.shapes.remove(&shape_id).map(|_| exec.shape_index.remove(&shape_id)).is_none()
+                            && let Some((key_cols, num_id, key_tuple)) = exec.family_of.remove(&shape_id)
+                            && let Some(router) = exec.families.get_mut(&key_cols)
+                        {
+                            // Drop the shape from its key's routing list (the shape stream is torn
+                            // down elsewhere); discard the router once it routes to no shapes.
+                            if let Some(routed) = router.index.get_mut(&key_tuple) {
+                                routed.retain(|rs| rs.num_id != num_id);
+                                if routed.is_empty() {
+                                    router.index.remove(&key_tuple);
+                                }
+                            }
+                            if router.index.is_empty() {
+                                exec.families.remove(&key_cols);
+                            }
+                        }
+                    }
+                    emitted.remove(&shape_id);
+                    publish_all(&execs, &offset, &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
+                }
+                Some(SequencerCmd::DumpNode { table, node_id, resp }) => {
+                    let val = execs.get(&table).and_then(|exec| dump_node_json(exec, &offset, &emitted, &node_id));
+                    let _ = resp.send(val);
                 }
                 None => break,
             },
-            res = ds.read(&table_path, &off, true) => match res {
+            res = ds.read(crate::CHANGES_STREAM, &off, true) => match res {
                 Ok(rr) => {
                     let next = rr.next_offset.clone();
                     if let Some(n) = rr.next_offset { offset = n; }
-                    // Process the whole read batch, collecting shape-stream appends, then flush them
-                    // concurrently. Appends (HTTP round-trips) dominate, so coalescing per stream and
-                    // parallelizing is the main throughput/latency lever.
-                    let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
-                    let mut batch_processed: u64 = 0;
-                    if crate::statsd::enabled() {
-                        // Telemetry on: split the batch into runs of one source transaction (envelopes
-                        // are stamped with txid and arrive in commit+seq order) so the storage metrics
-                        // are per-txn. The merged `pending` is byte-for-byte the ungrouped path's.
-                        let envs = rr.envelopes;
-                        let mut i = 0;
-                        while i < envs.len() {
-                            let txid = envs[i].headers.txid.clone();
-                            let mut j = i + 1;
-                            while j < envs.len() && envs[j].headers.txid == txid {
-                                j += 1;
-                            }
-                            let mut txn_pending: HashMap<String, Vec<Envelope>> = HashMap::new();
-                            for env in envs[i..j].iter() {
-                                let pos = match (env.headers.lsn.as_deref(), env.headers.seq) {
-                                    (Some(l), Some(s)) => Some((crate::pg::lsn_to_u64(l), s)),
-                                    _ => None,
-                                };
-                                if let (Some(p), Some(hw)) = (pos, highwater) {
-                                    if p <= hw {
-                                        tracing::debug!("tailer {}: skipping duplicate change at {p:?}", ts.name);
-                                        continue;
-                                    }
-                                }
-                                if let Err(e) = process_envelope(
-                                    &ts, &shapes, &families, &mut aggregates, env.clone(), &mut txn_pending, &subqueries, &trace_tx,
-                                )
-                                .await
-                                {
-                                    tracing::error!("process_envelope failed: {e:#}");
-                                }
-                                envelopes_total += 1;
-                                batch_processed += 1;
-                                if let Some(p) = pos {
-                                    highwater = Some(p);
-                                }
-                            }
-                            emit_storage_txn_metrics(&txn_pending);
-                            for (k, v) in txn_pending {
-                                pending.entry(k).or_default().extend(v);
-                            }
-                            i = j;
+                    // Split the read batch into transactions (runs of equal (txid, lsn) — the
+                    // ingestor appends whole commits contiguously, in commit order) and flush each
+                    // transaction's appends before processing the next: atomic per-transaction
+                    // emission, across tables.
+                    let envs = rr.envelopes;
+                    let mut touched = false;
+                    let mut i = 0;
+                    while i < envs.len() {
+                        let txid = envs[i].headers.txid.clone();
+                        let lsn = envs[i].headers.lsn.clone();
+                        let mut j = i + 1;
+                        while j < envs.len() && envs[j].headers.txid == txid && envs[j].headers.lsn == lsn {
+                            j += 1;
                         }
-                    } else {
-                        for env in rr.envelopes {
+                        let mut txn_pending: HashMap<String, Vec<Envelope>> = HashMap::new();
+                        for env in envs[i..j].iter() {
                             // Skip redelivered changes (see `highwater` above).
                             let pos = match (env.headers.lsn.as_deref(), env.headers.seq) {
-                                (Some(l), Some(s)) => Some((crate::pg::lsn_to_u64(l), s)),
+                                (Some(l), Some(seq)) => Some((crate::pg::lsn_to_u64(l), seq)),
                                 _ => None,
                             };
                             if let (Some(p), Some(hw)) = (pos, highwater) {
                                 if p <= hw {
-                                    tracing::debug!("tailer {}: skipping duplicate change at {p:?}", ts.name);
+                                    tracing::debug!("sequencer: skipping duplicate change at {p:?}");
                                     continue;
                                 }
                             }
+                            let Some(exec) = exec_for(&mut execs, &tables, &env.type_) else {
+                                tracing::error!("sequencer: change for unknown table '{}'", env.type_);
+                                if let Some(p) = pos { highwater = Some(p); }
+                                continue;
+                            };
+                            // Buffer for in-flight creations on this table: their `BeginShape` was
+                            // acknowledged before the creator's snapshot, so everything the
+                            // snapshot cannot contain lands in the buffer.
+                            for pending in exec.pending.values_mut() {
+                                pending.buffered.push(env.clone());
+                            }
                             if let Err(e) = process_envelope(
-                                &ts, &shapes, &families, &mut aggregates, env, &mut pending, &subqueries, &trace_tx,
+                                &exec.ts, &exec.shapes, &exec.shape_index, &exec.families,
+                                &mut exec.aggregates, env.clone(), &mut txn_pending, &subq, &trace_tx,
                             )
                             .await
                             {
                                 tracing::error!("process_envelope failed: {e:#}");
                             }
-                            envelopes_total += 1;
-                            batch_processed += 1;
+                            exec.envelopes_total += 1;
+                            touched = true;
                             if let Some(p) = pos {
                                 highwater = Some(p);
                             }
                         }
+                        emit_storage_txn_metrics(&txn_pending);
+                        for (path, envs) in &txn_pending {
+                            *emitted.entry(sid_of_path(path).to_string()).or_insert(0) += envs.len() as u64;
+                        }
+                        // Transaction boundary: every append of this commit lands before the next
+                        // commit is processed.
+                        flush_pending(&ds, txn_pending).await;
+                        i = j;
                     }
-                    let had_work = batch_processed > 0;
-                    for (path, envs) in &pending {
-                        *emitted.entry(sid_of_path(path).to_string()).or_insert(0) += envs.len() as u64;
-                    }
-                    flush_pending(&ds, pending).await;
                     // Publish the processed offset only after the whole batch is fanned out + flushed.
                     if let Some(n) = next {
-                        *processed.lock().unwrap() = n;
+                        *processed.lock().unwrap() = n.clone();
+                        if n != ckpt_offset && last_ckpt.elapsed() >= std::time::Duration::from_secs(2) {
+                            ckpt_offset = n.clone();
+                            last_ckpt = std::time::Instant::now();
+                            let _ = catalog_tx.send(CatalogEvent::Offset { offset: n });
+                        }
                     }
-                    if had_work {
-                        publish_node_states(
-                            &ts, &offset, envelopes_total, &shapes, &families, &family_of, &aggregates,
-                            &emitted, &node_states, &subqueries, &trace_tx,
-                        ).await;
+                    if touched {
+                        publish_all(&execs, &offset, &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("tailer read error on {table_path}: {e:#}; backing off");
+                    tracing::warn!("sequencer read error on {}: {e:#}; backing off", crate::CHANGES_STREAM);
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
             },
@@ -2336,247 +2921,314 @@ async fn tailer_loop(
     }
 }
 
-/// Seed a scalar aggregation from Postgres (fold the matching rows once), emit the initial value, and
-/// register it for incremental maintenance. Steady state holds only the running aggregate — no rows.
+/// Make a pending shape live: register its routing, then replay its buffered deltas through the
+/// snapshot gate — emitting exactly the changes the backfill snapshot did not see. The buffered
+/// replay is appended before the sequencer processes any further change, so the shape stream stays
+/// in commit order.
 #[allow(clippy::too_many_arguments)]
-async fn add_aggregate(
+async fn activate_shape(
     ds: &DsClient,
-    ts: &TableSchema,
-    pg_url: &Option<String>,
-    aggregates: &mut HashMap<String, AggShape>,
-    shape_id: String,
-    stream_path: String,
-    pred: Arc<CompiledPredicate>,
-    func: AggFn,
-    col: Option<usize>,
+    execs: &mut HashMap<String, TableExec>,
+    table: &str,
+    shape_id: &str,
+    gate: crate::pg::SnapshotGate,
+    agg_seed: Vec<Row>,
+    emitted_seed: u64,
+    emitted: &mut HashMap<String, u64>,
 ) -> Result<()> {
-    let bf = pg_backfill(pg_url, ts, Some(pred.as_ref())).await?;
-    let mut agg = AggShape {
-        pred,
-        func,
-        col,
-        stream_path: stream_path.clone(),
-        gate: bf.gate.clone(),
-        count: 0,
-        nn_count: 0,
-        sum: 0.0,
-        multiset: std::collections::BTreeMap::new(),
-        last: None,
-    };
-    let seed: Vec<Tup2<Row, ZWeight>> = bf.rows.iter().map(|r| Tup2(r.clone(), 1)).collect();
-    agg.apply(&seed);
-    let env = agg.envelope(ts, None, None);
-    agg.last = Some(agg.value());
-    ds.append(&stream_path, &[env]).await?;
-    aggregates.insert(shape_id, agg);
+    let exec = execs.get_mut(table).with_context(|| format!("no executor for table '{table}'"))?;
+    let p = exec
+        .pending
+        .remove(shape_id)
+        .with_context(|| format!("no pending shape '{shape_id}' (aborted?)"))?;
+    if emitted_seed > 0 {
+        emitted.insert(shape_id.to_string(), emitted_seed);
+    }
+    match p.kind {
+        CreateKind::Plain => {
+            // Register routing first (an equality template joins/creates its family's KeyRouter;
+            // everything else is a standalone indexed filter)...
+            match p.pred.equality_template() {
+                Some(pairs) => {
+                    let key_cols: Vec<usize> = pairs.iter().map(|(c, _)| *c).collect();
+                    let key_tuple = Row(pairs.into_iter().map(|(_, v)| v).collect());
+                    let router = exec
+                        .families
+                        .entry(key_cols.clone())
+                        .or_insert_with(|| KeyRouter { key_cols: key_cols.clone(), index: HashMap::new() });
+                    router.index.entry(key_tuple.clone()).or_default().push(RoutedShape {
+                        num_id: p.num_id,
+                        stream_path: p.stream_path.clone(),
+                        gate: gate.clone(),
+                        out_cols: p.out_cols.clone(),
+                    });
+                    exec.family_of.insert(shape_id.to_string(), (key_cols, p.num_id, key_tuple));
+                }
+                None => {
+                    exec.shape_index.insert(shape_id, &p.pred);
+                    exec.shapes.insert(
+                        shape_id.to_string(),
+                        StandaloneShape {
+                            pred: p.pred.clone(),
+                            stream_path: p.stream_path.clone(),
+                            gate: gate.clone(),
+                            out_cols: p.out_cols.clone(),
+                        },
+                    );
+                }
+            }
+            // ...then drain the buffer through the gate. `matches()` evaluates equality templates
+            // and standalone predicates alike, so one replay path covers both placements.
+            let mut outs: Vec<Envelope> = Vec::new();
+            for env in &p.buffered {
+                let Ok((delta, txid, lsn)) = apply_envelope(&exec.ts, env) else { continue };
+                if delta.is_empty() {
+                    continue;
+                }
+                let lsn_u64 = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0);
+                let xid = txid.as_deref().and_then(|s| s.parse::<u64>().ok());
+                if gate.should_skip(lsn_u64, xid) {
+                    continue;
+                }
+                let matched = eval_standalone(&p.pred, &delta);
+                if matched.is_empty() {
+                    continue;
+                }
+                outs.extend(translate_output(
+                    &exec.ts,
+                    matched,
+                    txid,
+                    lsn,
+                    p.out_cols.as_deref().map(Vec::as_slice),
+                ));
+            }
+            if !outs.is_empty() {
+                *emitted.entry(shape_id.to_string()).or_insert(0) += outs.len() as u64;
+                ds.append_reliable(&p.stream_path, &outs).await;
+            }
+        }
+        CreateKind::Aggregate { func, col } => {
+            // Seed the fold from the backfill rows, emit the initial value, then fold the gated
+            // buffer (emitting a value envelope whenever the aggregate moves).
+            let mut agg = AggShape {
+                pred: p.pred.clone(),
+                func,
+                col,
+                stream_path: p.stream_path.clone(),
+                gate: gate.clone(),
+                count: 0,
+                nn_count: 0,
+                sum: 0.0,
+                multiset: std::collections::BTreeMap::new(),
+                last: None,
+            };
+            let seed: Vec<Tup2<Row, ZWeight>> = agg_seed.iter().map(|r| Tup2(r.clone(), 1)).collect();
+            agg.apply(&seed);
+            let mut outs = vec![agg.envelope(&exec.ts, None, None)];
+            agg.last = Some(agg.value());
+            for env in &p.buffered {
+                let Ok((delta, txid, lsn)) = apply_envelope(&exec.ts, env) else { continue };
+                if delta.is_empty() {
+                    continue;
+                }
+                let lsn_u64 = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0);
+                let xid = txid.as_deref().and_then(|s| s.parse::<u64>().ok());
+                if gate.should_skip(lsn_u64, xid) {
+                    continue;
+                }
+                if agg.apply(&delta) {
+                    let val = agg.value();
+                    if agg.last.as_ref() != Some(&val) {
+                        agg.last = Some(val.clone());
+                        outs.push(agg.envelope(&exec.ts, txid, lsn));
+                    }
+                }
+            }
+            *emitted.entry(shape_id.to_string()).or_insert(0) += outs.len() as u64;
+            ds.append(&p.stream_path, &outs).await?;
+            exec.aggregates.insert(shape_id.to_string(), agg);
+        }
+    }
     Ok(())
 }
 
-/// Route a new shape to a shared family circuit (pure-equality predicate) or a standalone filter
-/// circuit (everything else). For a family, adding the shape is a `Params` insert; its backfill is
-/// the join of that param against the family's current data trace.
+/// Deep-dump one node's internal state for `GET /state/node` (see `SequencerCmd::DumpNode`).
+fn dump_node_json(
+    exec: &TableExec,
+    offset: &str,
+    emitted: &HashMap<String, u64>,
+    node_id: &str,
+) -> Option<serde_json::Value> {
+    if node_id.starts_with("family:") {
+        return exec
+            .families
+            .values()
+            .find(|r| family_node_id(&exec.ts, &r.key_cols) == node_id)
+            .map(|r| dump_family_json(&exec.ts, r));
+    }
+    if let Some(sid) = node_id.strip_prefix("shape:").or_else(|| node_id.strip_prefix("filter:")) {
+        if let Some(agg) = exec.aggregates.get(sid) {
+            return Some(dump_aggregate_json(sid, agg));
+        }
+        if exec.shapes.contains_key(sid) || exec.family_of.contains_key(sid) {
+            return Some(serde_json::json!({
+                "kind": if node_id.starts_with("filter:") { "filter" } else { "shape" },
+                "node": node_id,
+                "emitted": emitted.get(sid).copied().unwrap_or(0),
+            }));
+        }
+        return None;
+    }
+    if node_id == format!("table:{}", exec.ts.name) {
+        return Some(serde_json::json!({
+            "kind": "table",
+            "node": node_id,
+            "processedOffset": offset,
+            "envelopes": exec.envelopes_total,
+        }));
+    }
+    None
+}
+
+/// Replay the global change log from `from` for one dormant shape: apply each of its table's
+/// envelopes through the shape's snapshot gate + predicate + projection and append the matches to
+/// the retained stream. Pages until the log reports up-to-date. Appends are direct (`ds.append`):
+/// a 404 means the retained stream vanished (evicted/purged mid-replay) and must fail the resume.
 #[allow(clippy::too_many_arguments)]
-async fn add_shape_routed(
+async fn replay_changes_for_shape(
     ds: &DsClient,
     ts: &TableSchema,
+    table: &str,
+    pred: &CompiledPredicate,
+    out_cols: Option<&Arc<Vec<usize>>>,
+    gate: &crate::pg::SnapshotGate,
+    stream_path: &str,
+    from: &str,
+) -> Result<u64> {
+    let mut off = from.to_string();
+    let mut emitted = 0u64;
+    loop {
+        let rr = ds.read(crate::CHANGES_STREAM, &off, false).await?;
+        let mut outs: Vec<Envelope> = Vec::new();
+        for env in &rr.envelopes {
+            if env.type_ != table {
+                continue;
+            }
+            let Ok((delta, txid, lsn)) = apply_envelope(ts, env) else { continue };
+            if delta.is_empty() {
+                continue;
+            }
+            let lsn_u64 = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0);
+            let xid = txid.as_deref().and_then(|s| s.parse::<u64>().ok());
+            if gate.should_skip(lsn_u64, xid) {
+                continue;
+            }
+            let matched = eval_standalone(pred, &delta);
+            if matched.is_empty() {
+                continue;
+            }
+            outs.extend(translate_output(ts, matched, txid, lsn, out_cols.map(|c| c.as_slice())));
+        }
+        if !outs.is_empty() {
+            emitted += outs.len() as u64;
+            ds.append(stream_path, &outs).await.context("append replay to retained stream")?;
+        }
+        match rr.next_offset {
+            Some(n) if n != off => {
+                off = n;
+                if rr.up_to_date {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    Ok(emitted)
+}
+
+/// Creator-side half of the two-phase shape creation: await the pending-buffer ack, run the
+/// Postgres backfill on a pooled connection (appending the snapshot for plain shapes), then
+/// activate. The sequencer keeps processing other work the whole time — a slow backfill only
+/// delays THIS shape. Returns the creation outcome (`Err(reason)` mirrors the old handshake).
+#[allow(clippy::too_many_arguments)]
+async fn backfill_and_activate(
+    ds: &DsClient,
     pg_url: &Option<String>,
-    shapes: &mut HashMap<String, StandaloneShape>,
-    families: &mut HashMap<Vec<usize>, KeyRouter>,
-    family_of: &mut HashMap<String, (Vec<usize>, u64, Row)>,
-    emitted: &mut HashMap<String, u64>,
-    shape_id: String,
-    num_id: u64,
-    stream_path: String,
-    pred: Arc<CompiledPredicate>,
-    out_cols: Option<Arc<Vec<usize>>>,
+    cmd_tx: &mpsc::UnboundedSender<SequencerCmd>,
+    ts: &TableSchema,
+    table: &str,
+    shape_id: &str,
+    stream_path: &str,
+    pred: &Arc<CompiledPredicate>,
+    out_cols: Option<&Arc<Vec<usize>>>,
     changes_only: bool,
-) -> Result<()> {
-    // Backfill = current matching rows from Postgres (emitted as upserts). The predicate is pushed
-    // into the SELECT so only matching rows are read (for an equality template that is exactly the
-    // key-matching rows — the engine never holds a table copy); `matches()` below is the final
-    // authority (and a safety net if the SQL is ever a looser superset). Each shape records its own
-    // snapshot gate for the live-change reconciliation. A `changes_only` feed skips the backfill
-    // entirely and forwards every future match (passthrough gate) — this is the non-materialized
-    // live tail a subset query follows.
-    let proj = out_cols.as_deref().map(Vec::as_slice);
-    let gate = if changes_only {
-        crate::pg::SnapshotGate::passthrough()
+    is_aggregate: bool,
+    ack_rx: tokio::sync::oneshot::Receiver<()>,
+) -> std::result::Result<(), String> {
+    let abort = || {
+        let _ = cmd_tx.send(SequencerCmd::AbortShape {
+            table: table.to_string(),
+            shape_id: shape_id.to_string(),
+        });
+    };
+    if ack_rx.await.is_err() {
+        return Err("sequencer dropped the begin-shape ack".to_string());
+    }
+    // Backfill: current matching rows from a REPEATABLE READ snapshot, predicate pushed into the
+    // SELECT; `matches()` is the final authority (a safety net if the SQL is ever a looser
+    // superset). A `changes_only` feed skips the backfill and forwards only future matches
+    // (passthrough gate) — the non-materialized live tail a subset query follows.
+    let (gate, agg_seed, emitted_seed) = if changes_only {
+        (crate::pg::SnapshotGate::passthrough(), Vec::new(), 0u64)
     } else {
         let t0 = std::time::Instant::now();
-        let bf = pg_backfill(pg_url, ts, Some(pred.as_ref())).await?;
+        let bf = match pg_backfill(pg_url, ts, Some(pred.as_ref())).await {
+            Ok(bf) => bf,
+            Err(e) => {
+                abort();
+                return Err(format!("{e:#}"));
+            }
+        };
         let make_new_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let out: Vec<(Row, ZWeight)> = bf.rows.iter().filter(|r| pred.matches(r)).map(|r| (r.clone(), 1)).collect();
-        let rows = out.len() as u64;
-        let mut snapshot_bytes = 0u64;
-        if !out.is_empty() {
-            let envs = translate_output(ts, out, None, None, proj);
-            if crate::statsd::enabled() {
-                snapshot_bytes = envs_bytes(&envs);
+        if is_aggregate {
+            // The sequencer seeds the fold and emits the initial value itself.
+            (bf.gate, bf.rows, 0)
+        } else {
+            let out: Vec<(Row, ZWeight)> =
+                bf.rows.iter().filter(|r| pred.matches(r)).map(|r| (r.clone(), 1)).collect();
+            let rows = out.len() as u64;
+            let mut snapshot_bytes = 0u64;
+            let mut emitted_seed = 0u64;
+            if !out.is_empty() {
+                let envs = translate_output(ts, out, None, None, out_cols.map(|c| c.as_slice()));
+                if crate::statsd::enabled() {
+                    snapshot_bytes = envs_bytes(&envs);
+                }
+                if let Err(e) = ds.append(stream_path, &envs).await {
+                    abort();
+                    return Err(format!("append snapshot: {e:#}"));
+                }
+                emitted_seed = envs.len() as u64;
             }
-            ds.append(&stream_path, &envs).await?;
-            emitted.insert(shape_id.clone(), envs.len() as u64);
+            crate::statsd::snapshot_stored(rows, snapshot_bytes, make_new_ms);
+            (bf.gate, Vec::new(), emitted_seed)
         }
-        crate::statsd::snapshot_stored(rows, snapshot_bytes, make_new_ms);
-        bf.gate
     };
-    register_shape_routing(shapes, families, family_of, shape_id, num_id, stream_path, pred, out_cols, gate);
-    Ok(())
-}
-
-/// Unregister a plain row shape (standalone or family-routed) from the tailer's live routing,
-/// returning its snapshot gate if it was registered. Shared by `RemoveShape` (gate discarded) and
-/// `DeactivateShape` (the gate becomes part of the dormant resume state). Aggregates are not
-/// handled here. A registered family shape whose routing entry is unexpectedly missing yields a
-/// passthrough gate — a resume replaying pre-backfill changes appends absolute per-pk ops, which
-/// are harmless duplicates for readers.
-fn unregister_shape_routing(
-    shapes: &mut HashMap<String, StandaloneShape>,
-    families: &mut HashMap<Vec<usize>, KeyRouter>,
-    family_of: &mut HashMap<String, (Vec<usize>, u64, Row)>,
-    shape_id: &str,
-) -> Option<crate::pg::SnapshotGate> {
-    if let Some(s) = shapes.remove(shape_id) {
-        return Some(s.gate);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    if cmd_tx
+        .send(SequencerCmd::ActivateShape {
+            table: table.to_string(),
+            shape_id: shape_id.to_string(),
+            gate,
+            agg_seed,
+            emitted_seed,
+            ready: ready_tx,
+        })
+        .is_err()
+    {
+        return Err("sequencer is gone".to_string());
     }
-    let (key_cols, num_id, key_tuple) = family_of.remove(shape_id)?;
-    let mut gate = None;
-    if let Some(router) = families.get_mut(&key_cols) {
-        if let Some(routed) = router.index.get_mut(&key_tuple) {
-            gate = routed.iter().find(|rs| rs.num_id == num_id).map(|rs| rs.gate.clone());
-            routed.retain(|rs| rs.num_id != num_id);
-            if routed.is_empty() {
-                router.index.remove(&key_tuple);
-            }
-        }
-        if router.index.is_empty() {
-            families.remove(&key_cols);
-        }
-    }
-    gate.or_else(|| Some(crate::pg::SnapshotGate::passthrough()))
-}
-
-/// Register a plain row shape into the tailer's live routing: an equality template joins its
-/// shared family router (routed by key tuple); anything else becomes a standalone stateless
-/// filter. Shared by first-time registration ([`add_shape_routed`]) and dormant-shape resume
-/// ([`resume_shape_routed`]), which differ only in how the stream got seeded.
-#[allow(clippy::too_many_arguments)]
-fn register_shape_routing(
-    shapes: &mut HashMap<String, StandaloneShape>,
-    families: &mut HashMap<Vec<usize>, KeyRouter>,
-    family_of: &mut HashMap<String, (Vec<usize>, u64, Row)>,
-    shape_id: String,
-    num_id: u64,
-    stream_path: String,
-    pred: Arc<CompiledPredicate>,
-    out_cols: Option<Arc<Vec<usize>>>,
-    gate: crate::pg::SnapshotGate,
-) {
-    match pred.equality_template() {
-        Some(pairs) => {
-            let key_cols: Vec<usize> = pairs.iter().map(|(c, _)| *c).collect();
-            let key_tuple = Row(pairs.into_iter().map(|(_, v)| v).collect());
-            let router = families
-                .entry(key_cols.clone())
-                .or_insert_with(|| KeyRouter { key_cols: key_cols.clone(), index: HashMap::new() });
-            router.index.entry(key_tuple.clone()).or_default().push(RoutedShape {
-                num_id,
-                stream_path,
-                gate,
-                out_cols,
-            });
-            family_of.insert(shape_id, (key_cols, num_id, key_tuple));
-        }
-        None => {
-            shapes.insert(shape_id, StandaloneShape { pred, stream_path, gate, out_cols });
-        }
-    }
-}
-
-/// Reactivate a dormant shape (retention): replay the table stream from `resume_offset`, appending
-/// the shape's matching deltas to its **retained** stream — no Postgres backfill — then register it
-/// for live routing. Runs inline in the tailer loop, so no live envelope can interleave with the
-/// replay; envelopes past the tailer's own read position are replayed here AND processed again by
-/// the live loop, which is safe (shape envelopes are absolute per-pk upsert/delete — an
-/// at-least-once duplicate is idempotent for stream readers, the same argument as
-/// `append_reliable`). Replay length is bounded by the table stream's history (its trim watermark,
-/// once trimming exists) — the retention dormancy TTL keeps that window finite.
-#[allow(clippy::too_many_arguments)]
-async fn resume_shape_routed(
-    ds: &DsClient,
-    ts: &TableSchema,
-    table_path: &str,
-    shapes: &mut HashMap<String, StandaloneShape>,
-    families: &mut HashMap<Vec<usize>, KeyRouter>,
-    family_of: &mut HashMap<String, (Vec<usize>, u64, Row)>,
-    emitted: &mut HashMap<String, u64>,
-    shape_id: String,
-    num_id: u64,
-    stream_path: String,
-    pred: Arc<CompiledPredicate>,
-    out_cols: Option<Arc<Vec<usize>>>,
-    resume_offset: String,
-    gate: crate::pg::SnapshotGate,
-) -> Result<()> {
-    let proj = out_cols.as_deref().map(Vec::as_slice);
-    let mut from = resume_offset;
-    let mut replayed: u64 = 0;
-    loop {
-        let r = ds.read(table_path, &from, false).await?;
-        let mut envs: Vec<Envelope> = Vec::new();
-        for env in &r.envelopes {
-            match replay_envelope_for_shape(ts, &pred, &gate, proj, env) {
-                Ok(mut out) => envs.append(&mut out),
-                // A malformed envelope is skipped, matching the live loop's stance (log, keep going).
-                Err(e) => tracing::error!("replaying envelope for shape {shape_id}: {e:#}"),
-            }
-        }
-        if !envs.is_empty() {
-            replayed += envs.len() as u64;
-            if !ds.append_reliable(&stream_path, &envs).await {
-                bail!("shape stream {stream_path} is gone");
-            }
-        }
-        // Page until caught up; never spin on a non-advancing offset (same guard as the fold paths).
-        let advanced = r.next_offset.as_deref().is_some_and(|n| n != from);
-        if let Some(n) = r.next_offset {
-            from = n;
-        }
-        if r.up_to_date || !advanced {
-            break;
-        }
-    }
-    if replayed > 0 {
-        *emitted.entry(shape_id.clone()).or_insert(0) += replayed;
-    }
-    register_shape_routing(shapes, families, family_of, shape_id, num_id, stream_path, pred, out_cols, gate);
-    Ok(())
-}
-
-/// One table-stream envelope through one shape's filter, for the dormant-resume replay: input
-/// delta → snapshot-gate skip → predicate filter → projected output envelopes. Pure (same
-/// building blocks as the live loop: [`apply_envelope`], [`eval_standalone`],
-/// [`translate_output`]), so the replay semantics are unit-testable.
-fn replay_envelope_for_shape(
-    ts: &TableSchema,
-    pred: &CompiledPredicate,
-    gate: &crate::pg::SnapshotGate,
-    out_cols: Option<&[usize]>,
-    env: &Envelope,
-) -> Result<Vec<Envelope>> {
-    let (delta, txid, lsn) = apply_envelope(ts, env)?;
-    if delta.is_empty() {
-        return Ok(Vec::new());
-    }
-    let lsn_u64 = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0);
-    let xid = txid.as_deref().and_then(|s| s.parse::<u64>().ok());
-    if gate.should_skip(lsn_u64, xid) {
-        return Ok(Vec::new());
-    }
-    let out = eval_standalone(pred, &delta);
-    if out.is_empty() {
-        return Ok(Vec::new());
-    }
-    Ok(translate_output(ts, out, txid, lsn, out_cols))
+    ready_rx.await.unwrap_or_else(|_| Err("sequencer dropped the ready channel".to_string()))
 }
 
 /// Read a backfill snapshot from Postgres (current rows + snapshot LSN). `filter`, when given, is the
@@ -2589,7 +3241,7 @@ async fn pg_backfill(
 ) -> Result<crate::pg::Backfill> {
     match pg_url {
         Some(url) => {
-            let client = crate::pg::connect(url).await?;
+            let client = crate::pg::pool_for(url).get().await?;
             crate::pg::backfill(&client, ts, filter).await
         }
         None => Ok(crate::pg::Backfill {
@@ -2605,11 +3257,12 @@ async fn pg_backfill(
 async fn process_envelope(
     ts: &TableSchema,
     shapes: &HashMap<String, StandaloneShape>,
+    shape_index: &StandaloneIndex,
     families: &HashMap<Vec<usize>, KeyRouter>,
     aggregates: &mut HashMap<String, AggShape>,
     env: Envelope,
     pending: &mut HashMap<String, Vec<Envelope>>,
-    subqueries: &Arc<Mutex<SubqueryRegistry>>,
+    subq: &SubqueryHandle,
     trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
 ) -> Result<()> {
     let (delta, txid, lsn) = apply_envelope(ts, &env)?;
@@ -2634,8 +3287,17 @@ async fn process_envelope(
     let _t = Timer::new(&metrics().process_envelope);
     // Standalone shapes: evaluate each stateless filter directly on the delta (no thread, no clone).
     // Skip changes already visible to the shape's backfill snapshot (xid-visibility gate, LSN
-    // fallback for changes without a parseable xid).
-    for (sid, shape) in shapes {
+    // fallback for changes without a parseable xid). On the untraced hot path only the index's
+    // candidates are visited (a non-candidate's necessary conjunct fails, so it cannot match);
+    // with a trace subscriber the full scan is kept so every filter node still reports a hop.
+    let candidate_ids;
+    let candidates: Box<dyn Iterator<Item = (&String, &StandaloneShape)>> = if tr.is_some() {
+        Box::new(shapes.iter())
+    } else {
+        candidate_ids = shape_index.candidates(&delta);
+        Box::new(candidate_ids.iter().filter_map(|sid| shapes.get_key_value(sid)))
+    };
+    for (sid, shape) in candidates {
         if shape.gate.should_skip(lsn_u64, xid) {
             if let Some((hops, _)) = tr.as_mut() {
                 hops.push(crate::trace::TraceHop::new(format!("filter:{sid}"), "dropped"));
@@ -2659,7 +3321,7 @@ async fn process_envelope(
         pending.entry(shape.stream_path.clone()).or_default().extend(envs);
     }
     // Equality routers: route each delta row by its key to exactly the shapes registered on that key.
-    // No table copy, no dbsp — membership is the key match (an equality-template predicate matches a
+    // No table copy, no join state — membership is the key match (an equality-template predicate matches a
     // row iff its key equals the shape's constants). Each shape's own snapshot gate is applied, so
     // changes already in that shape's backfill are skipped.
     let _s = Timer::new(&metrics().family_step);
@@ -2718,24 +3380,36 @@ async fn process_envelope(
             }
         }
     }
-    // Subquery shapes/nodes: route this delta through the cross-table registry. It updates the shared
-    // inner-set nodes, emits outer-shape deltas, and propagates inner-set flips to dependents — appending
-    // move envelopes synchronously, so this batch's processed-offset barrier still implies convergence.
+    // Subquery shapes/nodes: route this delta through the cross-table registry. Under the lock it
+    // updates the shared inner-set nodes (in-memory) and emits outer-shape deltas; the flip-driven
+    // Postgres query-backs are handed to the engine's flip-propagator task so they never block
+    // this tailer. The convergence barrier is processed offsets + a drained flip queue
+    // (`pending_flips == 0`).
     {
-        let mut reg = subqueries.lock().await;
-        if reg.touches(&ts.name) {
-            let mut sq_hops: Option<Vec<crate::trace::TraceHop>> = tr.as_ref().map(|_| Vec::new());
-            reg.on_table_delta(ts, &delta, lsn_u64, xid, txid.clone(), sq_hops.as_mut()).await?;
-            if let (Some((hops, ids)), Some(sq)) = (tr.as_mut(), sq_hops) {
-                for h in &sq {
-                    if h.outcome == "passed"
-                        && let Some(sid) = h.node.strip_prefix("shape:")
-                        && !ids.iter().any(|i| i == sid)
-                    {
-                        ids.push(sid.to_string());
+        let mut work = std::collections::VecDeque::new();
+        {
+            let mut reg = subq.registry.lock().await;
+            if reg.touches(&ts.name) {
+                let mut sq_hops: Option<Vec<crate::trace::TraceHop>> = tr.as_ref().map(|_| Vec::new());
+                work = reg.on_table_delta(ts, &delta, lsn_u64, xid, txid.clone(), sq_hops.as_mut()).await?;
+                if let (Some((hops, ids)), Some(sq)) = (tr.as_mut(), sq_hops) {
+                    for h in &sq {
+                        if h.outcome == "passed"
+                            && let Some(sid) = h.node.strip_prefix("shape:")
+                            && !ids.iter().any(|i| i == sid)
+                        {
+                            ids.push(sid.to_string());
+                        }
                     }
+                    hops.extend(sq);
                 }
-                hops.extend(sq);
+            }
+        }
+        if !work.is_empty() {
+            subq.pending_flips.fetch_add(1, Ordering::SeqCst);
+            if subq.flip_tx.send(FlipWork { work, txid: txid.clone() }).is_err() {
+                // Propagator gone (shutdown) — don't leave the barrier stuck.
+                subq.pending_flips.fetch_sub(1, Ordering::SeqCst);
             }
         }
     }
@@ -2937,6 +3611,74 @@ mod tests {
     use super::*;
     use crate::schema::{TableDef, TableSchema};
 
+    /// The candidate set must contain every standalone shape that could match any row of the
+    /// delta (old or new side), and exclude shapes whose necessary conjunct fails on all rows.
+    #[test]
+    fn standalone_index_candidates() {
+        let def: TableDef = serde_json::from_value(serde_json::json!({
+            "columns": { "id": {"type":"int"}, "name": {"type":"text"}, "age": {"type":"int"}, "active": {"type":"bool"} },
+            "primaryKey": "id"
+        }))
+        .unwrap();
+        let ts = TableSchema::from_def("users", &def).unwrap();
+        let compile = |j: serde_json::Value| {
+            Arc::new(
+                CompiledPredicate::compile_opt(Some(&serde_json::from_value(j).unwrap()), &ts).unwrap(),
+            )
+        };
+        let mut idx = StandaloneIndex::default();
+        idx.insert("eq_a", &compile(serde_json::json!({"col":"name","op":"eq","value":"a"})));
+        idx.insert("gt_18", &compile(serde_json::json!({"col":"age","op":"gt","value":18})));
+        idx.insert("gte_18", &compile(serde_json::json!({"col":"age","op":"gte","value":18})));
+        idx.insert("lt_10", &compile(serde_json::json!({"col":"age","op":"lt","value":10})));
+        idx.insert("neq_b", &compile(serde_json::json!({"col":"name","op":"neq","value":"b"}))); // fallback scan
+
+        let row = |name: &str, age: i64| {
+            ts.row_from_json(
+                serde_json::json!({"id":1,"name":name,"age":age,"active":true}).as_object().unwrap(),
+            )
+            .unwrap()
+        };
+        fn cand(idx: &StandaloneIndex, delta: &[Tup2<Row, ZWeight>]) -> Vec<String> {
+            let mut c = idx.candidates(delta);
+            c.sort();
+            c
+        }
+
+        // age = 18 satisfies gte (non-strict) but not gt (strict); name 'a' hits the eq bucket;
+        // the un-indexable neq shape is always a candidate.
+        assert_eq!(cand(&idx, &[Tup2(row("a", 18), 1)]), vec!["eq_a", "gte_18", "neq_b"]);
+        // age = 25 satisfies both lower bounds; name 'z' misses the eq bucket.
+        assert_eq!(cand(&idx, &[Tup2(row("z", 25), 1)]), vec!["gt_18", "gte_18", "neq_b"]);
+        // age = 5 satisfies only the upper bound.
+        assert_eq!(cand(&idx, &[Tup2(row("z", 5), 1)]), vec!["lt_10", "neq_b"]);
+        // An update whose OLD row matches a shape must surface it (the retraction side).
+        assert_eq!(cand(&idx, &[Tup2(row("a", 18), -1), Tup2(row("z", 5), 1)]), vec![
+            "eq_a", "gte_18", "lt_10", "neq_b"
+        ]);
+        // A NULL cell satisfies no comparison conjunct.
+        let null_age = ts
+            .row_from_json(serde_json::json!({"id":1,"name":null,"age":null,"active":true}).as_object().unwrap())
+            .unwrap();
+        assert_eq!(cand(&idx, &[Tup2(null_age, 1)]), vec!["neq_b"]);
+
+        // Removal unindexes both indexed and fallback shapes.
+        idx.remove("eq_a");
+        idx.remove("neq_b");
+        assert_eq!(cand(&idx, &[Tup2(row("a", 18), 1)]), vec!["gte_18"]);
+    }
+
+    /// A SubqueryHandle over a fresh registry, with a live propagator task (tests run in tokio).
+    fn test_subq() -> SubqueryHandle {
+        let registry =
+            Arc::new(Mutex::new(SubqueryRegistry::new(DsClient::new("http://127.0.0.1:1"), None)));
+        let (flip_tx, flip_rx) = mpsc::unbounded_channel();
+        let pending_flips = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let (trace_tx, _) = tokio::sync::broadcast::channel(16);
+        spawn_flip_propagator(registry.clone(), flip_rx, pending_flips.clone(), trace_tx);
+        SubqueryHandle { registry, flip_tx, pending_flips }
+    }
+
     fn agg_shape(func: AggFn, col: Option<usize>, ts: &TableSchema) -> AggShape {
         let pred = Arc::new(CompiledPredicate::compile_opt(None, ts).unwrap());
         AggShape {
@@ -3037,6 +3779,7 @@ mod tests {
             family_key: fam.map(|v| v.iter().map(|s| s.to_string()).collect()),
             is_subquery: sq,
             aggregate: agg.map(|func| AggInfo { func, col: None }),
+            state: Some("active"),
         };
         let tables = vec!["users".to_string(), "orders".to_string()];
         let shapes = vec![
@@ -3281,14 +4024,17 @@ mod tests {
             },
         );
 
+        let mut shape_index = StandaloneIndex::default();
+        shape_index.insert("s9", &shapes["s9"].pred);
+
         let mut aggregates: HashMap<String, AggShape> = HashMap::new();
-        let subqueries = Arc::new(Mutex::new(SubqueryRegistry::new(DsClient::new("http://127.0.0.1:1"), None)));
+        let subqueries = test_subq();
         let (trace_tx, mut trace_rx) = tokio::sync::broadcast::channel::<Arc<String>>(16);
         let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
 
         // Insert routed to key 'a' -> family hop routed with the key, shape s7 reached, filter s9 drops.
         process_envelope(
-            &ts, &shapes, &families, &mut aggregates,
+            &ts, &shapes, &shape_index, &families, &mut aggregates,
             env("insert", "1", Some(serde_json::json!({"id":1,"name":"a","active":true})), None),
             &mut pending, &subqueries, &trace_tx,
         )
@@ -3309,7 +4055,7 @@ mod tests {
 
         // Insert whose key matches no routed shape -> family hop dropped, no shapes reached.
         process_envelope(
-            &ts, &shapes, &families, &mut aggregates,
+            &ts, &shapes, &shape_index, &families, &mut aggregates,
             env("insert", "2", Some(serde_json::json!({"id":2,"name":"zzz","active":true})), None),
             &mut pending, &subqueries, &trace_tx,
         )
@@ -3325,7 +4071,7 @@ mod tests {
         // Nobody subscribed -> nothing is built or sent (receiver dropped).
         drop(trace_rx);
         process_envelope(
-            &ts, &shapes, &families, &mut aggregates,
+            &ts, &shapes, &shape_index, &families, &mut aggregates,
             env("insert", "3", Some(serde_json::json!({"id":3,"name":"a","active":true})), None),
             &mut pending, &subqueries, &trace_tx,
         )
@@ -3340,15 +4086,16 @@ mod tests {
     async fn trace_aggregate_fold() {
         let ts = users();
         let shapes: HashMap<String, StandaloneShape> = HashMap::new();
+        let shape_index = StandaloneIndex::default();
         let families: HashMap<Vec<usize>, KeyRouter> = HashMap::new();
         let mut aggregates: HashMap<String, AggShape> = HashMap::new();
         aggregates.insert("s4".into(), agg(AggFn::Count, None)); // COUNT(*) WHERE active = true
-        let subqueries = Arc::new(Mutex::new(SubqueryRegistry::new(DsClient::new("http://127.0.0.1:1"), None)));
+        let subqueries = test_subq();
         let (trace_tx, mut trace_rx) = tokio::sync::broadcast::channel::<Arc<String>>(16);
         let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
 
         process_envelope(
-            &ts, &shapes, &families, &mut aggregates,
+            &ts, &shapes, &shape_index, &families, &mut aggregates,
             env("insert", "1", Some(serde_json::json!({"id":1,"name":"a","active":true})), None),
             &mut pending, &subqueries, &trace_tx,
         )
@@ -3360,7 +4107,7 @@ mod tests {
         assert_eq!(ev["shapes"].as_array().unwrap(), &vec![serde_json::json!("s4")]);
 
         process_envelope(
-            &ts, &shapes, &families, &mut aggregates,
+            &ts, &shapes, &shape_index, &families, &mut aggregates,
             env("insert", "2", Some(serde_json::json!({"id":2,"name":"b","active":false})), None),
             &mut pending, &subqueries, &trace_tx,
         )
@@ -3465,99 +4212,5 @@ mod tests {
         assert_eq!(mx.value(), serde_json::json!(8));
         mx.apply(&vec![Tup2(active(8), -1)]);
         assert_eq!(mx.value(), serde_json::json!(5));
-    }
-
-    // ---- dormant-shape resume replay (retention) ------------------------------------------------
-
-    fn active_pred(ts: &TableSchema) -> CompiledPredicate {
-        CompiledPredicate::compile_opt(
-            Some(&serde_json::from_value(serde_json::json!({"col":"active","op":"eq","value":true})).unwrap()),
-            ts,
-        )
-        .unwrap()
-    }
-
-    fn replay_ops(ts: &TableSchema, pred: &CompiledPredicate, env: &Envelope) -> Vec<(String, String)> {
-        replay_envelope_for_shape(ts, pred, &crate::pg::SnapshotGate::passthrough(), None, env)
-            .unwrap()
-            .into_iter()
-            .map(|e| (e.headers.operation, e.key))
-            .collect()
-    }
-
-    /// The resume replay must produce the same enter/leave/stay transitions the live loop would
-    /// have: an insert of a matching row enters, an update crossing the predicate boundary emits
-    /// upsert-or-delete accordingly, and non-matching traffic is dropped.
-    #[test]
-    fn replay_classifies_predicate_transitions() {
-        let ts = users();
-        let pred = active_pred(&ts);
-        let row = |id: i64, active: bool| serde_json::json!({ "id": id, "name": "n", "active": active });
-
-        // Insert of a matching row → upsert; insert of a non-matching row → nothing.
-        assert_eq!(
-            replay_ops(&ts, &pred, &env("insert", "1", Some(row(1, true)), None)),
-            vec![("upsert".to_string(), "1".to_string())]
-        );
-        assert!(replay_ops(&ts, &pred, &env("insert", "2", Some(row(2, false)), None)).is_empty());
-
-        // Update leaving the predicate → delete; entering it → upsert; staying inside → upsert.
-        assert_eq!(
-            replay_ops(&ts, &pred, &env("update", "1", Some(row(1, false)), Some(row(1, true)))),
-            vec![("delete".to_string(), "1".to_string())]
-        );
-        assert_eq!(
-            replay_ops(&ts, &pred, &env("update", "1", Some(row(1, true)), Some(row(1, false)))),
-            vec![("upsert".to_string(), "1".to_string())]
-        );
-        assert_eq!(
-            replay_ops(&ts, &pred, &env("update", "1", Some(row(1, true)), Some(row(1, true)))),
-            Vec::<(String, String)>::new(),
-            "a no-op update (old == new) produces an empty delta"
-        );
-
-        // Delete of a matching row → delete; of a non-matching row → nothing.
-        assert_eq!(
-            replay_ops(&ts, &pred, &env("delete", "1", None, Some(row(1, true)))),
-            vec![("delete".to_string(), "1".to_string())]
-        );
-        assert!(replay_ops(&ts, &pred, &env("delete", "2", None, Some(row(2, false)))).is_empty());
-    }
-
-    /// Replayed changes already covered by the shape's backfill snapshot must be skipped — the
-    /// gate travels through dormancy so a shape that went dormant right after creation doesn't
-    /// double-apply its backfill era on resume.
-    #[test]
-    fn replay_respects_the_snapshot_gate() {
-        let ts = users();
-        let pred = active_pred(&ts);
-        // Gate at LSN 100 (no xids): changes with commit LSN < 100 are already in the backfill.
-        let gate = crate::pg::SnapshotGate::parse("", "0/64");
-        let row = serde_json::json!({ "id": 1, "name": "n", "active": true });
-        let mut e = env("insert", "1", Some(row), None);
-        e.headers.lsn = Some("0/32".into()); // LSN 50 < 100 → already seeded, skip
-        assert!(replay_envelope_for_shape(&ts, &pred, &gate, None, &e).unwrap().is_empty());
-        e.headers.lsn = Some("0/C8".into()); // LSN 200 > 100 → replay
-        assert_eq!(replay_envelope_for_shape(&ts, &pred, &gate, None, &e).unwrap().len(), 1);
-    }
-
-    /// The replay applies the shape's column projection, like the live path.
-    #[test]
-    fn replay_projects_output_columns() {
-        let ts = users();
-        let pred = active_pred(&ts);
-        let proj = resolve_columns(&ts, Some(vec!["active".to_string()])).unwrap();
-        let row = serde_json::json!({ "id": 1, "name": "secret", "active": true });
-        let out = replay_envelope_for_shape(
-            &ts,
-            &pred,
-            &crate::pg::SnapshotGate::passthrough(),
-            proj.as_deref().map(Vec::as_slice),
-            &env("insert", "1", Some(row), None),
-        )
-        .unwrap();
-        let value = out[0].value.as_ref().unwrap();
-        assert!(value.get("active").is_some() && value.get("id").is_some(), "pk always projected");
-        assert!(value.get("name").is_none(), "unprojected column must not leak through the replay");
     }
 }

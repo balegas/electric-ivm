@@ -528,10 +528,21 @@ async fn replication_slot_sampler(pg_url: String, slot: String) {
     }
 }
 
-/// Recursive `du` (sum of regular-file sizes). Skips symlinks. `None` if the path does not exist.
+/// Recursive `du`. Counts **allocated** bytes (`st_blocks * 512`, like real `du`), not apparent
+/// file length — the durable-streams append files are block-rounded, so summing `len()` undercounts
+/// what the volume actually loses. Skips symlinks. `None` if the path does not exist.
 fn du_bytes(root: &std::path::Path) -> Option<u64> {
     if !root.exists() {
         return None;
+    }
+    fn file_bytes(md: &std::fs::Metadata) -> u64 {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            return md.blocks() * 512;
+        }
+        #[cfg(not(unix))]
+        md.len()
     }
     fn walk(p: &std::path::Path) -> u64 {
         let mut total = 0u64;
@@ -543,7 +554,7 @@ fn du_bytes(root: &std::path::Path) -> Option<u64> {
             } else if ft.is_dir() {
                 total += walk(&entry.path());
             } else if let Ok(md) = entry.metadata() {
-                total += md.len();
+                total += file_bytes(&md);
             }
         }
         total

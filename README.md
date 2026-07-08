@@ -126,8 +126,8 @@ engine one maintenance path and one append per change.
   app ──SQL writes──▶ POSTGRES (system of record; wal_level=logical)
                          │  logical replication
                          ▼
-                      DURABLE STREAMS   table/<name>       (the change log)
-                         │  one tailer per table
+                      DURABLE STREAMS   changes            (the single ordered change log)
+                         │  one LSN-ordered sequencer (all tables, commit order)
                          ▼
                       ENGINE   Z-set deltas → shared filters/routers/subqueries/aggregations
                          │
@@ -191,7 +191,7 @@ ELECTRIC_IVM_PG_TABLES='*' target/debug/electric-ivm-engine   # prints ENGINE_LI
 writes, shapes, subset queries, aggregations). Run via the demos or `docker/api-server.ts`.
 
 **`apps/pipeline-viz` — the pipeline explorer (TS).** A developer/debugging GUI that attaches to
-any running engine and renders the maintained dbsp pipeline — one graph in the engine's own node
+any running engine and renders the maintained pipeline — one graph in the engine's own node
 namespace, with the **live state of every node** on its card (routing-index sizes, subquery
 inner-set sizes, fold values, emit counters — pushed over the `/trace` SSE stream, not polled).
 Node details dump full operator state (routing indexes, aggregation multisets, inner sets), live

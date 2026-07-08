@@ -19,6 +19,7 @@ pub mod mem;
 pub mod metrics;
 pub mod params;
 pub mod pg;
+pub mod pgoutput;
 pub mod statsd;
 pub mod predicate;
 pub mod replication;
@@ -31,3 +32,7 @@ pub mod value;
 pub mod where_sql;
 
 pub use value::{Row, Value};
+
+/// The single ordered change log: the ingestor appends whole commits here (in commit order), and
+/// the engine's sequencer consumes it — the envelope's `type` field carries the table name.
+pub const CHANGES_STREAM: &str = "changes";

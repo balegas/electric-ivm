@@ -497,6 +497,9 @@ export default function App() {
                       <span className="shape-id">{s.id}</span>
                       <span className={`badge ${k.cls}`}>{k.label}</span>
                       {s.changesOnly ? <span className="badge k-feed">feed</span> : null}
+                      {s.state && s.state !== 'active' ? (
+                        <span className={`badge k-life k-life-${s.state}`}>{s.state}</span>
+                      ) : null}
                       <span
                         className="shape-del"
                         role="button"

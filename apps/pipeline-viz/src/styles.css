@@ -356,6 +356,42 @@ body,
   justify-content: space-between;
   gap: 6px;
 }
+/* Retention lifecycle: a parked (dormant/transitioning) shape keeps its stream + record but holds
+   no routing state — render it visibly asleep. */
+.badge.k-life {
+  background: #64748b;
+  color: #fff;
+}
+.badge.k-life-reactivating {
+  background: #0e7490;
+}
+.badge.k-life-deactivating {
+  background: #92400e;
+}
+
+.pnode-parked {
+  opacity: 0.55;
+  border-style: dashed !important;
+  filter: saturate(0.4);
+}
+.pnode-life {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 1px 5px;
+  border-radius: 8px;
+  background: #64748b;
+  color: #fff;
+  margin-right: 4px;
+}
+.pnode-life-reactivating {
+  background: #0e7490;
+}
+.pnode-life-deactivating {
+  background: #92400e;
+}
+
 .pnode-shared {
   color: #be123c;
   background: #ffe4e6;

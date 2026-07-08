@@ -19,8 +19,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use dbsp::ZWeight;
-use dbsp::utils::Tup2;
+use crate::value::{Tup2, ZWeight};
 
 use crate::ds::DsClient;
 use crate::predicate::{
@@ -216,10 +215,6 @@ pub struct SubqueryRegistry {
     ds: DsClient,
     pg_url: Option<String>,
     schemas: SchemaMap,
-    /// A single reused Postgres connection for node seeding / backfill / query-back. Subquery work is
-    /// serialized under the registry mutex, so one connection suffices — and reusing it is essential:
-    /// connecting per shape exhausts ephemeral TCP ports when thousands of subquery shapes are created.
-    pg_client: tokio::sync::Mutex<Option<Arc<tokio_postgres::Client>>>,
 }
 
 impl SubqueryRegistry {
@@ -233,23 +228,16 @@ impl SubqueryRegistry {
             ds,
             pg_url,
             schemas: Arc::new(HashMap::new()),
-            pg_client: tokio::sync::Mutex::new(None),
         }
     }
 
-    /// Lazily connect to Postgres and cache the client, reconnecting if the cached connection has closed.
-    /// All subquery PG access funnels through here so we hold one connection, not one per shape.
-    async fn pg(&self) -> Result<Arc<tokio_postgres::Client>> {
-        let url = self.pg_url.clone().context("subquery work requires postgres")?;
-        let mut guard = self.pg_client.lock().await;
-        if let Some(c) = guard.as_ref() {
-            if !c.is_closed() {
-                return Ok(c.clone());
-            }
-        }
-        let client = Arc::new(crate::pg::connect(&url).await?);
-        *guard = Some(client.clone());
-        Ok(client)
+    /// Check out a pooled Postgres connection. All subquery PG access funnels through the shared
+    /// per-URL pool: connections are reused across shapes (connecting per shape exhausts ephemeral
+    /// TCP ports when thousands of subquery shapes are created) without serializing query-backs on
+    /// a single session.
+    async fn pg(&self) -> Result<crate::pg::PooledClient> {
+        let url = self.pg_url.as_deref().context("subquery work requires postgres")?;
+        crate::pg::pool_for(url).get().await
     }
 
     pub fn set_schemas(&mut self, schemas: SchemaMap) {
@@ -270,7 +258,7 @@ impl SubqueryRegistry {
 
     /// The live **inner-set index** of one node (the visualizer's "see the index" view): up to `cap`
     /// `(value, contributor-count)` pairs, most-shared first, plus the true distinct count, refcount, and
-    /// whether the list was truncated. This is the actual dbsp-maintained set, not derivable from topology.
+    /// whether the list was truncated. This is the actual engine-maintained set, not derivable from topology.
     pub fn node_value_index(
         &self,
         sig: &str,
@@ -524,10 +512,13 @@ impl SubqueryRegistry {
 
     // --- live maintenance ---------------------------------------------------------------------
 
-    /// Process one table delta: update affected nodes, emit outer-shape deltas, and propagate inner-set
-    /// flips to dependents (querying back the affected rows). Appends move envelopes synchronously, so
-    /// the caller's processed-offset barrier still implies convergence. `lsn` is the change's commit
-    /// LSN (0 = unknown/never skip).
+    /// Process one table delta: update affected nodes (in-memory) and emit outer-shape deltas
+    /// synchronously, then **return** the inner-set flips for deferred propagation (the caller
+    /// hands them to the engine's flip-propagator task — see [`propagate_flips`]). Deferring the
+    /// flip-driven Postgres query-backs is safe because outer membership is emitted absolutely
+    /// (upsert-if-matches-now / idempotent delete), so cross-table convergence is order-independent;
+    /// the convergence barrier is the processed offset **plus** a drained flip queue. `lsn` is the
+    /// change's commit LSN (0 = unknown/never skip).
     pub async fn on_table_delta(
         &mut self,
         ts: &TableSchema,
@@ -536,7 +527,7 @@ impl SubqueryRegistry {
         xid: Option<u64>,
         txid: Option<String>,
         mut trace: Option<&mut Vec<crate::trace::TraceHop>>,
-    ) -> Result<()> {
+    ) -> Result<VecDeque<(SubquerySig, Flip)>> {
         let table = ts.name.clone();
         // Work queue of (node sig, flip) pairs to propagate (BFS up the dependency DAG).
         let mut work: VecDeque<(SubquerySig, Flip)> = VecDeque::new();
@@ -584,46 +575,10 @@ impl SubqueryRegistry {
             hop(&mut trace, format!("shape:{id}"), if emitted { "passed" } else { "dropped" });
         }
 
-        // 3. Propagate flips up the DAG.
-        while let Some((sig, flip)) = work.pop_front() {
-            for edge in self.edges_of(&sig) {
-                // A NULL-value flip only matters to NULL-sensitive dependents — a `NOT IN` leaf, or an
-                // `IN` leaf under any `Not{…}` (SQL: a NULL in the set makes the leaf UNKNOWN, which
-                // negation turns into a membership change). It can shift *every* dependent row, so
-                // re-derive the dependent fully; NULL-insensitive dependents can't change (AND/OR are
-                // monotone over FALSE < UNKNOWN < TRUE), so skip. (Not traced: rare path, and it
-                // re-derives whole dependents rather than following this envelope's delta.)
-                if matches!(flip.value, Value::Null) {
-                    if edge.null_sensitive {
-                        self.rederive_dependent(&edge, txid.clone(), &mut work).await?;
-                    }
-                    continue;
-                }
-                match &edge.dependent {
-                    Dependent::Shape(id) => {
-                        let moved =
-                            self.move_shape_for_value(id, edge.connecting_col, &flip.value, txid.clone()).await?;
-                        if moved {
-                            hop(&mut trace, format!("shape:{id}"), "passed");
-                        }
-                    }
-                    Dependent::Node(parent_sig) => {
-                        let new_flips = self
-                            .reconcile_parent_for_value(parent_sig, edge.connecting_col, &flip.value)
-                            .await?;
-                        hop(
-                            &mut trace,
-                            format!("node:{parent_sig}"),
-                            if new_flips.is_empty() { "dropped" } else { "passed" },
-                        );
-                        for f in new_flips {
-                            work.push_back((parent_sig.clone(), f));
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
+        // 3. Flip propagation (the Postgres query-backs) is deferred: the caller enqueues `work`
+        // onto the engine's flip-propagator task, which runs [`propagate_flips`] without holding
+        // this registry lock across round-trips.
+        Ok(work)
     }
 
     /// For each inner-row pk touched by `delta`, its desired contribution (`Some(proj)` if the row now
@@ -675,70 +630,10 @@ impl SubqueryRegistry {
         flips
     }
 
-    /// A parent node's value `v` was referenced by a flipped child; re-evaluate the parent's inner rows
-    /// with `connecting_col = v` and reconcile them, returning the parent's resulting flips.
-    async fn reconcile_parent_for_value(
-        &mut self,
-        parent_sig: &SubquerySig,
-        connecting_col: usize,
-        value: &Value,
-    ) -> Result<Vec<Flip>> {
-        let inner_table = match self.nodes.get(parent_sig) {
-            Some(n) => n.inner_table.clone(),
-            None => return Ok(Vec::new()),
-        };
-        let ts = self.schemas.get(&inner_table).cloned().context("parent node: unknown table")?;
-        let rows = self.query_candidates(&ts, connecting_col, value).await?;
-        let (pred, proj) = {
-            let n = self.nodes.get(parent_sig).context("parent node vanished")?;
-            (n.pred.clone(), n.proj_col)
-        };
-        let evals: Vec<(String, Option<Value>)> = rows
-            .iter()
-            .map(|r| {
-                let pk = ts.key_string(r).unwrap_or_default();
-                let pv = if pred.matches_ctx(r, self) {
-                    Some(r.0.get(proj).cloned().unwrap_or(Value::Null))
-                } else {
-                    None
-                };
-                (pk, pv)
-            })
-            .collect();
-        Ok(self.apply_node_flips(parent_sig, evals))
-    }
-
-    /// An inner-set value `v` flipped for an outer shape: query the outer rows with `connecting_col = v`,
-    /// re-evaluate the full shape predicate, and append `upsert` (matches) / `delete` (doesn't) by pk.
-    async fn move_shape_for_value(
-        &self,
-        shape_id: &str,
-        connecting_col: usize,
-        value: &Value,
-        txid: Option<String>,
-    ) -> Result<bool> {
-        let Some(shape) = self.shapes.get(shape_id) else { return Ok(false) };
-        let ts = self.schemas.get(&shape.outer_table).cloned().context("shape: unknown table")?;
-        let rows = self.query_candidates(&ts, connecting_col, value).await?;
-        if rows.is_empty() {
-            return Ok(false);
-        }
-        let pred = shape.pred.clone();
-        let out: Vec<(Row, ZWeight)> = rows
-            .into_iter()
-            .map(|r| {
-                let w: ZWeight = if pred.matches_ctx(&r, self) { 1 } else { -1 };
-                (r, w)
-            })
-            .collect();
-        let envs = crate::engine::translate_output(&ts, out, txid, None, shape.out_cols.as_deref().map(Vec::as_slice));
-        if envs.is_empty() {
-            return Ok(false);
-        }
-        // Reliable: a dropped move envelope is permanent divergence for the shape's subscribers.
-        self.ds.append_reliable(&shape.stream_path, &envs).await;
-        shape.emitted.fetch_add(envs.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        Ok(true)
+    /// Deferred-propagation helper: snapshot what a query-back needs (brief lock scope at the
+    /// call site — see the free functions below).
+    fn snapshot_for_table(&self, table: &str) -> Result<TableSchema> {
+        self.schemas.get(table).cloned().with_context(|| format!("unknown table '{table}'"))
     }
 
     /// Evaluate a subquery shape over a delta on its own (outer) table and append the resulting
@@ -788,74 +683,256 @@ impl SubqueryRegistry {
         Ok(true)
     }
 
-    /// Re-derive a dependent fully (used for NULL flips on negated edges): re-query every candidate row
-    /// of the dependent's table and reconcile/emit. Rare (projections are typically non-null).
-    async fn rederive_dependent(
-        &mut self,
-        edge: &Edge,
-        txid: Option<String>,
-        work: &mut VecDeque<(SubquerySig, Flip)>,
-    ) -> Result<()> {
-        match &edge.dependent {
-            Dependent::Shape(id) => {
-                let (outer_table, pred, stream_path, out_cols) = match self.shapes.get(id) {
-                    Some(s) => (s.outer_table.clone(), s.pred.clone(), s.stream_path.clone(), s.out_cols.clone()),
-                    None => return Ok(()),
-                };
-                let ts = self.schemas.get(&outer_table).cloned().context("rederive: unknown table")?;
-                let rows = self.query_all(&ts).await?;
-                let out: Vec<(Row, ZWeight)> = rows
-                    .into_iter()
-                    .map(|r| { let w: ZWeight = if pred.matches_ctx(&r, self) { 1 } else { -1 }; (r, w) })
-                    .collect();
-                let envs = crate::engine::translate_output(&ts, out, txid, None, out_cols.as_deref().map(Vec::as_slice));
-                if !envs.is_empty() {
-                    self.ds.append_reliable(&stream_path, &envs).await;
-                    if let Some(s) = self.shapes.get(id) {
-                        s.emitted.fetch_add(envs.len() as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+// --- deferred flip propagation ------------------------------------------------------------------
+//
+// Runs on the engine's dedicated flip-propagator task, NOT inside the table tailers, so the
+// flip-driven Postgres query-backs no longer sit on the tailer hot path or hold the registry
+// lock. Two invariants make this sound:
+//
+//  * **Deferral**: every emission is absolute (per pk: upsert if the row matches *now*, else
+//    idempotent delete), so a propagation that runs later re-derives from the then-current
+//    Postgres and node state and converges regardless of when it runs. The convergence barrier
+//    gains one term: the engine's pending-flip counter must drain to zero
+//    (`GET /replication/lsn` → `pendingFlips`).
+//  * **Eval+append atomicity**: membership evaluation and the resulting stream append happen
+//    under one registry-lock scope (as they always did), and there is exactly ONE propagator
+//    task. Otherwise a move evaluated at time t1 could land *after* a tailer emission evaluated
+//    at t2 > t1 for the same pk, leaving the stream's last word stale — permanent divergence.
+//    Only the Postgres round-trips run outside the lock.
+
+/// Propagate a batch of inner-set flips up the dependency DAG (BFS), querying back affected rows.
+pub async fn propagate_flips(
+    registry: &tokio::sync::Mutex<SubqueryRegistry>,
+    mut work: VecDeque<(SubquerySig, Flip)>,
+    txid: Option<String>,
+    trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
+) -> Result<()> {
+    while let Some((sig, flip)) = work.pop_front() {
+        let edges = registry.lock().await.edges_of(&sig);
+        for edge in edges {
+            // A NULL-value flip only matters to NULL-sensitive dependents — a `NOT IN` leaf, or an
+            // `IN` leaf under any `Not{…}` (SQL: a NULL in the set makes the leaf UNKNOWN, which
+            // negation turns into a membership change). It can shift *every* dependent row, so
+            // re-derive the dependent fully; NULL-insensitive dependents can't change (AND/OR are
+            // monotone over FALSE < UNKNOWN < TRUE), so skip.
+            if matches!(flip.value, Value::Null) {
+                if edge.null_sensitive {
+                    rederive_dependent(registry, &edge, txid.clone(), &mut work).await?;
+                }
+                continue;
+            }
+            match &edge.dependent {
+                Dependent::Shape(id) => {
+                    let moved =
+                        move_shape_for_value(registry, id, edge.connecting_col, &flip.value, txid.clone()).await?;
+                    if let Some((table, id)) = moved {
+                        emit_flip_trace(trace_tx, &table, format!("shape:{id}"), Some(id));
+                    }
+                }
+                Dependent::Node(parent_sig) => {
+                    let new_flips =
+                        reconcile_parent_for_value(registry, parent_sig, edge.connecting_col, &flip.value).await?;
+                    if let Some((table, flips)) = new_flips {
+                        if !flips.is_empty() {
+                            emit_flip_trace(trace_tx, &table, format!("node:{parent_sig}"), None);
+                        }
+                        for f in flips {
+                            work.push_back((parent_sig.clone(), f));
+                        }
                     }
                 }
             }
-            Dependent::Node(parent_sig) => {
-                let inner_table = match self.nodes.get(parent_sig) {
-                    Some(n) => n.inner_table.clone(),
-                    None => return Ok(()),
-                };
-                let ts = self.schemas.get(&inner_table).cloned().context("rederive: unknown table")?;
-                let rows = self.query_all(&ts).await?;
-                let (pred, proj) = {
-                    let n = self.nodes.get(parent_sig).context("rederive: node vanished")?;
-                    (n.pred.clone(), n.proj_col)
-                };
-                let evals: Vec<(String, Option<Value>)> = rows
-                    .iter()
-                    .map(|r| {
-                        let pk = ts.key_string(r).unwrap_or_default();
-                        let pv = if pred.matches_ctx(r, self) { Some(r.0.get(proj).cloned().unwrap_or(Value::Null)) } else { None };
-                        (pk, pv)
-                    })
-                    .collect();
-                for f in self.apply_node_flips(parent_sig, evals) {
-                    work.push_back((parent_sig.clone(), f));
-                }
+        }
+    }
+    Ok(())
+}
+
+/// An inner-set value `v` flipped for an outer shape: query the outer rows with `connecting_col = v`,
+/// re-evaluate the full shape predicate, and append `upsert` (matches) / `delete` (doesn't) by pk.
+/// Returns `Some((outer_table, shape_id))` when envelopes were appended.
+async fn move_shape_for_value(
+    registry: &tokio::sync::Mutex<SubqueryRegistry>,
+    shape_id: &str,
+    connecting_col: usize,
+    value: &Value,
+    txid: Option<String>,
+) -> Result<Option<(String, String)>> {
+    // Brief lock: snapshot what the query-back needs.
+    let (ts, pg_url) = {
+        let reg = registry.lock().await;
+        let Some(shape) = reg.shapes.get(shape_id) else { return Ok(None) };
+        (reg.snapshot_for_table(&shape.outer_table)?, reg.pg_url.clone())
+    };
+    let rows = query_candidates(&pg_url, &ts, connecting_col, value).await?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    // Evaluate membership against the *current* node sets and append, atomically under the lock
+    // (see the module comment on eval+append atomicity).
+    let reg = registry.lock().await;
+    let Some(shape) = reg.shapes.get(shape_id) else { return Ok(None) };
+    let out: Vec<(Row, ZWeight)> = rows
+        .into_iter()
+        .map(|r| {
+            let w: ZWeight = if shape.pred.matches_ctx(&r, &*reg) { 1 } else { -1 };
+            (r, w)
+        })
+        .collect();
+    let envs = crate::engine::translate_output(&ts, out, txid, None, shape.out_cols.as_deref().map(Vec::as_slice));
+    if envs.is_empty() {
+        return Ok(None);
+    }
+    shape.emitted.fetch_add(envs.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    // Reliable: a dropped move envelope is permanent divergence for the shape's subscribers.
+    reg.ds.append_reliable(&shape.stream_path, &envs).await;
+    Ok(Some((ts.name.clone(), shape_id.to_string())))
+}
+
+/// A parent node's value `v` was referenced by a flipped child; re-evaluate the parent's inner rows
+/// with `connecting_col = v` and reconcile them. Returns `Some((inner_table, flips))`, or `None` if
+/// the parent vanished.
+async fn reconcile_parent_for_value(
+    registry: &tokio::sync::Mutex<SubqueryRegistry>,
+    parent_sig: &SubquerySig,
+    connecting_col: usize,
+    value: &Value,
+) -> Result<Option<(String, Vec<Flip>)>> {
+    let (ts, pg_url) = {
+        let reg = registry.lock().await;
+        let Some(n) = reg.nodes.get(parent_sig) else { return Ok(None) };
+        (reg.snapshot_for_table(&n.inner_table)?, reg.pg_url.clone())
+    };
+    let rows = query_candidates(&pg_url, &ts, connecting_col, value).await?;
+    let mut reg = registry.lock().await;
+    let (pred, proj) = match reg.nodes.get(parent_sig) {
+        Some(n) => (n.pred.clone(), n.proj_col),
+        None => return Ok(None),
+    };
+    let evals: Vec<(String, Option<Value>)> = rows
+        .iter()
+        .map(|r| {
+            let pk = ts.key_string(r).unwrap_or_default();
+            let pv = if pred.matches_ctx(r, &*reg) {
+                Some(r.0.get(proj).cloned().unwrap_or(Value::Null))
+            } else {
+                None
+            };
+            (pk, pv)
+        })
+        .collect();
+    Ok(Some((ts.name.clone(), reg.apply_node_flips(parent_sig, evals))))
+}
+
+/// Re-derive a dependent fully (used for NULL flips on negated edges): re-query every candidate row
+/// of the dependent's table and reconcile/emit. Rare (projections are typically non-null).
+async fn rederive_dependent(
+    registry: &tokio::sync::Mutex<SubqueryRegistry>,
+    edge: &Edge,
+    txid: Option<String>,
+    work: &mut VecDeque<(SubquerySig, Flip)>,
+) -> Result<()> {
+    match &edge.dependent {
+        Dependent::Shape(id) => {
+            let (ts, pg_url) = {
+                let reg = registry.lock().await;
+                let Some(s) = reg.shapes.get(id) else { return Ok(()) };
+                (reg.snapshot_for_table(&s.outer_table)?, reg.pg_url.clone())
+            };
+            let rows = query_all(&pg_url, &ts).await?;
+            // Eval + append atomically under the lock (see the module comment).
+            let reg = registry.lock().await;
+            let Some(s) = reg.shapes.get(id) else { return Ok(()) };
+            let out: Vec<(Row, ZWeight)> = rows
+                .into_iter()
+                .map(|r| {
+                    let w: ZWeight = if s.pred.matches_ctx(&r, &*reg) { 1 } else { -1 };
+                    (r, w)
+                })
+                .collect();
+            let envs =
+                crate::engine::translate_output(&ts, out, txid, None, s.out_cols.as_deref().map(Vec::as_slice));
+            if envs.is_empty() {
+                return Ok(());
+            }
+            s.emitted.fetch_add(envs.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            reg.ds.append_reliable(&s.stream_path, &envs).await;
+        }
+        Dependent::Node(parent_sig) => {
+            let (ts, pg_url) = {
+                let reg = registry.lock().await;
+                let Some(n) = reg.nodes.get(parent_sig) else { return Ok(()) };
+                (reg.snapshot_for_table(&n.inner_table)?, reg.pg_url.clone())
+            };
+            let rows = query_all(&pg_url, &ts).await?;
+            let mut reg = registry.lock().await;
+            let (pred, proj) = match reg.nodes.get(parent_sig) {
+                Some(n) => (n.pred.clone(), n.proj_col),
+                None => return Ok(()),
+            };
+            let evals: Vec<(String, Option<Value>)> = rows
+                .iter()
+                .map(|r| {
+                    let pk = ts.key_string(r).unwrap_or_default();
+                    let pv = if pred.matches_ctx(r, &*reg) {
+                        Some(r.0.get(proj).cloned().unwrap_or(Value::Null))
+                    } else {
+                        None
+                    };
+                    (pk, pv)
+                })
+                .collect();
+            for f in reg.apply_node_flips(parent_sig, evals) {
+                work.push_back((parent_sig.clone(), f));
             }
         }
-        Ok(())
     }
+    Ok(())
+}
 
-    /// Query candidate rows of `ts` where `col = value` (current Postgres state).
-    async fn query_candidates(&self, ts: &TableSchema, col: usize, value: &Value) -> Result<Vec<Row>> {
-        let client = self.pg().await?;
-        let where_sql = value_eq_sql(&ts.columns[col].0, value, ts.pg_types.get(col).and_then(|o| o.as_deref()));
-        let bf = crate::pg::backfill_where(&client, ts, Some(where_sql)).await?;
-        Ok(bf.rows)
+/// Query candidate rows where `col = value` on a pooled connection (no registry lock held).
+async fn query_candidates(
+    pg_url: &Option<String>,
+    ts: &TableSchema,
+    col: usize,
+    value: &Value,
+) -> Result<Vec<Row>> {
+    let url = pg_url.as_deref().context("subquery work requires postgres")?;
+    let client = crate::pg::pool_for(url).get().await?;
+    let where_sql = value_eq_sql(&ts.columns[col].0, value, ts.pg_types.get(col).and_then(|o| o.as_deref()));
+    Ok(crate::pg::backfill_where(&client, ts, Some(where_sql)).await?.rows)
+}
+
+/// Query all rows of `ts` (full re-derive) on a pooled connection (no registry lock held).
+async fn query_all(pg_url: &Option<String>, ts: &TableSchema) -> Result<Vec<Row>> {
+    let url = pg_url.as_deref().context("subquery work requires postgres")?;
+    let client = crate::pg::pool_for(url).get().await?;
+    Ok(crate::pg::backfill_where(&client, ts, None).await?.rows)
+}
+
+/// Broadcast a lossy trace event for a deferred flip effect (a shape move or a parent-node
+/// reconcile), so the visualizer still animates propagation that no longer happens inside the
+/// originating envelope's trace.
+fn emit_flip_trace(
+    trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
+    table: &str,
+    node: String,
+    shape_id: Option<String>,
+) {
+    if trace_tx.receiver_count() == 0 {
+        return;
     }
-
-    /// Query all rows of `ts` (for full re-derive).
-    async fn query_all(&self, ts: &TableSchema) -> Result<Vec<Row>> {
-        let client = self.pg().await?;
-        let bf = crate::pg::backfill_where(&client, ts, None).await?;
-        Ok(bf.rows)
+    let ev = crate::trace::TraceEvent {
+        lsn: None,
+        txid: None,
+        table: table.to_string(),
+        delta: Vec::new(),
+        hops: vec![crate::trace::TraceHop::new(node, "passed")],
+        shapes: shape_id.into_iter().collect(),
+    };
+    if let Ok(json) = serde_json::to_string(&ev) {
+        let _ = trace_tx.send(Arc::new(json));
     }
 }
 
