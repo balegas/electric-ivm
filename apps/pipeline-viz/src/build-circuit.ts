@@ -44,7 +44,55 @@ function buildFull(g: EngineGraph): { nodes: Map<string, RawNode>; edges: RawEdg
     label: e.label ?? undefined,
     kind: e.kind,
   }))
+  addArrangements(g, nodes, edges)
   return { nodes, edges }
+}
+
+/** The compiled dbsp arrangement pipeline (present iff the engine runs with ELECTRIC_IVM_DBSP=1):
+ *  static infrastructure — one input per table, one map_index→integrate_trace pipeline per index —
+ *  rendered permanently, with dashed lookup edges to the subquery consumers each index currently
+ *  serves. Ids come from the engine (`arr:input:…` / `arr:index:…`), stable across snapshots, so
+ *  sticky layout keeps the lane parked while shapes come and go. */
+function addArrangements(g: EngineGraph, nodes: Map<string, RawNode>, edges: RawEdge[]) {
+  const arr = g.arrangements
+  if (!arr) return
+  for (const inp of arr.inputs) {
+    nodes.set(inp.id, {
+      id: inp.id,
+      data: {
+        kind: 'arr-input',
+        label: inp.table,
+        sub: inp.seeded ? 'seeded' : 'seeding…',
+        ref: { kind: 'op', opKind: 'arr-input', hop: inp.id, label: inp.table },
+      },
+    })
+  }
+  for (const ix of arr.indexes) {
+    const label = `map_index(${ix.cols.join(', ')})`
+    nodes.set(ix.id, {
+      id: ix.id,
+      data: {
+        kind: 'arr-index',
+        label,
+        sub: `integrate_trace · ${ix.seeded ? 'seeded' : 'seeding…'}`,
+        ref: { kind: 'op', opKind: 'arr-index', hop: ix.id, label },
+      },
+    })
+    edges.push({ id: `${ix.input}~>${ix.id}~`, source: ix.input, target: ix.id, kind: 'flow' })
+  }
+  for (const c of arr.consumers) {
+    // A lookup feeds the dependent's own operator — a shape's membership semijoin, or a nested
+    // node's inner filter: the exact operators whose flip re-derivations the index serves.
+    const target = c.dependentKind === 'shape' ? `sj:${c.dependentId}` : `sqf:${c.dependentId}`
+    if (!nodes.has(target)) continue
+    edges.push({
+      id: `${c.index}~>${target}~lookup`,
+      source: c.index,
+      target,
+      label: `lookup · ${c.connectingCol}`,
+      kind: 'state',
+    })
+  }
 }
 
 /** Keep only the upstream closure of the selected shapes' sinks (`snk:<id>`). */

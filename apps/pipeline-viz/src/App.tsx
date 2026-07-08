@@ -597,6 +597,12 @@ export default function App() {
             nodes
           </div>
         ) : null}
+        {graph?.arrangements ? (
+          <div className="counts" title="dbsp arrangement layer: compiled indexes, and how subquery lookups were answered (arrangement snapshot vs Postgres fallback)">
+            dbsp: {graph.arrangements.indexes.length} indexes · {graph.arrangements.served.toLocaleString()} served ·{' '}
+            {graph.arrangements.fallback.toLocaleString()} fallback
+          </div>
+        ) : null}
         {err ? <div className="err">{err}</div> : null}
 
         <input
@@ -710,6 +716,7 @@ export default function App() {
             <span className="lg lg-join">⋈ join</span>
             <span className="lg lg-agg">Σ fold</span>
             <span className="lg lg-shape">π · sink</span>
+            {graph?.arrangements ? <span className="lg lg-arr">dbsp arrangement</span> : null}
           </div>
         )}
 

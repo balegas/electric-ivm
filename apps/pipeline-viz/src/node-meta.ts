@@ -211,6 +211,35 @@ export const KIND_META: Record<NodeKind, KindMeta> = {
       'barrier really means every subscriber stream reflects the batch. Equal shape definitions ' +
       'share this one stream, ref-counted; the chip counts envelopes appended (backfill + live).',
   },
+
+  // --- the compiled dbsp arrangement pipeline (static; ELECTRIC_IVM_DBSP=1) -------------------
+  'arr-input': {
+    color: '#4338ca',
+    bg: '#e0e7ff',
+    tag: 'DBSP INPUT · static',
+    formula: 'add_input_zset<Row>',
+    stateful: false,
+    inside:
+      'A table input of the compiled dbsp arrangement circuit — one shared, storage-backed circuit ' +
+      'built once at boot (its structure is fixed at construction). The sequencer feeds each ' +
+      'replicated transaction here and steps the circuit before fanning the transaction out, so ' +
+      'lookups observe post-transaction state. “Seeding” means the initial Postgres snapshot is ' +
+      'still loading; until it completes, lookups fall back to Postgres.',
+  },
+  'arr-index': {
+    color: '#4338ca',
+    bg: '#e0e7ff',
+    tag: 'DBSP ARRANGEMENT · STATE',
+    formula: 'map_index(cols) · integrate_trace',
+    stateful: true,
+    inside:
+      'A storage-backed dbsp arrangement: the table’s rows indexed by the named columns, ' +
+      'maintained by integrate_trace and spilled to layer files as it grows. Subquery flip ' +
+      're-derivations do point lookups against its published read-only snapshot instead of ' +
+      'querying Postgres back — the dashed edges point at the consumers it currently serves. A ' +
+      'missing or unseeded index makes those consumers fall back to Postgres; correctness never ' +
+      'depends on this layer.',
+  },
 }
 
 /** Compact scalar for the live agg chip / stat card (rounds long floats, e.g. AVG). */

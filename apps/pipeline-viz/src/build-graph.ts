@@ -26,6 +26,8 @@ export type NodeKind =
   | 'op-fold'
   | 'op-project'
   | 'op-sink'
+  | 'arr-input'
+  | 'arr-index'
 
 /** Identity of the underlying engine entity a graph node represents (used by the detail panel). */
 export type NodeRef =
@@ -236,6 +238,9 @@ const KIND_SIZE: Partial<Record<NodeKind, { w: number; h: number }>> = {
   'op-fold': { w: 180, h: KIND_H },
   'op-project': { w: 150, h: KIND_H },
   'op-sink': { w: 180, h: KIND_H },
+  // the compiled dbsp arrangement pipeline (static infrastructure lane)
+  'arr-input': { w: 160, h: KIND_H },
+  'arr-index': { w: 220, h: KIND_H },
 }
 
 /** Optional layout hooks: `measure` overrides a node's box (return null to keep the default) —
@@ -273,7 +278,8 @@ export function layout(
     for (const [id, n] of raw.nodes) {
       // High weight: the ranker otherwise trades a longer align edge for a shorter flow edge and
       // lets a source drift into a deeper rank (e.g. a table whose only consumer sits far right).
-      if (n.data.kind === 'table' || n.data.kind === 'op-source') g.setEdge('__align_root', id, { weight: 100 })
+      if (n.data.kind === 'table' || n.data.kind === 'op-source' || n.data.kind === 'arr-input')
+        g.setEdge('__align_root', id, { weight: 100 })
     }
   }
   dagre.layout(g)

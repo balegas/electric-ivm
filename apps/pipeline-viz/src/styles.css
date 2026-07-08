@@ -813,6 +813,18 @@ body,
   color: #1d4ed8;
   border-color: #1d4ed8;
 }
+.lg-arr {
+  background: #e0e7ff;
+  color: #4338ca;
+  border-color: #4338ca;
+  border-style: dashed;
+}
+
+/* The compiled dbsp arrangement pipeline: static infrastructure, marked by a dashed border. */
+.pnode-arr-input,
+.pnode-arr-index {
+  border-style: dashed;
+}
 
 /* Aggregation */
 .k-agg {

@@ -286,6 +286,12 @@ depends on the layer.
   static table seeded as one giant batch never merges. The layer therefore seeds in bounded chunks
   (many level-0 batches ⇒ real merges) and checkpoints (persists every in-memory batch);
   `spill_produces_layer_files` / `memtest_spill_large` in `arrangements.rs` pin this down.
+- **Observability**: when the layer is on, `/graph` carries an `arrangements` section — the
+  compiled circuit as stable-id nodes (`arr:input:<table>` per table, `arr:index:<table>:<cols>`
+  per index pipeline, with seeded flags and the layer's served/fallback lookup counters) plus a
+  `consumers` list connecting each index to the subquery shapes/nodes whose flip re-derivations it
+  currently serves. The circuit is static, so the visualizer's circuit view renders it as a
+  permanent dashed lane; the consumer edges appear and disappear with the shapes.
 - **Limits (v1)**: indexes are fixed at boot (a dbsp circuit's structure is fixed at
   construction) — new lookup columns need a restart, until circuit-rebuild-on-demand lands;
   single worker; equality lookups and full scans only (no range seeks yet).

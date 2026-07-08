@@ -351,6 +351,25 @@ impl Arrangements {
         (self.served.load(Ordering::Relaxed), self.fallback.load(Ordering::Relaxed))
     }
 
+    /// The registered index specs, in the stable (sorted) order the circuit was built from.
+    /// The circuit is fixed at construction, so this never changes after `start`.
+    pub fn index_specs(&self) -> Vec<IndexSpec> {
+        let mut specs: Vec<IndexSpec> = self.slots.keys().cloned().collect();
+        specs.sort();
+        specs
+    }
+
+    /// Whether `table`'s initial seed has completed (its indexes serve lookups).
+    /// `false` for unknown tables.
+    pub fn is_seeded(&self, table: &str) -> bool {
+        self.seeded.get(table).is_some_and(|f| f.load(Ordering::Acquire))
+    }
+
+    /// Whether the circuit has an arrangement of `table` keyed by `cols`.
+    pub fn has_index(&self, table: &str, cols: &[usize]) -> bool {
+        self.slots.contains_key(&IndexSpec { table: table.to_string(), cols: cols.to_vec() })
+    }
+
     /// Checkpoint now (also runs on the periodic cadence and at shutdown).
     pub async fn checkpoint(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();

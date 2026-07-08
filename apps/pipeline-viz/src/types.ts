@@ -65,6 +65,25 @@ export interface OpEdge {
   label: string | null
 }
 
+/** The compiled dbsp arrangement pipeline (crate::engine::ArrangementGraph): static
+ *  infrastructure built once at boot — one input per table, one map_index→integrate_trace
+ *  pipeline per index — plus its live consumers and the layer's lookup counters. Present only
+ *  when the engine runs with ELECTRIC_IVM_DBSP=1. */
+export interface ArrangementGraph {
+  /** Lookups served from arrangement snapshots. */
+  served: number
+  /** Lookups that fell back to Postgres (missing index, or table not seeded yet). */
+  fallback: number
+  inputs: { id: string; table: string; seeded: boolean }[]
+  indexes: { id: string; input: string; table: string; cols: string[]; seeded: boolean }[]
+  consumers: {
+    index: string
+    dependentKind: 'shape' | 'node'
+    dependentId: string
+    connectingCol: string
+  }[]
+}
+
 export interface EngineGraph {
   tables: string[]
   shapes: GraphShape[]
@@ -74,6 +93,8 @@ export interface EngineGraph {
    *  engines older than the decomposition — consumers must treat missing as empty. */
   operators?: OpNode[]
   opEdges?: OpEdge[]
+  /** The compiled dbsp arrangement pipeline; absent when the layer is off. */
+  arrangements?: ArrangementGraph
 }
 
 /** `GET /graph/node?sig=…` — the live inner-set index of a subquery node. */

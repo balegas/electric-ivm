@@ -371,6 +371,62 @@ pub struct OpEdge {
     pub label: Option<String>,
 }
 
+/// One compiled table input of the dbsp arrangement circuit (id `arr:input:<table>`).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArrInput {
+    pub id: String,
+    pub table: String,
+    /// Whether the table's initial seed completed (until then, lookups fall back to Postgres).
+    pub seeded: bool,
+}
+
+/// One compiled index pipeline of the arrangement circuit — `input → map_index(cols) →
+/// integrate_trace` — with id `arr:index:<table>:<col,col>` (column names, in index order).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArrIndex {
+    pub id: String,
+    /// The feeding table input's node id (`arr:input:<table>`) — the input→index edge.
+    pub input: String,
+    pub table: String,
+    /// Index-key column names, in order.
+    pub cols: Vec<String>,
+    /// Mirrors the table input's seeded flag (an index serves iff its table is seeded).
+    pub seeded: bool,
+}
+
+/// A live consumer of a compiled index: a subquery dependent whose flip re-derivations are served
+/// from that index's snapshot (`query_candidates` in `subquery.rs`). Unlike the inputs/indexes —
+/// which are fixed at boot — consumers appear and disappear with the shapes/nodes that need them.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArrConsumer {
+    /// The serving index's node id (an `ArrIndex::id`).
+    pub index: String,
+    /// `"shape"` (an outer subquery shape) or `"node"` (a parent node, for nested IN).
+    pub dependent_kind: String,
+    /// The dependent's id in this graph: a shape id, or a subquery node signature.
+    pub dependent_id: String,
+    /// Column name (in the dependent's queried table) the lookup keys on.
+    pub connecting_col: String,
+}
+
+/// The compiled dbsp arrangement pipeline (see `arrangements.rs` and `docs/ARCHITECTURE.md` §6b):
+/// static infrastructure built once at boot, plus its live consumers and the layer's lookup
+/// counters. Absent from `/graph` when `ELECTRIC_IVM_DBSP` is off.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArrangementGraph {
+    /// Lookups served from arrangement snapshots.
+    pub served: u64,
+    /// Lookups that fell back to Postgres (missing index, or table not seeded yet).
+    pub fallback: u64,
+    pub inputs: Vec<ArrInput>,
+    pub indexes: Vec<ArrIndex>,
+    pub consumers: Vec<ArrConsumer>,
+}
+
 /// The whole maintained pipeline at an instant: tables, shapes (with their routing placement),
 /// the shared subquery node/edge DAG, and the exploded operator decomposition (`operators` /
 /// `opEdges`) the circuit view renders. The visualizer derives family + subquery sharing from this.
@@ -383,6 +439,9 @@ pub struct EngineGraph {
     pub subquery_edges: Vec<GraphEdge>,
     pub operators: Vec<OpNode>,
     pub op_edges: Vec<OpEdge>,
+    /// The compiled dbsp arrangement pipeline; omitted entirely when the layer is off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arrangements: Option<ArrangementGraph>,
 }
 
 /// One column of a table's schema, as surfaced to the visualizer (`GET /table/{name}/schema`) so it
@@ -1351,7 +1410,9 @@ impl Engine {
             })
             .collect();
         subquery_nodes.sort_by(|a, b| a.sig.cmp(&b.sig));
-        let subquery_edges: Vec<GraphEdge> = reg
+        // Each registry edge, resolved to (kind, id, queried table, connecting-column index):
+        // the shape of a flip re-derivation, which is what the arrangement layer serves.
+        let dependents: Vec<(&'static str, String, String, usize)> = reg
             .edges
             .iter()
             .map(|e| {
@@ -1367,20 +1428,33 @@ impl Engine {
                         reg.nodes.get(sig).map(|n| n.inner_table.clone()).unwrap_or_default(),
                     ),
                 };
-                GraphEdge {
-                    node_sig: e.node_sig.clone(),
-                    dependent_kind: kind.to_string(),
-                    dependent_id: dep_id,
-                    connecting_col: col_name(&dep_table, e.connecting_col),
-                    negated: e.negated,
-                }
+                (kind, dep_id, dep_table, e.connecting_col)
             })
             .collect();
+        let subquery_edges: Vec<GraphEdge> = reg
+            .edges
+            .iter()
+            .zip(&dependents)
+            .map(|(e, (kind, dep_id, dep_table, _))| GraphEdge {
+                node_sig: e.node_sig.clone(),
+                dependent_kind: kind.to_string(),
+                dependent_id: dep_id.clone(),
+                connecting_col: col_name(dep_table, e.connecting_col),
+                negated: e.negated,
+            })
+            .collect();
+        drop(reg);
         let mut subquery_edges = subquery_edges;
         subquery_edges
             .sort_by(|a, b| (&a.node_sig, &a.dependent_kind, &a.dependent_id).cmp(&(&b.node_sig, &b.dependent_kind, &b.dependent_id)));
         let (operators, op_edges) = circuit_ops(&tables, &shapes, &subquery_nodes, &subquery_edges);
-        EngineGraph { tables, shapes, subquery_nodes, subquery_edges, operators, op_edges }
+        let arrangements = self
+            .arrangements
+            .lock()
+            .unwrap()
+            .clone()
+            .map(|arr| arrangement_graph(&arr, &dependents, &col_name));
+        EngineGraph { tables, shapes, subquery_nodes, subquery_edges, operators, op_edges, arrangements }
     }
 
     /// The live inner-set index of one subquery node (values + contributor counts), for the visualizer's
@@ -2324,6 +2398,62 @@ fn circuit_ops(
     }
 
     (ops, edges)
+}
+
+/// The compiled dbsp arrangement pipeline as graph nodes, plus its live consumers. The circuit is
+/// static (built at boot), so the inputs/indexes are stable across snapshots — stable ids let the
+/// visualizer keep them parked while shapes come and go. `dependents` is each registered subquery
+/// edge resolved to `(kind, id, queried table, connecting-column index)`; a dependent becomes a
+/// consumer of the `(table, [col])` index iff that index exists in the compiled circuit — exactly
+/// the condition under which `query_candidates` serves its flip re-derivations from the layer.
+fn arrangement_graph(
+    arr: &crate::arrangements::Arrangements,
+    dependents: &[(&'static str, String, String, usize)],
+    col_name: &impl Fn(&str, usize) -> String,
+) -> ArrangementGraph {
+    let (served, fallback) = arr.counters();
+    let specs = arr.index_specs(); // sorted: deterministic node order across snapshots
+    let input_id = |table: &str| format!("arr:input:{table}");
+    let index_id = |table: &str, cols: &[usize]| {
+        let names: Vec<String> = cols.iter().map(|&c| col_name(table, c)).collect();
+        format!("arr:index:{table}:{}", names.join(","))
+    };
+
+    let mut inputs: Vec<ArrInput> = Vec::new();
+    for spec in &specs {
+        if !inputs.iter().any(|i| i.table == spec.table) {
+            inputs.push(ArrInput {
+                id: input_id(&spec.table),
+                table: spec.table.clone(),
+                seeded: arr.is_seeded(&spec.table),
+            });
+        }
+    }
+    let indexes: Vec<ArrIndex> = specs
+        .iter()
+        .map(|spec| ArrIndex {
+            id: index_id(&spec.table, &spec.cols),
+            input: input_id(&spec.table),
+            table: spec.table.clone(),
+            cols: spec.cols.iter().map(|&c| col_name(&spec.table, c)).collect(),
+            seeded: arr.is_seeded(&spec.table),
+        })
+        .collect();
+
+    let mut consumers: Vec<ArrConsumer> = dependents
+        .iter()
+        .filter(|(_, _, table, col)| arr.has_index(table, &[*col]))
+        .map(|(kind, dep_id, table, col)| ArrConsumer {
+            index: index_id(table, &[*col]),
+            dependent_kind: kind.to_string(),
+            dependent_id: dep_id.clone(),
+            connecting_col: col_name(table, *col),
+        })
+        .collect();
+    consumers.sort();
+    consumers.dedup();
+
+    ArrangementGraph { served, fallback, inputs, indexes, consumers }
 }
 
 /// A non-shareable shape (range / OR / NOT / inequality / match-all). Its predicate is a stateless
@@ -4139,6 +4269,116 @@ mod tests {
         assert_eq!(dep.kind, "subquery");
         // The params arrangement feeds the route join as a state edge.
         assert!(edges.iter().any(|e| e.source == "arr:users:active" && e.target == "rjoin:users:active" && e.kind == "state"));
+    }
+
+    /// With the dbsp layer off, `/graph` omits the `arrangements` section entirely: no arr nodes
+    /// for the visualizer, and an unchanged payload for older consumers.
+    #[tokio::test]
+    async fn graph_omits_arrangements_when_off() {
+        let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+        let g = engine.graph().await;
+        assert!(g.arrangements.is_none());
+        let v = serde_json::to_value(&g).unwrap();
+        assert!(v.get("arrangements").is_none(), "arrangements key must be absent: {v}");
+    }
+
+    /// With the dbsp layer running, `/graph` carries the compiled pipeline — one input per table,
+    /// one index pipeline per spec (stable ids using column NAMES), seeded flags, lookup
+    /// counters — and connects each registered subquery dependent to the index that serves its
+    /// flip re-derivations. Dependents without a matching index yield no consumer, and seeding
+    /// flips the flags on the next snapshot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn graph_includes_arrangement_pipeline_and_consumers() {
+        let ts = users(); // columns sorted: active(0), id(1), name(2); pk = id
+        let dir = std::env::temp_dir().join(format!("arr-graph-test-{}", uuid::Uuid::new_v4()));
+        let arr = crate::arrangements::Arrangements::start(
+            crate::arrangements::ArrangementsConfig {
+                dir: dir.clone(),
+                checkpoint_every: None,
+                ..crate::arrangements::ArrangementsConfig::default()
+            },
+            vec![
+                crate::arrangements::IndexSpec { table: "users".into(), cols: vec![1] }, // pk (id)
+                crate::arrangements::IndexSpec { table: "users".into(), cols: vec![2] }, // name
+            ],
+        )
+        .unwrap();
+
+        let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+        engine.state.lock().await.tables.insert("users".into(), ts.clone());
+        *engine.arrangements.lock().unwrap() = Some(arr.clone());
+
+        // Register one subquery node, one dependent shape, and three edges: two on indexed
+        // columns (name → shape, id → parent node) and one on an unindexed column (active).
+        {
+            let mut reg = engine.subqueries.lock().await;
+            let sig: crate::predicate::SubquerySig = "users|name|".into();
+            let pred = Arc::new(CompiledPredicate::compile_opt(None, &ts).unwrap());
+            let mut node = crate::subquery::SubqueryNode::new(sig.clone(), "users".into(), 2, 1, pred.clone());
+            node.refcount = 1;
+            reg.nodes.insert(sig.clone(), node);
+            reg.shapes.insert(
+                "s1".into(),
+                crate::subquery::SubqueryShape {
+                    shape_id: "s1".into(),
+                    outer_table: "users".into(),
+                    stream_path: "shape/s1".into(),
+                    pred,
+                    out_cols: None,
+                    gate: crate::pg::SnapshotGate::passthrough(),
+                    emitted: std::sync::atomic::AtomicU64::new(0),
+                },
+            );
+            let edge = |dependent, connecting_col| crate::subquery::Edge {
+                node_sig: sig.clone(),
+                dependent,
+                connecting_col,
+                negated: false,
+                null_sensitive: false,
+            };
+            reg.edges.push(edge(crate::subquery::Dependent::Shape("s1".into()), 2)); // name: indexed
+            reg.edges.push(edge(crate::subquery::Dependent::Node(sig.clone()), 1)); // id: indexed
+            reg.edges.push(edge(crate::subquery::Dependent::Shape("s1".into()), 0)); // active: not indexed
+        }
+
+        let g = engine.graph().await;
+        let a = g.arrangements.as_ref().expect("arrangements section present");
+        assert_eq!(a.inputs.len(), 1);
+        assert_eq!(a.inputs[0].id, "arr:input:users");
+        assert!(!a.inputs[0].seeded, "unseeded until finish_seed");
+        let index_ids: Vec<&str> = a.indexes.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(index_ids, vec!["arr:index:users:id", "arr:index:users:name"]);
+        assert!(a.indexes.iter().all(|i| i.input == "arr:input:users" && !i.seeded));
+        assert_eq!(a.indexes[1].cols, vec!["name".to_string()]);
+        // Exactly the two indexed dependents become consumers (sorted by index id).
+        assert_eq!(a.consumers.len(), 2, "unindexed 'active' edge must not appear: {:?}", a.consumers);
+        assert_eq!(a.consumers[0].index, "arr:index:users:id");
+        assert_eq!(a.consumers[0].dependent_kind, "node");
+        assert_eq!(a.consumers[1].index, "arr:index:users:name");
+        assert_eq!(a.consumers[1].dependent_kind, "shape");
+        assert_eq!(a.consumers[1].dependent_id, "s1");
+        assert_eq!(a.consumers[1].connecting_col, "name");
+        // Wire format: camelCase keys under the `arrangements` section.
+        let v = serde_json::to_value(&g).unwrap();
+        assert_eq!(v["arrangements"]["indexes"][1]["id"], "arr:index:users:name");
+        assert_eq!(v["arrangements"]["consumers"][1]["dependentKind"], "shape");
+        assert_eq!(v["arrangements"]["consumers"][1]["connectingCol"], "name");
+        assert_eq!(v["arrangements"]["served"], 0);
+        assert_eq!(v["arrangements"]["fallback"], 0);
+
+        // Seed the table: the next snapshot reports seeded (and served counts a lookup).
+        arr.seed_chunk("users", vec![Row(vec![Value::Bool(true), Value::Int(1), Value::Text("a".into())])])
+            .await
+            .unwrap();
+        arr.finish_seed("users");
+        assert!(arr.lookup("users", &[2], &Row(vec![Value::Text("a".into())])).is_some());
+        let g2 = engine.graph().await;
+        let a2 = g2.arrangements.as_ref().unwrap();
+        assert!(a2.inputs[0].seeded && a2.indexes.iter().all(|i| i.seeded));
+        assert_eq!(a2.served, 1);
+
+        arr.shutdown().await;
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Wire format: summaries are kind-tagged camelCase objects, and a `StateEvent` wraps them
