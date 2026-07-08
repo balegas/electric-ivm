@@ -1,0 +1,13 @@
+# Serves the built pipeline visualizer and proxies /engine/* to the engine's control plane —
+# the same URL contract as the app's Vite dev server (vite.config.ts), so the app code is
+# identical in dev and in the container. ENGINE_UPSTREAM overrides the target (host:port).
+:5180 {
+	handle_path /engine/* {
+		reverse_proxy {$ENGINE_UPSTREAM:engine:7010}
+	}
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+}
