@@ -22,6 +22,7 @@ the project is growing toward).
 | `electric-conformance/` | Electric's own oracle/property/integration tests pointed at our `/v1/shape`. |
 | `docker/` | Containerized stack: `compose.yaml` (postgres + ds + engine + api), `Dockerfile.engine`, `Dockerfile.node`. `pnpm docker:up`. |
 | `apps/pipeline-viz` | Live pipeline explorer (shapes, shared families/nodes, reactive per-node state + index dumps) over `GET /graph` + `/state` + `/trace`. |
+| `tutorials/` | Tutorial series: one compose stack (postgres+ds+engine+api+viz) + per-episode walkthroughs (episodes/01-first-shape, 02-inside-the-pipeline). |
 | `examples/linearlite` | The flagship demo. `scripts/linearlite.sh start <size>` boots everything. |
 
 ## Docs (read these before designing)
@@ -104,7 +105,10 @@ port lingers: `lsof -ti :5174 -ti :5180 | xargs kill`).
 The **visualizer** can also attach to any running engine on its own:
 `ELECTRIC_IVM_ENGINE_URL=http://127.0.0.1:<port> pnpm --filter @electric-ivm/pipeline-viz dev`.
 Its dev server proxies `/engine/*` → the engine control plane, so browser-side `fetch('/engine/graph')`
-etc. work from the page — the backbone of the verification workflow below.
+etc. work from the page — the backbone of the verification workflow below. A third way is the
+containerized visualizer (`docker/Dockerfile.viz`): `cd tutorials && docker compose up --build` serves
+`http://localhost:5180` with Caddy proxying `/engine/*` to the engine; set `ENGINE_UPSTREAM` to
+point it at another engine.
 
 ### Typical verification workflow (Playwright MCP)
 

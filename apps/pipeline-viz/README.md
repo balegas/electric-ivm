@@ -101,6 +101,13 @@ ELECTRIC_IVM_ENGINE_URL=http://127.0.0.1:<engine-port> VIZ_PORT=5180 \
 The Vite dev server proxies `/engine/*` to that engine (no CORS needed). `VIZ_HOST` pins the bind
 address when a TLS proxy needs a deterministic upstream.
 
+Or containerized via the tutorials stack:
+
+```bash
+cd tutorials && docker compose up --build    # serves http://localhost:5180
+# ENGINE_UPSTREAM=other-engine:7010 to point at another engine
+```
+
 ## Backed by
 
 - `GET /graph` (`apps/engine/src/http.rs` → `Engine::graph`) returns tables, every shape with its

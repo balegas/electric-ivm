@@ -1,0 +1,105 @@
+# The tutorial-series stack — every service any episode needs, boots with episode 1's data:
+#
+#   postgres — system of record (wal_level=logical), auto-seeded from ./seed on first boot
+#   ds       — durable-streams server (the log)
+#   engine   — the Rust engine: replication ingest + shape maintenance + GET /v1/shape (7010)
+#   api      — the extended tRPC API (unused until episode 3, present so this file never changes)
+#   viz      — the pipeline visualizer (http://localhost:5180), proxying /engine/* to the engine
+#
+#   cd tutorials && docker compose up --build
+#
+# Reset to episode 1's initial state from anywhere in the series:
+#   docker compose down -v && docker compose up
+#
+# Later episodes change database state with SQL scripts (episodes/0N-…/setup.sql), not by
+# editing this file. The engine introspects the table set at startup — an episode script that
+# ADDS tables is always followed by `docker compose restart engine` in the episode text.
+
+name: electric-ivm-tutorials
+
+services:
+  postgres:
+    image: postgres:16
+    command: ["postgres", "-c", "wal_level=logical"]
+    environment:
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: electric
+    ports:
+      - "${PG_PORT:-5432}:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./seed:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d electric"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  ds:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.node
+    command: ["pnpm", "run", "ds"]
+    environment:
+      DS_PORT: 8791
+      DS_DATA_DIR: /data
+    ports:
+      - "${DS_PORT:-8791}:8791"
+    volumes:
+      - ds-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8791').then(()=>process.exit(0),()=>process.exit(1))\""]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  engine:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.engine
+    environment:
+      ELECTRIC_IVM_DS_URL: http://ds:8791
+      ELECTRIC_IVM_PG_URL: postgres://postgres:password@postgres:5432/electric
+      ELECTRIC_IVM_PG_TABLES: "*"
+      ELECTRIC_IVM_BIND: 0.0.0.0:7010
+    ports:
+      - "${ENGINE_PORT:-7010}:7010"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ds:
+        condition: service_healthy
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.node
+    command: ["pnpm", "run", "api"]
+    environment:
+      DS_URL: http://ds:8791
+      ENGINE_URL: http://engine:7010
+      API_PORT: 8790
+    ports:
+      - "${API_PORT:-8790}:8790"
+    depends_on:
+      ds:
+        condition: service_healthy
+      engine:
+        condition: service_started
+
+  viz:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.viz
+    environment:
+      ENGINE_UPSTREAM: engine:7010
+    ports:
+      - "${VIZ_PORT:-5180}:5180"
+    depends_on:
+      engine:
+        condition: service_started
+
+volumes:
+  pg-data:
+  ds-data:
