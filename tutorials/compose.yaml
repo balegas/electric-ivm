@@ -95,7 +95,10 @@ services:
     environment:
       ENGINE_UPSTREAM: engine:7010
     ports:
-      - "${VIZ_PORT:-5180}:5180"
+      - "${VIZ_PORT:-5280}:5180"          # plain HTTP (curl/scripts)
+      - "${VIZ_HTTPS_PORT:-5543}:5443"    # HTTPS/HTTP-2 for browser use (5543 avoids the linearlite demo's 5443)
+    volumes:
+      - viz-caddy-data:/data              # persist Caddy's internal CA (XDG_DATA_HOME) across rebuilds
     depends_on:
       engine:
         condition: service_started
@@ -103,3 +106,4 @@ services:
 volumes:
   pg-data:
   ds-data:
+  viz-caddy-data:
