@@ -56,7 +56,9 @@ The recipe for capturing an app's query set in one circuit:
    output index, rows in an input relation) — never circuit structure.
 2. **Find the access cohort** (LinearLite: the project) and key every pipeline output by it,
    never by user or shape. Per-shape work happens only at the fan-out edge: a shape = the set
-   of cohort groups its parameters select, unioned by delivery. Genuinely per-user predicates
+   of cohort groups its parameters select, unioned by delivery. The union is correct only when
+   the cohort key **partitions** the table (a row lives in exactly one group) — overlapping
+   groups would double-emit and need dedup at the edge. Genuinely per-user predicates
    (`username = $me`) get their own keyed feed — same pattern, cohort of size one.
 3. **Visibility relations become the delivery router**, not a join input: a membership feed's
    deltas drive subscribe/unsubscribe to cohort feeds, and backfill = replaying the cohort
