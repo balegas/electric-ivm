@@ -54,9 +54,12 @@ electric-ivm is built on this model. Every replicated change becomes a Z-set del
 `REPLICA IDENTITY FULL` supplies the old row, so updates retract precisely), and every shape,
 subquery, and aggregation is an incremental operator over those deltas. The engine implements the
 operators directly in Rust — stateless filters, key routers, shared inner-set nodes, running
-folds — rather than running a general dbsp circuit, so it keeps **no copy of any table**: engine
-RSS is ~19 MiB whether the database has 1k or 100k rows, +~0.8 KiB per shape
-(measured by the shape-memory matrix benchmark in `packages/bench`).
+folds — rather than running a general dbsp circuit, so the hot path keeps **no copy of any
+table**: engine RSS is ~19 MiB whether the database has 1k or 100k rows, +~0.8 KiB per shape
+(measured by the shape-memory matrix benchmark in `packages/bench`). For when tables grow, an
+optional dbsp-backed **arrangement layer** (`ELECTRIC_IVM_DBSP=1`) maintains disk-spillable
+table indexes that serve subquery re-derivations locally instead of querying Postgres back —
+see `docs/ARCHITECTURE.md` §6b.
 
 ## A shape as a DBSP pipeline
 
@@ -119,6 +122,34 @@ engine is inspectable live in the **pipeline explorer** (`apps/pipeline-viz`).
 projection) share one maintained pipeline and one output stream, ref-counted — as do identical
 subquery inner sets and identical aggregations. A thousand clients opening the same shape cost the
 engine one maintenance path and one append per change.
+
+## Designing the pipeline for your app
+
+The full treatment is `docs/building-app-pipelines.md`; the model in three sentences:
+**pipelines serve query families, routing serves query instances, the fallback serves query
+strangers.** A pipeline is compiled at deploy time and keyed by the app's *access cohort*; a
+shape is a selection/union of cohort groups from one pipeline's output, materialized at the
+delivery edge — so shape cardinality is unbounded while the circuit never grows. Anything that
+matches no template falls back to the engine's dynamic path (stateless eval, key routers,
+subquery registry), which serves any predicate.
+
+A todo app — `lists`, `todos(list_id, done, assignee)`, `list_members(list_id, user_id)` —
+compiles to five pipelines:
+
+```text
+lists ────────────────────────────────────────▶ lists_all            one global feed
+list_members ─ map_index(user_id) ────────────▶ memberships_by_user  per-user feed = THE ROUTER
+todos ─┬─ map_index(list_id) ─────────────────▶ todos_by_list        per-list cohort feed
+       ├─ map_index(assignee) ────────────────▶ todos_by_assignee    per-user feed (cohort of one)
+       └─ map_index((list_id, done))
+          .aggregate_linear(count) ───────────▶ open_counts          per-(list, done) live counts
+```
+
+"Todos of all my lists" is the union of `todos_by_list` groups for the user's memberships;
+joining a list is a `memberships_by_user` delta that subscribes the client to one more group
+and replays its log — move-in with no computation. `todos WHERE list_id IN (3,7,9)` is three
+routing entries over the same pipeline; a thousand such combinations cost the circuit nothing.
+`title LIKE '%urgent%'` matches no template and is served by the fallback, immediately.
 
 ## The system
 

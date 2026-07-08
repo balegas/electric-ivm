@@ -34,6 +34,8 @@ the project is growing toward).
 - `docs/shapes-and-subqueries-guide.md` — user/integrator guide.
 - `docs/deployment-postgres.md` — Postgres-as-source-of-record setup.
 - Each package has its own `README.md` (surface, commands, env knobs).
+- `docs/building-app-pipelines.md` — how to design a pipeline for an app: the three-tier
+  serving model (pipelines/routing/fallback), the recipe, and a worked simple model.
 - `docs/linearlite-circuit-design.md` — design study: one dbsp circuit for an entire app's
   query set; source of the recipe below.
 

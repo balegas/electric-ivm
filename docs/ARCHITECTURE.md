@@ -290,6 +290,24 @@ depends on the layer.
   construction) — new lookup columns need a restart, until circuit-rebuild-on-demand lands;
   single worker; equality lookups and full scans only (no range seeks yet).
 
+### The serving model this is one tier of
+
+The arrangement layer is the degenerate first tier of a three-tier serving model
+(`building-app-pipelines.md` is the full treatment):
+
+- **Pipelines serve query families.** Deploy-time circuit structure, one delta stream per
+  *cohort group*, never growing with shapes/users/parameter combinations.
+- **Routing serves query instances.** A shape = a selection/union of cohort groups from one
+  pipeline's keyed output, materialized at the delivery edge; correct when the cohort key
+  partitions the table. Time-varying membership (subquery shapes) is routing *driven by a
+  feed*: membership deltas subscribe/unsubscribe cohort groups, move-in = replay the group's
+  log.
+- **The fallback serves query strangers.** Predicates matching no template run on the
+  always-on dynamic path (standalone eval + `AccessLeaf` index, `KeyRouter` families, the
+  subquery registry). The pipeline tiers are optimizations in front of it, never a
+  correctness dependency — a new query pattern works immediately at fallback cost and is
+  promoted into the circuit at the next deploy if it matters.
+
 ---
 
 ## 7. Subset queries and client positioning
