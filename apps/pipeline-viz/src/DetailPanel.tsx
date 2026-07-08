@@ -189,7 +189,12 @@ const BROWSE_PAGE = 25
  *  editable row aligned to the table's columns; submitting inserts into Postgres via
  *  the engine (`POST /engine/table/{table}/rows`), then reloads the current page so the
  *  new row shows. The insert is captured by logical replication, so the pipeline animates
- *  on its own. Blank inputs are omitted (column default / NULL). */
+ *  on its own. Blank inputs are omitted (column default / NULL).
+ *
+ *  Delete too: when the schema exposes a primary key, each row gets a checkbox (plus a
+ *  page-wide one in the header); `− delete n rows` removes the selected rows from Postgres
+ *  in one request (`DELETE /engine/table/{table}/rows` with their primary keys), so the
+ *  deletes replicate and flow through the pipeline like any other write. */
 function TableBrowser({ table }: { table: string }) {
   const [page, setPage] = useState(0)
   const [rows, setRows] = useState<Record<string, unknown>[]>([])
@@ -208,12 +213,28 @@ function TableBrowser({ table }: { table: string }) {
   const [insertErr, setInsertErr] = useState<string | null>(null)
   const [okFlash, setOkFlash] = useState(false)
 
+  // Row-selection + delete state. Each selected row is its serialized primary key — a JSON
+  // object built in the schema's pk-column order, so the string is stable and parses straight
+  // back into the DELETE request's key format.
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [deleting, setDeleting] = useState(false)
+  const [deleteErr, setDeleteErr] = useState<string | null>(null)
+  const [delFlash, setDelFlash] = useState(0)
+
   useEffect(() => {
     setPage(0)
     setAdding(false)
     setValues({})
     setInsertErr(null)
+    setSelected(new Set())
+    setDeleteErr(null)
   }, [table])
+
+  // Selection is per page: rows off-screen should never be part of a delete.
+  useEffect(() => {
+    setSelected(new Set())
+    setDeleteErr(null)
+  }, [page])
 
   // Fetch the column list once per table (used for the header and the inline editor).
   useEffect(() => {
@@ -289,6 +310,69 @@ function TableBrowser({ table }: { table: string }) {
     return m
   }, [schema])
 
+  // Selection needs the primary key: without one there is no safe row identity to delete by.
+  const pkCols = useMemo(() => schema?.primaryKey ?? [], [schema])
+  const canSelect = pkCols.length > 0
+
+  /** A row's selection key: its primary key as JSON, in pk-column order (null ⇒ not selectable). */
+  const rowKey = (r: Record<string, unknown>): string | null => {
+    const key: Record<string, unknown> = {}
+    for (const c of pkCols) {
+      const v = r[c]
+      if (v === null || v === undefined) return null
+      key[c] = v
+    }
+    return JSON.stringify(key)
+  }
+
+  const pageKeys = canSelect ? rows.map(rowKey).filter((k): k is string => k !== null) : []
+  const allSelected = pageKeys.length > 0 && pageKeys.every((k) => selected.has(k))
+
+  const toggleRow = (key: string) => {
+    setSelected((s) => {
+      const next = new Set(s)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+  const toggleAll = () => {
+    setSelected((s) => {
+      const next = new Set(s)
+      if (allSelected) pageKeys.forEach((k) => next.delete(k))
+      else pageKeys.forEach((k) => next.add(k))
+      return next
+    })
+  }
+
+  const deleteSelected = async () => {
+    if (selected.size === 0 || deleting) return
+    setDeleting(true)
+    setDeleteErr(null)
+    try {
+      // One request for the whole selection — the engine deletes all keys in a single
+      // statement, so a multi-row delete reaches the pipeline as one replication batch.
+      const keys = [...selected].map((k) => JSON.parse(k) as Record<string, unknown>)
+      const r = await fetch(`/engine/table/${encodeURIComponent(table)}/rows`, {
+        method: 'DELETE',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ keys }),
+      })
+      if (!r.ok) {
+        const eb = (await r.json().catch(() => null)) as { error?: string } | null
+        throw new Error(eb?.error ?? `delete → ${r.status}`)
+      }
+      setSelected(new Set())
+      setDelFlash(keys.length)
+      setTimeout(() => setDelFlash(0), 1600)
+      setNonce((n) => n + 1)
+    } catch (e) {
+      setDeleteErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setDeleting(false)
+    }
+  }
+
   const openEditor = () => {
     setValues({})
     setInsertErr(null)
@@ -363,23 +447,54 @@ function TableBrowser({ table }: { table: string }) {
           <table className="dp-table">
             <thead>
               <tr>
+                {canSelect ? (
+                  <th className="dp-selcol">
+                    <input
+                      type="checkbox"
+                      className="dp-sel-cb"
+                      title="select all rows on this page"
+                      checked={allSelected}
+                      disabled={deleting || pageKeys.length === 0}
+                      onChange={toggleAll}
+                    />
+                  </th>
+                ) : null}
                 {columns.map((c) => (
                   <th key={c}>{c}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {rows.map((r, i) => (
-                <tr key={`${page}:${i}`}>
-                  {columns.map((c) => (
-                    <td key={c} title={String(r[c] ?? '')}>
-                      {fmtCell(r[c])}
-                    </td>
-                  ))}
-                </tr>
-              ))}
+              {rows.map((r, i) => {
+                const key = canSelect ? rowKey(r) : null
+                const isSel = key !== null && selected.has(key)
+                return (
+                  <tr key={`${page}:${i}`} className={isSel ? 'dp-row-sel' : undefined}>
+                    {canSelect ? (
+                      <td className="dp-selcol">
+                        {key !== null ? (
+                          <input
+                            type="checkbox"
+                            className="dp-sel-cb"
+                            title="select row for delete"
+                            checked={isSel}
+                            disabled={deleting}
+                            onChange={() => toggleRow(key)}
+                          />
+                        ) : null}
+                      </td>
+                    ) : null}
+                    {columns.map((c) => (
+                      <td key={c} title={String(r[c] ?? '')}>
+                        {fmtCell(r[c])}
+                      </td>
+                    ))}
+                  </tr>
+                )
+              })}
               {adding ? (
                 <tr className="dp-addrow-tr">
+                  {canSelect ? <td className="dp-selcol" /> : null}
                   {columns.map((c, i) => {
                     const info = colInfo.get(c)
                     return (
@@ -411,6 +526,7 @@ function TableBrowser({ table }: { table: string }) {
         </div>
       ) : null}
       {insertErr ? <div className="dp-err">{insertErr}</div> : null}
+      {deleteErr ? <div className="dp-err">{deleteErr}</div> : null}
       <div className="dp-addrow-bar">
         {adding ? (
           <>
@@ -426,7 +542,22 @@ function TableBrowser({ table }: { table: string }) {
             <button className="dp-addrow-open" disabled={loading} title="insert a row into this table" onClick={openEditor}>
               + add row
             </button>
+            {selected.size > 0 ? (
+              <button
+                className="dp-delrow-btn"
+                disabled={deleting}
+                title="delete the selected rows from this table"
+                onClick={() => void deleteSelected()}
+              >
+                {deleting ? 'deleting…' : `− delete ${selected.size} row${selected.size === 1 ? '' : 's'}`}
+              </button>
+            ) : null}
             {okFlash ? <span className="dp-addrow-ok">✓ inserted</span> : null}
+            {delFlash > 0 ? (
+              <span className="dp-delrow-ok">
+                ✓ deleted {delFlash} row{delFlash === 1 ? '' : 's'}
+              </span>
+            ) : null}
           </>
         )}
       </div>

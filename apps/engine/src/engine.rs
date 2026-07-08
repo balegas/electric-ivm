@@ -1010,6 +1010,74 @@ impl Engine {
         Ok(serde_json::json!({ "ok": true, "inserted": n }))
     }
 
+    /// Delete rows from a replicated table's Postgres relation by primary key, so the deletes are
+    /// captured by logical replication and flow through the pipeline (backing the visualizer's
+    /// delete-rows action). `keys` holds one map per row: primary-key column → value. Every key must
+    /// supply exactly the table's primary-key columns, non-NULL. All rows go in one parameterized
+    /// statement (identifiers quoted, values bound and cast to the columns' native types), so a
+    /// multi-row delete is a single transaction — one replication batch, one pipeline delta.
+    pub async fn delete_rows(
+        &self,
+        table: &str,
+        keys: &[serde_json::Map<String, serde_json::Value>],
+    ) -> Result<serde_json::Value> {
+        const MAX_KEYS: usize = 1000;
+        let ts = {
+            let st = self.state.lock().await;
+            st.tables.get(table).cloned().ok_or_else(|| anyhow::anyhow!("unknown table '{table}'"))?
+        };
+        if keys.is_empty() {
+            bail!("no keys provided");
+        }
+        if keys.len() > MAX_KEYS {
+            bail!("too many keys ({}); at most {MAX_KEYS} rows per delete", keys.len());
+        }
+        if ts.pk_cols.is_empty() {
+            bail!("table '{table}' has no primary key");
+        }
+        let pk_names: Vec<&str> = ts.pk_cols.iter().map(|&i| ts.columns[i].0.as_str()).collect();
+        let mut clauses: Vec<String> = Vec::with_capacity(keys.len());
+        let mut params: Vec<String> = Vec::with_capacity(keys.len() * pk_names.len());
+        for key in keys {
+            // Only primary-key columns are accepted (as with insert, this also closes the
+            // identifier-injection surface: every emitted identifier comes from the catalog).
+            for col in key.keys() {
+                if !pk_names.contains(&col.as_str()) {
+                    bail!("column '{col}' is not in table '{table}''s primary key");
+                }
+            }
+            let mut conj: Vec<String> = Vec::with_capacity(pk_names.len());
+            for &col in &pk_names {
+                let val = key
+                    .get(col)
+                    .ok_or_else(|| anyhow::anyhow!("key is missing primary-key column '{col}'"))?;
+                if val.is_null() {
+                    bail!("primary-key column '{col}' must not be NULL");
+                }
+                // Same bind-as-text-then-cast scheme as insert_row (see the comment there).
+                let n = params.len() + 1;
+                let placeholder = match ts.pg_type_of(col) {
+                    Some(t) => format!("${n}::text::{}", crate::pg::quote_ident(t)),
+                    None => format!("${n}::text"),
+                };
+                conj.push(format!("{} = {placeholder}", crate::pg::quote_ident(col)));
+                params.push(match val {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                });
+            }
+            clauses.push(format!("({})", conj.join(" and ")));
+        }
+        let sql =
+            format!("delete from {} where {}", crate::pg::quote_ident(table), clauses.join(" or "));
+        let url = self.pg_url.clone().context("delete_rows requires postgres mode")?;
+        let client = crate::pg::pool_for(&url).get().await?;
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+        let n = client.execute(&sql, &param_refs).await.with_context(|| format!("delete from {table}"))?;
+        Ok(serde_json::json!({ "ok": true, "deleted": n }))
+    }
+
     /// `share`: when true, an identical existing shape (same table, canonical predicate, and columns) is
     /// joined by ref-count instead of creating a second stream — so N app clients subscribing to the same
     /// reference shape (e.g. `project_members WHERE user_id = me`) share one maintained output. The

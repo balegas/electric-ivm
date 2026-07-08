@@ -1208,6 +1208,48 @@ body,
 .dp-cell-i:disabled {
   opacity: 0.6;
 }
+/* Row selection + delete (embedded in the data browser) */
+.dp-selcol {
+  width: 18px;
+  text-align: center;
+  padding-left: 4px;
+  padding-right: 2px;
+}
+.dp-sel-cb {
+  vertical-align: middle;
+  margin: 0;
+  accent-color: #dc2626;
+  cursor: pointer;
+}
+.dp-sel-cb:disabled {
+  cursor: default;
+}
+.dp-table tr.dp-row-sel td {
+  background: #fef2f2;
+}
+.dp-delrow-btn {
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  color: #b91c1c;
+  background: #fee2e2;
+  border: 1px solid #fecaca;
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.dp-delrow-btn:hover:not(:disabled) {
+  background: #fecaca;
+}
+.dp-delrow-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.dp-delrow-ok {
+  font-size: 11px;
+  font-weight: 600;
+  color: #b91c1c;
+}
 
 /* New-shape form — sidebar (Feature 2) */
 .newshape {

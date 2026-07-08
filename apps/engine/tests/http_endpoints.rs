@@ -77,6 +77,25 @@ async fn legacy_health_still_ok() {
     assert_eq!(body_string(res).await, "ok");
 }
 
+/// `DELETE /table/{table}/rows` is registered and validates its input: an unknown table is a 400
+/// with an `error` body (not a 404/405, which would mean the route or method is missing).
+#[tokio::test]
+async fn delete_table_rows_rejects_unknown_table() {
+    let res = router(library_engine())
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/table/nope/rows")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"keys":[{"id":1}]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert!(body_string(res).await.contains("unknown table"));
+}
+
 const INTROSPECTION_ROUTES: &[&str] = &["/trace", "/graph", "/graph/node", "/state", "/state/node"];
 
 /// `ELECTRIC_IVM_TRACE=0` (introspection off) removes the visualizer/introspection surface entirely
