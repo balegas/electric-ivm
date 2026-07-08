@@ -26,6 +26,8 @@ COPY --from=build /repo/target/release/electric-ivm-engine /usr/local/bin/electr
 #   ELECTRIC_IVM_PG_SLOT    slot name (default electric_ivm)
 #   ELECTRIC_IVM_BIND       bind address (default here 0.0.0.0:7010)
 #   ELECTRIC_IVM_LOG        tracing filter (default info)
+#   ELECTRIC_IVM_TRACE      0/false/off unregisters the visualizer introspection endpoints
+#                           (/trace /graph /state — unauthenticated when on; default on)
 ENV ELECTRIC_IVM_BIND=0.0.0.0:7010 \
     ELECTRIC_IVM_PG_TABLES=*
 

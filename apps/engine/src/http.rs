@@ -12,7 +12,15 @@ use crate::predicate::PredicateJson;
 use crate::schema::Schema;
 
 pub fn router(engine: Engine) -> Router {
-    Router::new()
+    router_with_introspection(engine, true)
+}
+
+/// `introspection = false` (`ELECTRIC_IVM_TRACE=0`) leaves the visualizer/introspection surface
+/// unregistered — `/trace` (SSE), `/graph`(`/node`), `/state`(`/node`) all 404. With no route there
+/// can be no `/trace` subscriber, so the per-envelope trace instrumentation stays on its
+/// zero-subscriber fast path (one atomic load). The surface is unauthenticated when enabled.
+pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router {
+    let mut r = Router::new()
         // Fleet surface: root probe + health state machine (CORS preflight is on the /v1/shape route).
         .route("/", get(|| async { StatusCode::OK }))
         .route("/v1/health", get(health_v1))
@@ -27,21 +35,24 @@ pub fn router(engine: Engine) -> Router {
         .route("/tables/{name}/offset", get(table_offset))
         .route("/tables/{name}/families", get(table_families))
         .route("/subqueries", get(subquery_stats))
-        .route("/graph", get(get_graph))
-        .route("/graph/node", get(get_node_index))
-        .route("/state", get(get_state))
-        .route("/state/node", get(get_state_node))
         .route("/replication/lsn", get(replication_lsn))
         .route("/metrics", get(get_metrics))
         .route("/metrics/reset", post(reset_metrics))
         .route("/memory", get(get_memory))
         .route("/metrics/prometheus", get(get_prometheus))
-        // Per-envelope pipeline trace (SSE) — best-effort, for visualization/debugging.
-        .route("/trace", get(get_trace))
         // Electric-protocol adapter: lets Electric's official client + oracle harness read our shapes.
         // OPTIONS is the CORS preflight the fleet's browser-style clients send.
-        .route("/v1/shape", get(crate::electric::shape).options(shape_options))
-        .with_state(engine)
+        .route("/v1/shape", get(crate::electric::shape).options(shape_options));
+    if introspection {
+        r = r
+            .route("/graph", get(get_graph))
+            .route("/graph/node", get(get_node_index))
+            .route("/state", get(get_state))
+            .route("/state/node", get(get_state_node))
+            // Per-envelope pipeline trace (SSE) — best-effort, for visualization/debugging.
+            .route("/trace", get(get_trace));
+    }
+    r.with_state(engine)
 }
 
 /// SSE stream of per-envelope [`crate::trace::TraceEvent`]s (one JSON object per `data:` line).

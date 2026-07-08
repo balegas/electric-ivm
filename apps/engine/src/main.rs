@@ -14,7 +14,6 @@ use anyhow::{Context, Result};
 use electric_ivm_engine::config::{self, Config};
 use electric_ivm_engine::ds::DsClient;
 use electric_ivm_engine::engine::Engine;
-use electric_ivm_engine::http::router;
 use electric_ivm_engine::statsd;
 
 #[tokio::main]
@@ -92,7 +91,7 @@ async fn main() -> Result<()> {
     statsd::spawn_system_sampler(config.metrics_period);
     statsd::spawn_storage_sampler(config.storage_dir.clone());
 
-    let app = router(engine);
+    let app = electric_ivm_engine::http::router_with_introspection(engine, config.trace);
 
     let listener =
         tokio::net::TcpListener::bind(&config.bind).await.with_context(|| format!("binding {}", config.bind))?;

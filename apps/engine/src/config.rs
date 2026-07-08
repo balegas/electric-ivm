@@ -59,6 +59,11 @@ pub struct Config {
     pub prometheus_port: Option<u16>,
     /// Max pooled Postgres connections for backfills/query-backs (`ELECTRIC_DB_POOL_SIZE`, default 20).
     pub db_pool_size: usize,
+    /// Register the introspection surface (`/trace` SSE + `/graph`(`/node`) + `/state`(`/node`) —
+    /// the pipeline-visualizer backend). `ELECTRIC_IVM_TRACE=0|false|off` disables it: the routes
+    /// are never registered, so nothing can subscribe and the hot-path trace gating stays on its
+    /// zero-subscriber fast path. Default on. Note: the surface is unauthenticated either way.
+    pub trace: bool,
     /// Unknown/unimplemented `ELECTRIC_*` vars, accepted as no-ops and logged once at boot.
     pub noop_vars: Vec<String>,
 }
@@ -194,6 +199,10 @@ impl Config {
             .filter(|n| *n >= 1)
             .unwrap_or(20);
 
+        let trace = g("ELECTRIC_IVM_TRACE")
+            .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+            .unwrap_or(true);
+
         Config {
             pg_url,
             ds_url,
@@ -210,6 +219,7 @@ impl Config {
             storage_dir,
             prometheus_port,
             db_pool_size,
+            trace,
             noop_vars: Vec::new(),
         }
     }
@@ -229,7 +239,7 @@ impl Config {
     pub fn redacted(&self) -> String {
         format!(
             "bind={} pg_url={} ds_url={} slot={} instance_id={} stack_id={} statsd={} metrics_period={:?} \
-             secret={} storage_dir={} prometheus_port={:?} log={}",
+             secret={} storage_dir={} prometheus_port={:?} trace={} log={}",
             self.bind,
             self.pg_url.as_deref().map(redact_url).unwrap_or_else(|| "<none>".into()),
             self.ds_url.as_deref().unwrap_or("<none>"),
@@ -241,6 +251,7 @@ impl Config {
             if self.secret.is_some() { "<redacted>" } else { "<none>" },
             self.storage_dir.as_deref().unwrap_or("<none>"),
             self.prometheus_port,
+            self.trace,
             self.log_filter,
         )
     }
@@ -423,6 +434,16 @@ mod tests {
         assert!(secret_ok(Some("s"), None, Some("s")));
         assert!(!secret_ok(Some("s"), Some("nope"), None));
         assert!(!secret_ok(Some("s"), None, None));
+    }
+
+    #[test]
+    fn trace_flag() {
+        assert!(cfg(&[]).trace, "introspection defaults on");
+        assert!(!cfg(&[("ELECTRIC_IVM_TRACE", "0")]).trace);
+        assert!(!cfg(&[("ELECTRIC_IVM_TRACE", "false")]).trace);
+        assert!(!cfg(&[("ELECTRIC_IVM_TRACE", "off")]).trace);
+        assert!(cfg(&[("ELECTRIC_IVM_TRACE", "1")]).trace);
+        assert!(cfg(&[("ELECTRIC_IVM_TRACE", "true")]).trace);
     }
 
     #[test]

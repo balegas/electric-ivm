@@ -129,3 +129,10 @@ activeUsers.subscribe((rows) => render(rows))
   recreate shapes after one.
 - **Permissions:** the engine's Postgres role needs `SELECT` on the watched tables, ownership (for
   `ALTER TABLE … REPLICA IDENTITY`), and the `REPLICATION` attribute (to create/read the slot).
+- **Introspection surface:** the engine's control port also serves the pipeline-visualizer backend —
+  `/trace` (per-envelope SSE), `/graph`, `/state`, and the `/state/node` deep dumps, which expose row
+  data. These endpoints are **unauthenticated**; anyone who can reach the control port can read them.
+  The runtime cost is near zero while nobody subscribes (instrumentation is gated on subscriber
+  count), so leaving them on is fine when the port is private. If the control port is reachable
+  beyond your trust boundary, either front it with network policy or disable the surface outright
+  with `ELECTRIC_IVM_TRACE=0` (the routes are then never registered).

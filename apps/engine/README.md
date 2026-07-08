@@ -38,6 +38,7 @@ discover the bound port.
 | `ELECTRIC_IVM_PG_POLL_MS` | `50` | Replication-slot poll interval |
 | `ELECTRIC_IVM_BIND` | `127.0.0.1:0` | Bind address (`:0` = ephemeral port) |
 | `ELECTRIC_IVM_LOG` | `info` | `tracing` EnvFilter (e.g. `warn`, `electric_ivm_engine=debug`) |
+| `ELECTRIC_IVM_TRACE` | `1` (on) | `0`/`false`/`off` unregisters the introspection surface (`/trace` SSE, `/graph`, `/graph/node`, `/state`, `/state/node` — the pipeline-visualizer backend). When on, it costs ~nothing until a client subscribes (and stays unauthenticated — see the deployment doc) |
 | `ELECTRIC_IVM_SHAPE_IDLE_SECS` | `1800` | Retention: idle time (no engine-visible reads, refcount 0) before an active shape goes **dormant** (engine state dropped; stream + record retained). `0` disables dormancy |
 | `ELECTRIC_IVM_SHAPE_DORMANT_TTL_SECS` | `604800` (7 days) | Retention: how long a shape may stay dormant before it is **evicted** (stream + record deleted). `0` disables the TTL layer |
 | `ELECTRIC_IVM_MAX_SHAPES` | `10000` | Retention: total shape-count cap; over it, least-recently-read **dormant** shapes are evicted (active shapes never are). `0` = unlimited |
