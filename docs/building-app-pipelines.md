@@ -103,12 +103,121 @@ State: `todos` ×2–3 (by list, by assignee, count groups), `lists`/`list_membe
 constant factor over one table copy, on disk, **independent of user count**. A thousand users
 cost a thousand subscriptions.
 
-## Where this lives in the code
+## Setting up a pipeline in code
 
 Today the engine ships the tier-3 fallback (always on) and a tier-1 *degenerate* pipeline —
-the arrangement layer (`src/arrangements.rs`, `ELECTRIC_IVM_DBSP=1`): passive indexes
-(`input → map_index → integrate_trace`) that serve subquery re-derivations locally. The
-constructor closure in `Arrangements::start` is where a fuller app pipeline slots in: each
-recipe template is a handful of operators between the existing inputs and a new output, using
-the same feed, stepping, checkpoint, and snapshot plumbing. `linearlite-circuit-design.md`
-works this through for a complete application.
+the arrangement layer (`src/arrangements.rs`, `ELECTRIC_IVM_DBSP=1`): passive indexes that
+serve subquery re-derivations locally. Everything below extends the same skeleton; the feed,
+stepping, checkpoint, and restore plumbing in `arrangements.rs` is reused unchanged.
+
+### The skeleton that exists (arrangements.rs, abridged)
+
+A dbsp circuit is built once, inside the constructor closure of `Runtime::init_circuit`; the
+closure declares inputs and wires operators, and returns the input handles the feeder uses:
+
+```rust
+let storage = CircuitStorageConfig::for_config(
+    StorageConfig { path: dir, cache: StorageCacheConfig::default() },
+    StorageOptions { min_storage_bytes, cache_mib, ..Default::default() },
+)?;
+let mut config = CircuitConfig::with_workers(1).with_storage(Some(storage));
+config.max_rss_bytes = max_rss_bytes;
+
+let (mut dbsp, inputs) = Runtime::init_circuit(config, move |circuit| {
+    let mut handles = HashMap::new();
+    for (table, table_specs) in &tables {
+        // One Z-set input per replicated table: deltas are Vec<Tup2<Row, ZWeight>>.
+        let (stream, handle) = circuit.add_input_zset::<Row>();
+        for spec in table_specs {
+            // A passive index: key by the projected columns, keep the full row,
+            // integrate into a (disk-spillable) trace, publish a read snapshot.
+            let slot = slot_for(spec);
+            stream
+                .map_index(move |row| (project(row, &spec.cols), row.clone()))
+                .integrate_trace()
+                .apply(move |spine| { *slot.write().unwrap() = Some(spine.ro_snapshot()); });
+        }
+        handles.insert(table.clone(), handle);
+    }
+    Ok(handles)
+})?;
+
+// Feeding (the sequencer does this per transaction):
+inputs["todos"].append(&mut delta);   // Vec<Tup2<Row, ZWeight>>
+dbsp.transaction()?;                  // one atomic step; snapshots update
+```
+
+Two dbsp API traps, learned the hard way: tap a trace stream with **`apply`, never
+`inspect`** (`inspect` re-emits the `Spine` downstream, and `Spine::clone()` is
+`unimplemented!()`); and snapshots publish only when a step runs, so run one empty
+`transaction()` after a checkpoint restore before serving reads.
+
+### Adding the todo-model templates
+
+Each recipe template is a few operators between an existing input and a new **output
+handle**. Where the passive indexes use pull-style snapshots (`integrate_trace` +
+`apply(ro_snapshot)`), cohort *feeds* want push-style deltas: `.output()` returns an
+`OutputHandle` whose per-step delta you drain after each transaction and route to per-cohort
+durable streams.
+
+```rust
+// (B) memberships_by_user — THE ROUTER: per-user membership deltas.
+let router = members
+    .map_index(|m: &Row| (m.get(USER_ID).clone(), m.clone()))
+    .output();                              // OutputHandle<OrdIndexedZSet<Value, Row>>
+
+// (C) todos_by_list — the cohort feed. list_id partitions todos, so a shape for
+// lists {3,7,9} is the union of three groups of THIS one pipeline.
+let todos_by_list = todos
+    .map_index(|t: &Row| (t.get(LIST_ID).clone(), t.clone()))
+    .output();
+
+// (E) open_counts — COUNT is linear: one maintained integer per (list_id, done) group.
+let open_counts = todos
+    .map_index(|t: &Row| (Row(vec![t.get(LIST_ID).clone(), t.get(DONE).clone()]), ()))
+    .weighted_count()                       // or .aggregate_linear(|_| 1)
+    .output();
+
+// Derived visibility needs ONE join (both sides are integrated by dbsp — priced state):
+// comments keyed by their issue's project, re-homed automatically if the issue moves.
+let issue_project = issues.map_index(|i: &Row| (i.get(PK).clone(), i.get(PROJECT_ID).clone()));
+let comments_by_project = comments
+    .map_index(|c: &Row| (c.get(ISSUE_ID).clone(), c.clone()))
+    .join_index(&issue_project, |_issue, c, project| Some((project.clone(), c.clone())))
+    .output();
+```
+
+### Draining outputs into shape streams
+
+After each `dbsp.transaction()` (in `circuit_thread`'s `Cmd::Batch` arm), drain each output
+handle and fan the delta out by cohort key — this is the pipeline→shape edge, and the only
+per-shape work in the system:
+
+```rust
+let delta = todos_by_list.consolidate();          // this step's delta, merged
+let mut cursor = delta.cursor();
+while cursor.key_valid() {                        // key = the cohort (list_id)
+    let group = cursor.key().clone();
+    // collect this group's (row, weight) pairs and append them, as envelopes,
+    // to every stream routed to this cohort group (`shape/list:<id>`, unions, …)
+    ...
+    cursor.step_key();
+}
+```
+
+Routing — which shapes subscribe to which groups — stays outside the circuit, driven by the
+router feed (B): a membership delta subscribes/unsubscribes a client to cohort streams, and
+move-in is served by replaying the group's log, not by computing anything.
+
+### Checklist for a new template
+
+1. Decide its cohort key (§recipe step 2) and check it partitions the table.
+2. Add the operators in the constructor closure; linear ops free, joins/aggregates priced.
+3. `.output()` for a feed (push deltas → durable streams) or
+   `integrate_trace()+apply(ro_snapshot)` for a lookup index (pull).
+4. Drain the new handle in the step loop; route by group at the delivery edge.
+5. The layout fingerprint changes → state is discarded and reseeded on next boot; that is
+   the intended deploy story. `cargo test -p electric-ivm-engine` and the conformance suite
+   (`pnpm test:conformance`, with and without `ELECTRIC_IVM_DBSP=1`) are the safety net.
+
+`linearlite-circuit-design.md` works the full application through this process.
