@@ -2,7 +2,7 @@ import { Background, Controls, MiniMap, ReactFlow, type Edge, type Node, type No
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { buildCircuit, hopIndex } from './build-circuit'
-import { buildGraph, type NodeRef, type VizNodeData } from './build-graph'
+import { buildGraph, logicalHopRedirect, type NodeRef, type VizNodeData } from './build-graph'
 import { clearDeltas, recordDelta } from './delta-store'
 import { DetailPanel } from './DetailPanel'
 import { edgeTypes, type PulseEdgeData } from './edges'
@@ -268,17 +268,25 @@ export default function App() {
     return view === 'circuit' ? buildCircuit(graph, sel, focus?.id ?? null, opts) : buildGraph(graph, sel, focus?.id ?? null, opts)
   }, [graph, mode, selected, focus, view, groupShapes])
 
-  // hop id → rendered node ids: identity in the logical view; in the circuit view, the operator
-  // group the ENGINE stamped with that hop (OpNode.hop) — trace flashes and fresh-structure
-  // highlights expand through this, never through client-side guessing.
+  // hop id → rendered node ids. Grouping collapses the repeated per-shape structure only in the
+  // whole-graph view (a selection always expands), so BOTH views remap under the SAME condition their
+  // builders group under: mode 'all' with the toggle on. A hop into a collapsed member then resolves
+  // to the stacked representative that stands in for it — so the path to a stacked shape lights up
+  // (node flashes, connecting edges pulse) instead of pointing at a node the render never drew.
+  // Trace flashes and fresh-structure highlights expand through this, never through client guessing.
   const expandHop = useMemo(() => {
-    if (view === 'logical' || !graph) return (h: string) => [h]
-    // Grouping collapses the repeated per-shape operator chains only in the whole-graph view (a
-    // selection expands to individual operators). A hop into a collapsed member must resolve to the
-    // stacked representative that stands in for it, so hopIndex remaps under the SAME condition
-    // buildCircuit groups: mode 'all' with the toggle on.
-    const idx = hopIndex(graph, mode === 'all' && groupShapes)
-    return (h: string) => idx.get(h) ?? []
+    if (!graph) return (h: string) => [h]
+    const grouping = mode === 'all' && groupShapes
+    if (view === 'circuit') {
+      // Circuit view: the operator group the ENGINE stamped with that hop (OpNode.hop), redirected
+      // to the stacked representative when a collapsed chain swallowed it.
+      const idx = hopIndex(graph, grouping)
+      return (h: string) => idx.get(h) ?? []
+    }
+    // Logical view: a hop IS a rendered node id (identity), except a collapsed member, which the
+    // redirect points at its stacked rep — the logical mirror of the circuit view's hopIndex.
+    const redirect = logicalHopRedirect(graph, grouping)
+    return (h: string) => [redirect.get(h) ?? h]
   }, [view, graph, mode, groupShapes])
   const expandRef = useRef(expandHop)
   expandRef.current = expandHop

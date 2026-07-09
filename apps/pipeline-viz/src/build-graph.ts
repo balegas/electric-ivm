@@ -102,63 +102,62 @@ export interface RawEdge {
   kind: 'flow' | 'route' | 'subquery' | 'state' | 'serve'
 }
 
-/**
- * Turn the engine's `/graph` snapshot into the full pipeline graph (all nodes + edges). Shared
- * structure collapses naturally: family routers are keyed by (table, key-cols) and subquery nodes by
- * signature, so two shapes that share one underneath connect to the SAME node here.
- *
- * With `group` on, the two per-shape fan-outs collapse (only in the whole-graph view; a selection
- * always expands so every shape's sink stays reachable — see `buildGraph`):
- *   - Route-join families: instead of one output node per shape, a family with >1 member gets ONE
- *     `shapegroup` node badged with the count.
- *   - Subquery templates: subquery shapes whose maintained pipeline is structurally identical (same
- *     outer table, predicate template, projection) — differing only in their bound parameter — get
- *     ONE stacked `sqgroup` output node PLUS one stacked inner-set (`sqnode`) node in place of the
- *     repeated per-instance pair. This is the logical mirror of the circuit view's subquery folding
- *     (`build-circuit`'s `planGroups`), keyed on the SAME shared `subqueryTemplateKey`.
- */
-function buildFull(g: EngineGraph, group: boolean): { nodes: Map<string, RawNode>; edges: RawEdge[] } {
-  const nodes = new Map<string, RawNode>()
-  const edges: RawEdge[] = []
+// ---------------------------------------------------------------------------------------------
+// Stable rendered-node ids for the logical view's stacked representatives (the "group shapes"
+// toggle). `buildFull` folds a collapsed member's OWN node into one of these, and
+// `logicalHopRedirect` reuses the SAME id functions so a trace hop into a collapsed member resolves
+// to exactly the node `buildFull` drew — the two can never disagree. Kept at module scope precisely
+// so both producers share one definition.
+// ---------------------------------------------------------------------------------------------
+
+/** The shared route-join (family) node id: one per (table, key-cols). */
+const familyId = (table: string, keyCols: string[]) => `family:${table}:${keyCols.join(',')}`
+/** The stacked output rep standing in for a >1-member route family (the family's shapes folded). */
+const shapeGroupId = (familyNodeId: string) => `shapegroup:${familyNodeId}`
+/** The stacked output rep standing in for a >1-member subquery-template group. */
+const sqGroupId = (templateKey: string) => `sqgroup:${templateKey}`
+/** The stacked inner-set rep standing in for a subquery-template group's inner `sqnode`(s). */
+const sqNodeGroupId = (templateKey: string) => `sqnode:group:${templateKey}`
+
+/** A subquery-template group: the structurally identical subquery shapes that fold together (same
+ *  outer table + predicate template + projection), plus the inner-set signatures they depend on. */
+interface SqGroup {
+  outerTable: string
+  where: EngineGraph['shapes'][number]['where']
+  shapeIds: string[]
+  sigs: Set<string>
+}
+
+/** The logical view's grouping decision, derived purely from `/graph` — shared by `buildFull` (which
+ *  renders the stacked reps) and `logicalHopRedirect` (which points trace hops at them), so the two
+ *  agree by construction. Mirrors the circuit view's `planGroups`, keyed on the SAME grouping helpers
+ *  (`isSubqueryShape`, `subqueryTemplateKey`, the family key). When `group` is false only
+ *  `familyMembers` is populated (grouping never collapses a subquery), and the caller ignores it. */
+interface LogicalGroupPlan {
+  /** family node id → number of equality-shape members (a family with >1 folds its output nodes). */
+  familyMembers: Map<string, number>
+  /** template key → the group, for real (>1-member) subquery groups only. */
+  sqGroups: Map<string, SqGroup>
+  /** grouped subquery shape id → its template key. */
+  shapeToSqGroup: Map<string, string>
+  /** grouped subquery inner-set sig → its template key. */
+  sigToSqGroup: Map<string, string>
+}
+
+function logicalGroupPlan(g: EngineGraph, group: boolean): LogicalGroupPlan {
+  // Route-join families: count the equality shapes on each (table, key-cols) route. Aggregate and
+  // subquery shapes never flow through a route join (they compile to their own chains), so they are
+  // excluded here exactly as they are in the fold below.
   const familyMembers = new Map<string, number>()
-
-  const add = (id: string, data: VizNodeData) => {
-    const existing = nodes.get(id)
-    if (existing) {
-      if (data.shared && (!existing.data.shared || data.shared > existing.data.shared)) existing.data.shared = data.shared
-      return
-    }
-    // Logical node ids ARE the engine's state-summary ids, so every node gets live chips.
-    nodes.set(id, { id, data: { stateId: id, ...data } })
-  }
-  const edge = (source: string, target: string, kind: RawEdge['kind'], label?: string) => {
-    const id = `${source}~>${target}~${label ?? ''}`
-    if (!edges.some((e) => e.id === id)) edges.push({ id, source, target, label, kind })
-  }
-  const tableId = (t: string) => `table:${t}`
-
-  for (const t of g.tables) add(tableId(t), { kind: 'table', label: t, ref: { kind: 'table', name: t } })
-
   for (const s of g.shapes) {
     if (s.familyKey && !isSubqueryShape(s)) {
-      const fid = `family:${s.table}:${s.familyKey.join(',')}`
+      const fid = familyId(s.table, s.familyKey)
       familyMembers.set(fid, (familyMembers.get(fid) ?? 0) + 1)
     }
   }
 
-  // Subquery-template groups (the "group shapes" toggle) — the logical mirror of the circuit view's
-  // subquery folding. Subquery shapes whose maintained pipeline is structurally identical (same
-  // outer table, predicate template, and projection) differ only in their bound parameter, so a
-  // group of >1 collapses to ONE stacked `sqgroup` output node PLUS one stacked inner-set (`sqnode`)
-  // node — the two per-instance nodes that would otherwise repeat once per member. Built only when
-  // `group` is on (whole-graph view); a selection leaves the maps empty, so every subquery shape
-  // and node renders individually exactly as before.
-  interface SqGroup {
-    outerTable: string
-    where: EngineGraph['shapes'][number]['where']
-    shapeIds: string[]
-    sigs: Set<string>
-  }
+  // Subquery-template groups — built only when grouping is on (whole-graph view); a selection leaves
+  // the maps empty so every subquery shape/node renders individually.
   const sqGroups = new Map<string, SqGroup>()
   const shapeToSqGroup = new Map<string, string>() // shape id → group key (grouped members only)
   const sigToSqGroup = new Map<string, string>() // subquery node sig → group key (grouped members only)
@@ -190,9 +189,56 @@ function buildFull(g: EngineGraph, group: boolean): { nodes: Map<string, RawNode
       for (const sig of grp.sigs) sigToSqGroup.set(sig, key)
     }
   }
+  return { familyMembers, sqGroups, shapeToSqGroup, sigToSqGroup }
+}
+
+/**
+ * Turn the engine's `/graph` snapshot into the full pipeline graph (all nodes + edges). Shared
+ * structure collapses naturally: family routers are keyed by (table, key-cols) and subquery nodes by
+ * signature, so two shapes that share one underneath connect to the SAME node here.
+ *
+ * With `group` on, the two per-shape fan-outs collapse (only in the whole-graph view; a selection
+ * always expands so every shape's sink stays reachable — see `buildGraph`):
+ *   - Route-join families: instead of one output node per shape, a family with >1 member gets ONE
+ *     `shapegroup` node badged with the count.
+ *   - Subquery templates: subquery shapes whose maintained pipeline is structurally identical (same
+ *     outer table, predicate template, projection) — differing only in their bound parameter — get
+ *     ONE stacked `sqgroup` output node PLUS one stacked inner-set (`sqnode`) node in place of the
+ *     repeated per-instance pair. This is the logical mirror of the circuit view's subquery folding
+ *     (`build-circuit`'s `planGroups`), keyed on the SAME shared `subqueryTemplateKey`.
+ */
+function buildFull(g: EngineGraph, group: boolean): { nodes: Map<string, RawNode>; edges: RawEdge[] } {
+  const nodes = new Map<string, RawNode>()
+  const edges: RawEdge[] = []
+  // The grouping decision (family member counts + subquery-template folds), shared with
+  // `logicalHopRedirect` so a trace hop into a collapsed member lands on the very node built here.
+  const { familyMembers, sqGroups, shapeToSqGroup, sigToSqGroup } = logicalGroupPlan(g, group)
+
+  const add = (id: string, data: VizNodeData) => {
+    const existing = nodes.get(id)
+    if (existing) {
+      if (data.shared && (!existing.data.shared || data.shared > existing.data.shared)) existing.data.shared = data.shared
+      return
+    }
+    // Logical node ids ARE the engine's state-summary ids, so every node gets live chips.
+    nodes.set(id, { id, data: { stateId: id, ...data } })
+  }
+  const edge = (source: string, target: string, kind: RawEdge['kind'], label?: string) => {
+    const id = `${source}~>${target}~${label ?? ''}`
+    if (!edges.some((e) => e.id === id)) edges.push({ id, source, target, label, kind })
+  }
+  const tableId = (t: string) => `table:${t}`
+
+  for (const t of g.tables) add(tableId(t), { kind: 'table', label: t, ref: { kind: 'table', name: t } })
+
+  // Subquery-template groups (the "group shapes" toggle) — the logical mirror of the circuit view's
+  // subquery folding. Subquery shapes whose maintained pipeline is structurally identical (same
+  // outer table, predicate template, and projection) differ only in their bound parameter, so a
+  // group of >1 collapses to ONE stacked `sqgroup` output node PLUS one stacked inner-set (`sqnode`)
+  // node — the two per-instance nodes that would otherwise repeat once per member. The maps come from
+  // `logicalGroupPlan` (empty unless `group` is on), so every subquery shape and node otherwise
+  // renders individually exactly as before.
   const nodeBySig = new Map(g.subqueryNodes.map((n) => [n.sig, n]))
-  const sqGroupId = (key: string) => `sqgroup:${key}`
-  const sqNodeGroupId = (key: string) => `sqnode:group:${key}`
   // Both stacked representatives (the output node and the inner-set node) carry the SAME `sqgroup`
   // ref, so clicking either opens the one detail panel that lists every member shape and each
   // instance's inner set — the members and their distinct contents stay inspectable behind the card.
@@ -227,7 +273,7 @@ function buildFull(g: EngineGraph, group: boolean): { nodes: Map<string, RawNode
     // A family with >1 member collapses to a single `shapegroup` node, and a subquery shape that
     // shares a template with others collapses to a single `sqgroup` node — either way we skip the
     // per-shape node (and, for a family, its route edge below).
-    const fid = s.familyKey && !isSubqueryShape(s) ? `family:${s.table}:${s.familyKey.join(',')}` : null
+    const fid = s.familyKey && !isSubqueryShape(s) ? familyId(s.table, s.familyKey) : null
     const shared = fid ? (familyMembers.get(fid) ?? 1) : 1
     const sqKey = shapeToSqGroup.get(s.id) // set only when this subquery shape collapses into a group
     const grouped = (group && fid !== null && shared > 1) || sqKey !== undefined
@@ -279,7 +325,7 @@ function buildFull(g: EngineGraph, group: boolean): { nodes: Map<string, RawNode
       edge(tableId(s.table), fid, 'flow')
       if (grouped) {
         // One collapsed output node for the whole family (deduped by id across its members).
-        const gid = `shapegroup:${fid}`
+        const gid = shapeGroupId(fid)
         add(gid, {
           kind: 'shape',
           // The query template the members share — the key predicate with the value parameterized
@@ -603,4 +649,37 @@ export function buildGraph(
   const full = buildFull(g, opts?.groupShapes !== false && selection === 'all')
   const restricted = selection === 'all' ? full : restrictToSelection(full, selection)
   return layout(restricted, focus, opts)
+}
+
+/** hop id → the ONE rendered node id it should light, for the LOGICAL view. A logical trace hop
+ *  (`table:`/`family:`/`filter:`/`node:`/`shape:`) IS a rendered node id, so the mapping is identity
+ *  by default; this map carries ONLY the collapsed members whose own node `buildFull` folded into a
+ *  stacked representative (the "group shapes" toggle). It is the logical mirror of the circuit view's
+ *  `hopIndex` redirect, built from the SAME `logicalGroupPlan` that `buildFull` renders under — so a
+ *  hop into a collapsed member can never point at a node the render didn't draw. Empty (pure
+ *  identity) when grouping is off, i.e. when the caller isn't grouping the whole-graph view, so a
+ *  selection and the ungrouped overview keep the original identity behaviour. `App`'s `expandHop`
+ *  applies it as `[redirect.get(hop) ?? hop]`, exactly as it applies `hopIndex(g, true)` for the
+ *  circuit view. */
+export function logicalHopRedirect(g: EngineGraph, group: boolean): Map<string, string> {
+  const redirect = new Map<string, string>()
+  if (!group) return redirect
+  const { familyMembers, shapeToSqGroup, sigToSqGroup } = logicalGroupPlan(g, group)
+
+  // Route-family fold: a >1-member equality family collapses each member's own output node into the
+  // family's stacked `shapegroup` rep. Aggregates never reach the fold (they render as their own
+  // terminal `agg` node), so they are excluded here — matching `buildFull`, which folds only the
+  // non-aggregate, non-subquery members' `shape:<id>` nodes and leaves the shared `family:` node
+  // itself standing (it keeps identity, so the route edge into the rep still lights end to end).
+  for (const s of g.shapes) {
+    if (!s.familyKey || isSubqueryShape(s) || s.aggregate) continue
+    const fid = familyId(s.table, s.familyKey)
+    if ((familyMembers.get(fid) ?? 0) > 1) redirect.set(`shape:${s.id}`, shapeGroupId(fid))
+  }
+  // Subquery-template fold: each grouped member's output node → the stacked `sqgroup` output rep, and
+  // each grouped inner-set sig → the stacked inner-set rep. A subquery shape is excluded from families
+  // above, so these never contend for the same `shape:<id>` key.
+  for (const [sid, key] of shapeToSqGroup) redirect.set(`shape:${sid}`, sqGroupId(key))
+  for (const [sig, key] of sigToSqGroup) redirect.set(`node:${sig}`, sqNodeGroupId(key))
+  return redirect
 }

@@ -7,7 +7,7 @@
 
 import { describe, expect, it } from 'vitest'
 
-import { type VizNodeData, buildGraph } from './build-graph'
+import { type VizNodeData, buildGraph, logicalHopRedirect } from './build-graph'
 import { predicateTemplate, subqueryTemplateKey } from './predicate-label'
 import type { EngineGraph, GraphEdge, GraphShape } from './types'
 
@@ -159,6 +159,53 @@ describe('logical grouping', () => {
     expect(ids.has('shape:s55')).toBe(true)
     expect(ids.has(`node:${sigA}`)).toBe(true)
     expect(refKinds(grouped).some((k) => k === 'sqgroup')).toBe(false)
+  })
+})
+
+describe('logical hop redirect', () => {
+  it('points a collapsed member hop at the stacked rep the render actually drew', () => {
+    const g = fixture()
+    const grouped = buildGraph(g, 'all', null, { groupShapes: true })
+    const groupedIds = idset(grouped)
+    const redirect = logicalHopRedirect(g, true)
+    const key = subqueryTemplateKey(g.shapes.find((s) => s.id === 's55')!)
+
+    // A subquery member's `shape:` hop → the ONE stacked `sqgroup` output rep; its inner-set `node:`
+    // hop → the ONE stacked inner-set rep. Both members redirect to the same pair, and both rep ids
+    // are present in the grouped render — so the trace hop flashes a node that exists.
+    expect(redirect.get('shape:s55')).toBe(`sqgroup:${key}`)
+    expect(redirect.get('shape:s68')).toBe(`sqgroup:${key}`)
+    expect(redirect.get(`node:${sigA}`)).toBe(`sqnode:group:${key}`)
+    expect(redirect.get(`node:${sigB}`)).toBe(`sqnode:group:${key}`)
+    expect(groupedIds.has(`sqgroup:${key}`)).toBe(true)
+    expect(groupedIds.has(`sqnode:group:${key}`)).toBe(true)
+
+    // A route-family member's `shape:` hop → the family's stacked `shapegroup` rep (also rendered).
+    expect(redirect.get('shape:s2')).toBe('shapegroup:family:users:active')
+    expect(redirect.get('shape:s3')).toBe('shapegroup:family:users:active')
+    expect(groupedIds.has('shapegroup:family:users:active')).toBe(true)
+
+    // An uncollapsed hop is absent from the map — the caller falls back to identity for it. The
+    // shared `family:` node itself stays standing (only its members' output nodes fold), so the route
+    // edge into the rep still lights end to end.
+    expect(redirect.has('table:users')).toBe(false)
+    expect(redirect.has('family:users:active')).toBe(false)
+    expect(groupedIds.has('family:users:active')).toBe(true)
+  })
+
+  it('is empty (pure identity) when grouping is off', () => {
+    // Ungrouped whole-graph view and any selection both leave every hop as its own rendered id.
+    expect(logicalHopRedirect(fixture(), false).size).toBe(0)
+  })
+
+  it('leaves a lone subquery shape as identity (needs >1 member to fold)', () => {
+    const g = fixture()
+    g.shapes = g.shapes.filter((s) => s.id !== 's68')
+    g.subqueryNodes = g.subqueryNodes.filter((n) => n.sig !== sigB)
+    g.subqueryEdges = g.subqueryEdges.filter((e) => e.nodeSig !== sigB)
+    const redirect = logicalHopRedirect(g, true)
+    expect(redirect.has('shape:s55')).toBe(false)
+    expect(redirect.has(`node:${sigA}`)).toBe(false)
   })
 })
 
