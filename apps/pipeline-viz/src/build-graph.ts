@@ -52,6 +52,10 @@ export interface VizNodeData extends Record<string, unknown> {
   shared?: number
   /** Render as a stack of cards — a collapsed `shapegroup` standing in for its N member shapes. */
   stack?: boolean
+  /** A control-plane annotation shown in place of the formula line, for an operator fed from
+   *  outside the data graph (the params arrangement, populated by shape create/drop — it has no
+   *  incoming data edge on purpose). Styled distinctly so it reads as a note, not a stream. */
+  note?: string
   /** An id shown inline in the header tag row (e.g. the shape id next to "SHAPE OUTPUT"). */
   idTag?: string
   /** Render `label` as a highlighted expression (used for a shape's filter predicate). */

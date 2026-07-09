@@ -54,6 +54,10 @@ function buildFull(g: EngineGraph): { nodes: Map<string, RawNode>; edges: RawEdg
         kind: OP_KIND[o.kind],
         label,
         ...(o.state ? { stateId: o.state } : null),
+        // The family params arrangement has no incoming data edge: it is populated by shape
+        // create/drop (the control plane), not by any stream. Annotate rather than leave it looking
+        // disconnected.
+        ...(o.kind === 'arrange' ? { note: '← shape create / drop' } : null),
         ref: { kind: 'op', opKind: OP_KIND[o.kind], hop: o.hop, label },
       },
     })

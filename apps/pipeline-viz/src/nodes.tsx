@@ -146,10 +146,16 @@ export function PipelineNode({ id, data }: NodeProps) {
       <div className={`pnode-label${d.highlight ? ' pnode-highlight' : ''}`} title={d.label}>
         {d.label}
       </div>
-      {/* Operators carry their dbsp formula as the sub line; logical nodes their own sub text. */}
-      {d.sub ?? (d.kind.startsWith('op-') ? meta.formula : undefined) ? (
+      {/* Operators carry their dbsp formula as the sub line; logical nodes their own sub text. A
+          control-plane `note` takes the formula's place (and is styled as an annotation below). */}
+      {d.sub ?? (d.kind.startsWith('op-') && !d.note ? meta.formula : undefined) ? (
         <div className="pnode-sub" title={d.sub ?? meta.formula}>
           {d.sub ?? meta.formula}
+        </div>
+      ) : null}
+      {d.note ? (
+        <div className="pnode-note" title={d.note}>
+          {d.note}
         </div>
       ) : null}
       {d.stateId ? <StateChips id={d.stateId} /> : null}
