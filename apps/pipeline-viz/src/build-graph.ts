@@ -155,10 +155,11 @@ function buildFull(g: EngineGraph, group: boolean): { nodes: Map<string, RawNode
       add(shapeId, {
         kind: 'shape',
         // The filter predicate is the node's headline content (highlighted); the shape id moves inline
-        // into the header tag row.
+        // into the header tag row, and the source table names the relation the predicate is over.
         label: predicateLabel(s.where),
         idTag: s.id,
         highlight: true,
+        sub: s.table,
         life: s.state,
         serve: s.circuit?.label,
         ref: { kind: 'shape', shapeId: s.id },
@@ -185,7 +186,7 @@ function buildFull(g: EngineGraph, group: boolean): { nodes: Map<string, RawNode
           // (`issue_id = ?`), shown like a concrete shape's predicate but abstracted over its value.
           label: s.familyKey!.map((c) => `${c} = ?`).join(' AND '),
           highlight: true,
-          sub: `${shared} shapes`,
+          sub: `${s.table} · ${shared} shapes`,
           stack: true,
           ref: { kind: 'shapegroup', table: s.table, keyCols: s.familyKey! },
         })
