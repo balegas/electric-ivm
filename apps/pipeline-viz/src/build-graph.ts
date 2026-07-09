@@ -58,6 +58,11 @@ export interface VizNodeData extends Record<string, unknown> {
   /** Circuit placement label (`dynamic:<col>` / `counts` / …) when the shape is circuit-served —
    *  rendered as a chip in the card's tag row. */
   serve?: string
+  /** Circuit view: the compiled dbsp arrangements folded onto a table's SOURCE node — the
+   *  arrangement lane (inputs, indexes, counts) is collapsed onto the source to declutter. Present
+   *  only on `op-source` nodes whose table has arrangements; drives the indexed treatment + count
+   *  badge, and the detail panel expands the full list from `graph.arrangements`. */
+  arr?: { indexes: number; counts: number; seeded: boolean }
   ref: NodeRef
   selected?: boolean
   dimmed?: boolean

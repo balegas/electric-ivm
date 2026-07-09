@@ -181,6 +181,38 @@ function SinkView({ shape }: { shape: GraphShape | undefined }) {
 
 const BROWSE_PAGE = 25
 
+/** The compiled dbsp arrangements folded onto a table's SOURCE node. On the canvas the arrangement
+ *  lane is collapsed onto the source (a count badge) to keep the graph legible; here, where a click
+ *  affords the room, the indexes and counts pipelines are spelled out in full. Read straight from
+ *  `graph.arrangements` — every index/counts entry whose table is this one. */
+function SourceArrangements({ table, arr }: { table: string; arr: EngineGraph['arrangements'] }) {
+  if (!arr) return null
+  const indexes = arr.indexes.filter((i) => i.table === table)
+  const counts = (arr.counts ?? []).filter((c) => c.table === table)
+  if (indexes.length === 0 && counts.length === 0) return null
+  return (
+    <>
+      <div className="dp-sec">compiled dbsp arrangements</div>
+      <div className="dp-list dp-index">
+        {indexes.map((i) => (
+          <div key={i.id} className="dp-item">
+            <code>map_index({i.cols.join(', ')})</code>
+            <span className="dp-item-sub">integrate_trace · {i.seeded ? 'seeded' : 'seeding…'}</span>
+          </div>
+        ))}
+        {counts.map((c) => (
+          <div key={c.id} className="dp-item">
+            <code>weighted_count({c.groupCols.join(', ')})</code>
+            <span className="dp-item-sub">counts pipeline · {c.seeded ? 'seeded' : 'seeding…'}</span>
+          </div>
+        ))}
+      </div>
+      <div className="dp-note">{KIND_META['arr-index'].inside}</div>
+      {counts.length > 0 ? <div className="dp-note">{KIND_META['arr-counts'].inside}</div> : null}
+    </>
+  )
+}
+
 /** Paginated browser over a table's rows via the engine's one-shot subset query
  *  (`POST /query` with limit/offset) — each page is fetched on demand, no shape is
  *  created and nothing is materialized, so large tables never load upfront.
@@ -998,7 +1030,11 @@ export function DetailPanel({
           </>
         ) : null}
         <InsideNote kind={node.opKind} />
-        {/* Source operator: same write + browse affordances as the logical table node. */}
+        {/* Source operator: the table's compiled arrangements (folded onto this node on the canvas),
+            then the same write + browse affordances as the logical table node. */}
+        {node.opKind === 'op-source' && opTable ? (
+          <SourceArrangements table={opTable} arr={graph.arrangements} />
+        ) : null}
         {node.opKind === 'op-source' && opTable ? (
           <TableBrowser table={opTable} />
         ) : null}

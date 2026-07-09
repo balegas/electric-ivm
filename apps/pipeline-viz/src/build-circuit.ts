@@ -49,66 +49,53 @@ function buildFull(g: EngineGraph): { nodes: Map<string, RawNode>; edges: RawEdg
 }
 
 /** The compiled dbsp arrangement pipeline (always present once the always-on circuit is running):
- *  static infrastructure — one input per table, one map_index→integrate_trace pipeline per index,
- *  one map_index(group)→weighted_count pipeline per counted table — rendered permanently. Each
- *  table input feeds off the same per-table delta stream (`d:<table>`) the shape filters read, so
- *  the lane is drawn descending from the table it arranges rather than floating free. Two
- *  consumer-edge kinds hang off it: dashed LOOKUP edges to subquery dependents whose flip
- *  re-derivations read an index, and solid animated SERVING edges to circuit-served shapes and
- *  aggregates whose data comes from the circuit itself. Ids come from the engine (`arr:input:…` /
- *  `arr:index:…` / `arr:counts:…`), stable across snapshots, so sticky layout keeps the lane
- *  parked while shapes come and go. */
+ *  static infrastructure — one input per table, one map_index→integrate_trace arrangement per
+ *  index, one weighted_count pipeline per counted table. Drawn as a separate lane it swamps the
+ *  canvas (three-plus nodes per table), so instead it is FOLDED onto each table's SOURCE node: the
+ *  source carries an "indexed" treatment + an index/counts count badge, and the detail panel
+ *  expands the full list. The two consumer-edge kinds still hang off it, re-anchored to the source
+ *  node: dashed LOOKUP edges to subquery dependents whose flip re-derivations read an index, and
+ *  solid animated SERVING edges to circuit-served shapes and aggregates whose data comes from the
+ *  circuit itself. Every arrangement id maps back to `src:<table>` so those edges land there. */
 function addArrangements(g: EngineGraph, nodes: Map<string, RawNode>, edges: RawEdge[]) {
   const arr = g.arrangements
   if (!arr) return
-  for (const inp of arr.inputs) {
-    nodes.set(inp.id, {
-      id: inp.id,
-      data: {
-        kind: 'arr-input',
-        label: inp.table,
-        sub: inp.seeded ? 'seeded' : 'seeding…',
-        ref: { kind: 'op', opKind: 'arr-input', hop: inp.id, label: inp.table },
-      },
-    })
-    // Wire the input to its table's delta stream: the sequencer feeds every table's deltas into
-    // the circuit, so `arr:input` is a peer consumer of `d:<table>` alongside the shape filters —
-    // not a disconnected root. Guarded because the delta op exists only for tables the engine
-    // emits operators for (`operatorGraph` iterates the same table set the circuit configures).
-    const deltaId = `d:${inp.table}`
-    if (nodes.has(deltaId)) {
-      edges.push({ id: `${deltaId}~>${inp.id}~`, source: deltaId, target: inp.id, kind: 'flow' })
-    }
+
+  // Map every arrangement id (input / index / counts) back to its table, and tally per table how
+  // many indexes and counts pipelines it carries and whether they are all seeded.
+  const idTable = new Map<string, string>()
+  const fold = new Map<string, { indexes: number; counts: number; seeded: boolean }>()
+  const bump = (table: string, seeded: boolean, isCount: boolean) => {
+    const cur = fold.get(table) ?? { indexes: 0, counts: 0, seeded: true }
+    if (isCount) cur.counts += 1
+    else cur.indexes += 1
+    cur.seeded = cur.seeded && seeded
+    fold.set(table, cur)
   }
+  for (const inp of arr.inputs) idTable.set(inp.id, inp.table)
   for (const ix of arr.indexes) {
-    const label = `map_index(${ix.cols.join(', ')})`
-    nodes.set(ix.id, {
-      id: ix.id,
-      data: {
-        kind: 'arr-index',
-        label,
-        sub: `integrate_trace · ${ix.seeded ? 'seeded' : 'seeding…'}`,
-        ref: { kind: 'op', opKind: 'arr-index', hop: ix.id, label },
-      },
-    })
-    edges.push({ id: `${ix.input}~>${ix.id}~`, source: ix.input, target: ix.id, kind: 'flow' })
+    idTable.set(ix.id, ix.table)
+    bump(ix.table, ix.seeded, false)
   }
   for (const ct of arr.counts ?? []) {
-    // A counts pipeline COMPUTES (a maintained weighted_count per group), where an index REMEMBERS
-    // (rows) — its card carries the reduction as the headline, the grouping step as the sub line.
-    const label = `weighted_count(${ct.groupCols.join(', ')})`
-    nodes.set(ct.id, {
-      id: ct.id,
-      data: {
-        kind: 'arr-counts',
-        label,
-        sub: `map_index(${ct.groupCols.join(', ')}) · ${ct.seeded ? 'seeded' : 'seeding…'}`,
-        ref: { kind: 'op', opKind: 'arr-counts', hop: ct.id, label },
-      },
-    })
-    edges.push({ id: `${ct.input}~>${ct.id}~`, source: ct.input, target: ct.id, kind: 'flow' })
+    idTable.set(ct.id, ct.table)
+    bump(ct.table, ct.seeded, true)
   }
+
+  // Stamp the fold summary onto each table's source node — that is what the indexed treatment and
+  // the count badge read, and the detail panel re-derives the full list from `graph.arrangements`.
+  for (const [table, sum] of fold) {
+    const src = nodes.get(`src:${table}`)
+    if (src) src.data.arr = sum
+  }
+
+  // Consumer edges now hang off the table's source node (its arrangements are folded there). The
+  // edge id carries the arrangement id so two indexes on one table serving two shapes stay distinct.
   for (const c of arr.consumers) {
+    const table = idTable.get(c.index)
+    if (table === undefined) continue
+    const src = `src:${table}`
+    if (!nodes.has(src)) continue
     if (c.dependentKind === 'circuit-shape' || c.dependentKind === 'circuit-agg') {
       // A SERVING edge: the dependent's data comes FROM the circuit (seeded there, maintained
       // there) — not an occasional read. It lands on the dependent's own operator: the fold of a
@@ -118,10 +105,10 @@ function addArrangements(g: EngineGraph, nodes: Map<string, RawNode>, edges: Raw
           ? [`fold:${c.dependentId}`, `snk:${c.dependentId}`]
           : [`sj:${c.dependentId}`, `sigma:${c.dependentId}`, `snk:${c.dependentId}`]
       const target = candidates.find((t) => nodes.has(t))
-      if (!target || !nodes.has(c.index)) continue
+      if (!target) continue
       edges.push({
-        id: `${c.index}~>${target}~serves`,
-        source: c.index,
+        id: `${src}~>${target}~serves~${c.index}`,
+        source: src,
         target,
         label: c.connectingCol ? `serves · ${c.connectingCol}` : 'serves',
         kind: 'serve',
@@ -133,8 +120,8 @@ function addArrangements(g: EngineGraph, nodes: Map<string, RawNode>, edges: Raw
     const target = c.dependentKind === 'shape' ? `sj:${c.dependentId}` : `sqf:${c.dependentId}`
     if (!nodes.has(target)) continue
     edges.push({
-      id: `${c.index}~>${target}~lookup`,
-      source: c.index,
+      id: `${src}~>${target}~lookup~${c.index}`,
+      source: src,
       target,
       label: `lookup · ${c.connectingCol}`,
       kind: 'state',

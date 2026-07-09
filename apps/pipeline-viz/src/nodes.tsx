@@ -98,22 +98,40 @@ function chips(s: NodeStateSummary): React.ReactNode {
   }
 }
 
+// The indigo of the compiled dbsp arrangement lane (KIND_META['arr-index']): a source node whose
+// arrangements are folded onto it borrows this treatment so "indexed" reads at a glance.
+const ARR_COLOR = '#4338ca'
+const ARR_BG = '#e0e7ff'
+
 export function PipelineNode({ id, data }: NodeProps) {
   const d = data as VizNodeData
   const meta = KIND_META[d.kind]
   const parked = d.life === 'dormant' || d.life === 'deactivating' || d.life === 'reactivating'
+  // A table source with compiled arrangements folded onto it: indigo treatment + a count badge,
+  // standing in for the (decluttered-away) arrangement lane. The detail panel expands the list.
+  const indexed = d.kind === 'op-source' && d.arr && d.arr.indexes + d.arr.counts > 0 ? d.arr : null
+  const color = indexed ? ARR_COLOR : meta.color
   return (
     <div
-      className={`pnode pnode-${d.kind}${d.selected ? ' pnode-selected' : ''}${d.dimmed ? ' pnode-dimmed' : ''}${parked ? ' pnode-parked' : ''}`}
-      style={{ borderColor: meta.color, background: meta.bg }}
+      className={`pnode pnode-${d.kind}${indexed ? ' pnode-indexed' : ''}${d.selected ? ' pnode-selected' : ''}${d.dimmed ? ' pnode-dimmed' : ''}${parked ? ' pnode-parked' : ''}`}
+      style={{ borderColor: color, background: indexed ? ARR_BG : meta.bg }}
     >
       <Handle type="target" position={Position.Left} />
-      <div className="pnode-tag" style={{ color: meta.color }}>
+      <div className="pnode-tag" style={{ color }}>
         <span>
           {meta.tag}
           {d.idTag ? <span className="pnode-idtag">{d.idTag}</span> : null}
         </span>
         <span className="pnode-tag-r">
+          {indexed ? (
+            <span
+              className="pnode-arr"
+              title={`compiled dbsp arrangements on this table — click the source to see the ${indexed.indexes} index${indexed.indexes === 1 ? '' : 'es'}${indexed.counts ? ` and ${indexed.counts} counts pipeline${indexed.counts === 1 ? '' : 's'}` : ''}. ${indexed.seeded ? 'seeded' : 'seeding…'}`}
+            >
+              ⧉ {indexed.indexes} idx{indexed.counts ? ` · ${indexed.counts}× count` : ''}
+              {indexed.seeded ? '' : ' · seeding…'}
+            </span>
+          ) : null}
           {parked ? <span className={`pnode-life pnode-life-${d.life}`}>{d.life}</span> : null}
           {d.serve ? (
             <span

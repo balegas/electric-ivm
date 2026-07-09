@@ -858,6 +858,19 @@ body,
   white-space: nowrap;
 }
 
+/* Count badge on a table source whose compiled dbsp arrangements are folded onto it (the lane is
+   collapsed on the canvas). Solid indigo fill so it reads on the source's light-indigo "indexed"
+   card; click the source to see the full index/counts list in the detail panel. */
+.pnode-arr {
+  font-size: 9px;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: #4338ca;
+  color: #fff;
+  white-space: nowrap;
+}
+
 /* Sidebar badge for circuit-served shapes. */
 .k-circuit {
   background: #e0e7ff;
