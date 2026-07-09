@@ -133,6 +133,13 @@ alice is in lists 1 and 2, so you get back **four inserts** — todos 1, 2, 3 (G
 (Launch plan) — then `up-to-date`. Nothing surprising in the *result*. The surprise is *where it
 came from*.
 
+> The `+ new shape` form handles this subquery gracefully: pick `todos`, and the `WHERE` editor
+> autocompletes the whole `list_id IN (SELECT list_id FROM list_members WHERE user_id = 'alice')`
+> predicate — column names, the `IN (SELECT …)` scaffold, and all. Submit and the same shape latches
+> onto the lane on the canvas. We stay on `curl` here because §5 long-polls this shape's tail and
+> needs the `electric-handle` / `electric-offset` the create response returns — the browser keeps
+> those to itself.
+
 Look at the canvas. A shape node just appeared and **latched onto the static lane with a solid,
 animated `serves` edge** — from the `todos map_index(list_id)` arrangement into the shape's
 membership operator. The sidebar counter ticked to `1 served`, and the shape's row in the list wears
@@ -166,6 +173,11 @@ psql "postgres://postgres:password@localhost:5432/electric" \
   -c "INSERT INTO list_members (list_id, user_id) VALUES (3, 'alice')"
 ```
 
+> This is a pure "cause a change and watch it flow" write, so the canvas is a fine place to make it:
+> click the **`list_members` table node**, and its **add-row** form will insert `(3, alice)` for you
+> (`POST /table/list_members/rows`) — you write the membership row and watch two todos move into
+> alice's shape in the same window.
+
 Watch it three ways:
 
 1. **On the canvas**, the change enters at `list_members`, not `todos`. The membership delta
@@ -183,6 +195,10 @@ Reverse it and the todos **move out**:
 psql "postgres://postgres:password@localhost:5432/electric" \
   -c "DELETE FROM list_members WHERE list_id = 3 AND user_id = 'alice'"
 ```
+
+> Or do it from the canvas: open the `list_members` node, tick the `(3, alice)` row in its detail
+> panel, and delete it (`DELETE /table/list_members/rows`, by primary key). Same move-out, watched on
+> the lane — the membership row leaves, and alice's cohort group 3 unsubscribes.
 
 The next long-poll returns two **deletes** for todos 6 and 7 — they didn't leave Postgres, they left
 *alice's shape* when she left the list. Subscribe/unsubscribe, not recompute.
@@ -280,6 +296,13 @@ On the canvas it stands alone, attached to no lane. This is "dynamic" of the thi
 **cross-key predicate**. The circuit sits *in front of* the fallback as an optimization — if this
 pattern turned out to matter, you'd promote it into the circuit at the next deploy. Until then it
 just works, at fallback cost.
+
+> By now the sidebar's shape list has a handful of entries — the membership shape, the aggregate, the
+> routed equality and union shapes, the fallback. Each has a **delete** button, and there's a
+> **delete-all-shapes** control alongside; use them to watch shapes **let go** of the lane in reverse.
+> Delete the membership shape and its `serves` edge detaches and the `served` counter ticks back down;
+> clear them all and the static lane sits there alone again, exactly as in §3 — structure that never
+> came and went with the subscriptions in the first place.
 
 ## 8. What you now know
 

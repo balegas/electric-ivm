@@ -50,6 +50,8 @@ psql "postgres://postgres:password@localhost:5432/electric" \
   -c "INSERT INTO issues VALUES (7, 'review this tutorial', 'todo', 2)"
 ```
 
+> As in episode 1, you can drive this write from the canvas instead — the `issues` table node's **add-row** form does the same insert. (The updates in §4 stay on `psql`: the table node writes and deletes rows, but changing a column in place is `UPDATE`'s job — which is exactly the point §4 makes.)
+
 The green dot is labeled **`+1`**, and that label is the core of DBSP: a change is a **weighted row**. `+1` means "this row is now present"; `−1` means "this row is no longer present". Every operator in the circuit consumes a stream of weighted rows and emits one — σ passes or drops them, π folds them into feed envelopes, the sink appends those to your shape's stream. Nothing anywhere re-reads the table.
 
 ## 4. An update is a retraction plus an insertion
