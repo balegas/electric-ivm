@@ -48,7 +48,7 @@ function buildFull(g: EngineGraph): { nodes: Map<string, RawNode>; edges: RawEdg
   return { nodes, edges }
 }
 
-/** The compiled dbsp arrangement pipeline (present iff the engine runs with ELECTRIC_IVM_DBSP=1):
+/** The compiled dbsp arrangement pipeline (always present once the always-on circuit is running):
  *  static infrastructure — one input per table, one map_index→integrate_trace pipeline per index,
  *  one map_index(group)→weighted_count pipeline per counted table — rendered permanently. Each
  *  table input feeds off the same per-table delta stream (`d:<table>`) the shape filters read, so

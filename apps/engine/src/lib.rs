@@ -1,17 +1,20 @@
 //! electric-ivm query engine.
 //!
 //! Takes change events from the ordered change log and fans each change out to registered shapes,
-//! across a three-tier serving model. The **circuit** ([`arrangements`], `ELECTRIC_IVM_DBSP=1`):
-//! one shared storage-enabled dbsp circuit maintains disk-spillable table arrangements and counts
-//! pipelines, serves point lookups (subquery re-derivations) from local snapshots, and — with
-//! `ELECTRIC_IVM_DBSP_SERVE=1` — serves membership shapes and decomposable COUNT aggregates end
-//! to end. The **routing tier**: equality shapes are routed by key (a `key -> shapes` index per
-//! template), and indexed standalone predicates by necessary conjunct — the hot path holds **no
-//! table data**, only per-shape metadata. The **fallback** serves everything else: stateless
-//! three-valued filters and the cross-table subquery registry. Matching deltas are appended (as
-//! State-Protocol envelopes) to per-shape durable streams. The Z-set element is a
-//! dynamically-typed [`value::Row`] (positional `Vec<Value>`); the schema gives names to the
-//! positions. See `docs/ARCHITECTURE.md` and `docs/ivm-engine-internals.md` for the system design.
+//! across a three-tier serving model. The **circuit** ([`arrangements`]) is always-on infrastructure
+//! (Postgres mode): one shared storage-enabled dbsp circuit maintains disk-spillable table
+//! arrangements and counts pipelines, serves point lookups (subquery re-derivations) from local
+//! snapshots, and serves membership shapes and decomposable COUNT aggregates end to end — seeding
+//! and move-in/out come from arrangement snapshots instead of Postgres backfills. The circuit only
+//! serves a shape whose connecting column has a configured index (`ELECTRIC_IVM_DBSP_INDEXES` /
+//! `_COUNTS`); everything else falls through to the tiers below. The **routing tier**: equality
+//! shapes are routed by key (a `key -> shapes` index per template), and indexed standalone
+//! predicates by necessary conjunct — the hot path holds **no table data**, only per-shape metadata.
+//! The **fallback** serves everything else: stateless three-valued filters and the cross-table
+//! subquery registry. Matching deltas are appended (as State-Protocol envelopes) to per-shape
+//! durable streams. The Z-set element is a dynamically-typed [`value::Row`] (positional
+//! `Vec<Value>`); the schema gives names to the positions. See `docs/ARCHITECTURE.md` and
+//! `docs/ivm-engine-internals.md` for the system design.
 
 pub mod arrangements;
 pub mod config;

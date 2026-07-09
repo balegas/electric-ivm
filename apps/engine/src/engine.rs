@@ -79,8 +79,6 @@ pub struct Engine {
     /// Per-table seed-snapshot gates fencing the arrangement feed (fresh seeds only; empty
     /// after a checkpoint restore, where the highwater does the fencing instead).
     arr_gates: Arc<std::sync::RwLock<HashMap<String, crate::pg::SnapshotGate>>>,
-    /// Serve template-matching shapes/aggregates from the circuit (`ELECTRIC_IVM_DBSP_SERVE`).
-    dbsp_serve: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// One tailer envelope's worth of deferred subquery flips (see [`Engine::flip_tx`]).
@@ -424,7 +422,7 @@ pub struct ArrConsumer {
 
 /// The compiled dbsp arrangement pipeline (see `arrangements.rs` and `docs/ARCHITECTURE.md` §6b):
 /// static infrastructure built once at boot, plus its live consumers and the layer's lookup
-/// counters. Absent from `/graph` when `ELECTRIC_IVM_DBSP` is off.
+/// counters. Present in `/graph` whenever the circuit is running (always, in Postgres mode).
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArrangementGraph {
@@ -465,7 +463,8 @@ pub struct EngineGraph {
     pub subquery_edges: Vec<GraphEdge>,
     pub operators: Vec<OpNode>,
     pub op_edges: Vec<OpEdge>,
-    /// The compiled dbsp arrangement pipeline; omitted entirely when the layer is off.
+    /// The compiled dbsp arrangement pipeline; present once the circuit is running (always, in
+    /// Postgres mode), omitted only during the pre-`setup_postgres` window and in library mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arrangements: Option<ArrangementGraph>,
 }
@@ -723,11 +722,11 @@ impl Engine {
             dbsp_cfg: Arc::new(std::sync::Mutex::new(None)),
             arrangements: Arc::new(std::sync::Mutex::new(None)),
             arr_gates: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            dbsp_serve: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
-    /// Enable the dbsp arrangement layer (call before [`setup_postgres`](Self::setup_postgres)).
+    /// Configure the always-on dbsp arrangement layer (call before
+    /// [`setup_postgres`](Self::setup_postgres), which builds and seeds it).
     pub fn set_dbsp_config(&self, cfg: crate::config::DbspConfig) {
         *self.dbsp_cfg.lock().unwrap() = Some(cfg);
     }
@@ -800,7 +799,6 @@ impl Engine {
         }
         self.subqueries.lock().await.set_arrangements(arr.clone());
         *self.arrangements.lock().unwrap() = Some(arr);
-        self.dbsp_serve.store(cfg.serve, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -1213,11 +1211,11 @@ impl Engine {
         let stream_path = format!("shape/{id}");
         self.ds.ensure_stream(&stream_path).await?;
 
-        // Circuit-served path: when serving is enabled and the predicate decomposes over the
-        // compiled arrangements, the shape is seeded from snapshots inside the sequencer — no
-        // Postgres backfill, no gate. Bookkeeping (catalog/sharing/lives) matches the legacy
-        // path exactly. `changes_only` feeds stay on the legacy (passthrough) path.
-        if !changes_only && self.dbsp_serve.load(std::sync::atomic::Ordering::Acquire) {
+        // Circuit-served path: when the predicate decomposes over the compiled arrangements, the
+        // shape is seeded from snapshots inside the sequencer — no Postgres backfill, no gate.
+        // Bookkeeping (catalog/sharing/lives) matches the legacy path exactly. `changes_only`
+        // feeds stay on the legacy (passthrough) path.
+        if !changes_only {
             let arr = self.arrangements.lock().unwrap().clone();
             if let Some(arr) = arr {
                 if let Some(plan) = plan_circuit_shape(where_.as_ref(), &ts, &st.tables, &arr) {
@@ -1522,10 +1520,7 @@ impl Engine {
 
         // Circuit-served path: a bare COUNT whose predicate decomposes over the table's counts
         // pipeline is seeded by summing groups and updated from group deltas — no Postgres.
-        if matches!(func, AggFn::Count)
-            && col_idx.is_none()
-            && self.dbsp_serve.load(std::sync::atomic::Ordering::Acquire)
-        {
+        if matches!(func, AggFn::Count) && col_idx.is_none() {
             let arr = self.arrangements.lock().unwrap().clone();
             if let Some(arr) = arr {
                 if let Some(gcols) = arr.counts_group_cols(table).map(|g| g.to_vec()) {
@@ -2320,13 +2315,11 @@ impl Engine {
                 if rec.is_subquery {
                     // Circuit-served subquery shapes need no registry state: they re-register
                     // against the arrangements (seed=false) like any other circuit shape.
-                    let circuit_ok = self.dbsp_serve.load(std::sync::atomic::Ordering::Acquire)
-                        && self.arrangements.lock().unwrap().clone().is_some_and(|arr| {
-                            compiled.get(&rec.table).is_some_and(|ts| {
-                                plan_circuit_shape(rec.where_json.as_ref(), ts, compiled, &arr)
-                                    .is_some()
-                            })
-                        });
+                    let circuit_ok = self.arrangements.lock().unwrap().clone().is_some_and(|arr| {
+                        compiled.get(&rec.table).is_some_and(|ts| {
+                            plan_circuit_shape(rec.where_json.as_ref(), ts, compiled, &arr).is_some()
+                        })
+                    });
                     if !circuit_ok {
                         tracing::warn!(
                             "restore: dropping subquery shape {id} (inner-node state is not persisted);                          subscribers observe the deleted stream and recreate"
@@ -2421,70 +2414,18 @@ impl Engine {
         // from the router snapshot, which the catch-up replay has brought to the same point).
         // Aggregates re-seed from the counts snapshot (their fold is not persisted) — same
         // fresh-value semantics as the legacy aggregate resume.
-        if self.dbsp_serve.load(std::sync::atomic::Ordering::Acquire) {
-            let arr = self.arrangements.lock().unwrap().clone();
-            if let Some(arr) = arr {
-                match &rec.aggregate {
-                    Some(a) if matches!(a.func, AggFn::Count) && a.col.is_none() => {
-                        if let Some(gcols) = arr.counts_group_cols(&rec.table).map(|g| g.to_vec()) {
-                            if let Some(constraints) = plan_circuit_agg(rec.where_json.as_ref(), ts, &gcols) {
-                                let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-                                cmd_tx
-                                    .send(SequencerCmd::CreateCircuitAgg {
-                                        table: rec.table.clone(),
-                                        shape_id: rec.id.clone(),
-                                        stream_path: rec.stream_path.clone(),
-                                        constraints,
-                                        ready: ready_tx,
-                                    })
-                                    .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
-                                ready_rx
-                                    .await
-                                    .unwrap_or_else(|_| Err("sequencer dropped".to_string()))
-                                    .map_err(|e| anyhow::anyhow!(e))?;
-                                self.state.lock().await.circuit_placement.insert(
-                                    rec.id.clone(),
-                                    CircuitPlacement { label: "counts".into(), col: None, counts: true },
-                                );
-                                return Ok(());
-                            }
-                        }
-                    }
-                    None => {
-                        if let Some(plan) = {
-                            let st = self.state.lock().await;
-                            plan_circuit_shape(rec.where_json.as_ref(), ts, &st.tables, &arr)
-                        } {
-                            let residual = match plan.residual.as_ref() {
-                                Some(r) => Some(Arc::new(CompiledPredicate::compile(r, ts)?)),
-                                None => None,
-                            };
-                            let placement = match &plan.constraint {
-                                PlannedConstraint::All => {
-                                    CircuitPlacement { label: "all".into(), col: None, counts: false }
-                                }
-                                PlannedConstraint::Static { col, .. } => CircuitPlacement {
-                                    label: format!("static:{}", ts.columns[*col].0),
-                                    col: Some(*col),
-                                    counts: false,
-                                },
-                                PlannedConstraint::Dynamic { col, .. } => CircuitPlacement {
-                                    label: format!("dynamic:{}", ts.columns[*col].0),
-                                    col: Some(*col),
-                                    counts: false,
-                                },
-                            };
+        if let Some(arr) = self.arrangements.lock().unwrap().clone() {
+            match &rec.aggregate {
+                Some(a) if matches!(a.func, AggFn::Count) && a.col.is_none() => {
+                    if let Some(gcols) = arr.counts_group_cols(&rec.table).map(|g| g.to_vec()) {
+                        if let Some(constraints) = plan_circuit_agg(rec.where_json.as_ref(), ts, &gcols) {
                             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
                             cmd_tx
-                                .send(SequencerCmd::CreateCircuitShape {
+                                .send(SequencerCmd::CreateCircuitAgg {
                                     table: rec.table.clone(),
                                     shape_id: rec.id.clone(),
-                                    num_id,
                                     stream_path: rec.stream_path.clone(),
-                                    constraint: plan.constraint,
-                                    residual,
-                                    out_cols: out_cols.clone(),
-                                    seed: false,
+                                    constraints,
                                     ready: ready_tx,
                                 })
                                 .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
@@ -2492,12 +2433,61 @@ impl Engine {
                                 .await
                                 .unwrap_or_else(|_| Err("sequencer dropped".to_string()))
                                 .map_err(|e| anyhow::anyhow!(e))?;
-                            self.state.lock().await.circuit_placement.insert(rec.id.clone(), placement);
+                            self.state.lock().await.circuit_placement.insert(
+                                rec.id.clone(),
+                                CircuitPlacement { label: "counts".into(), col: None, counts: true },
+                            );
                             return Ok(());
                         }
                     }
-                    _ => {}
                 }
+                None => {
+                    if let Some(plan) = {
+                        let st = self.state.lock().await;
+                        plan_circuit_shape(rec.where_json.as_ref(), ts, &st.tables, &arr)
+                    } {
+                        let residual = match plan.residual.as_ref() {
+                            Some(r) => Some(Arc::new(CompiledPredicate::compile(r, ts)?)),
+                            None => None,
+                        };
+                        let placement = match &plan.constraint {
+                            PlannedConstraint::All => {
+                                CircuitPlacement { label: "all".into(), col: None, counts: false }
+                            }
+                            PlannedConstraint::Static { col, .. } => CircuitPlacement {
+                                label: format!("static:{}", ts.columns[*col].0),
+                                col: Some(*col),
+                                counts: false,
+                            },
+                            PlannedConstraint::Dynamic { col, .. } => CircuitPlacement {
+                                label: format!("dynamic:{}", ts.columns[*col].0),
+                                col: Some(*col),
+                                counts: false,
+                            },
+                        };
+                        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                        cmd_tx
+                            .send(SequencerCmd::CreateCircuitShape {
+                                table: rec.table.clone(),
+                                shape_id: rec.id.clone(),
+                                num_id,
+                                stream_path: rec.stream_path.clone(),
+                                constraint: plan.constraint,
+                                residual,
+                                out_cols: out_cols.clone(),
+                                seed: false,
+                                ready: ready_tx,
+                            })
+                            .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
+                        ready_rx
+                            .await
+                            .unwrap_or_else(|_| Err("sequencer dropped".to_string()))
+                            .map_err(|e| anyhow::anyhow!(e))?;
+                        self.state.lock().await.circuit_placement.insert(rec.id.clone(), placement);
+                        return Ok(());
+                    }
+                }
+                _ => {}
             }
         }
         // Compiled lazily, after the circuit branch: a circuit-served subquery record never

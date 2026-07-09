@@ -113,10 +113,11 @@ replication slot (`pgoutput` + a `<slot>_pub` publication, name from `ELECTRIC_I
 default `electric_ivm`),
 and starts the ingestor. Nothing else to migrate or install in the database.
 
-Optionally, enable the engine's circuit tier — disk-spillable table arrangements, counts
-pipelines, and circuit serving — with the `ELECTRIC_IVM_DBSP*` variables; the full reference
-table is in `ARCHITECTURE.md` §6b. The LinearLite demo (`pnpm demo:linearlite`) runs the
-engine with the full circuit configuration by default.
+The engine's circuit tier — disk-spillable table arrangements, counts pipelines, and circuit
+serving — is always on. Tune it (state dir, cache/spill budgets, which lookup indexes and
+counts pipelines to compile) with the `ELECTRIC_IVM_DBSP_*` variables; the full reference table
+is in `ARCHITECTURE.md` §6b. The LinearLite demo (`pnpm demo:linearlite`) runs the engine with
+the full circuit configuration by default.
 
 Check it's up:
 

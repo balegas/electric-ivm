@@ -46,12 +46,12 @@ Baseline engine RSS is ~19 MiB whether the database has 1,000 or 100,000 rows
 The data model is [`dbsp`](https://crates.io/crates/dbsp)'s: rows carry signed weights and a
 change is a **Z-set delta** (`Row`, a positional `Vec<Value>`; `Tup2<Row, ZWeight>`; and
 `ZWeight`, a signed `i64` multiplicity). The engine runs dbsp at exactly one place — **one
-shared, storage-enabled circuit per engine** (`ELECTRIC_IVM_DBSP=1`, `src/arrangements.rs`)
+shared, storage-enabled circuit per engine** (always-on infrastructure, `src/arrangements.rs`)
 that maintains **table arrangements** (pk + declared lookup columns) whose batches spill to
 disk as tables grow, plus **counts pipelines** (a live COUNT per group). It serves subquery
 flip re-derivations from local snapshots instead of Postgres query-backs (with automatic
-Postgres fallback), and, with `ELECTRIC_IVM_DBSP_SERVE=1`, serves membership shapes and
-decomposable COUNT aggregates end to end. See `ARCHITECTURE.md` §6b.
+Postgres fallback), and serves membership shapes and decomposable COUNT aggregates end to end
+(for shapes whose connecting columns are arrangement-indexed). See `ARCHITECTURE.md` §6b.
 
 There are deliberately **no per-shape circuits and no per-shape threads**: the routing and
 fallback tiers are plain Rust — key routing and stateless tri-valued predicate evaluation.
@@ -211,11 +211,11 @@ every change, so a deployment leaning on many such shapes still degrades linearl
 ### 3.3 Subqueries → shared inner-set nodes (`subquery.rs`)
 
 A subquery shape's `WHERE` contains `col [NOT] IN (SELECT proj FROM inner WHERE …)`, possibly
-nested. With circuit serving on (`ELECTRIC_IVM_DBSP_SERVE=1`), single-level non-negated
-membership subqueries over arrangement-indexed columns are served by the circuit instead —
-seeded from arrangement snapshots, maintained by cohort routing in the sequencer
-(`ARCHITECTURE.md` §6b). The registry described here serves everything else: nested, negated,
-and multi-subquery predicates, and every subquery when the circuit is off. Subqueries are
+nested. Single-level non-negated membership subqueries over arrangement-indexed columns are
+served by the always-on circuit instead — seeded from arrangement snapshots, maintained by
+cohort routing in the sequencer (`ARCHITECTURE.md` §6b). The registry described here serves
+everything else: nested, negated, and multi-subquery predicates, and any subquery whose columns
+are not arrangement-indexed. Subqueries are
 inherently cross-table (a change to `inner` moves rows of the outer
 table), so they route through one shared `Arc<Mutex<SubqueryRegistry>>` the sequencer calls.
 
@@ -401,7 +401,7 @@ dominate.
 
 ### 4.5 Disk
 
-Disk holds exactly one kind of engine state: the circuit's. When `ELECTRIC_IVM_DBSP=1`,
+Disk holds exactly one kind of engine state: the circuit's. The circuit is always on, and
 dbsp spills arrangement batches to Snappy-compressed layer files as tables grow and
 checkpoints the circuit periodically, so table-scale state is disk-resident and RAM-bounded
 (`ELECTRIC_IVM_DBSP_MIN_STORAGE_KB` / `_CACHE_MIB` / `_MAX_RSS_MB`; `ARCHITECTURE.md` §6b).

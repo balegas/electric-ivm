@@ -42,30 +42,32 @@ That partitioning is the load-bearing property; hold onto it.
 
 ## 2. Deploy the pipeline
 
-From the `tutorials/` directory, reset to episode 1's clean slate, add the todo tables, then turn
-the circuit **on** — three steps, because that is genuinely what a deploy is here:
+From the `tutorials/` directory, reset to episode 1's clean slate, add the todo tables, then
+**configure the circuit to serve the todo model** — three steps, because that is genuinely what a
+deploy is here:
 
 ```sh
-# 1. clean slate: postgres with just the `issues` table, engine with NO circuit
+# 1. clean slate: postgres with just the `issues` table; the engine's circuit runs, but has
+#    nothing app-specific to serve yet (only per-table primary-key arrangements)
 docker compose down -v && docker compose up -d --wait
 
 # 2. add the todo model (this is not part of the seed — a reset drops it)
 psql "postgres://postgres:password@localhost:5432/electric" \
   -f episodes/03-serving-model/setup.sql
 
-# 3. recreate the engine WITH the static circuit configured for those tables
+# 3. recreate the engine WITH the circuit's serving templates configured for those tables
 docker compose -f compose.yaml -f episodes/03-serving-model/compose.circuit.yaml \
   up -d --force-recreate engine
 ```
 
-Step 3 is the point. Unlike a shape — which the engine builds the instant you ask — **the circuit
-is configured by static environment variables, not by introspection**, and a dbsp circuit is fixed
-at construction. New pipelines ship with a restart. The overlay
-([`compose.circuit.yaml`](compose.circuit.yaml)) sets exactly the todo-model config from the recipe:
+Step 3 is the point. The circuit is always running — but *what it serves* is configured by static
+environment variables, not by introspection, and a dbsp circuit is fixed at construction. Unlike a
+shape — which the engine builds the instant you ask — a new serving template ships with a restart.
+The overlay ([`compose.circuit.yaml`](compose.circuit.yaml)) declares exactly the todo-model
+serving config from the recipe:
 
 ```sh
-ELECTRIC_IVM_DBSP=1                 # run the circuit
-ELECTRIC_IVM_DBSP_SERVE=1           # and serve shapes from it, end to end
+# the circuit is always on; these declare which shapes it serves end to end
 ELECTRIC_IVM_DBSP_INDEXES=todos.list_id,list_members.user_id,list_members.list_id
 ELECTRIC_IVM_DBSP_COUNTS=todos:list_id+done
 ```

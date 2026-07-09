@@ -33,12 +33,10 @@ Two observations do all the work:
 
 ## 2. The circuit the demo launches
 
-`examples/linearlite/start.ts` boots the engine with the full circuit configuration by
-default (pre-set `ELECTRIC_IVM_DBSP*` vars win over these):
+The circuit is always on; `examples/linearlite/start.ts` boots the engine with the full circuit
+configuration by default (pre-set `ELECTRIC_IVM_DBSP_*` vars win over these):
 
 ```sh
-ELECTRIC_IVM_DBSP=1
-ELECTRIC_IVM_DBSP_SERVE=1
 ELECTRIC_IVM_DBSP_INDEXES=issues.project_id,project_members.user_id,\
 project_members.project_id,comments.issue_id
 ELECTRIC_IVM_DBSP_COUNTS=issues:project_id+status+priority+username

@@ -176,9 +176,9 @@ The shape of the predicate picks the strategy (full detail + cost model: interna
   delta. No state. A necessary-conjunct index (`(column, op)` — equality hash buckets + ordered
   range bounds) selects only the candidate shapes per change; predicates with no indexable
   conjunct (OR/NOT/LIKE/`!=` at the top) fall back to a scan list.
-- **Subqueries** (`col [NOT] IN (SELECT …)`) → the cross-table registry (§6). With circuit
-  serving on (`ELECTRIC_IVM_DBSP_SERVE=1`), single-level non-negated membership subqueries are
-  served by the circuit instead (§6b); the registry serves the rest.
+- **Subqueries** (`col [NOT] IN (SELECT …)`) → the cross-table registry (§6). Single-level
+  non-negated membership subqueries whose columns are arrangement-indexed are served by the
+  always-on circuit instead (§6b); the registry serves the rest.
 
 **Aggregations** (electric-ivm extension, not part of the Electric-compatible API): a scalar
 COUNT/SUM/AVG/MIN/MAX over a non-subquery predicate, maintained incrementally as a fold over the
@@ -261,8 +261,8 @@ sequencer feeds every table's deltas into:
 
 ## 6b. The circuit: dbsp arrangements, counts, and serving
 
-`ELECTRIC_IVM_DBSP=1` (`arrangements.rs`) runs one shared, storage-enabled dbsp circuit per
-engine — the **circuit tier** of the serving model below. The sequencer feeds each transaction
+The circuit (`arrangements.rs`) is always-on infrastructure: one shared, storage-enabled dbsp
+circuit per engine — the **circuit tier** of the serving model below. The sequencer feeds each transaction
 into the circuit and steps it **before** fanning the transaction out, so everything that reads
 circuit state observes post-transaction snapshots — the same read-your-committed-writes
 guarantee a Postgres query-back gives. The circuit holds two kinds of state:
@@ -271,17 +271,18 @@ guarantee a Postgres query-back gives. The circuit holds two kinds of state:
   declared via `ELECTRIC_IVM_DBSP_INDEXES=table.col,…`. Arrangement batches spill to
   Snappy-compressed layer files as tables grow, so RAM stays bounded. They serve point lookups
   (subquery flip re-derivations and full re-derives read local snapshots instead of querying
-  Postgres back) and, with serving on, shape seeding. A lookup against a missing/unseeded
+  Postgres back) and shape seeding. A lookup against a missing/unseeded
   index returns `None` and the caller falls back to Postgres — correctness never depends on
   the circuit.
 - **Counts pipelines** — `ELECTRIC_IVM_DBSP_COUNTS=table:col+col,…` compiles, per table (at
   most one spec each), a `map_index(group) → weighted_count` pipeline: a live COUNT per
   distinct projection of the group columns.
 
-### Serving (`ELECTRIC_IVM_DBSP_SERVE=1`)
+### Serving
 
-With serving on, the circuit does not just accelerate lookups — it serves two shape classes
-end to end, inside the sequencer:
+The circuit does not just accelerate lookups — it serves two shape classes
+end to end, inside the sequencer (for shapes whose connecting columns are arrangement-indexed;
+everything else falls through to the routing/fallback tiers):
 
 - **Membership-subquery shapes**: a single-level, non-negated
   `col IN (SELECT proj FROM inner WHERE inner_col = $v)` cohort constraint (both columns
@@ -324,9 +325,12 @@ spill, while many level-0 batches force real merges (`spill_produces_layer_files
 
 ### Configuration reference
 
+The circuit itself is always on; these knobs only tune it. Empty `_INDEXES`/`_COUNTS` are valid
+(the circuit still builds per-table primary-key arrangements; serving simply kicks in only for
+shapes whose connecting column has a configured index).
+
 | variable | default | meaning |
 |---|---|---|
-| `ELECTRIC_IVM_DBSP` | off | `1` enables the circuit (arrangements + counts pipelines). |
 | `ELECTRIC_IVM_DBSP_DIR` | `<ELECTRIC_STORAGE_DIR \| ./data>/dbsp/<slot>` | state directory (layer files, checkpoints, `meta.json`); slot-keyed by default. |
 | `ELECTRIC_IVM_DBSP_CACHE_MIB` | dbsp default (256/thread) | storage block-cache budget, MiB. |
 | `ELECTRIC_IVM_DBSP_MIN_STORAGE_KB` | `1024` | spill threshold, KiB: batches at least this large go to disk when merged (`0` spills everything eligible). |
@@ -334,13 +338,11 @@ spill, while many level-0 batches force real merges (`spill_produces_layer_files
 | `ELECTRIC_IVM_DBSP_CHECKPOINT_SECS` | `60` | checkpoint cadence, seconds (`0` = only at shutdown). |
 | `ELECTRIC_IVM_DBSP_INDEXES` | none | lookup indexes beyond each table's pk: `table.column[,…]`. |
 | `ELECTRIC_IVM_DBSP_COUNTS` | none | counts pipelines: `table:col+col[,…]`; at most one per table. |
-| `ELECTRIC_IVM_DBSP_SERVE` | off | `1` serves membership shapes and decomposable COUNTs from the circuit. |
 
-The conformance suite passes with the circuit off, on, and on with serving — the test harness
-passes `ELECTRIC_IVM_DBSP*` vars through to the engine, so all three modes run against the
-same oracle.
+The conformance suite runs against the always-on circuit — the harness passes the
+`ELECTRIC_IVM_DBSP_*` tunables through to the engine and runs against the same oracle.
 
-- **Observability**: when the circuit is on, `/graph` carries an `arrangements` section — the
+- **Observability**: `/graph` carries an `arrangements` section — the
   compiled circuit as stable-id nodes (`arr:input:<table>` per table, `arr:index:<table>:<cols>`
   per index pipeline, `arr:counts:<table>` per counts pipeline, with seeded flags and the
   served/fallback lookup counters) plus a `consumers` list connecting each node to the

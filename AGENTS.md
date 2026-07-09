@@ -189,8 +189,9 @@ ELECTRIC_IVM_ENGINE_PREBUILT=1 pnpm test  # full vitest suite (set the var iff y
 ```
 
 For anything touching the circuit (`arrangements.rs`, circuit serving in `engine.rs`), run the
-conformance suite in all three modes — the harness passes the vars through to the engine:
-plain, `ELECTRIC_IVM_DBSP=1`, and `ELECTRIC_IVM_DBSP=1 ELECTRIC_IVM_DBSP_SERVE=1`.
+conformance suite. The circuit is always-on infrastructure now — there is no off mode — so the
+suite exercises it on every run. The `ELECTRIC_IVM_DBSP_INDEXES`/`_COUNTS` tunables decide which
+shapes the circuit actually serves versus which fall through to the routing/fallback tiers.
 
 Then, for anything touching the engine's live path, shapes, or the visualizer: **drive the demo as
 above** — the suites don't render a canvas or exercise the browser.
@@ -198,7 +199,7 @@ above** — the suites don't render a canvas or exercise the browser.
 ## Invariants (violate these and conformance will catch you — eventually)
 
 - **Postgres is the system of record; the engine's hot path holds no table copy.** Backfills read
-  matching rows in a `REPEATABLE READ` snapshot. (The circuit tier, `ELECTRIC_IVM_DBSP=1`,
+  matching rows in a `REPEATABLE READ` snapshot. (The always-on circuit tier
   holds disk-spillable *derived* state — table arrangements + counts pipelines — rebuildable,
   with Postgres fallback for lookups, never the record of truth; see `ARCHITECTURE.md` §6b.)
 - **Backfill↔live is fenced by xid visibility, NOT by LSN.** Every seeded structure carries a

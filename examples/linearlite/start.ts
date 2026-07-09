@@ -270,8 +270,6 @@ try {
   const dbspDir = mkdtempSync(join(tmpdir(), 'el-linearlite-dbsp-'))
   engineProc = spawn(join(repoRoot(), 'target', 'debug', 'electric-ivm-engine'), [], {
     env: {
-      ELECTRIC_IVM_DBSP: '1',
-      ELECTRIC_IVM_DBSP_SERVE: '1',
       ELECTRIC_IVM_DBSP_DIR: dbspDir,
       ELECTRIC_IVM_DBSP_INDEXES:
         'issues.project_id,project_members.user_id,project_members.project_id,comments.issue_id',

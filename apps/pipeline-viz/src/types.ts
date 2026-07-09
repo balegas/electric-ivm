@@ -72,8 +72,8 @@ export interface OpEdge {
 
 /** The compiled dbsp arrangement pipeline (crate::engine::ArrangementGraph): static
  *  infrastructure built once at boot — one input per table, one map_index→integrate_trace
- *  pipeline per index — plus its live consumers and the layer's lookup counters. Present only
- *  when the engine runs with ELECTRIC_IVM_DBSP=1. */
+ *  pipeline per index — plus its live consumers and the layer's lookup counters. Present
+ *  whenever the always-on circuit is running (Postgres mode). */
 export interface ArrangementGraph {
   /** Lookups served from arrangement snapshots. */
   served: number

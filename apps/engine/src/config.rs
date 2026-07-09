@@ -64,8 +64,9 @@ pub struct Config {
     /// are never registered, so nothing can subscribe and the hot-path trace gating stays on its
     /// zero-subscriber fast path. Default on. Note: the surface is unauthenticated either way.
     pub trace: bool,
-    /// dbsp-backed table arrangements (`ELECTRIC_IVM_DBSP=1`; see `arrangements.rs`), or `None`.
-    pub dbsp: Option<DbspConfig>,
+    /// dbsp-backed table arrangements (always built; see `arrangements.rs`). The circuit is
+    /// mandatory infrastructure — the sub-knobs below tune it, but it can no longer be turned off.
+    pub dbsp: DbspConfig,
     /// Unknown/unimplemented `ELECTRIC_*` vars, accepted as no-ops and logged once at boot.
     pub noop_vars: Vec<String>,
 }
@@ -94,9 +95,6 @@ pub struct DbspConfig {
     /// maintains a live COUNT per distinct group projection; COUNT aggregates whose predicate
     /// decomposes over these columns are served from the groups.
     pub counts: Vec<(String, Vec<String>)>,
-    /// Serve template-matching shapes/aggregates from the circuit (`ELECTRIC_IVM_DBSP_SERVE=1`):
-    /// seeding and move-in/out come from arrangement snapshots instead of Postgres backfills.
-    pub serve: bool,
 }
 
 /// `ELECTRIC_*` vars the engine actually reads and acts on. Anything else matching `^ELECTRIC_`
@@ -234,60 +232,55 @@ impl Config {
             .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
             .unwrap_or(true);
 
-        let dbsp = g("ELECTRIC_IVM_DBSP")
-            .filter(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"))
-            .map(|_| DbspConfig {
-                // Default dir is keyed by the replication slot: dbsp state is only valid for
-                // the database identity it was built from, and parallel engines (conformance
-                // harnesses) get disjoint state dirs for free.
-                dir: g("ELECTRIC_IVM_DBSP_DIR")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| {
-                        std::path::Path::new(storage_dir.as_deref().unwrap_or("./data"))
-                            .join("dbsp")
-                            .join(&slot)
-                    }),
-                cache_mib: g("ELECTRIC_IVM_DBSP_CACHE_MIB").and_then(|s| s.trim().parse().ok()),
-                min_storage_bytes: Some(
-                    g("ELECTRIC_IVM_DBSP_MIN_STORAGE_KB")
-                        .and_then(|s| s.trim().parse::<usize>().ok())
-                        .unwrap_or(1024)
-                        * 1024,
-                ),
-                max_rss_bytes: g("ELECTRIC_IVM_DBSP_MAX_RSS_MB")
-                    .and_then(|s| s.trim().parse::<u64>().ok())
-                    .map(|mb| mb * 1024 * 1024),
-                checkpoint_every: match g("ELECTRIC_IVM_DBSP_CHECKPOINT_SECS")
-                    .and_then(|s| s.trim().parse::<u64>().ok())
-                {
-                    Some(0) => None,
-                    Some(s) => Some(Duration::from_secs(s)),
-                    None => Some(Duration::from_secs(60)),
-                },
-                indexes: g("ELECTRIC_IVM_DBSP_INDEXES")
-                    .unwrap_or_default()
-                    .split(',')
-                    .filter_map(|s| {
-                        let (t, c) = s.trim().split_once('.')?;
-                        Some((t.trim().to_string(), c.trim().to_string()))
-                    })
-                    .collect(),
-                counts: g("ELECTRIC_IVM_DBSP_COUNTS")
-                    .unwrap_or_default()
-                    .split(',')
-                    .filter_map(|s| {
-                        let (t, cols) = s.trim().split_once(':')?;
-                        let cols: Vec<String> = cols
-                            .split('+')
-                            .map(|c| c.trim().to_string())
-                            .filter(|c| !c.is_empty())
-                            .collect();
-                        if cols.is_empty() { None } else { Some((t.trim().to_string(), cols)) }
-                    })
-                    .collect(),
-                serve: g("ELECTRIC_IVM_DBSP_SERVE")
-                    .is_some_and(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on")),
-            });
+        // The dbsp arrangement circuit is always built — it is mandatory infrastructure, no longer
+        // gated by an on/off flag. The knobs below only tune it (state dir, cache/spill budgets,
+        // extra indexes, counts pipelines); empty `_INDEXES`/`_COUNTS` are valid (the circuit still
+        // builds per-table primary-key arrangements).
+        let dbsp = DbspConfig {
+            // Default dir is keyed by the replication slot: dbsp state is only valid for the
+            // database identity it was built from, and parallel engines (conformance harnesses)
+            // get disjoint state dirs for free.
+            dir: g("ELECTRIC_IVM_DBSP_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| {
+                std::path::Path::new(storage_dir.as_deref().unwrap_or("./data")).join("dbsp").join(&slot)
+            }),
+            cache_mib: g("ELECTRIC_IVM_DBSP_CACHE_MIB").and_then(|s| s.trim().parse().ok()),
+            min_storage_bytes: Some(
+                g("ELECTRIC_IVM_DBSP_MIN_STORAGE_KB")
+                    .and_then(|s| s.trim().parse::<usize>().ok())
+                    .unwrap_or(1024)
+                    * 1024,
+            ),
+            max_rss_bytes: g("ELECTRIC_IVM_DBSP_MAX_RSS_MB")
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .map(|mb| mb * 1024 * 1024),
+            checkpoint_every: match g("ELECTRIC_IVM_DBSP_CHECKPOINT_SECS").and_then(|s| s.trim().parse::<u64>().ok())
+            {
+                Some(0) => None,
+                Some(s) => Some(Duration::from_secs(s)),
+                None => Some(Duration::from_secs(60)),
+            },
+            indexes: g("ELECTRIC_IVM_DBSP_INDEXES")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|s| {
+                    let (t, c) = s.trim().split_once('.')?;
+                    Some((t.trim().to_string(), c.trim().to_string()))
+                })
+                .collect(),
+            counts: g("ELECTRIC_IVM_DBSP_COUNTS")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|s| {
+                    let (t, cols) = s.trim().split_once(':')?;
+                    let cols: Vec<String> = cols
+                        .split('+')
+                        .map(|c| c.trim().to_string())
+                        .filter(|c| !c.is_empty())
+                        .collect();
+                    if cols.is_empty() { None } else { Some((t.trim().to_string(), cols)) }
+                })
+                .collect(),
+        };
 
         Config {
             pg_url,
@@ -531,6 +524,37 @@ mod tests {
         assert!(!cfg(&[("ELECTRIC_IVM_TRACE", "off")]).trace);
         assert!(cfg(&[("ELECTRIC_IVM_TRACE", "1")]).trace);
         assert!(cfg(&[("ELECTRIC_IVM_TRACE", "true")]).trace);
+    }
+
+    #[test]
+    fn dbsp_circuit_is_always_built() {
+        // The circuit is mandatory infrastructure: no on/off flag. With nothing configured it
+        // still resolves, with an empty index/counts config and a slot-keyed default state dir.
+        let c = cfg(&[]);
+        assert!(c.dbsp.indexes.is_empty(), "empty _INDEXES is valid");
+        assert!(c.dbsp.counts.is_empty(), "empty _COUNTS is valid");
+        assert!(c.dbsp.dir.ends_with("dbsp/electric_ivm"), "default dir is slot-keyed: {:?}", c.dbsp.dir);
+        assert_eq!(c.dbsp.checkpoint_every, Some(Duration::from_secs(60)));
+        assert_eq!(c.dbsp.min_storage_bytes, Some(1024 * 1024));
+    }
+
+    #[test]
+    fn dbsp_tunables_parse() {
+        let c = cfg(&[
+            ("ELECTRIC_IVM_DBSP_DIR", "/tmp/dbsp"),
+            ("ELECTRIC_IVM_DBSP_INDEXES", "todos.list_id, list_members.user_id"),
+            ("ELECTRIC_IVM_DBSP_COUNTS", "todos:list_id+done"),
+            ("ELECTRIC_IVM_DBSP_CHECKPOINT_SECS", "0"),
+            ("ELECTRIC_IVM_DBSP_MIN_STORAGE_KB", "2048"),
+        ]);
+        assert_eq!(c.dbsp.dir, std::path::PathBuf::from("/tmp/dbsp"));
+        assert_eq!(
+            c.dbsp.indexes,
+            vec![("todos".to_string(), "list_id".to_string()), ("list_members".to_string(), "user_id".to_string())]
+        );
+        assert_eq!(c.dbsp.counts, vec![("todos".to_string(), vec!["list_id".to_string(), "done".to_string()])]);
+        assert_eq!(c.dbsp.checkpoint_every, None, "0 means checkpoint only at shutdown");
+        assert_eq!(c.dbsp.min_storage_bytes, Some(2048 * 1024));
     }
 
     #[test]

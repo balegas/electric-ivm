@@ -221,7 +221,7 @@ export const KIND_META: Record<NodeKind, KindMeta> = {
       'share this one stream, ref-counted; the chip counts envelopes appended (backfill + live).',
   },
 
-  // --- the compiled dbsp arrangement pipeline (static; ELECTRIC_IVM_DBSP=1) -------------------
+  // --- the compiled dbsp arrangement pipeline (static; always-on infrastructure) --------------
   'arr-input': {
     color: '#4338ca',
     bg: '#e0e7ff',

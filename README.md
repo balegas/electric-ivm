@@ -53,7 +53,7 @@ scales with the size of the *change*, not the size of the *data*.
 electric-ivm is built on this model. Every replicated change becomes a Z-set delta (Postgres's
 `REPLICA IDENTITY FULL` supplies the old row, so updates retract precisely), and every shape,
 subquery, and aggregation is an incremental operator over those deltas. The engine serves them
-from **three tiers**. One shared, storage-enabled dbsp **circuit** (`ELECTRIC_IVM_DBSP=1`)
+from **three tiers**. One shared, storage-enabled dbsp **circuit** — always-on infrastructure —
 maintains per-table arrangements and counts pipelines whose state spills to disk as tables
 grow; it seeds and maintains membership (visibility-subquery) shapes and decomposable COUNT
 aggregates entirely from local snapshots — no Postgres backfill. Equality and template shapes

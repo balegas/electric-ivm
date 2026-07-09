@@ -39,7 +39,7 @@ The load-bearing separation is between what is *compiled* and what is *routed*:
    route finds a change's shapes in `O(log N)`, whereas a circuit shape would scan every
    delta linearly.
 2. **Time-varying membership** (`project_id IN (SELECT … WHERE user_id = $me)`) → the
-   circuit (`ELECTRIC_IVM_DBSP_SERVE=1`): the membership table's deltas subscribe/unsubscribe
+   always-on circuit: the membership table's deltas subscribe/unsubscribe
    the shape's cohort groups, and move-in/move-out are emitted from the post-transaction
    arrangement snapshots — no Postgres backfill, no snapshot gate. The dynamism moves from
    computation into routing.
@@ -111,13 +111,13 @@ cost a thousand subscriptions.
 
 ## Setting up a pipeline in code
 
-All three tiers ship in the engine. The fallback is always on. The circuit
-(`src/arrangements.rs`, `ELECTRIC_IVM_DBSP=1`) compiles two template kinds from env
+All three tiers ship in the engine and are always on. The circuit
+(`src/arrangements.rs`) compiles two template kinds from env
 configuration: **lookup arrangements** (`ELECTRIC_IVM_DBSP_INDEXES`) that serve subquery
 re-derivations and shape seeding from local snapshots, and **counts pipelines**
-(`ELECTRIC_IVM_DBSP_COUNTS`) that maintain a live COUNT per group. With
-`ELECTRIC_IVM_DBSP_SERVE=1` the sequencer serves membership shapes and decomposable COUNT
-aggregates from that state end to end (`engine.rs`; `ARCHITECTURE.md` §6b). New template
+(`ELECTRIC_IVM_DBSP_COUNTS`) that maintain a live COUNT per group. The sequencer serves
+membership shapes and decomposable COUNT aggregates from that state end to end, for shapes whose
+connecting columns are arrangement-indexed (`engine.rs`; `ARCHITECTURE.md` §6b). New template
 kinds extend the same skeleton; the feed, stepping, checkpoint, and restore plumbing in
 `arrangements.rs` is reused unchanged.
 
@@ -174,8 +174,8 @@ The todo circuit above maps onto the engine's compiled template kinds directly:
   seeded by summing groups and updated live. The badge for list L is the `(L, false)` group;
   a dashboard sums the user's groups — one pipeline serves every filter combination.
 - **(B)+(C) is a circuit-served membership shape** — with
-  `ELECTRIC_IVM_DBSP_INDEXES=todos.list_id,list_members.user_id,list_members.list_id` and
-  serving on, the shape `todos WHERE list_id IN (SELECT list_id FROM list_members WHERE
+  `ELECTRIC_IVM_DBSP_INDEXES=todos.list_id,list_members.user_id,list_members.list_id`
+  declared, the shape `todos WHERE list_id IN (SELECT list_id FROM list_members WHERE
   user_id = $me)` is seeded from the arrangement snapshots and maintained by cohort routing
   in the sequencer: the `list_members` deltas refcount the shape's cohort groups, and
   move-in/move-out read the post-transaction snapshots (`CohortGroups`, `engine.rs`).
@@ -226,7 +226,6 @@ move-in is served from the group's post-transaction snapshot, not by computing a
 4. Drain the new handle in the step loop; route by group at the delivery edge.
 5. The layout fingerprint changes → state is discarded and reseeded on next boot; that is
    the intended deploy story. `cargo test -p electric-ivm-engine` and the conformance suite
-   (`pnpm test:conformance` — run with the circuit off, on, and on with
-   `ELECTRIC_IVM_DBSP_SERVE=1`) are the safety net.
+   (`pnpm test:conformance` — always exercises the on circuit) are the safety net.
 
 `linearlite-circuit-design.md` maps the full flagship application onto these tiers.
