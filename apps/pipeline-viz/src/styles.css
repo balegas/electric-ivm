@@ -135,6 +135,13 @@ body,
 .btn:hover {
   background: #f1f5f9;
 }
+/* An equal-width action row: every button shares the space and stays one line, so a longer
+   label ("Entire graph") no longer wraps taller than its neighbours. */
+.toolbar-eq .btn {
+  flex: 1;
+  white-space: nowrap;
+  text-align: center;
+}
 .btn-on {
   background: #0f172a;
   color: #fff;
@@ -984,9 +991,29 @@ body,
   animation: flash-fadeout 2.5s forwards;
 }
 
+/* inline "show details" control — the primary way to open a shape's detail panel from the list.
+   Kept gently visible (not hover-only like delete) so it stays discoverable. `margin-left: auto`
+   pushes it and the delete control together to the row's right edge. */
+.shape-detail {
+  margin-left: auto;
+  color: #64748b;
+  font-size: 13px;
+  padding: 0 4px;
+  border-radius: 5px;
+  opacity: 0.55;
+  transition: opacity 0.12s, background 0.12s, color 0.12s;
+}
+.shape-row:hover .shape-detail {
+  opacity: 1;
+}
+.shape-detail:hover {
+  color: #fff;
+  background: #2563eb;
+}
+
 /* shape deletion controls */
 .shape-del {
-  margin-left: auto;
+  margin-left: 2px;
   color: #94a3b8;
   font-size: 11px;
   font-weight: 700;

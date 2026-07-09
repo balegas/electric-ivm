@@ -187,6 +187,9 @@ export default function App() {
   const [loadedAt, setLoadedAt] = useState<number>(0)
   const [search, setSearch] = useState('')
   const [focus, setFocus] = useState<{ id: string; ref: NodeRef } | null>(null)
+  // Clicking a node focuses it (highlights its connections) but no longer pops the detail panel;
+  // the panel opens on demand via the sidebar "Show details" button. Once open it tracks the focus.
+  const [showDetail, setShowDetail] = useState(false)
   const [view, setView] = useState<View>('logical')
   // Collapse the fan-out of shapes that share one query template (same route join) into a single
   // node badged with the count — on by default, since a real app opens the same handful of shapes
@@ -553,7 +556,7 @@ export default function App() {
           </button>
         </div>
 
-        <div className="toolbar">
+        <div className="toolbar toolbar-eq">
           <button
             className={mode === 'all' ? 'btn btn-on' : 'btn'}
             onClick={() => {
@@ -639,14 +642,22 @@ export default function App() {
                     onClick={(e) => {
                       const additive = e.metaKey || e.ctrlKey || e.shiftKey
                       toggle(s.id, additive)
-                      // A plain click also opens the detail panel for this shape (SQL + live contents);
-                      // additive clicks just build up the multi-select without stealing focus.
+                      // A plain click focuses this shape (and, if the detail panel is open, it tracks
+                      // the focus); it no longer pops the panel. Additive clicks just build up the
+                      // multi-select without stealing focus. Double-click (below) opens the panel.
                       if (!additive) {
                         setFocus({
                           id: `shape:${s.id}`,
                           ref: s.aggregate ? { kind: 'aggshape', shapeId: s.id } : { kind: 'shape', shapeId: s.id },
                         })
                       }
+                    }}
+                    onDoubleClick={() => {
+                      setFocus({
+                        id: `shape:${s.id}`,
+                        ref: s.aggregate ? { kind: 'aggshape', shapeId: s.id } : { kind: 'shape', shapeId: s.id },
+                      })
+                      setShowDetail(true)
                     }}
                     title={shapeSql(s)}
                   >
@@ -662,6 +673,21 @@ export default function App() {
                       {s.state && s.state !== 'active' ? (
                         <span className={`badge k-life k-life-${s.state}`}>{s.state}</span>
                       ) : null}
+                      <span
+                        className="shape-detail"
+                        role="button"
+                        title="Show details — SQL, live contents, internals"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          setFocus({
+                            id: `shape:${s.id}`,
+                            ref: s.aggregate ? { kind: 'aggshape', shapeId: s.id } : { kind: 'shape', shapeId: s.id },
+                          })
+                          setShowDetail(true)
+                        }}
+                      >
+                        ⓘ
+                      </span>
                       <span
                         className="shape-del"
                         role="button"
@@ -781,7 +807,14 @@ export default function App() {
             fitView
             minZoom={0.1}
             onNodeClick={(_e, n) => setFocus({ id: n.id, ref: (n.data as VizNodeData).ref })}
-            onPaneClick={() => setFocus(null)}
+            onNodeDoubleClick={(_e, n) => {
+              setFocus({ id: n.id, ref: (n.data as VizNodeData).ref })
+              setShowDetail(true)
+            }}
+            onPaneClick={() => {
+              setFocus(null)
+              setShowDetail(false)
+            }}
             proOptions={{ hideAttribution: true }}
           >
             <Background gap={20} color="#eef2f7" />
@@ -791,13 +824,13 @@ export default function App() {
         )}
         <div className="stamp">
           {loadedAt ? `updated ${new Date(loadedAt).toLocaleTimeString()}` : ''}
-          {focus ? ' · click a node for details' : ''}
+          {focus ? ' · focused — click ⓘ on a shape (or double-click a node) for the panel' : ''}
         </div>
-        {focus && graph ? (
+        {showDetail && focus && graph ? (
           <DetailPanel
             node={focus.ref}
             graph={graph}
-            onClose={() => setFocus(null)}
+            onClose={() => setShowDetail(false)}
             onSelectShape={(id) => toggle(id, false)}
           />
         ) : null}
