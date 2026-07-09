@@ -240,8 +240,10 @@ const KIND_SIZE: Partial<Record<NodeKind, { w: number; h: number }>> = {
   sqnode: { w: 250, h: KIND_H },
   shape: { w: 200, h: KIND_H },
   agg: { w: 210, h: KIND_H },
-  // circuit-view operators (denser boxes, same height so ranks stay level)
-  'op-source': { w: 150, h: KIND_H },
+  // circuit-view operators (denser boxes, same height so ranks stay level). op-source is a touch
+  // wider than the rest: it carries the folded-arrangement count badge (`⧉ N idx · M cnt`) beside
+  // its SOURCE tag, and the widest table names (`project_members`).
+  'op-source': { w: 176, h: KIND_H },
   'op-delta': { w: 120, h: KIND_H },
   'op-filter': { w: 150, h: KIND_H },
   'op-key': { w: 150, h: KIND_H },

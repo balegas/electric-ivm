@@ -181,10 +181,11 @@ function SinkView({ shape }: { shape: GraphShape | undefined }) {
 
 const BROWSE_PAGE = 25
 
-/** The compiled dbsp arrangements folded onto a table's SOURCE node. On the canvas the arrangement
- *  lane is collapsed onto the source (a count badge) to keep the graph legible; here, where a click
- *  affords the room, the indexes and counts pipelines are spelled out in full. Read straight from
- *  `graph.arrangements` — every index/counts entry whose table is this one. */
+/** The compiled dbsp arrangements folded onto a table's SOURCE node, as a compact list. On the
+ *  canvas the arrangement lane is collapsed onto the source (a count badge) to keep the graph
+ *  legible; here, where a click affords the room, the indexes and counts pipelines are spelled out.
+ *  The prose that explains what each KIND does lives in [`SourceArrangementNotes`], rendered lower
+ *  so the row browser stays near the top. Read straight from `graph.arrangements`. */
 function SourceArrangements({ table, arr }: { table: string; arr: EngineGraph['arrangements'] }) {
   if (!arr) return null
   const indexes = arr.indexes.filter((i) => i.table === table)
@@ -207,8 +208,32 @@ function SourceArrangements({ table, arr }: { table: string; arr: EngineGraph['a
           </div>
         ))}
       </div>
-      <div className="dp-note">{KIND_META['arr-index'].inside}</div>
-      {counts.length > 0 ? <div className="dp-note">{KIND_META['arr-counts'].inside}</div> : null}
+    </>
+  )
+}
+
+/** The "what this kind does" prose for a source's folded arrangements — one headed card per kind
+ *  the table actually has. Rendered BELOW the row browser (verbose reference, not the headline), and
+ *  headed like `InsideNote` so the panel's explanation cards read consistently. */
+function SourceArrangementNotes({ table, arr }: { table: string; arr: EngineGraph['arrangements'] }) {
+  if (!arr) return null
+  const hasIndex = arr.indexes.some((i) => i.table === table)
+  const hasCounts = (arr.counts ?? []).some((c) => c.table === table)
+  if (!hasIndex && !hasCounts) return null
+  return (
+    <>
+      {hasIndex ? (
+        <div className="dp-note dp-inside">
+          <span className="dp-inside-h">what an index remembers</span>
+          {KIND_META['arr-index'].inside}
+        </div>
+      ) : null}
+      {hasCounts ? (
+        <div className="dp-note dp-inside">
+          <span className="dp-inside-h">what a counts pipeline computes</span>
+          {KIND_META['arr-counts'].inside}
+        </div>
+      ) : null}
     </>
   )
 }
@@ -1030,13 +1055,17 @@ export function DetailPanel({
           </>
         ) : null}
         <InsideNote kind={node.opKind} />
-        {/* Source operator: the table's compiled arrangements (folded onto this node on the canvas),
-            then the same write + browse affordances as the logical table node. */}
+        {/* Source operator: the table's compiled arrangements (folded onto this node on the canvas)
+            as a compact list, then the row browser near the top where it is most useful, and the
+            verbose per-kind explanation cards last. */}
         {node.opKind === 'op-source' && opTable ? (
           <SourceArrangements table={opTable} arr={graph.arrangements} />
         ) : null}
         {node.opKind === 'op-source' && opTable ? (
           <TableBrowser table={opTable} />
+        ) : null}
+        {node.opKind === 'op-source' && opTable ? (
+          <SourceArrangementNotes table={opTable} arr={graph.arrangements} />
         ) : null}
         {/* Δ change operator: the reconstructed Z-set of the most recent change on this table. */}
         {node.opKind === 'op-delta' && opTable ? <DeltaView table={opTable} /> : null}

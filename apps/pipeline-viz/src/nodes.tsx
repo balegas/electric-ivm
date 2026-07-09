@@ -128,8 +128,7 @@ export function PipelineNode({ id, data }: NodeProps) {
               className="pnode-arr"
               title={`compiled dbsp arrangements on this table — click the source to see the ${indexed.indexes} index${indexed.indexes === 1 ? '' : 'es'}${indexed.counts ? ` and ${indexed.counts} counts pipeline${indexed.counts === 1 ? '' : 's'}` : ''}. ${indexed.seeded ? 'seeded' : 'seeding…'}`}
             >
-              ⧉ {indexed.indexes} idx{indexed.counts ? ` · ${indexed.counts}× count` : ''}
-              {indexed.seeded ? '' : ' · seeding…'}
+              ⧉ {indexed.indexes} idx{indexed.counts ? ` · ${indexed.counts} cnt` : ''}
             </span>
           ) : null}
           {parked ? <span className={`pnode-life pnode-life-${d.life}`}>{d.life}</span> : null}
