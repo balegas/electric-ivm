@@ -50,6 +50,8 @@ export interface VizNodeData extends Record<string, unknown> {
   sub?: string
   /** How many things share this node (family members / subquery refcount) — drives the "shared" badge. */
   shared?: number
+  /** Render as a stack of cards — a collapsed `shapegroup` standing in for its N member shapes. */
+  stack?: boolean
   /** An id shown inline in the header tag row (e.g. the shape id next to "SHAPE OUTPUT"). */
   idTag?: string
   /** Render `label` as a highlighted expression (used for a shape's filter predicate). */
@@ -181,6 +183,7 @@ function buildFull(g: EngineGraph, group: boolean): { nodes: Map<string, RawNode
           kind: 'shape',
           label: `${shared} shapes`,
           sub: `route by (${s.familyKey!.join(', ')})`,
+          stack: true,
           ref: { kind: 'shapegroup', table: s.table, keyCols: s.familyKey! },
         })
         edge(fid, gid, 'route')
