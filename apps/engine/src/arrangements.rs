@@ -1,11 +1,13 @@
-//! Storage-backed table arrangements, powered by dbsp.
+//! Storage-backed table arrangements and counts pipelines, powered by dbsp — the circuit tier.
 //!
-//! This module reintroduces dbsp — not as per-shape circuits (removed for cause; see
-//! `docs/ARCHITECTURE.md` §"routing model") but as the engine's **table-state layer**: one
-//! shared circuit whose arrangements hold replicated tables indexed by primary key and by
-//! registered lookup columns, with dbsp's storage layer spilling batches to disk as tables
-//! grow. Point lookups that previously required a Postgres query-back (subquery flip
-//! re-derivation, `query_all` re-derives) are served from consistent local snapshots instead.
+//! One shared circuit per engine (never per-shape circuits: structure must not scale with
+//! subscriptions — see `docs/ARCHITECTURE.md` §6b). Its arrangements hold replicated tables
+//! indexed by primary key and by registered lookup columns, with dbsp's storage layer
+//! spilling batches to disk as tables grow; its counts pipelines maintain a live COUNT per
+//! group projection. Point lookups (subquery flip re-derivation, `query_all` re-derives) are
+//! served from consistent local snapshots, with Postgres as the fallback; with serving
+//! enabled, the sequencer seeds and maintains membership shapes and decomposable COUNT
+//! aggregates from this state (`engine.rs`).
 //!
 //! Design constraints, and how they are honored:
 //!
@@ -13,10 +15,10 @@
 //!   schemas are known, from the index specs registered up front. A lookup against an index
 //!   that does not exist returns `None` and the caller falls back to Postgres — correctness
 //!   never depends on an index being present.
-//! - **Spilling engages at merge and checkpoint boundaries** (the 0.299 memtest lesson:
-//!   a static trace seeded as one giant batch never merges, so it never spills). Seeding
-//!   therefore feeds tables in bounded chunks — many level-0 batches force real merges —
-//!   and periodic checkpoints persist every in-memory batch as layer files.
+//! - **Spilling engages at merge and checkpoint boundaries** — a static trace seeded as one
+//!   giant batch never merges, so it never spills. Seeding therefore feeds tables in bounded
+//!   chunks — many level-0 batches force real merges — and periodic checkpoints persist
+//!   every in-memory batch as layer files.
 //! - **Restart**: each checkpoint records the change-log position and the `(lsn, seq)`
 //!   de-duplication highwater in `meta.json` next to dbsp's own state. On boot the circuit
 //!   resumes from the checkpoint and the engine replays the change log from the recorded

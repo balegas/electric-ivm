@@ -1,10 +1,10 @@
-# A single dbsp circuit for all of LinearLite's queries
+# How LinearLite's query graph is served
 
-Design study: can one deploy-time dbsp circuit serve every query the LinearLite app makes?
-Answer: yes — the app's whole query surface collapses to seven templates, none of which needs
-per-user state. This documents the inventory, the circuit, and what it would replace.
-(Design only; the engine's dynamic-shape path is unchanged. See `ARCHITECTURE.md` §6b for the
-arrangement layer that exists today — this is the "Level 3" end state of that ladder.)
+The flagship demo (`examples/linearlite`) exercises every tier of the serving model
+(`building-app-pipelines.md`): the circuit serves its visibility shapes and its live header
+count, the routing tier serves its equality and reference shapes, and its ordered pages go to
+Postgres by design. This documents the query inventory, the circuit the demo launches with,
+and which tier serves what.
 
 ## 1. Query inventory (every call site in `examples/linearlite`)
 
@@ -23,95 +23,63 @@ arrangement layer that exists today — this is the "Level 3" end state of that 
 Two observations do all the work:
 
 - **Visibility is cohort-shaped.** Every member of a project sees the same issues. The app
-  already exploits this: the browse view mounts one `ProjectSubsetFeed` **per member project**
-  and merges client-side, and the count expands visibility to an explicit project-id list
-  (`aggProjects = memberIds`). The per-user subquery (`visibleIssues($me)`) is per-user only in
-  its *routing*, not in its *data*.
-- **Ordering/pagination is deliberately not IVM.** Subsets (#7, #8) are keyset pages evaluated
-  by Postgres with a changes-only live tail. That division of labor is good; the circuit
-  should not absorb it.
+  exploits this everywhere: the browse view mounts one `ProjectSubsetFeed` **per member
+  project** and merges client-side, and the count expands visibility to an explicit
+  project-id list (`aggProjects = memberIds`). The per-user subquery (`visibleIssues($me)`)
+  is per-user only in its *routing*, not in its *data*.
+- **Ordering/pagination is deliberately not IVM.** Subsets (#7, #8) are keyset pages
+  evaluated by Postgres with a changes-only live tail. That division of labor is right; the
+  circuit does not absorb it.
 
-## 2. The circuit
+## 2. The circuit the demo launches
 
-Inputs: one Z-set input per table (`issues`, `comments`, `projects`, `users`,
-`project_members`), fed per transaction by the sequencer exactly as the arrangement layer is
-today. Seven output pipelines, all fixed at deploy time — **no per-user, per-shape, or
-per-subscription structure anywhere**:
+`examples/linearlite/start.ts` boots the engine with the full circuit configuration by
+default (pre-set `ELECTRIC_IVM_DBSP*` vars win over these):
 
-```text
-users ───────────────────────────────────────────▶ (A) users_all         one global feed
-projects ────────────────────────────────────────▶ (B) projects_all      one global feed
-project_members ── map_index(user_id) ───────────▶ (C) memberships_by_user   per-user feed
-                                                       = query #3 AND the delivery router:
-                                                       C's deltas drive subscribe/unsubscribe
-                                                       to the project-cohort feeds below
-
-issues ─┬─ map_index(project_id, LIST_COLUMNS) ──▶ (D) issues_by_project      per-project feed
-        ├─ map_index((project_id, status),
-        │            BOARD_COLUMNS) ─────────────▶ (E) board_columns          per-(project,status) feed
-        └─ map_index((project_id, status,
-        │             priority, username))
-        │  .aggregate_linear(count) ─────────────▶ (G) issue_counts           per-group live counts
-comments ── map_index(issue_id) ─────────────────▶ (F) comments_by_issue      per-issue feed
+```sh
+ELECTRIC_IVM_DBSP=1
+ELECTRIC_IVM_DBSP_SERVE=1
+ELECTRIC_IVM_DBSP_INDEXES=issues.project_id,project_members.user_id,\
+project_members.project_id,comments.issue_id
+ELECTRIC_IVM_DBSP_COUNTS=issues:project_id+status+priority+username
 ```
 
-How each query is served:
+That compiles: one Z-set input per table, fed per transaction by the sequencer; a pk
+arrangement per table plus the four declared lookup arrangements; and one counts pipeline —
+a live COUNT of `issues` per `(project_id, status, priority, username)` group that actually
+occurs (sparse). No per-user, per-shape, or per-subscription structure anywhere.
 
-- **#1/#2** → feeds A/B verbatim.
-- **#3** → feed C keyed by the requesting user.
-- **#4 (board)** → feed E: a user's board column for status S = the union of `(P, S)` feeds
-  over their member projects (delivery resolves the union via C); with a project filter it is
-  exactly one feed. No subquery machinery at all.
-- **#5 (comments)** → feed F per issue. (Optional upgrade: `comments ⋈ issue→project`, keyed
-  `(project, issue)`, makes an issue moving projects re-home its comments automatically — one
-  bilinear join. LinearLite doesn't move issues across projects, so v1 skips it.)
-- **#6 (search list)** → feed D per member project, merged client-side — which is already the
-  app's browse architecture; status/priority/mine narrowing stays a client filter over the
-  synced window.
-- **#7/#8 (ordered pages)** → unchanged: Postgres keyset pages, with the *live tail* now being
-  feed D (changes-only per project) instead of a per-shape stream.
-- **#9 (header count)** → feed G: `COUNT` is linear, so `aggregate_linear` maintains one
-  integer per `(project, status, priority, username)` group that actually occurs (sparse).
-  The header count = sum over the groups matching (member projects × selected statuses ×
-  selected priorities [× me]). The client (or delivery) sums a few dozen integers; the
-  "aggregations don't take subquery predicates" limitation disappears because visibility is,
-  again, a set of project cohorts.
+## 3. Which query goes to which tier
 
-## 3. What this replaces, and what it costs
+| Queries | Tier | How |
+|---|---|---|
+| #4 board columns, #6 search list | **circuit** | the visibility subquery is the cohort constraint (`project_id IN (SELECT project_id FROM project_members WHERE user_id = $me)`, both columns arrangement-indexed); status/priority/project/mine filters ride as the residual. Seeded from arrangement snapshots — no Postgres backfill, no snapshot gate. Adding/removing the user from a project is a `project_members` delta that moves whole project cohorts in/out, emitted from the post-transaction snapshots. |
+| #9 header count | **circuit (counts)** | the predicate — member-project IN-list × selected statuses × priorities [× me] — decomposes over the counts pipeline's group columns, so the aggregate is seeded by summing matching groups and updated from each step's group deltas. The visibility-over-aggregates problem disappears because visibility is, again, a set of project cohorts. |
+| #3 memberships, #5 comments | **routing** | single-column equality templates on `KeyRouter` families (`user_id`, `issue_id`); one router per template, shared by every instance. Deliberately not circuit-served — the router finds a change's shapes by index instead of scanning deltas. |
+| #1 users, #2 projects | **routing** | whole-table (match-all) fan-out; nothing to compute. |
+| #7, #8 ordered pages | **Postgres, by design** | keyset pages evaluated natively (subquery predicates included), merged client-side with a changes-only live tail. |
+| anything ad hoc | **fallback** | stateless three-valued eval / the subquery registry; works immediately at fallback cost. |
 
-**Replaced for this app**: the subquery registry (nodes, contributor sets, flip query-backs),
-per-shape snapshot gates for issue/comment shapes, and the per-shape aggregate folds. Move-in/
-move-out (user added to / removed from a project) stops being computation entirely: it is a
-delta on feed C, which delivery turns into subscribe + replay-cohort-log / unsubscribe. Backfill
-of a newly visible project = reading feed D's durable log from offset 0 — no Postgres snapshot,
-no xmin fencing.
+**State** (all in disk-spillable dbsp arrangements): issues ×2 (pk + by project) + the sparse
+count groups; comments ×2 (pk + by issue); members ×3 (pk + by user + by project);
+users/projects ×1 (pk) — a small constant factor over one table copy, independent of user
+count. A thousand users cost a thousand *subscriptions*, zero circuit growth.
 
-**State** (all in disk-spillable dbsp arrangements): issues ×3 (by project; by project+status;
-count groups), comments ×1, members ×1, users/projects ×1 — a small constant factor over one
-table copy, independent of user count. A thousand users cost a thousand *subscriptions*, zero
-engine state.
+**What the circuit replaces for these shapes**: the subquery registry's nodes, contributor
+sets, and flip query-backs; per-shape Postgres backfills and snapshot gates for the
+visibility shapes; and the per-shape aggregate fold for the header count. Move-in/move-out
+(user added to / removed from a project) is not computation at all: a membership delta
+re-derives the shape's cohort groups from local snapshots.
 
-**What stays outside the circuit**: ordering/pagination (Postgres, by design), text search
-(client-side), and the generic dynamic-shape path for ad-hoc predicates — the standalone
-evaluator and KeyRouter remain for shapes that don't match a template.
+## 4. Future directions
 
-## 4. The generalization
+Two upgrades are designed but not implemented:
 
-The recipe that produced this circuit, applicable to any app on the engine. The load-bearing
-separation: **pipelines are few and fixed; shapes are many and dynamic.** Shape cardinality —
-one shape per parameter combination clients ask for, e.g. an issues filter per combination of
-projects — can vastly exceed pipeline cardinality, because a shape is just a selection/union
-of cohort groups from one pipeline's keyed output, materialized at the delivery edge. The
-circuit never grows with shape count; only the routing table does.
-
-1. **Enumerate call sites** and collapse them to templates — parameters become data.
-2. **Find the access cohort** (here: project). Key every feed by cohort, never by user.
-   Per-user predicates that are genuinely per-user (`username = $me`) get their own small
-   keyed feed, same pattern.
-3. **Visibility relations become the delivery router** (feed C), not a join input — until an
-   app needs server-side per-user materialization, no membership join is needed at all.
-4. **Linear operators are free** (filter/project/index); **joins and aggregates knowingly**
-   (each join stores both inputs — acceptable now that spilling works; `aggregate_linear` is
-   cheap).
-5. **Structure ships with deploys.** New templates = circuit rebuild + reseed (or
-   `Mode::Persistent` bootstrap); ad-hoc queries fall back to the dynamic-shape path.
+- **Cohort-feed delivery with a client-side union**: materialize one durable feed per project
+  cohort (`issues_by_project`) and serve a user's shape as the union of their cohorts' feeds,
+  resolved at the delivery edge — making backfill a log replay instead of a snapshot read.
+  Today each circuit-served shape has its own stream, seeded from snapshots.
+- **Comments inherit their issue's project** (`comments ⋈ issue→project`, keyed
+  `(project, issue)`): one bilinear join that would re-home comments automatically if an
+  issue moved projects. LinearLite doesn't move issues across projects, so `comments` stays
+  on the `issue_id` router.

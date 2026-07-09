@@ -37,9 +37,10 @@ The as-built system architecture. Companion documents:
 
 Three ideas carry the whole design:
 
-1. **Postgres is the system of record; the engine holds no copy of any table.** State that scales
-   with row count lives in Postgres. The engine keeps per-shape routing metadata and shared subquery
-   inner-sets only; shape backfills read just the matching rows back from Postgres.
+1. **Postgres is the system of record; the engine's hot path holds no copy of any table.** The
+   hot path keeps per-shape routing metadata and shared subquery inner-sets only; shape backfills
+   read just the matching rows back from Postgres. The circuit's table arrangements (§6b) are
+   *derived*, disk-spillable, rebuildable state — never the record of truth.
 2. **Everything between layers is an append-only stream.** The write path (replication → table
    streams) and the read path (shape streams → clients) never talk directly; the engine is a
    restartable consumer in the middle.
@@ -53,7 +54,8 @@ Three ideas carry the whole design:
 ## 1. Components
 
 - **durable-streams** — append-only, offset-addressed JSON streams with long-poll tailing. One
-  `table/<name>` stream per table (the write log), one `shape/<id>` stream per distinct shape (the
+  `changes` stream for all tables (the write log; the envelope's `type` carries the table name),
+  one `shape/<id>` stream per distinct shape (the
   result feed). The decoupling boundary between write and read paths.
 - **engine** (`apps/engine`, Rust) — the core: replication ingest, per-change Z-set deltas, fan-out to
   shapes/subqueries/aggregations, the control-plane HTTP API, and the Electric-compatible
@@ -75,11 +77,11 @@ Three ideas carry the whole design:
 - **Z-set delta** — `Vec<Tup2<Row, ZWeight>>`, `ZWeight` a signed i64: insert = `(row,+1)`, delete =
   `(old,−1)`, update = `(old,−1),(new,+1)`. `old` comes from the replication envelope
   (`REPLICA IDENTITY FULL`), so no local table state is needed to retract a row. The delta algebra
-  is [`dbsp`](https://crates.io/crates/dbsp)'s, and the crate is a dependency again — `Tup2` and
-  `ZWeight` are dbsp's own, and `Value`/`Row` carry the `DBData` derive stack. The **hot path still
-  runs no dbsp circuit** (key routing + stateless predicate evaluation; internals doc §1); dbsp
-  powers the optional storage-backed arrangement layer (§6b) that replaces Postgres query-backs
-  with local, disk-spillable table indexes.
+  is [`dbsp`](https://crates.io/crates/dbsp)'s — `Tup2` and `ZWeight` are dbsp's own, and
+  `Value`/`Row` carry the `DBData` derive stack. Routing- and fallback-tier shapes are evaluated
+  by plain Rust (key routing + stateless predicate evaluation; internals doc §1); the shared
+  storage-enabled circuit (§6b) maintains the engine's table arrangements and counts pipelines
+  and serves membership shapes and decomposable COUNT aggregates.
 - **Envelope** (`ds.rs`) — the unit on every stream:
   `{ type, key, value, old, headers{ operation, txid, offset, lsn, seq } }`. The ingestor stamps
   `lsn` (transaction **commit** LSN), `txid` (the Postgres **xid**), and `seq` (the change's position
@@ -92,7 +94,7 @@ Three ideas carry the whole design:
 `replication.rs` **streams** a `pgoutput` slot over the walsender protocol (push delivery — no
 poll floor; the wire client is `pgwire-replication`, the message decoding is our `pgoutput.rs`).
 Each transaction's changes are buffered between `Begin` and `Commit`, stamped with
-`(commit LSN, xid, seq)`, appended to `table/<name>`, and only **then** acknowledged to Postgres
+`(commit LSN, xid, seq)`, appended to `changes`, and only **then** acknowledged to Postgres
 (`confirmed_flush_lsn`) — a failed append tears the connection down unacknowledged, and the server
 resends from the confirmed position.
 
@@ -174,12 +176,15 @@ The shape of the predicate picks the strategy (full detail + cost model: interna
   delta. No state. A necessary-conjunct index (`(column, op)` — equality hash buckets + ordered
   range bounds) selects only the candidate shapes per change; predicates with no indexable
   conjunct (OR/NOT/LIKE/`!=` at the top) fall back to a scan list.
-- **Subqueries** (`col [NOT] IN (SELECT …)`) → the cross-table registry (§6).
+- **Subqueries** (`col [NOT] IN (SELECT …)`) → the cross-table registry (§6). With circuit
+  serving on (`ELECTRIC_IVM_DBSP_SERVE=1`), single-level non-negated membership subqueries are
+  served by the circuit instead (§6b); the registry serves the rest.
 
 **Aggregations** (electric-ivm extension, not part of the Electric-compatible API): a scalar
 COUNT/SUM/AVG/MIN/MAX over a non-subquery predicate, maintained incrementally as a fold over the
 delta — COUNT/SUM/AVG hold running scalars, MIN/MAX a `value → net-weight` multiset so retractions
-restore the previous extreme. SQL NULL semantics are mirrored exactly: aggregates ignore NULL values,
+restore the previous extreme. A COUNT whose predicate decomposes over a counts pipeline's group
+columns is served from the circuit instead (§6b). SQL NULL semantics are mirrored exactly: aggregates ignore NULL values,
 `COUNT(col)` counts non-NULLs (`COUNT(*)` counts rows), AVG divides by the non-NULL count, and
 SUM/AVG/MIN/MAX over zero non-NULL values are NULL. The feed carries the current value as a
 single-row stream (`{ value, n }`).
@@ -254,63 +259,113 @@ sequencer feeds every table's deltas into:
 
 ---
 
-## 6b. dbsp arrangements (optional): disk-spillable table state
+## 6b. The circuit: dbsp arrangements, counts, and serving
 
-`ELECTRIC_IVM_DBSP=1` (`arrangements.rs`) brings dbsp back — not as per-shape circuits (removed
-for cause; see the git history around `75488b6`/`c1aa075`) but as a **table-state layer**: one
-shared, storage-enabled circuit maintains per-table arrangements (primary key always, plus
-columns declared via `ELECTRIC_IVM_DBSP_INDEXES=table.col,…`). Subquery flip re-derivations and
-full re-derives read these local snapshots instead of querying Postgres back; a lookup against a
-missing/unseeded index returns `None` and the caller falls back to Postgres, so correctness never
-depends on the layer.
+`ELECTRIC_IVM_DBSP=1` (`arrangements.rs`) runs one shared, storage-enabled dbsp circuit per
+engine — the **circuit tier** of the serving model below. The sequencer feeds each transaction
+into the circuit and steps it **before** fanning the transaction out, so everything that reads
+circuit state observes post-transaction snapshots — the same read-your-committed-writes
+guarantee a Postgres query-back gives. The circuit holds two kinds of state:
 
-- **Why**: the workload is small today but may not stay small. The engine's zero-state invariant
-  priced every flip as a Postgres round-trip; the arrangement layer keeps that state local with a
-  bounded RAM footprint — dbsp spills batches to Snappy-compressed layer files as tables grow
-  (`ELECTRIC_IVM_DBSP_MIN_STORAGE_KB`, default 1 MiB; block cache `ELECTRIC_IVM_DBSP_CACHE_MIB`;
-  memory-pressure spilling via `ELECTRIC_IVM_DBSP_MAX_RSS_MB`).
-- **Consistency**: the sequencer feeds each transaction into the circuit and steps it **before**
-  fanning the transaction out, so flip re-derivations enqueued by a txn observe post-txn state —
-  the same read-your-committed-writes guarantee the Postgres query-back gave. Fresh seeds read one
-  `REPEATABLE READ` snapshot per table (chunked), and the live feed is fenced by the seed's
-  `SnapshotGate` (xid visibility), exactly like shape backfills.
-- **Restart**: periodic checkpoints (`ELECTRIC_IVM_DBSP_CHECKPOINT_SECS`, default 60; plus at
-  shutdown) persist the circuit; `meta.json` records the change-log offset and the `(lsn, seq)`
-  de-duplication highwater. On boot the circuit restores and the sequencer replays the gap;
-  overlap is harmless because the arrangement layer re-checks the highwater (Z-set deltas are not
-  idempotent). An index-layout change discards state and reseeds. The default state dir is
-  slot-keyed (`<storage>/dbsp/<slot>`): dbsp state is only valid for the database identity it was
-  built from.
-- **The 0.299 lesson, addressed**: the earlier memtest (git `f5dab45`) found dbsp storage spilled
-  ~2 MB of a ~570 MB trace — because batches spill at **merge and checkpoint boundaries**, and a
-  static table seeded as one giant batch never merges. The layer therefore seeds in bounded chunks
-  (many level-0 batches ⇒ real merges) and checkpoints (persists every in-memory batch);
-  `spill_produces_layer_files` / `memtest_spill_large` in `arrangements.rs` pin this down.
-- **Observability**: when the layer is on, `/graph` carries an `arrangements` section — the
+- **Per-table arrangements** — every replicated table indexed by primary key, plus columns
+  declared via `ELECTRIC_IVM_DBSP_INDEXES=table.col,…`. Arrangement batches spill to
+  Snappy-compressed layer files as tables grow, so RAM stays bounded. They serve point lookups
+  (subquery flip re-derivations and full re-derives read local snapshots instead of querying
+  Postgres back) and, with serving on, shape seeding. A lookup against a missing/unseeded
+  index returns `None` and the caller falls back to Postgres — correctness never depends on
+  the circuit.
+- **Counts pipelines** — `ELECTRIC_IVM_DBSP_COUNTS=table:col+col,…` compiles, per table (at
+  most one spec each), a `map_index(group) → weighted_count` pipeline: a live COUNT per
+  distinct projection of the group columns.
+
+### Serving (`ELECTRIC_IVM_DBSP_SERVE=1`)
+
+With serving on, the circuit does not just accelerate lookups — it serves two shape classes
+end to end, inside the sequencer:
+
+- **Membership-subquery shapes**: a single-level, non-negated
+  `col IN (SELECT proj FROM inner WHERE inner_col = $v)` cohort constraint (both columns
+  arrangement-indexed), optionally AND-ed with a non-subquery residual. The shape is seeded
+  from arrangement snapshots — **no Postgres backfill and no snapshot gate**; consistency
+  comes from creating and reading between transactions inside the sequencer. Live table
+  deltas route through (cohort groups ∧ residual); membership deltas drive move-in/move-out
+  by reading the post-transaction snapshots, emitted absolutely (idempotent per pk). Nested,
+  negated, or multi-subquery predicates stay on the registry (§6).
+- **COUNT aggregates whose predicate decomposes over a counts pipeline's group columns** (a
+  conjunction of equalities / IN-lists over group columns only): seeded by summing the
+  matching groups, updated live from each step's group deltas. SUM/AVG/MIN/MAX — and COUNTs
+  that don't decompose — use the sequencer's incremental fold (§5.2).
+
+Equality/template shapes are **deliberately not** circuit-served: the `KeyRouter` families and
+the conjunct-indexed standalone tier route a change to its shapes by index, whereas a circuit
+shape pays a linear scan of every delta — the planner declines static and match-all
+constraints for exactly this reason. `changes_only` feeds also stay on the routing path
+(passthrough gate, nothing to seed).
+
+### Durability and restart
+
+Periodic checkpoints (`ELECTRIC_IVM_DBSP_CHECKPOINT_SECS`, default 60; plus at shutdown)
+persist the circuit; `meta.json` records the change-log offset and the `(lsn, seq)`
+de-duplication highwater. On boot the circuit restores and the sequencer replays the gap;
+overlap is harmless because the circuit re-checks the highwater (Z-set deltas are not
+idempotent). Circuit-served shapes re-register without reseeding — their streams are already
+complete up to the resume offset — and circuit-served aggregates re-seed from the counts
+snapshot. The index/counts layout is fingerprinted: a layout change discards state and
+reseeds, which is the intended deploy story for new templates. The default state dir is
+slot-keyed (`<storage>/dbsp/<slot>`): circuit state is only valid for the database identity it
+was built from.
+
+Fresh seeds read one `REPEATABLE READ` snapshot per table, **in bounded chunks**, and the live
+feed is fenced by the seed's `SnapshotGate` (xid visibility), exactly like shape backfills.
+Chunked seeding is a spilling rule, not a convenience: **spilling engages at merge and
+checkpoint boundaries**, so a table seeded as one giant batch would never merge and never
+spill, while many level-0 batches force real merges (`spill_produces_layer_files` /
+`memtest_spill_large` in `arrangements.rs` pin this down).
+
+### Configuration reference
+
+| variable | default | meaning |
+|---|---|---|
+| `ELECTRIC_IVM_DBSP` | off | `1` enables the circuit (arrangements + counts pipelines). |
+| `ELECTRIC_IVM_DBSP_DIR` | `<ELECTRIC_STORAGE_DIR \| ./data>/dbsp/<slot>` | state directory (layer files, checkpoints, `meta.json`); slot-keyed by default. |
+| `ELECTRIC_IVM_DBSP_CACHE_MIB` | dbsp default (256/thread) | storage block-cache budget, MiB. |
+| `ELECTRIC_IVM_DBSP_MIN_STORAGE_KB` | `1024` | spill threshold, KiB: batches at least this large go to disk when merged (`0` spills everything eligible). |
+| `ELECTRIC_IVM_DBSP_MAX_RSS_MB` | none | memory ceiling driving dbsp's pressure-based eager spilling. |
+| `ELECTRIC_IVM_DBSP_CHECKPOINT_SECS` | `60` | checkpoint cadence, seconds (`0` = only at shutdown). |
+| `ELECTRIC_IVM_DBSP_INDEXES` | none | lookup indexes beyond each table's pk: `table.column[,…]`. |
+| `ELECTRIC_IVM_DBSP_COUNTS` | none | counts pipelines: `table:col+col[,…]`; at most one per table. |
+| `ELECTRIC_IVM_DBSP_SERVE` | off | `1` serves membership shapes and decomposable COUNTs from the circuit. |
+
+The conformance suite passes with the circuit off, on, and on with serving — the test harness
+passes `ELECTRIC_IVM_DBSP*` vars through to the engine, so all three modes run against the
+same oracle.
+
+- **Observability**: when the circuit is on, `/graph` carries an `arrangements` section — the
   compiled circuit as stable-id nodes (`arr:input:<table>` per table, `arr:index:<table>:<cols>`
-  per index pipeline, with seeded flags and the layer's served/fallback lookup counters) plus a
-  `consumers` list connecting each index to the subquery shapes/nodes whose flip re-derivations it
-  currently serves. The circuit is static, so the visualizer's circuit view renders it as a
-  permanent dashed lane; the consumer edges appear and disappear with the shapes.
-- **Limits (v1)**: indexes are fixed at boot (a dbsp circuit's structure is fixed at
-  construction) — new lookup columns need a restart, until circuit-rebuild-on-demand lands;
-  single worker; equality lookups and full scans only (no range seeks yet).
+  per index pipeline, `arr:counts:<table>` per counts pipeline, with seeded flags and the
+  served/fallback lookup counters) plus a `consumers` list connecting each node to the
+  shapes/subquery nodes it currently serves. The circuit is static, so the visualizer's circuit
+  view renders it as a permanent dashed lane; the consumer edges appear and disappear with the
+  shapes.
+- **Limits**: circuit structure is fixed at boot (a dbsp circuit is fixed at construction) —
+  new lookup columns or counts specs need a restart, and the layout fingerprint handles the
+  discard/reseed; single worker; equality lookups and full scans only (no range seeks).
 
 ### The serving model this is one tier of
 
-The arrangement layer is the degenerate first tier of a three-tier serving model
+The circuit is the first tier of a three-tier serving model
 (`building-app-pipelines.md` is the full treatment):
 
-- **Pipelines serve query families.** Deploy-time circuit structure, one delta stream per
+- **The circuit serves query families.** Deploy-time circuit structure, one delta stream per
   *cohort group*, never growing with shapes/users/parameter combinations.
 - **Routing serves query instances.** A shape = a selection/union of cohort groups from one
   pipeline's keyed output, materialized at the delivery edge; correct when the cohort key
   partitions the table. Time-varying membership (subquery shapes) is routing *driven by a
-  feed*: membership deltas subscribe/unsubscribe cohort groups, move-in = replay the group's
-  log.
+  feed*: membership deltas subscribe/unsubscribe cohort groups, and move-in is served by
+  reading the group's post-transaction state, never by recomputation.
 - **The fallback serves query strangers.** Predicates matching no template run on the
   always-on dynamic path (standalone eval + `AccessLeaf` index, `KeyRouter` families, the
-  subquery registry). The pipeline tiers are optimizations in front of it, never a
+  subquery registry). The circuit is an optimization in front of it, never a
   correctness dependency — a new query pattern works immediately at fallback cost and is
   promoted into the circuit at the next deploy if it matters.
 
@@ -368,7 +423,7 @@ absolute membership emission makes them unnecessary for convergence).
 | shared shapes | signature + refcount + ready-watch + atomic rollback | joiners see a live, backfilled stream or an error; last drop tears everything down |
 | subset page ↔ live tail | per-pk LSN watermarks + delete tombstones | no double-count, no resurrections/ghosts across the seam (LSN-based; see §4 residual) |
 | client lifecycle | one-shot close, delete-with-retry | balanced create/drop; no refcount pinning or steal |
-| engine restart | durable shape catalog (`meta/catalog`: create/join/leave/drop + change-log offset checkpoints) | plain/routed shapes + aggregates restore without client re-registration (plain resume via replay + passthrough gates; aggregates re-seed with a fresh gate); subquery shapes are dropped loudly (inner-node state is not persisted) and recreated by clients |
+| engine restart | durable shape catalog (`meta/catalog`: create/join/leave/drop + change-log offset checkpoints) | plain/routed shapes + aggregates restore without client re-registration (plain resume via replay + passthrough gates; aggregates re-seed with a fresh gate); circuit-served shapes re-register against the restored circuit (§6b); registry subquery shapes are dropped loudly (inner-node state is not persisted) and recreated by clients |
 
 The invariant the conformance suite asserts end-to-end: *for any shape and any op stream, the
 client-materialized set equals the oracle's `SELECT … WHERE <predicate>`* — through the real API,
@@ -386,6 +441,7 @@ stream, and client, including live replication, batched mutations, NULLs, and co
 | replication ingestor | 1 task | stream pgoutput/decode/append/acknowledge |
 | subquery registry | 0 (a mutex) | the sequencer reconciles nodes + emits under it (in-memory + appends only) |
 | flip propagator | 1 task | deferred subquery query-backs; PG round-trips never hold the registry lock |
+| circuit (when enabled) | 1 OS thread | owns the `DBSPHandle`; blocking steps, fed by a bounded channel (backpressure to the sequencer) |
 
 Threads are flat in the number of shapes *and* in the number of equality templates.
 
@@ -458,7 +514,7 @@ predicate (which recreates the feed per click) — see AGENTS.md "gotchas".
 |------|------|
 | `apps/engine/src/engine.rs` | the LSN-ordered sequencer, delta computation, routing + standalone + aggregation fan-out, shape sharing/lifecycle, reliable per-txn flush |
 | `apps/engine/src/subquery.rs` | subquery registry: shared nodes, edges, flips, absolute emission, atomic create/rollback |
-| `apps/engine/src/arrangements.rs` | optional dbsp arrangement layer: storage-backed table indexes, checkpoints, snapshot lookups (§6b) |
+| `apps/engine/src/arrangements.rs` | the circuit: storage-backed table arrangements + counts pipelines, checkpoints, snapshot lookups (§6b) |
 | `apps/engine/src/replication.rs` | ingestor: streaming pgoutput, per-txn buffering, (lsn, xid, seq) stamping, append-then-acknowledge |
 | `apps/engine/src/pg.rs` | connect/introspect, slot + REPLICA IDENTITY, backfill (+ `SnapshotGate`), subset query-back, value normalization |
 | `apps/engine/src/predicate.rs` | predicate compile, three-valued eval, equality templates, subquery signatures |

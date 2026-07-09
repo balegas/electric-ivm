@@ -108,10 +108,15 @@ DS_URL=http://127.0.0.1:8791 ENGINE_URL=http://127.0.0.1:7010 API_PORT=8790 \
 
 `ELECTRIC_IVM_PG_TABLES="*"` (or empty) means *introspect every public table that has a primary
 key*. On boot, per table, the engine: introspects columns/types/pk, sets
-`REPLICA IDENTITY FULL`, ensures a `table/<name>` durable stream, creates the logical
+`REPLICA IDENTITY FULL`, ensures the `changes` durable stream, creates the logical
 replication slot (`pgoutput` + a `<slot>_pub` publication, name from `ELECTRIC_IVM_PG_SLOT`,
 default `electric_ivm`),
 and starts the ingestor. Nothing else to migrate or install in the database.
+
+Optionally, enable the engine's circuit tier — disk-spillable table arrangements, counts
+pipelines, and circuit serving — with the `ELECTRIC_IVM_DBSP*` variables; the full reference
+table is in `ARCHITECTURE.md` §6b. The LinearLite demo (`pnpm demo:linearlite`) runs the
+engine with the full circuit configuration by default.
 
 Check it's up:
 

@@ -11,7 +11,7 @@ the project is growing toward).
 
 | Path | What |
 |---|---|
-| `apps/engine` | Rust engine. Key files: `engine.rs` (the LSN-ordered sequencer, routing, shape sharing/lifecycle, aggregations), `subquery.rs` (cross-table registry: shared inner-set nodes, flips, absolute emission), `replication.rs` (streaming pgoutput ingestor) + `pgoutput.rs` (message decoder), `pg.rs` (backfill + `SnapshotGate`), `electric.rs` (`/v1/shape`), `where_sql.rs`/`sql.rs` (SQL⇄predicate), `ds.rs` (streams client incl. `append_reliable`). |
+| `apps/engine` | Rust engine. Key files: `engine.rs` (the LSN-ordered sequencer, routing, circuit serving, shape sharing/lifecycle, aggregations), `arrangements.rs` (the circuit: table arrangements + counts pipelines, checkpoints), `subquery.rs` (cross-table registry: shared inner-set nodes, flips, absolute emission), `replication.rs` (streaming pgoutput ingestor) + `pgoutput.rs` (message decoder), `pg.rs` (backfill + `SnapshotGate`), `electric.rs` (`/v1/shape`), `where_sql.rs`/`sql.rs` (SQL⇄predicate), `ds.rs` (streams client incl. `append_reliable`). |
 | `apps/api` | tRPC API (`router.ts`) over the engine + durable-streams (`core.ts`). |
 | `packages/protocol` | Shared types + the change-event envelope (`types.ts`, `envelope.ts`). |
 | `packages/client` | Browser client: `shape()`, `subset()` (see `subset.ts` — LSN watermarks + tombstones), `aggregate()`. All lifecycles tracked; `close()` is one-shot and deletes server-side with retry. |
@@ -35,9 +35,9 @@ the project is growing toward).
 - `docs/deployment-postgres.md` — Postgres-as-source-of-record setup.
 - Each package has its own `README.md` (surface, commands, env knobs).
 - `docs/building-app-pipelines.md` — how to design a pipeline for an app: the three-tier
-  serving model (pipelines/routing/fallback), the recipe, and a worked simple model.
-- `docs/linearlite-circuit-design.md` — design study: one dbsp circuit for an entire app's
-  query set; source of the recipe below.
+  serving model (circuit/routing/fallback), the recipe, and a worked simple model.
+- `docs/linearlite-circuit-design.md` — how the flagship app's query graph is served
+  (which queries go to which tier); source of the recipe below.
 
 ## Designing dbsp circuits: pipelines vs shapes
 
@@ -49,8 +49,8 @@ cardinality can vastly exceed pipeline cardinality: a subquery shape filtering i
 per *combination* of projects a client asks for, yet every combination is fed from the same
 `issues_by_project` pipeline — the circuit never grows with shape count, only the routing
 table does. If a design makes the circuit's structure scale with shapes, users, or parameter
-combinations, it is wrong (that is the circuit-per-shape mistake this repo already made and
-removed; see the git history around `75488b6`/`c1aa075`).
+combinations, it is wrong (the circuit-per-shape trap: structure must never scale with
+subscriptions).
 
 The recipe for capturing an app's query set in one circuit:
 
@@ -62,9 +62,10 @@ The recipe for capturing an app's query set in one circuit:
    the cohort key **partitions** the table (a row lives in exactly one group) — overlapping
    groups would double-emit and need dedup at the edge. Genuinely per-user predicates
    (`username = $me`) get their own keyed feed — same pattern, cohort of size one.
-3. **Visibility relations become the delivery router**, not a join input: a membership feed's
-   deltas drive subscribe/unsubscribe to cohort feeds, and backfill = replaying the cohort
-   feed's own durable log (no Postgres snapshot, no xmin fencing, no flip query-backs).
+3. **Visibility relations become the delivery router**, not a join input: a membership
+   table's deltas drive subscribe/unsubscribe to cohort groups, and move-in/move-out read
+   the post-transaction arrangement snapshots (no Postgres snapshot, no xmin fencing, no
+   flip query-backs).
 4. **Linear operators are free** (filter / project / `map_index`); **joins and aggregates
    knowingly** — a join stores both inputs (acceptable with storage-backed spilling; see
    `ARCHITECTURE.md` §6b), and `aggregate_linear` (COUNT/SUM) is cheap. Aggregate at the
@@ -187,15 +188,19 @@ ELECTRIC_IVM_ENGINE_PREBUILT=1 pnpm test  # full vitest suite (set the var iff y
 ./electric-conformance/run.sh oracle      # Electric's own oracle vs /v1/shape (needs elixir + ../electric)
 ```
 
+For anything touching the circuit (`arrangements.rs`, circuit serving in `engine.rs`), run the
+conformance suite in all three modes — the harness passes the vars through to the engine:
+plain, `ELECTRIC_IVM_DBSP=1`, and `ELECTRIC_IVM_DBSP=1 ELECTRIC_IVM_DBSP_SERVE=1`.
+
 Then, for anything touching the engine's live path, shapes, or the visualizer: **drive the demo as
 above** — the suites don't render a canvas or exercise the browser.
 
 ## Invariants (violate these and conformance will catch you — eventually)
 
 - **Postgres is the system of record; the engine's hot path holds no table copy.** Backfills read
-  matching rows in a `REPEATABLE READ` snapshot. (The optional dbsp arrangement layer,
-  `ELECTRIC_IVM_DBSP=1`, holds disk-backed *derived* table indexes — rebuildable state with
-  Postgres fallback, never the record of truth; see `ARCHITECTURE.md` §6b.)
+  matching rows in a `REPEATABLE READ` snapshot. (The circuit tier, `ELECTRIC_IVM_DBSP=1`,
+  holds disk-spillable *derived* state — table arrangements + counts pipelines — rebuildable,
+  with Postgres fallback for lookups, never the record of truth; see `ARCHITECTURE.md` §6b.)
 - **Backfill↔live is fenced by xid visibility, NOT by LSN.** Every seeded structure carries a
   `pg::SnapshotGate` (from `pg_current_snapshot()`); a replicated change is skipped iff its xid was
   visible to that snapshot. `commit_lsn < seed_lsn` is only the fallback for changes without an xid.

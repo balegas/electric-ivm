@@ -52,14 +52,18 @@ scales with the size of the *change*, not the size of the *data*.
 
 electric-ivm is built on this model. Every replicated change becomes a Z-set delta (Postgres's
 `REPLICA IDENTITY FULL` supplies the old row, so updates retract precisely), and every shape,
-subquery, and aggregation is an incremental operator over those deltas. The engine implements the
-operators directly in Rust — stateless filters, key routers, shared inner-set nodes, running
-folds — rather than running a general dbsp circuit, so the hot path keeps **no copy of any
-table**: engine RSS is ~19 MiB whether the database has 1k or 100k rows, +~0.8 KiB per shape
-(measured by the shape-memory matrix benchmark in `packages/bench`). For when tables grow, an
-optional dbsp-backed **arrangement layer** (`ELECTRIC_IVM_DBSP=1`) maintains disk-spillable
-table indexes that serve subquery re-derivations locally instead of querying Postgres back —
-see `docs/ARCHITECTURE.md` §6b.
+subquery, and aggregation is an incremental operator over those deltas. The engine serves them
+from **three tiers**. One shared, storage-enabled dbsp **circuit** (`ELECTRIC_IVM_DBSP=1`)
+maintains per-table arrangements and counts pipelines whose state spills to disk as tables
+grow; it seeds and maintains membership (visibility-subquery) shapes and decomposable COUNT
+aggregates entirely from local snapshots — no Postgres backfill. Equality and template shapes
+go to the **routing tier** — key routers and conjunct indexes in plain Rust — because an
+indexed route beats a linear delta scan. Everything else lands on the **fallback**: stateless
+three-valued filters and the shared subquery registry, which serves any predicate. The hot
+path keeps **no copy of any table**: engine RSS is ~19 MiB whether the database has 1k or
+100k rows, +~0.8 KiB per shape (measured by the shape-memory matrix benchmark in
+`packages/bench`); the circuit's table state is disk-spillable and bounded — see
+`docs/ARCHITECTURE.md` §6b.
 
 ## A shape as a DBSP pipeline
 
@@ -126,7 +130,7 @@ engine one maintenance path and one append per change.
 ## Designing the pipeline for your app
 
 The full treatment is `docs/building-app-pipelines.md`; the model in three sentences:
-**pipelines serve query families, routing serves query instances, the fallback serves query
+**the circuit serves query families, routing serves query instances, the fallback serves query
 strangers.** A pipeline is compiled at deploy time and keyed by the app's *access cohort*; a
 shape is a selection/union of cohort groups from one pipeline's output, materialized at the
 delivery edge — so shape cardinality is unbounded while the circuit never grows. Anything that
@@ -237,8 +241,10 @@ ELECTRIC_IVM_ENGINE_URL=http://127.0.0.1:<engine-port> VIZ_PORT=5180 \
 ```
 
 **`examples/linearlite` — the flagship demo app (TS).** A Linear-style issue tracker synced
-entirely through shapes (visibility subqueries, live counts, subset pagination):
-`pnpm demo:linearlite`, or `scripts/linearlite.sh start large` for a 100k-issue workload.
+entirely through shapes (visibility subqueries, live counts, subset pagination). The demo
+launches the engine with the full circuit configuration by default (arrangements, counts, and
+serving — see `docs/linearlite-circuit-design.md`): `pnpm demo:linearlite`, or
+`scripts/linearlite.sh start large` for a 100k-issue workload.
 
 **`examples/web` — the minimal example (TS).** The smallest end-to-end app using the extended
 client: `pnpm demo:web`. (`pnpm demo` runs the even smaller headless todos walkthrough.)

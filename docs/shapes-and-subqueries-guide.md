@@ -58,12 +58,12 @@ identical either way.)
 |---|---|
 | `ELECTRIC_IVM_PG_URL` | Postgres connection string. Its presence selects Postgres mode. |
 | `ELECTRIC_IVM_PG_TABLES` | comma-separated table list, or `*`/empty to **introspect every public table that has a primary key** (skipping the engine's `__el_sync` bookkeeping table). |
-| `ELECTRIC_IVM_PG_SLOT` | replication slot name (`test_decoding`). |
+| `ELECTRIC_IVM_PG_SLOT` | replication slot name (default `electric_ivm`; the slot uses the `pgoutput` plugin). |
 | `ELECTRIC_IVM_PG_POLL_MS` | slot poll interval. |
 
 On boot the engine introspects the configured tables (columns, types, primary key — composite
 keys ordered by index position), sets `REPLICA IDENTITY FULL`, creates the replication slot,
-ensures a `table/<name>` durable stream per table, and starts the ingestor.
+ensures the `changes` durable stream, and starts the ingestor.
 
 In production you run three processes — the `durable-streams-server`, the engine binary, and the
 API server — pointed at your Postgres, and point the client at the API URL. The demos colocate

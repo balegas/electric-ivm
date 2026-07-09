@@ -1,15 +1,17 @@
 //! electric-ivm query engine.
 //!
-//! Takes change events from per-table durable streams and fans each change out to registered shapes.
-//! The hot path holds **no table data** — only per-shape metadata: equality shapes are routed by key
-//! (a `key -> shapes` index per template, each shape backfilled directly from Postgres), while
-//! non-shareable shapes (ranges / OR / NOT / inequality) are stateless filters evaluated directly on
-//! each delta. Matching deltas are appended (as State-Protocol envelopes) to per-shape durable
-//! streams. The Z-set element is a dynamically-typed [`value::Row`] (positional `Vec<Value>`); the
-//! schema gives names to the positions. Optionally (`ELECTRIC_IVM_DBSP=1`), a dbsp-backed
-//! [`arrangements`] layer maintains disk-spillable table indexes that serve point lookups
-//! (subquery re-derivations) locally instead of querying Postgres back. See `docs/ARCHITECTURE.md`
-//! and `docs/ivm-engine-internals.md` for the system design.
+//! Takes change events from the ordered change log and fans each change out to registered shapes,
+//! across a three-tier serving model. The **circuit** ([`arrangements`], `ELECTRIC_IVM_DBSP=1`):
+//! one shared storage-enabled dbsp circuit maintains disk-spillable table arrangements and counts
+//! pipelines, serves point lookups (subquery re-derivations) from local snapshots, and — with
+//! `ELECTRIC_IVM_DBSP_SERVE=1` — serves membership shapes and decomposable COUNT aggregates end
+//! to end. The **routing tier**: equality shapes are routed by key (a `key -> shapes` index per
+//! template), and indexed standalone predicates by necessary conjunct — the hot path holds **no
+//! table data**, only per-shape metadata. The **fallback** serves everything else: stateless
+//! three-valued filters and the cross-table subquery registry. Matching deltas are appended (as
+//! State-Protocol envelopes) to per-shape durable streams. The Z-set element is a
+//! dynamically-typed [`value::Row`] (positional `Vec<Value>`); the schema gives names to the
+//! positions. See `docs/ARCHITECTURE.md` and `docs/ivm-engine-internals.md` for the system design.
 
 pub mod arrangements;
 pub mod config;
