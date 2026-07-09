@@ -273,9 +273,13 @@ export default function App() {
   // highlights expand through this, never through client-side guessing.
   const expandHop = useMemo(() => {
     if (view === 'logical' || !graph) return (h: string) => [h]
-    const idx = hopIndex(graph)
+    // Grouping collapses the repeated per-shape operator chains only in the whole-graph view (a
+    // selection expands to individual operators). A hop into a collapsed member must resolve to the
+    // stacked representative that stands in for it, so hopIndex remaps under the SAME condition
+    // buildCircuit groups: mode 'all' with the toggle on.
+    const idx = hopIndex(graph, mode === 'all' && groupShapes)
     return (h: string) => idx.get(h) ?? []
-  }, [view, graph])
+  }, [view, graph, mode, groupShapes])
   const expandRef = useRef(expandHop)
   expandRef.current = expandHop
 

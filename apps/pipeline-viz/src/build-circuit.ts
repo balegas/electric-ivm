@@ -6,7 +6,8 @@
 
 import type { Edge, Node } from '@xyflow/react'
 
-import { layout, type BuildOpts, type NodeKind, type RawEdge, type RawNode } from './build-graph'
+import { layout, type BuildOpts, type NodeKind, type NodeRef, type RawEdge, type RawNode } from './build-graph'
+import { predicateTemplate, predicateTemplateLabel } from './predicate-label'
 import type { EngineGraph, OpNode } from './types'
 
 const OP_KIND: Record<OpNode['kind'], NodeKind> = {
@@ -187,8 +188,190 @@ function restrictToSelection(
   return { nodes, edges }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Shape grouping (the "group shapes" toggle) for the circuit view.
+//
+// The engine reports one per-shape operator chain per shape, so a real app — which opens the same
+// handful of query templates once per user/value — swamps the circuit with N near-identical
+// parallel chains. Under the toggle (whole-graph view only) those repeated chains collapse to a
+// single STACKED representative badged with the member count, mirroring build-graph's `shapegroup`.
+// Two dimensions collapse:
+//   1. Route-join families: the N per-shape `pi`→`snk` chains hanging off one shared route join
+//      (same table + key columns) fold into one stacked SINK — the exact families build-graph folds.
+//   2. Subquery templates: subquery shapes whose maintained pipeline is structurally identical
+//      (same outer table, predicate template, projection) — differing only in their bound parameter
+//      and thus their materialized inner set — fold their inner-set chain (`sqf`/`sqp`/`dist`) into
+//      one stacked IN-SET ARRANGE and their outer chain (`sj`/`pi`/`snk`) into one stacked SINK.
+// Both dimensions reduce to the same mechanism: a `redirect` map (collapsed operator id → the
+// representative node that stands in for it) plus the representative nodes themselves. `collapse`
+// then drops the collapsed operators, adds the representatives, and rewrites every edge endpoint
+// through the redirect (deduping, and dropping edges that become self-loops on a representative).
+// ---------------------------------------------------------------------------------------------
+
+interface GroupPlan {
+  /** collapsed per-shape operator id → the representative node that stands in for it. */
+  redirect: Map<string, string>
+  /** the stacked representative nodes to add in place of the collapsed operators. */
+  reps: RawNode[]
+}
+
+/** Enumerate the circuit's collapsible shape groups (see the block comment above) and return the
+ *  representative nodes plus the operator-id redirect they imply. Derived purely from `/graph` — the
+ *  same shape data build-graph groups on — so grouping is deterministic and matches the logical
+ *  view's family folding. Empty (no reps) when nothing collapses. */
+function planGroups(g: EngineGraph): GroupPlan {
+  const redirect = new Map<string, string>()
+  const reps: RawNode[] = []
+
+  // (1) Route-join families: >1 equality shape sharing one (table, key-cols) route join. Aggregates
+  // and subquery shapes never flow through the route join (they compile to their own chains), so
+  // they are excluded from the count — only the `pi`/`snk` chains fed by the route join collapse.
+  const fam = new Map<string, { table: string; cols: string[]; ids: string[] }>()
+  for (const s of g.shapes ?? []) {
+    if (!s.familyKey || s.isSubquery || s.aggregate) continue
+    const key = `${s.table}:${s.familyKey.join(',')}`
+    const e = fam.get(key) ?? { table: s.table, cols: s.familyKey, ids: [] }
+    e.ids.push(s.id)
+    fam.set(key, e)
+  }
+  for (const [key, e] of fam) {
+    if (e.ids.length <= 1) continue
+    const repId = `snk:group:${key}`
+    reps.push({
+      id: repId,
+      data: {
+        kind: 'op-sink',
+        // The query template the members share (`issue_id = ?`), highlighted like a shape's
+        // predicate — the same headline the logical view's `shapegroup` node carries.
+        label: e.cols.map((c) => `${c} = ?`).join(' AND '),
+        highlight: true,
+        sub: `${e.table} · ${e.ids.length} shapes`,
+        stack: true,
+        ref: { kind: 'shapegroup', table: e.table, keyCols: e.cols },
+      },
+    })
+    for (const sid of e.ids) {
+      redirect.set(`pi:${sid}`, repId)
+      redirect.set(`snk:${sid}`, repId)
+    }
+  }
+
+  // (2) Subquery templates: subquery shapes keyed by their structural template (outer table +
+  // predicate template + projection), values dropped. Members of a >1 group share one maintained
+  // pipeline shape and differ only in their binding — so the whole per-instance pipeline collapses.
+  const sigsOfShape = new Map<string, string[]>() // shape id → the subquery node sigs it depends on
+  for (const e of g.subqueryEdges ?? []) {
+    if (e.dependentKind !== 'shape') continue
+    const arr = sigsOfShape.get(e.dependentId) ?? []
+    arr.push(e.nodeSig)
+    sigsOfShape.set(e.dependentId, arr)
+  }
+  const nodeBySig = new Map((g.subqueryNodes ?? []).map((n) => [n.sig, n]))
+  const tpl = new Map<
+    string,
+    { outerTable: string; where: EngineGraph['shapes'][number]['where']; ids: string[]; sigs: Set<string> }
+  >()
+  for (const s of g.shapes ?? []) {
+    if (!s.isSubquery) continue
+    const key = `${s.table}|${predicateTemplate(s.where)}|${(s.columns ?? []).join(',')}`
+    const e = tpl.get(key) ?? { outerTable: s.table, where: s.where, ids: [], sigs: new Set<string>() }
+    e.ids.push(s.id)
+    for (const sig of sigsOfShape.get(s.id) ?? []) e.sigs.add(sig)
+    tpl.set(key, e)
+  }
+  for (const [key, e] of tpl) {
+    if (e.ids.length <= 1) continue
+    const sigs = [...e.sigs]
+    // Labels come from a representative inner node — the members are structurally identical, so any
+    // one of them names the inner table / projected column for the whole group.
+    const firstNode = sigs.map((sig) => nodeBySig.get(sig)).find((n) => n !== undefined)
+    const innerTable = firstNode?.innerTable ?? '?'
+    const projCol = firstNode?.projCol ?? '?'
+    const distId = `dist:sqgroup:${key}`
+    const snkId = `snk:sqgroup:${key}`
+    const ref: NodeRef = { kind: 'sqgroup', outerTable: e.outerTable, innerTable, projCol, shapeIds: e.ids, sigs }
+    reps.push({
+      id: distId,
+      data: {
+        kind: 'op-distinct',
+        label: `distinct ${projCol}`,
+        sub: `${innerTable} · ${e.ids.length} instances`,
+        stack: true,
+        ref,
+      },
+    })
+    reps.push({
+      id: snkId,
+      data: {
+        kind: 'op-sink',
+        // The outer predicate template (`project_id IN (SELECT id FROM projects WHERE …)`), values
+        // shown as `?` — the shape all members share.
+        label: predicateTemplateLabel(e.where),
+        highlight: true,
+        sub: `${e.outerTable} · ${e.ids.length} shapes`,
+        stack: true,
+        ref,
+      },
+    })
+    // The inner-set chain (σ inner where → π proj → distinct) collapses to the IN-SET ARRANGE rep…
+    for (const sig of sigs) {
+      redirect.set(`sqf:${sig}`, distId)
+      redirect.set(`sqp:${sig}`, distId)
+      redirect.set(`dist:${sig}`, distId)
+    }
+    // …and the outer chain (membership semijoin → π → sink) to the SINK rep.
+    for (const sid of e.ids) {
+      redirect.set(`sj:${sid}`, snkId)
+      redirect.set(`pi:${sid}`, snkId)
+      redirect.set(`snk:${sid}`, snkId)
+    }
+  }
+
+  return { redirect, reps }
+}
+
+/** Collapse the repeated per-shape operator chains into their stacked representatives (see the
+ *  block comment above `planGroups`). Returns the full circuit untouched when nothing groups. */
+function collapse(
+  full: { nodes: Map<string, RawNode>; edges: RawEdge[] },
+  g: EngineGraph,
+): { nodes: Map<string, RawNode>; edges: RawEdge[] } {
+  const plan = planGroups(g)
+  if (plan.reps.length === 0) return full
+
+  // Nodes: drop every collapsed per-shape operator, add the representatives in their place.
+  const nodes = new Map<string, RawNode>()
+  for (const [id, n] of full.nodes) {
+    if (!plan.redirect.has(id)) nodes.set(id, n)
+  }
+  for (const rep of plan.reps) nodes.set(rep.id, rep)
+
+  // Edges: redirect each endpoint through the collapse map. An edge whose two ends land on the SAME
+  // representative was an internal step of a collapsed chain (`pi`→`snk`, `sqf`→`sqp`→`dist`) — it
+  // becomes a self-loop and is dropped. A redirected edge drops its per-shape label (the route join
+  // fans one labelled edge per member; they must merge into one), and the whole set is deduped by
+  // its rebuilt id (which carries the edge kind, so serve / lookup / flow between the same pair stay
+  // distinct). Every representative endpoint exists, so no edge dangles.
+  const edges: RawEdge[] = []
+  const seen = new Set<string>()
+  for (const e of full.edges) {
+    const source = plan.redirect.get(e.source) ?? e.source
+    const target = plan.redirect.get(e.target) ?? e.target
+    if (source === target) continue
+    const collapsed = source !== e.source || target !== e.target
+    const label = collapsed ? undefined : e.label
+    const id = `${source}~>${target}~${e.kind}~${label ?? ''}`
+    if (seen.has(id)) continue
+    seen.add(id)
+    edges.push({ id, source, target, label, kind: e.kind })
+  }
+  return { nodes, edges }
+}
+
 /** Build laid-out React Flow nodes+edges for the circuit view. Same selection/focus semantics as
- *  the logical view. */
+ *  the logical view: grouping (the shared `groupShapes` toggle) applies only to the whole-graph
+ *  view — a selection restricts to shape SINKS, which a collapsed representative wouldn't carry, so
+ *  it always expands to the individual operators (exactly like `buildGraph`). */
 export function buildCircuit(
   g: EngineGraph,
   selection: 'all' | Set<string>,
@@ -196,17 +379,26 @@ export function buildCircuit(
   opts?: BuildOpts,
 ): { nodes: Node[]; edges: Edge[] } {
   const full = buildFull(g)
-  const restricted = selection === 'all' ? full : restrictToSelection(full, selection)
-  return layout(restricted, focus, opts)
+  const grouped = opts?.groupShapes !== false && selection === 'all'
+  const shown = selection === 'all' ? (grouped ? collapse(full, g) : full) : restrictToSelection(full, selection)
+  return layout(shown, focus, opts)
 }
 
-/** hop id → operator ids. The engine stamps each operator with its trace-hop id, so expanding a
- *  trace hop (or a graph-diff id) to circuit nodes is a lookup, not a guess. */
-export function hopIndex(g: EngineGraph): Map<string, string[]> {
+/** hop id → rendered node ids. The engine stamps each operator with its trace-hop id, so expanding a
+ *  trace hop (or a graph-diff id) to circuit nodes is a lookup, not a guess. With `group` on, an
+ *  operator that a collapsed chain swallowed resolves to the representative that stands in for it —
+ *  so a trace hop into any collapsed member still flashes the stacked group node (and pulses its
+ *  edges). Must be called with the SAME `group` flag `buildCircuit` grouped under. */
+export function hopIndex(g: EngineGraph, group = false): Map<string, string[]> {
+  const redirect = group ? planGroups(g).redirect : null
   const m = new Map<string, string[]>()
   for (const o of g.operators ?? []) {
+    const id = redirect?.get(o.id) ?? o.id
     if (!m.has(o.hop)) m.set(o.hop, [])
-    m.get(o.hop)!.push(o.id)
+    const ids = m.get(o.hop)!
+    // A hop can own several operators that all collapse to one representative (a member's `pi` and
+    // `snk` both map to its group sink) — dedupe so the representative flashes once.
+    if (!ids.includes(id)) ids.push(id)
   }
   return m
 }

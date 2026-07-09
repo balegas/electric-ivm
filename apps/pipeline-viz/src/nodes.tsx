@@ -111,10 +111,16 @@ export function PipelineNode({ id, data }: NodeProps) {
   // standing in for the (decluttered-away) arrangement lane. The detail panel expands the list.
   const indexed = d.kind === 'op-source' && d.arr && d.arr.indexes + d.arr.counts > 0 ? d.arr : null
   const color = indexed ? ARR_COLOR : meta.color
+  // A stacked (collapsed-group) card paints two offset silhouettes behind it via box-shadow; drive
+  // their fill/border off this kind's palette so a grouped SINK reads green and a grouped IN-SET
+  // ARRANGE reads purple, instead of the one hard-coded colour a single stacked kind would fix.
+  const stackVars = d.stack
+    ? ({ '--stack-bg': meta.bg, '--stack-br': `${color}88` } as React.CSSProperties)
+    : null
   return (
     <div
       className={`pnode pnode-${d.kind}${indexed ? ' pnode-indexed' : ''}${d.stack ? ' pnode-stacked' : ''}${d.selected ? ' pnode-selected' : ''}${d.dimmed ? ' pnode-dimmed' : ''}${parked ? ' pnode-parked' : ''}`}
-      style={{ borderColor: color, background: indexed ? ARR_BG : meta.bg }}
+      style={{ borderColor: color, background: indexed ? ARR_BG : meta.bg, ...stackVars }}
     >
       <Handle type="target" position={Position.Left} />
       <div className="pnode-tag" style={{ color }}>

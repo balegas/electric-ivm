@@ -36,6 +36,45 @@ export function subqueryLabel(s: SubqueryRef): string {
   return `(SELECT ${s.project} FROM ${s.table}${w})`
 }
 
+/** Canonical TEMPLATE signature of a predicate: its structure with every leaf VALUE dropped, and
+ *  AND/OR children sorted so equivalent predicates share one key (mirrors the engine's
+ *  `canonical_pred`). Two subquery shapes that differ only in a bound parameter — `owner = 5` vs
+ *  `owner = 8` — share this key, which is what lets the circuit view stack their identical
+ *  pipelines while their materialized contents differ. */
+export function predicateTemplate(p: Predicate | null | undefined): string {
+  if (!p) return '*'
+  if ('and' in p) return `A(${p.and.map(predicateTemplate).sort().join(',')})`
+  if ('or' in p) return `O(${p.or.map(predicateTemplate).sort().join(',')})`
+  if ('not' in p) return `N(${predicateTemplate(p.not)})`
+  // A subquery leaf: its structure (table, projection, negation, inner-where TEMPLATE) is part of
+  // the template; the inner bound values are dropped just like the outer ones.
+  if ('in' in p)
+    return `I(${p.col},${p.negated ? 1 : 0},${p.in.table},${p.in.project},${predicateTemplate(p.in.where)})`
+  return `L(${p.col},${p.op})`
+}
+
+/** Human-readable rendering of a predicate's TEMPLATE — like `predicateLabel`, but every literal is
+ *  shown as `?` (a bound parameter). Used as the headline of a stacked subquery group, which stands
+ *  in for several instances that share this shape and differ only in their bindings. */
+export function predicateTemplateLabel(p: Predicate | null | undefined): string {
+  if (!p) return 'match all'
+  if ('and' in p) return p.and.map((c) => wrapTemplate(c)).join(' AND ')
+  if ('or' in p) return p.or.map((c) => wrapTemplate(c)).join(' OR ')
+  if ('not' in p) return `NOT (${predicateTemplateLabel(p.not)})`
+  if ('in' in p) return `${p.col} ${p.negated ? 'NOT IN' : 'IN'} ${subqueryTemplateLabel(p.in)}`
+  return `${p.col} ${OPS[p.op] ?? p.op} ?`
+}
+
+function wrapTemplate(p: Predicate): string {
+  const s = predicateTemplateLabel(p)
+  return 'and' in p || 'or' in p ? `(${s})` : s
+}
+
+function subqueryTemplateLabel(s: SubqueryRef): string {
+  const w = s.where ? ` WHERE ${predicateTemplateLabel(s.where)}` : ''
+  return `(SELECT ${s.project} FROM ${s.table}${w})`
+}
+
 /** Short equality-key summary for a family member, e.g. `status = 'todo'`. Falls back to the predicate. */
 export function keyLabel(where: Predicate | null): string {
   return predicateLabel(where)

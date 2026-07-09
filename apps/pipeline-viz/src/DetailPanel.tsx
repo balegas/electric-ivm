@@ -3,7 +3,7 @@ import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import type { NodeKind, NodeRef } from './build-graph'
 import { useLatestDelta } from './delta-store'
 import { KIND_META, fmtScalar, servingTier } from './node-meta'
-import { predicateLabel } from './predicate-label'
+import { predicateLabel, predicateTemplateLabel } from './predicate-label'
 import { nodeInnerSql, shapeSql } from './shape-sql'
 import { useNodeState } from './state-store'
 import type { AggregateDump, EngineGraph, FamilyDump, GraphShape, NodeIndex } from './types'
@@ -897,8 +897,8 @@ export function DetailPanel({
             ? `filter:${node.shapeId}`
             : node.kind === 'sqnode'
               ? `node:${node.sig}`
-              : node.kind === 'shapegroup'
-                ? '' // a collapsed family carries no single engine state id
+              : node.kind === 'shapegroup' || node.kind === 'sqgroup'
+                ? '' // a collapsed group carries no single engine state id
                 : `shape:${node.shapeId}`
   const live = useNodeState(stateId)
 
@@ -1042,6 +1042,48 @@ export function DetailPanel({
               <span className="dp-item-sub">{predicateLabel(s.where)}</span>
             </div>
           ))}
+        </div>
+      </>
+    )
+  } else if (node.kind === 'sqgroup') {
+    // A stacked group of subquery shapes with one pipeline shape but distinct bindings. The members
+    // and their subquery nodes are re-derived from the ids the node carries, so each instance's
+    // materialized contents (distinct values / refcount) stay inspectable behind the collapsed card.
+    const members = graph.shapes.filter((s) => node.shapeIds.includes(s.id))
+    const nodes = graph.subqueryNodes.filter((n) => node.sigs.includes(n.sig))
+    const template = predicateTemplateLabel(members[0]?.where ?? null)
+    title = `Subquery shapes · ${node.outerTable}`
+    body = (
+      <>
+        <Row k="outer table" v={node.outerTable} />
+        <Row k="pipeline template" v={<code>{template}</code>} />
+        <Row k="inner set" v={<code>{`distinct ${node.projCol} FROM ${node.innerTable}`}</code>} />
+        <Row k="grouped instances" v={members.length} />
+        <div className="dp-note">
+          One card per subquery PIPELINE — these {members.length} shapes share the same maintained
+          structure and differ only in their bound parameter (and thus their inner set). Turn off
+          “group shapes”, or click a member below, to see them individually.
+        </div>
+        <div className="dp-sec">shapes in this group</div>
+        <div className="dp-list">
+          {members.map((s) => (
+            <div key={s.id} className="dp-item">
+              <ShapeLink id={s.id} onSelect={onSelectShape} />
+              <span className="dp-item-sub">{predicateLabel(s.where)}</span>
+            </div>
+          ))}
+        </div>
+        <div className="dp-sec">inner-set instances · distinct values / refcount</div>
+        <div className="dp-list dp-index">
+          {nodes.map((n) => (
+            <div key={n.sig} className="dp-item">
+              <code className="dp-key">{n.innerTable}</code>
+              <span className="dp-badge-n">
+                {n.distinctValues} value{n.distinctValues === 1 ? '' : 's'} · ref {n.refcount}
+              </span>
+            </div>
+          ))}
+          {nodes.length === 0 ? <div className="dp-empty-idx">no maintained inner nodes</div> : null}
         </div>
       </>
     )

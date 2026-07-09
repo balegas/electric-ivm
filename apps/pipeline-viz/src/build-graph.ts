@@ -41,6 +41,12 @@ export type NodeRef =
   /** A collapsed family of shapes (the "group shapes" toggle): every equality shape on this
    *  (table, key-cols) route join, shown as one node. The detail panel lists the members. */
   | { kind: 'shapegroup'; table: string; keyCols: string[] }
+  /** A collapsed group of subquery shapes whose maintained circuit pipeline is structurally
+   *  identical — same outer table, predicate template, and projection — differing only in their
+   *  bound parameter (and thus their materialized inner set). The circuit view stacks them under
+   *  the "group shapes" toggle; the detail panel lists each member instance and its subquery
+   *  node(s) so the distinct contents (distinctValues / refcount) stay inspectable. */
+  | { kind: 'sqgroup'; outerTable: string; innerTable: string; projCol: string; shapeIds: string[]; sigs: string[] }
   /** A circuit-view operator: its kind, the trace-hop it animates under, and its display label. */
   | { kind: 'op'; opKind: NodeKind; hop: string; label: string }
 
