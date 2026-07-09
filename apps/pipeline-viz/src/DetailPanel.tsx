@@ -897,7 +897,9 @@ export function DetailPanel({
             ? `filter:${node.shapeId}`
             : node.kind === 'sqnode'
               ? `node:${node.sig}`
-              : `shape:${node.shapeId}`
+              : node.kind === 'shapegroup'
+                ? '' // a collapsed family carries no single engine state id
+                : `shape:${node.shapeId}`
   const live = useNodeState(stateId)
 
   let title = ''
@@ -1012,6 +1014,31 @@ export function DetailPanel({
               <span className="dp-item-sub">
                 {e.negated ? 'NOT IN' : 'IN'} via {e.connectingCol}
               </span>
+            </div>
+          ))}
+        </div>
+      </>
+    )
+  } else if (node.kind === 'shapegroup') {
+    const members = graph.shapes.filter(
+      (s) => s.table === node.table && s.familyKey && !s.isSubquery && s.familyKey.join(',') === node.keyCols.join(','),
+    )
+    title = `Shapes · route by (${node.keyCols.join(', ')})`
+    body = (
+      <>
+        <Row k="table" v={node.table} />
+        <Row k="grouped shapes" v={members.length} />
+        <div className="dp-note">
+          One node per query family — these {members.length} equality shapes share the same route join,
+          one routing entry each; shape cardinality is unbounded over the one template. Turn off “group
+          shapes”, or click a member below, to see them individually.
+        </div>
+        <div className="dp-sec">shapes in this group</div>
+        <div className="dp-list">
+          {members.map((s) => (
+            <div key={s.id} className="dp-item">
+              <ShapeLink id={s.id} onSelect={onSelectShape} />
+              <span className="dp-item-sub">{predicateLabel(s.where)}</span>
             </div>
           ))}
         </div>

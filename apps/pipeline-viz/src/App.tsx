@@ -188,6 +188,10 @@ export default function App() {
   const [search, setSearch] = useState('')
   const [focus, setFocus] = useState<{ id: string; ref: NodeRef } | null>(null)
   const [view, setView] = useState<View>('logical')
+  // Collapse the fan-out of shapes that share one query template (same route join) into a single
+  // node badged with the count — on by default, since a real app opens the same handful of shapes
+  // once per user/value and the canvas would otherwise explode. Selecting a shape expands its family.
+  const [groupShapes, setGroupShapes] = useState(true)
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [sidebarW, setSidebarW] = useState(340)
   const [resizing, setResizing] = useState(false)
@@ -257,9 +261,9 @@ export default function App() {
     if (mode === 'select' && selected.size === 0) return { nodes: [], edges: [] }
     const sel = mode === 'all' ? 'all' : selected
     // alignSources pins every replication-source node into the leftmost rank.
-    const opts = { alignSources: true, positions: stickyPositions.current }
+    const opts = { alignSources: true, positions: stickyPositions.current, groupShapes }
     return view === 'circuit' ? buildCircuit(graph, sel, focus?.id ?? null, opts) : buildGraph(graph, sel, focus?.id ?? null, opts)
-  }, [graph, mode, selected, focus, view])
+  }, [graph, mode, selected, focus, view, groupShapes])
 
   // hop id → rendered node ids: identity in the logical view; in the circuit view, the operator
   // group the ENGINE stamped with that hop (OpNode.hop) — trace flashes and fresh-structure
@@ -568,6 +572,13 @@ export default function App() {
             }}
           >
             Clear
+          </button>
+          <button
+            className={groupShapes ? 'btn btn-on' : 'btn'}
+            title="Collapse shapes that share one query template (same route join) into a single node with a count — selecting a shape expands its family"
+            onClick={() => setGroupShapes((g) => !g)}
+          >
+            ⊞ Group shapes
           </button>
         </div>
         <div className="toolbar">

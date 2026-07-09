@@ -38,6 +38,9 @@ export type NodeRef =
   | { kind: 'sqnode'; sig: string; innerTable: string; projCol: string }
   | { kind: 'shape'; shapeId: string }
   | { kind: 'aggshape'; shapeId: string }
+  /** A collapsed family of shapes (the "group shapes" toggle): every equality shape on this
+   *  (table, key-cols) route join, shown as one node. The detail panel lists the members. */
+  | { kind: 'shapegroup'; table: string; keyCols: string[] }
   /** A circuit-view operator: its kind, the trace-hop it animates under, and its display label. */
   | { kind: 'op'; opKind: NodeKind; hop: string; label: string }
 
@@ -86,8 +89,13 @@ export interface RawEdge {
  * Turn the engine's `/graph` snapshot into the full pipeline graph (all nodes + edges). Shared
  * structure collapses naturally: family routers are keyed by (table, key-cols) and subquery nodes by
  * signature, so two shapes that share one underneath connect to the SAME node here.
+ *
+ * With `group` on, the fan-out of equality shapes on a shared route join collapses too: instead of
+ * one output node per shape, a family with >1 member gets ONE `shapegroup` node badged with the
+ * count. (Only in the whole-graph view; a selection always expands to individual shapes so their
+ * sinks stay reachable — see `buildGraph`.)
  */
-function buildFull(g: EngineGraph): { nodes: Map<string, RawNode>; edges: RawEdge[] } {
+function buildFull(g: EngineGraph, group: boolean): { nodes: Map<string, RawNode>; edges: RawEdge[] } {
   const nodes = new Map<string, RawNode>()
   const edges: RawEdge[] = []
   const familyMembers = new Map<string, number>()
@@ -135,42 +143,60 @@ function buildFull(g: EngineGraph): { nodes: Map<string, RawNode>; edges: RawEdg
       continue
     }
 
-    add(shapeId, {
-      kind: 'shape',
-      // The filter predicate is the node's headline content (highlighted); the shape id moves inline
-      // into the header tag row.
-      label: predicateLabel(s.where),
-      idTag: s.id,
-      highlight: true,
-      life: s.state,
-      serve: s.circuit?.label,
-      ref: { kind: 'shape', shapeId: s.id },
-    })
+    // A family with >1 member collapses to a single `shapegroup` node when grouping — so skip the
+    // per-shape node for those, and skip its route edge below.
+    const fid = s.familyKey && !s.isSubquery ? `family:${s.table}:${s.familyKey.join(',')}` : null
+    const shared = fid ? (familyMembers.get(fid) ?? 1) : 1
+    const grouped = group && fid !== null && shared > 1
+
+    if (!grouped) {
+      add(shapeId, {
+        kind: 'shape',
+        // The filter predicate is the node's headline content (highlighted); the shape id moves inline
+        // into the header tag row.
+        label: predicateLabel(s.where),
+        idTag: s.id,
+        highlight: true,
+        life: s.state,
+        serve: s.circuit?.label,
+        ref: { kind: 'shape', shapeId: s.id },
+      })
+    }
 
     if (s.isSubquery) {
       edge(tableId(s.table), shapeId, 'flow', 'filter + moves')
-    } else if (s.familyKey) {
-      const fid = `family:${s.table}:${s.familyKey.join(',')}`
-      const shared = familyMembers.get(fid) ?? 1
+    } else if (fid) {
       add(fid, {
         kind: 'family',
-        label: `route by (${s.familyKey.join(', ')})`,
+        label: `route by (${s.familyKey!.join(', ')})`,
         sub: shared > 1 ? `shared by ${shared} shapes` : undefined,
         shared,
-        ref: { kind: 'family', table: s.table, keyCols: s.familyKey },
+        ref: { kind: 'family', table: s.table, keyCols: s.familyKey! },
       })
       edge(tableId(s.table), fid, 'flow')
-      edge(fid, shapeId, 'route', keyLabel(s.where))
+      if (grouped) {
+        // One collapsed output node for the whole family (deduped by id across its members).
+        const gid = `shapegroup:${fid}`
+        add(gid, {
+          kind: 'shape',
+          label: `${shared} shapes`,
+          sub: `route by (${s.familyKey!.join(', ')})`,
+          ref: { kind: 'shapegroup', table: s.table, keyCols: s.familyKey! },
+        })
+        edge(fid, gid, 'route')
+      } else {
+        edge(fid, shapeId, 'route', keyLabel(s.where))
+      }
     } else {
-      const fid = `filter:${s.id}`
-      add(fid, {
+      const filterId = `filter:${s.id}`
+      add(filterId, {
         kind: 'filter',
         label: 'filter',
         sub: predicateLabel(s.where),
         ref: { kind: 'filter', shapeId: s.id },
       })
-      edge(tableId(s.table), fid, 'flow')
-      edge(fid, shapeId, 'flow')
+      edge(tableId(s.table), filterId, 'flow')
+      edge(filterId, shapeId, 'flow')
     }
   }
 
@@ -273,6 +299,9 @@ export interface BuildOpts {
    *  appear in the right slot of the STABLE frame instead of the re-ranked one. Final positions
    *  are written back. Clear the map to re-tidy the whole layout (the refresh button). */
   positions?: Map<string, { x: number; y: number }>
+  /** Collapse each family's fan-out of equality shapes into one `shapegroup` node (default on in
+   *  the app). Consumed by `buildGraph`; ignored by the circuit view. */
+  groupShapes?: boolean
 }
 
 export function layout(
@@ -431,7 +460,9 @@ export function buildGraph(
   focus: string | null = null,
   opts?: BuildOpts,
 ): { nodes: Node[]; edges: Edge[] } {
-  const full = buildFull(g)
+  // Grouping only applies to the whole-graph overview: a selection restricts to shape SINKS
+  // (`shape:<id>`), which a collapsed family node wouldn't carry, so we always expand there.
+  const full = buildFull(g, opts?.groupShapes !== false && selection === 'all')
   const restricted = selection === 'all' ? full : restrictToSelection(full, selection)
   return layout(restricted, focus, opts)
 }
