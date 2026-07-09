@@ -181,8 +181,11 @@ function buildFull(g: EngineGraph, group: boolean): { nodes: Map<string, RawNode
         const gid = `shapegroup:${fid}`
         add(gid, {
           kind: 'shape',
-          label: `${shared} shapes`,
-          sub: `route by (${s.familyKey!.join(', ')})`,
+          // The query template the members share — the key predicate with the value parameterized
+          // (`issue_id = ?`), shown like a concrete shape's predicate but abstracted over its value.
+          label: s.familyKey!.map((c) => `${c} = ?`).join(' AND '),
+          highlight: true,
+          sub: `${shared} shapes`,
           stack: true,
           ref: { kind: 'shapegroup', table: s.table, keyCols: s.familyKey! },
         })

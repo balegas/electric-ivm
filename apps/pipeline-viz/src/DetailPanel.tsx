@@ -1027,6 +1027,7 @@ export function DetailPanel({
     body = (
       <>
         <Row k="table" v={node.table} />
+        <Row k="query template" v={<code>{node.keyCols.map((c) => `${c} = ?`).join(' AND ')}</code>} />
         <Row k="grouped shapes" v={members.length} />
         <div className="dp-note">
           One node per query family — these {members.length} equality shapes share the same route join,
