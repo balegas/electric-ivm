@@ -3,7 +3,7 @@
 #   postgres — system of record (wal_level=logical), auto-seeded from ./seed on first boot
 #   ds       — durable-streams server (the log)
 #   engine   — the Rust engine: replication ingest + shape maintenance + GET /v1/shape (7010)
-#   api      — the extended tRPC API (unused until episode 3, present so this file never changes)
+#   api      — the extended tRPC API (not used by the current series; present so this file never changes)
 #   viz      — the pipeline visualizer (http://localhost:5180), proxying /engine/* to the engine
 #
 #   cd tutorials && docker compose up --build

@@ -14,7 +14,7 @@ From the `tutorials/` directory:
 docker compose up --build
 ```
 
-Five containers come up: **postgres** (already seeded with a tiny `issues` table), **ds** (the durable-streams log), the **engine**, an **api** server (ignore it until episode 3), and the **visualizer**. (If a port is already taken on your machine — a local Postgres on 5432 is the usual culprit — override it: `PG_PORT=15432 docker compose up --build`; same idea for `DS_PORT`, `ENGINE_PORT`, `API_PORT`, `VIZ_PORT`, and `VIZ_HTTPS_PORT`.)
+Five containers come up: **postgres** (already seeded with a tiny `issues` table), **ds** (the durable-streams log), the **engine**, an **api** server (the extended tRPC API — this series never needs it; it's here so the stack file never changes), and the **visualizer**. (If a port is already taken on your machine — a local Postgres on 5432 is the usual culprit — override it: `PG_PORT=15432 docker compose up --build`; same idea for `DS_PORT`, `ENGINE_PORT`, `API_PORT`, `VIZ_PORT`, and `VIZ_HTTPS_PORT`.)
 
 In a second terminal, check the engine is up and the data is there:
 

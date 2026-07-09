@@ -84,4 +84,4 @@ The interesting DBSP machinery starts when a circuit *must* remember things: equ
 
 Shapes compile to circuits of operators that pass weighted row-changes; an update is a retraction plus an insertion; and a predicate like yours needs no state at all. When a reader asks you "how does the engine know a row *left* a query result without re-running it?", you now know the answer: the `−1` told it.
 
-**Next — Episode 3, Shapes as resources:** creating shapes with the extended API, reading feeds straight from the durable-streams log, and what happens when two clients ask for the same shape (spoiler: one pipeline, on screen).
+**Next — Episode 3, Pipelines, shapes, and strangers:** step out of one shape and into the app's whole query graph — the engine's static compiled pipeline, the three-tier serving model, and shapes latching onto that pipeline (and letting go) live on the canvas. That's where "two clients, one pipeline" turns out to live.
