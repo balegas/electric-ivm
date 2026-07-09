@@ -1,4 +1,4 @@
-import type { Predicate, SubqueryRef } from './types'
+import type { GraphShape, Predicate, SubqueryRef } from './types'
 
 const OPS: Record<string, string> = {
   eq: '=',
@@ -78,4 +78,45 @@ function subqueryTemplateLabel(s: SubqueryRef): string {
 /** Short equality-key summary for a family member, e.g. `status = 'todo'`. Falls back to the predicate. */
 export function keyLabel(where: Predicate | null): string {
   return predicateLabel(where)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Shared "is this a subquery-bearing shape, and what template does it share" helpers. The logical
+// view (`build-graph`) and the circuit view (`build-circuit`) BOTH group repeated subquery shapes,
+// and they must agree exactly on which shapes are subquery-bearing and which of them share a
+// pipeline — otherwise one view stacks a pair the other leaves apart. These two functions are that
+// single shared definition; both views import them rather than re-deriving the test inline.
+// ---------------------------------------------------------------------------------------------
+
+/** Does a predicate use an `IN (SELECT …)` membership test anywhere in its tree? Mirrors the
+ *  engine's `predicate_has_subquery` (subquery.rs) so the visualizer's notion of "subquery-bearing"
+ *  never drifts from the executor's. */
+export function predicateHasSubquery(p: Predicate | null | undefined): boolean {
+  if (!p) return false
+  if ('and' in p) return p.and.some(predicateHasSubquery)
+  if ('or' in p) return p.or.some(predicateHasSubquery)
+  if ('not' in p) return predicateHasSubquery(p.not)
+  if ('in' in p) return true
+  return false
+}
+
+/** Is this shape subquery-bearing? The engine stamps this on the OUTER shape that USES the subquery
+ *  (`GraphShape.isSubquery`) — NOT on the inner subquery nodes — so keying grouping on the flag is
+ *  correct. We additionally fall back to inspecting the predicate so a shape from an older/mislabeled
+ *  engine that forgot the flag still groups. Both views group on THIS definition. */
+export function isSubqueryShape(s: GraphShape): boolean {
+  return s.isSubquery || predicateHasSubquery(s.where)
+}
+
+/** The structural template key of a subquery shape's maintained pipeline: its outer table, its
+ *  predicate TEMPLATE (every bound value dropped — see `predicateTemplate`), and its projection as an
+ *  ORDER-INSENSITIVE column set. Two instances of the same query that differ only in their bound
+ *  parameter (`user_id = 5` vs `user_id = 8`) produce the SAME key, which is what lets both views
+ *  stack their structurally identical pipelines while their materialized inner sets differ. The
+ *  projection is sorted so two callers that request the same columns in a different order still
+ *  share the key (a SELECT-list is a set for grouping purposes, and the engine emits `columns` in
+ *  request order — it does not canonicalize it the way it canonicalizes the predicate). */
+export function subqueryTemplateKey(s: GraphShape): string {
+  const cols = (s.columns ?? []).slice().sort().join(',')
+  return `${s.table}|${predicateTemplate(s.where)}|${cols}`
 }

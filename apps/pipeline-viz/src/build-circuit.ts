@@ -7,7 +7,7 @@
 import type { Edge, Node } from '@xyflow/react'
 
 import { layout, type BuildOpts, type NodeKind, type NodeRef, type RawEdge, type RawNode } from './build-graph'
-import { predicateTemplate, predicateTemplateLabel } from './predicate-label'
+import { isSubqueryShape, predicateTemplateLabel, subqueryTemplateKey } from './predicate-label'
 import type { EngineGraph, OpNode } from './types'
 
 const OP_KIND: Record<OpNode['kind'], NodeKind> = {
@@ -228,7 +228,7 @@ function planGroups(g: EngineGraph): GroupPlan {
   // they are excluded from the count — only the `pi`/`snk` chains fed by the route join collapse.
   const fam = new Map<string, { table: string; cols: string[]; ids: string[] }>()
   for (const s of g.shapes ?? []) {
-    if (!s.familyKey || s.isSubquery || s.aggregate) continue
+    if (!s.familyKey || isSubqueryShape(s) || s.aggregate) continue
     const key = `${s.table}:${s.familyKey.join(',')}`
     const e = fam.get(key) ?? { table: s.table, cols: s.familyKey, ids: [] }
     e.ids.push(s.id)
@@ -272,8 +272,8 @@ function planGroups(g: EngineGraph): GroupPlan {
     { outerTable: string; where: EngineGraph['shapes'][number]['where']; ids: string[]; sigs: Set<string> }
   >()
   for (const s of g.shapes ?? []) {
-    if (!s.isSubquery) continue
-    const key = `${s.table}|${predicateTemplate(s.where)}|${(s.columns ?? []).join(',')}`
+    if (!isSubqueryShape(s)) continue
+    const key = subqueryTemplateKey(s)
     const e = tpl.get(key) ?? { outerTable: s.table, where: s.where, ids: [], sigs: new Set<string>() }
     e.ids.push(s.id)
     for (const sig of sigsOfShape.get(s.id) ?? []) e.sigs.add(sig)

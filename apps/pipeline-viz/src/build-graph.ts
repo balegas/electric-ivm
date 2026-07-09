@@ -1,7 +1,7 @@
 import dagre from '@dagrejs/dagre'
 import type { Edge, Node } from '@xyflow/react'
 
-import { keyLabel, predicateLabel } from './predicate-label'
+import { isSubqueryShape, keyLabel, predicateLabel, predicateTemplateLabel, subqueryTemplateKey } from './predicate-label'
 import type { EngineGraph } from './types'
 
 // The node kinds are the engine's real maintained structures — the same set `GET /graph` reports
@@ -102,10 +102,15 @@ export interface RawEdge {
  * structure collapses naturally: family routers are keyed by (table, key-cols) and subquery nodes by
  * signature, so two shapes that share one underneath connect to the SAME node here.
  *
- * With `group` on, the fan-out of equality shapes on a shared route join collapses too: instead of
- * one output node per shape, a family with >1 member gets ONE `shapegroup` node badged with the
- * count. (Only in the whole-graph view; a selection always expands to individual shapes so their
- * sinks stay reachable — see `buildGraph`.)
+ * With `group` on, the two per-shape fan-outs collapse (only in the whole-graph view; a selection
+ * always expands so every shape's sink stays reachable — see `buildGraph`):
+ *   - Route-join families: instead of one output node per shape, a family with >1 member gets ONE
+ *     `shapegroup` node badged with the count.
+ *   - Subquery templates: subquery shapes whose maintained pipeline is structurally identical (same
+ *     outer table, predicate template, projection) — differing only in their bound parameter — get
+ *     ONE stacked `sqgroup` output node PLUS one stacked inner-set (`sqnode`) node in place of the
+ *     repeated per-instance pair. This is the logical mirror of the circuit view's subquery folding
+ *     (`build-circuit`'s `planGroups`), keyed on the SAME shared `subqueryTemplateKey`.
  */
 function buildFull(g: EngineGraph, group: boolean): { nodes: Map<string, RawNode>; edges: RawEdge[] } {
   const nodes = new Map<string, RawNode>()
@@ -130,11 +135,70 @@ function buildFull(g: EngineGraph, group: boolean): { nodes: Map<string, RawNode
   for (const t of g.tables) add(tableId(t), { kind: 'table', label: t, ref: { kind: 'table', name: t } })
 
   for (const s of g.shapes) {
-    if (s.familyKey && !s.isSubquery) {
+    if (s.familyKey && !isSubqueryShape(s)) {
       const fid = `family:${s.table}:${s.familyKey.join(',')}`
       familyMembers.set(fid, (familyMembers.get(fid) ?? 0) + 1)
     }
   }
+
+  // Subquery-template groups (the "group shapes" toggle) — the logical mirror of the circuit view's
+  // subquery folding. Subquery shapes whose maintained pipeline is structurally identical (same
+  // outer table, predicate template, and projection) differ only in their bound parameter, so a
+  // group of >1 collapses to ONE stacked `sqgroup` output node PLUS one stacked inner-set (`sqnode`)
+  // node — the two per-instance nodes that would otherwise repeat once per member. Built only when
+  // `group` is on (whole-graph view); a selection leaves the maps empty, so every subquery shape
+  // and node renders individually exactly as before.
+  interface SqGroup {
+    outerTable: string
+    where: EngineGraph['shapes'][number]['where']
+    shapeIds: string[]
+    sigs: Set<string>
+  }
+  const sqGroups = new Map<string, SqGroup>()
+  const shapeToSqGroup = new Map<string, string>() // shape id → group key (grouped members only)
+  const sigToSqGroup = new Map<string, string>() // subquery node sig → group key (grouped members only)
+  if (group) {
+    // The subquery node sigs each shape depends on (from the registry edges), so a group can name
+    // its inner set(s) and redirect their nodes.
+    const sigsOfShape = new Map<string, string[]>()
+    for (const e of g.subqueryEdges) {
+      if (e.dependentKind !== 'shape') continue
+      const arr = sigsOfShape.get(e.dependentId) ?? []
+      arr.push(e.nodeSig)
+      sigsOfShape.set(e.dependentId, arr)
+    }
+    for (const s of g.shapes) {
+      if (!isSubqueryShape(s)) continue
+      const key = subqueryTemplateKey(s)
+      const grp = sqGroups.get(key) ?? { outerTable: s.table, where: s.where, shapeIds: [], sigs: new Set<string>() }
+      grp.shapeIds.push(s.id)
+      for (const sig of sigsOfShape.get(s.id) ?? []) grp.sigs.add(sig)
+      sqGroups.set(key, grp)
+    }
+    // Keep only real groups (>1 member); a lone subquery shape renders individually, unchanged.
+    for (const [key, grp] of sqGroups) {
+      if (grp.shapeIds.length <= 1) {
+        sqGroups.delete(key)
+        continue
+      }
+      for (const id of grp.shapeIds) shapeToSqGroup.set(id, key)
+      for (const sig of grp.sigs) sigToSqGroup.set(sig, key)
+    }
+  }
+  const nodeBySig = new Map(g.subqueryNodes.map((n) => [n.sig, n]))
+  const sqGroupId = (key: string) => `sqgroup:${key}`
+  const sqNodeGroupId = (key: string) => `sqnode:group:${key}`
+  // Both stacked representatives (the output node and the inner-set node) carry the SAME `sqgroup`
+  // ref, so clicking either opens the one detail panel that lists every member shape and each
+  // instance's inner set — the members and their distinct contents stay inspectable behind the card.
+  const sqGroupRef = (grp: SqGroup, innerTable: string, projCol: string): NodeRef => ({
+    kind: 'sqgroup',
+    outerTable: grp.outerTable,
+    innerTable,
+    projCol,
+    shapeIds: grp.shapeIds,
+    sigs: [...grp.sigs],
+  })
 
   for (const s of g.shapes) {
     const shapeId = `shape:${s.id}`
@@ -155,11 +219,13 @@ function buildFull(g: EngineGraph, group: boolean): { nodes: Map<string, RawNode
       continue
     }
 
-    // A family with >1 member collapses to a single `shapegroup` node when grouping — so skip the
-    // per-shape node for those, and skip its route edge below.
-    const fid = s.familyKey && !s.isSubquery ? `family:${s.table}:${s.familyKey.join(',')}` : null
+    // A family with >1 member collapses to a single `shapegroup` node, and a subquery shape that
+    // shares a template with others collapses to a single `sqgroup` node — either way we skip the
+    // per-shape node (and, for a family, its route edge below).
+    const fid = s.familyKey && !isSubqueryShape(s) ? `family:${s.table}:${s.familyKey.join(',')}` : null
     const shared = fid ? (familyMembers.get(fid) ?? 1) : 1
-    const grouped = group && fid !== null && shared > 1
+    const sqKey = shapeToSqGroup.get(s.id) // set only when this subquery shape collapses into a group
+    const grouped = (group && fid !== null && shared > 1) || sqKey !== undefined
 
     if (!grouped) {
       add(shapeId, {
@@ -176,8 +242,27 @@ function buildFull(g: EngineGraph, group: boolean): { nodes: Map<string, RawNode
       })
     }
 
-    if (s.isSubquery) {
-      edge(tableId(s.table), shapeId, 'flow', 'filter + moves')
+    if (isSubqueryShape(s)) {
+      if (sqKey !== undefined) {
+        // Collapse this subquery shape into ONE stacked output node for its whole template group.
+        // Every member adds the SAME id (deduped by `add`), so N instances become one card.
+        const grp = sqGroups.get(sqKey)!
+        const rep = [...grp.sigs].map((sig) => nodeBySig.get(sig)).find((n) => n !== undefined)
+        const gid = sqGroupId(sqKey)
+        add(gid, {
+          kind: 'shape',
+          // The pipeline template all members share — the membership predicate with every bound
+          // value shown as `?` (`project_id IN (SELECT … WHERE user_id = ?)`).
+          label: predicateTemplateLabel(s.where),
+          highlight: true,
+          sub: `${s.table} · ${grp.shapeIds.length} shapes`,
+          stack: true,
+          ref: sqGroupRef(grp, rep?.innerTable ?? '?', rep?.projCol ?? '?'),
+        })
+        edge(tableId(s.table), gid, 'flow', 'filter + moves')
+      } else {
+        edge(tableId(s.table), shapeId, 'flow', 'filter + moves')
+      }
     } else if (fid) {
       add(fid, {
         kind: 'family',
@@ -218,6 +303,22 @@ function buildFull(g: EngineGraph, group: boolean): { nodes: Map<string, RawNode
   }
 
   for (const n of g.subqueryNodes) {
+    const sqKey = sigToSqGroup.get(n.sig)
+    if (sqKey !== undefined) {
+      // Collapse this inner set into ONE stacked IN-SET node for its whole template group. Every
+      // member sig adds the SAME id (deduped by `add`), so the N `project_members` nodes become one.
+      const grp = sqGroups.get(sqKey)!
+      add(sqNodeGroupId(sqKey), {
+        kind: 'sqnode',
+        label: n.innerTable,
+        sub: `distinct ${n.projCol} · ${grp.sigs.size} instances`,
+        stack: true,
+        ref: sqGroupRef(grp, n.innerTable, n.projCol),
+      })
+      add(tableId(n.innerTable), { kind: 'table', label: n.innerTable, ref: { kind: 'table', name: n.innerTable } })
+      edge(tableId(n.innerTable), sqNodeGroupId(sqKey), 'flow')
+      continue
+    }
     add(`node:${n.sig}`, {
       kind: 'sqnode',
       // No query expression on the canvas — the detail panel carries the full SQL.
@@ -230,10 +331,22 @@ function buildFull(g: EngineGraph, group: boolean): { nodes: Map<string, RawNode
     edge(tableId(n.innerTable), `node:${n.sig}`, 'flow')
   }
   for (const e of g.subqueryEdges) {
-    const src = `node:${e.nodeSig}`
+    // Redirect either endpoint onto its stacked group representative when grouping collapsed it, so
+    // the membership edge lands between the two reps (deduped across members by `edge`, no dangle).
+    const srcKey = sigToSqGroup.get(e.nodeSig)
+    const src = srcKey !== undefined ? sqNodeGroupId(srcKey) : `node:${e.nodeSig}`
     const rel = `${e.negated ? 'NOT IN' : 'IN'} · ${e.connectingCol}`
-    if (e.dependentKind === 'shape') edge(src, `shape:${e.dependentId}`, 'subquery', rel)
-    else edge(src, `node:${e.dependentId}`, 'subquery', rel)
+    let tgt: string
+    if (e.dependentKind === 'shape') {
+      const depKey = shapeToSqGroup.get(e.dependentId)
+      tgt = depKey !== undefined ? sqGroupId(depKey) : `shape:${e.dependentId}`
+    } else {
+      const depKey = sigToSqGroup.get(e.dependentId)
+      tgt = depKey !== undefined ? sqNodeGroupId(depKey) : `node:${e.dependentId}`
+    }
+    // A collapsed inner node feeding another collapsed node in the SAME group would self-loop; skip.
+    if (src === tgt) continue
+    edge(src, tgt, 'subquery', rel)
   }
 
   return { nodes, edges }
