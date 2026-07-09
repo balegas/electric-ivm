@@ -22,18 +22,39 @@ const OP_KIND: Record<OpNode['kind'], NodeKind> = {
   sink: 'op-sink',
 }
 
+/** The table an operator acts over, when naming it aids reading — and only then. Derived from the
+ *  engine's stable id/hop conventions (`d:<table>`, `sj:<shapeId>`, route join hop `family:<table>:…`,
+ *  `dist:<sig>`). Returns null for operators whose table is either obvious (the source, already named)
+ *  or one adjacent edge away (per-shape σ / π / sink), where a label would just add clutter. */
+function opTable(o: OpNode, shapeTable: Map<string, string>, innerTable: Map<string, string>): string | null {
+  if (o.kind === 'delta') return o.id.startsWith('d:') ? o.id.slice(2) : null
+  if (o.kind === 'join') {
+    if (o.id.startsWith('sj:')) return shapeTable.get(o.id.slice(3)) ?? null // membership: the outer (delta) table
+    if (o.hop.startsWith('family:')) return o.hop.slice('family:'.length).split(':')[0] || null // route join
+    return null
+  }
+  if (o.kind === 'distinct') return o.id.startsWith('dist:') ? (innerTable.get(o.id.slice(5)) ?? null) : null
+  return null
+}
+
 function buildFull(g: EngineGraph): { nodes: Map<string, RawNode>; edges: RawEdge[] } {
   const nodes = new Map<string, RawNode>()
+  const shapeTable = new Map((g.shapes ?? []).map((s) => [s.id, s.table]))
+  const innerTable = new Map((g.subqueryNodes ?? []).map((n) => [n.sig, n.innerTable]))
   // An engine older than the decomposition omits operators/opEdges — render an empty circuit
   // rather than crashing (the logical view still works against such an engine).
   for (const o of g.operators ?? []) {
+    const t = opTable(o, shapeTable, innerTable)
+    // Delta streams are one-per-table and otherwise identical ("Δ change"); name them by the table
+    // like the source above them. Joins and the subquery distinct append the table to their label.
+    const label = t === null ? o.label : o.kind === 'delta' ? t : `${o.label} · ${t}`
     nodes.set(o.id, {
       id: o.id,
       data: {
         kind: OP_KIND[o.kind],
-        label: o.label,
+        label,
         ...(o.state ? { stateId: o.state } : null),
-        ref: { kind: 'op', opKind: OP_KIND[o.kind], hop: o.hop, label: o.label },
+        ref: { kind: 'op', opKind: OP_KIND[o.kind], hop: o.hop, label },
       },
     })
   }
