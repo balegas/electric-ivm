@@ -718,7 +718,13 @@ pub async fn propagate_flips(
     trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
 ) -> Result<()> {
     while let Some((sig, flip)) = work.pop_front() {
-        let edges = registry.lock().await.edges_of(&sig);
+        // The flipped inner-set node's dependents, plus the table its change entered through: the
+        // head of the propagation path each dependent's trace lights (`table:<t>` → `node:<sig>` →
+        // dependent). Fetched under one lock so a concurrent drop can't split them.
+        let (edges, source_table) = {
+            let reg = registry.lock().await;
+            (reg.edges_of(&sig), reg.nodes.get(&sig).map(|n| n.inner_table.clone()))
+        };
         for edge in edges {
             // A NULL-value flip only matters to NULL-sensitive dependents — a `NOT IN` leaf, or an
             // `IN` leaf under any `Not{…}` (SQL: a NULL in the set makes the leaf UNKNOWN, which
@@ -735,16 +741,21 @@ pub async fn propagate_flips(
                 Dependent::Shape(id) => {
                     let moved =
                         move_shape_for_value(registry, id, edge.connecting_col, &flip.value, txid.clone()).await?;
-                    if let Some((table, id)) = moved {
-                        emit_flip_trace(trace_tx, &table, format!("shape:{id}"), Some(id));
+                    // Light the whole path only when the shape actually moved rows: source
+                    // `table:<t>` → the flipped `node:<sig>` → this `shape:<id>`.
+                    if let (Some((outer, net)), Some(src)) = (moved, source_table.as_deref()) {
+                        emit_flip_trace(trace_tx, &outer, src, &sig, format!("shape:{id}"), vec![id.clone()], net);
                     }
                 }
                 Dependent::Node(parent_sig) => {
                     let new_flips =
                         reconcile_parent_for_value(registry, parent_sig, edge.connecting_col, &flip.value).await?;
-                    if let Some((table, flips)) = new_flips {
-                        if !flips.is_empty() {
-                            emit_flip_trace(trace_tx, &table, format!("node:{parent_sig}"), None);
+                    if let Some((_inner, flips)) = new_flips {
+                        // A nested `IN`: connect the flipped child `node:<sig>` to the parent
+                        // `node:<parent_sig>` it re-derived, so the propagation reads through. The
+                        // parent's own downstream shape lights when its flips reach a shape edge.
+                        if let (false, Some(src)) = (flips.is_empty(), source_table.as_deref()) {
+                            emit_flip_trace(trace_tx, src, src, &sig, format!("node:{parent_sig}"), Vec::new(), flip_net(&flips));
                         }
                         for f in flips {
                             work.push_back((parent_sig.clone(), f));
@@ -759,14 +770,16 @@ pub async fn propagate_flips(
 
 /// An inner-set value `v` flipped for an outer shape: query the outer rows with `connecting_col = v`,
 /// re-evaluate the full shape predicate, and append `upsert` (matches) / `delete` (doesn't) by pk.
-/// Returns `Some((outer_table, shape_id))` when envelopes were appended.
+/// Returns `Some((outer_table, net_weight))` when envelopes were appended — the shape's own table
+/// (the event's `table`) and the net membership change (for the trace dot's label/colour) — or
+/// `None` when nothing moved.
 async fn move_shape_for_value(
     registry: &tokio::sync::Mutex<SubqueryRegistry>,
     shape_id: &str,
     connecting_col: usize,
     value: &Value,
     txid: Option<String>,
-) -> Result<Option<(String, String)>> {
+) -> Result<Option<(String, i64)>> {
     // Brief lock: snapshot what the query-back needs.
     let (ts, pg_url, arr) = {
         let reg = registry.lock().await;
@@ -788,6 +801,8 @@ async fn move_shape_for_value(
             (r, w)
         })
         .collect();
+    // Net membership change this move applies (enters +1, leaves −1), for the trace dot.
+    let net: i64 = out.iter().map(|(_, w)| *w as i64).sum();
     let envs = crate::engine::translate_output(&ts, out, txid, None, shape.out_cols.as_deref().map(Vec::as_slice));
     if envs.is_empty() {
         return Ok(None);
@@ -795,7 +810,7 @@ async fn move_shape_for_value(
     shape.emitted.fetch_add(envs.len() as u64, std::sync::atomic::Ordering::Relaxed);
     // Reliable: a dropped move envelope is permanent divergence for the shape's subscribers.
     reg.ds.append_reliable(&shape.stream_path, &envs).await;
-    Ok(Some((ts.name.clone(), shape_id.to_string())))
+    Ok(Some((ts.name.clone(), net)))
 }
 
 /// A parent node's value `v` was referenced by a flipped child; re-evaluate the parent's inner rows
@@ -937,14 +952,40 @@ async fn query_all(
     Ok(crate::pg::backfill_where(&client, ts, None).await?.rows)
 }
 
-/// Broadcast a lossy trace event for a deferred flip effect (a shape move or a parent-node
-/// reconcile), so the visualizer still animates propagation that no longer happens inside the
-/// originating envelope's trace.
+/// Net membership change carried by a batch of parent-node flips (enters +1, leaves −1), for the
+/// trace dot's label/colour.
+fn flip_net(flips: &[Flip]) -> i64 {
+    flips
+        .iter()
+        .map(|f| match f.dir {
+            FlipDir::Enter => 1,
+            FlipDir::Leave => -1,
+        })
+        .sum()
+}
+
+/// Broadcast a lossy trace event lighting the WHOLE path a deferred inner-set flip travelled: the
+/// source inner `table:<t>` the change entered through, the flipped inner-set `node:<sig>` (its
+/// `IN-SET ARRANGE`/distinct), and the re-derived `dependent` (`shape:<sid>` for an outer subquery
+/// shape, or a parent `node:<sig>` for nested `IN`). The originating envelope's own trace stops at
+/// the inner-set node — the propagator moves the dependent out of band, after the query-backs — so
+/// without this the visualizer flashes the source, fades the moved shape off that direct change's
+/// path, and never pulses the serving edge (an edge pulses only when both endpoints flash). One
+/// synthetic weighted row carries the net membership change so the travelling dot is labelled +1 /
+/// −1 and coloured. Best-effort and zero-cost when no one is subscribed, mirroring the in-engine
+/// trace path.
+///
+/// `event_table` is the table the event is *about* (the dependent shape's own table, matching the
+/// direct-change trace's `table`); `source_table` is where the change entered and heads the hop path
+/// (they differ: a `project_members` change moves an `issues` shape).
 fn emit_flip_trace(
     trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
-    table: &str,
-    node: String,
-    shape_id: Option<String>,
+    event_table: &str,
+    source_table: &str,
+    node_sig: &SubquerySig,
+    dependent: String,
+    shapes: Vec<String>,
+    net: i64,
 ) {
     if trace_tx.receiver_count() == 0 {
         return;
@@ -952,10 +993,16 @@ fn emit_flip_trace(
     let ev = crate::trace::TraceEvent {
         lsn: None,
         txid: None,
-        table: table.to_string(),
-        delta: Vec::new(),
-        hops: vec![crate::trace::TraceHop::new(node, "passed")],
-        shapes: shape_id.into_iter().collect(),
+        table: event_table.to_string(),
+        // One synthetic weighted row carrying the net change: a single flip can move many outer
+        // rows, so the payload is not one table row — left empty, weighted by the net.
+        delta: vec![crate::trace::TraceDelta { row: serde_json::json!({}), w: net }],
+        hops: vec![
+            crate::trace::TraceHop::new(format!("table:{source_table}"), "passed"),
+            crate::trace::TraceHop::new(format!("node:{node_sig}"), "passed"),
+            crate::trace::TraceHop::new(dependent, "passed"),
+        ],
+        shapes,
     };
     if let Ok(json) = serde_json::to_string(&ev) {
         let _ = trace_tx.send(Arc::new(json));
@@ -1132,6 +1179,53 @@ mod tests {
             hops.iter().any(|h| h.node == "node:sig1" && h.outcome == "dropped"),
             "expected dropped node hop, got {hops:?}"
         );
+    }
+
+    /// A deferred inner-set flip that moves a dependent shape must light the WHOLE propagation path
+    /// — the source inner `table:`, the flipped `node:<sig>` (IN-SET ARRANGE/distinct), and the
+    /// re-derived `shape:<sid>` — so the visualizer animates the moved shape instead of fading it
+    /// off the direct change's path (the "leaving a project" bug).
+    #[test]
+    fn flip_trace_lights_source_node_and_shape() {
+        let (trace_tx, mut trace_rx) = tokio::sync::broadcast::channel::<Arc<String>>(8);
+        // A `project_members` delete flipped inner-set value; the `issues` shape s1 lost 103 rows.
+        let sig = "project_members|project_id|L(user_id,Eq,1)".to_string();
+        emit_flip_trace(&trace_tx, "issues", "project_members", &sig, "shape:s1".into(), vec!["s1".into()], -103);
+
+        let ev: serde_json::Value = serde_json::from_str(&trace_rx.try_recv().unwrap()).unwrap();
+        // The event is about the dependent shape's table; the path still heads at the source.
+        assert_eq!(ev["table"], "issues");
+        let outcome = |node: &str| {
+            ev["hops"].as_array().unwrap().iter().find(|h| h["node"] == node).map(|h| h["outcome"].clone())
+        };
+        assert_eq!(outcome("table:project_members"), Some(serde_json::json!("passed")), "source lit");
+        assert_eq!(outcome(&format!("node:{sig}")), Some(serde_json::json!("passed")), "subquery node lit");
+        assert_eq!(outcome("shape:s1"), Some(serde_json::json!("passed")), "dependent shape lit");
+        assert_eq!(ev["shapes"].as_array().unwrap(), &vec![serde_json::json!("s1")]);
+        assert_eq!(ev["delta"][0]["w"], -103, "the dot carries the real net −103 leave, not 0");
+    }
+
+    /// Gating: a flip that changes no dependent membership emits nothing. Here a NULL flip reaches a
+    /// plain (non-negated) `IN` dependent, which NULL can't move — `propagate_flips` skips it, so no
+    /// path lights and the visualizer fades nothing spuriously.
+    #[tokio::test]
+    async fn flip_no_op_emits_no_trace() {
+        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+        reg.nodes.insert("sig1".into(), node_with_sig("sig1"));
+        reg.edges.push(Edge {
+            node_sig: "sig1".into(),
+            dependent: Dependent::Shape("s7".into()),
+            connecting_col: 0,
+            negated: false,
+            null_sensitive: false,
+        });
+        let reg = tokio::sync::Mutex::new(reg);
+        let (trace_tx, mut trace_rx) = tokio::sync::broadcast::channel::<Arc<String>>(8);
+
+        let mut work: VecDeque<(SubquerySig, Flip)> = VecDeque::new();
+        work.push_back(("sig1".into(), Flip { value: Value::Null, dir: FlipDir::Enter }));
+        propagate_flips(&reg, work, None, &trace_tx).await.unwrap();
+        assert!(trace_rx.try_recv().is_err(), "a NULL flip on a non-null-sensitive dependent emits nothing");
     }
 
     fn node_with_sig(sig: &str) -> SubqueryNode {
