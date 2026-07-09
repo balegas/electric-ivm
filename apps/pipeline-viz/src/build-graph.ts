@@ -439,6 +439,9 @@ export function layout(
       id: e.id,
       source: e.source,
       target: e.target,
+      // Carry the kind so the trace animation can tell a data stream from a state READ (a dashed
+      // arrangement lookup shouldn't get a travelling delta dot).
+      data: { kind: e.kind },
       // Serving edges animate like subquery flips: data continuously flows FROM the circuit.
       animated: (e.kind === 'subquery' || e.kind === 'serve') && !dim,
       style: {
