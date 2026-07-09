@@ -3832,20 +3832,26 @@ fn process_router_deltas(
 }
 
 /// Fold one transaction's count-group deltas into the circuit-served aggregates and emit one
-/// updated `{value, n}` envelope per changed aggregate.
+/// updated `{value, n}` envelope per changed aggregate. A circuit-served count is maintained here
+/// (over the table's counts pipeline), NOT by the in-engine fold in [`process_envelope`], so this
+/// is also where its fold trace hop is emitted — otherwise a count-affecting change would flash the
+/// source table but never the fold node, and the source→fold serving edge would never pulse.
 fn apply_count_deltas(
     execs: &mut HashMap<String, TableExec>,
     deltas: Vec<crate::arrangements::CountDelta>,
     txid: Option<String>,
     lsn: Option<String>,
     txn_pending: &mut HashMap<String, Vec<Envelope>>,
+    trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
 ) {
-    let mut changed: Vec<(String, String)> = Vec::new(); // (table, shape id)
+    let mut changed: Vec<(String, String)> = Vec::new(); // (table, shape id), in first-touch order
+    let mut net: HashMap<String, i64> = HashMap::new(); // shape id -> net count change this txn
     for d in deltas {
         let Some(exec) = execs.get_mut(&d.table) else { continue };
         for (sid, agg) in exec.circuit_aggs.iter_mut() {
             if agg.group_matches(&d.group) {
                 agg.value += d.delta;
+                *net.entry(sid.clone()).or_insert(0) += d.delta;
                 if !changed.iter().any(|(_, s)| s == sid) {
                     changed.push((d.table.clone(), sid.clone()));
                 }
@@ -3857,6 +3863,49 @@ fn apply_count_deltas(
         let Some(agg) = exec.circuit_aggs.get(&sid) else { continue };
         let env = agg.envelope(&exec.ts.name, txid.clone(), lsn.clone());
         txn_pending.entry(agg.stream_path.clone()).or_default().push(env);
+        // Animate the fold absorbing the source delta (see the fn doc): emit a `folded` hop on the
+        // aggregate's `shape:<sid>` node, alongside the source `table:<t>` node the change entered
+        // through — but only when the running count actually moved (a net-zero regrouping shows
+        // nothing).
+        let delta = net.get(&sid).copied().unwrap_or(0);
+        if delta != 0 {
+            emit_count_fold_trace(trace_tx, &table, &sid, delta, txid.clone(), lsn.clone());
+        }
+    }
+}
+
+/// Broadcast a trace event for a circuit-served COUNT fold that absorbed a source delta this
+/// transaction: the source `table:<t>` passed the change into the aggregate's `shape:<sid>` fold.
+/// This lets the pipeline visualizer flash the fold node and pulse the source→fold serving edge,
+/// exactly as the in-engine fold does from [`process_envelope`]. Best-effort and zero-cost when no
+/// one is subscribed (see [`crate::trace`]).
+fn emit_count_fold_trace(
+    trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
+    table: &str,
+    sid: &str,
+    delta: i64,
+    txid: Option<String>,
+    lsn: Option<String>,
+) {
+    if trace_tx.receiver_count() == 0 {
+        return;
+    }
+    let ev = crate::trace::TraceEvent {
+        lsn,
+        txid,
+        table: table.to_string(),
+        // One synthetic weighted row carrying the net count change, so the visualizer labels the
+        // travelling dot +1 / −1 and colours it. The count's grouping is not itself a table row, so
+        // the row payload is left empty.
+        delta: vec![crate::trace::TraceDelta { row: serde_json::json!({}), w: delta }],
+        hops: vec![
+            crate::trace::TraceHop::new(format!("table:{table}"), "passed"),
+            crate::trace::TraceHop::new(format!("shape:{sid}"), "folded"),
+        ],
+        shapes: vec![sid.to_string()],
+    };
+    if let Ok(json) = serde_json::to_string(&ev) {
+        let _ = trace_tx.send(Arc::new(json));
     }
 }
 
@@ -4400,6 +4449,7 @@ async fn sequencer_loop(
                         if !txn_count_deltas.is_empty() {
                             apply_count_deltas(
                                 &mut execs, txn_count_deltas, txid.clone(), lsn.clone(), &mut txn_pending,
+                                &trace_tx,
                             );
                         }
                         emit_storage_txn_metrics(&txn_pending);
@@ -5895,6 +5945,68 @@ mod tests {
         let ev: serde_json::Value = serde_json::from_str(&trace_rx.try_recv().unwrap()).unwrap();
         let hops = ev["hops"].as_array().unwrap();
         assert!(hops.iter().any(|h| h["node"] == "shape:s4" && h["outcome"] == "dropped"), "{hops:?}");
+    }
+
+    /// A circuit-served COUNT is maintained over the table's counts pipeline, not the in-engine
+    /// fold, so `apply_count_deltas` must emit the fold's trace hop itself — otherwise a
+    /// count-affecting change would flash the source but never the fold node (and the source→fold
+    /// serving edge would never pulse in the visualizer's circuit view).
+    #[test]
+    fn count_delta_emits_fold_trace() {
+        use crate::arrangements::CountDelta;
+        let mut execs: HashMap<String, TableExec> = HashMap::new();
+        let mut exec = TableExec::new(users());
+        // COUNT(*) over the whole table: one unconstrained group dimension matches every group.
+        exec.circuit_aggs
+            .insert("s4".into(), CircuitAgg { stream_path: "shape/s4".into(), constraints: vec![None], value: 0 });
+        execs.insert("users".into(), exec);
+
+        let (trace_tx, mut trace_rx) = tokio::sync::broadcast::channel::<Arc<String>>(16);
+        let group = |g: &str| Row(vec![Value::Text(g.into())]);
+        let hop_outcome = |ev: &serde_json::Value, node: &str| {
+            ev["hops"].as_array().unwrap().iter().find(|h| h["node"] == node).map(|h| h["outcome"].clone())
+        };
+
+        // Insert (+1): the fold absorbs the change; trace flags the source passed and shape:s4 folded.
+        let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
+        apply_count_deltas(
+            &mut execs,
+            vec![CountDelta { table: "users".into(), group: group("open"), delta: 1 }],
+            Some("7".into()), None, &mut pending, &trace_tx,
+        );
+        assert_eq!(execs["users"].circuit_aggs["s4"].value, 1);
+        assert!(pending.contains_key("shape/s4"), "aggregate envelope emitted");
+        let ev: serde_json::Value = serde_json::from_str(&trace_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(ev["table"], "users");
+        assert_eq!(hop_outcome(&ev, "table:users"), Some(serde_json::json!("passed")));
+        assert_eq!(hop_outcome(&ev, "shape:s4"), Some(serde_json::json!("folded")));
+        assert_eq!(ev["delta"][0]["w"], 1);
+        assert_eq!(ev["shapes"].as_array().unwrap(), &vec![serde_json::json!("s4")]);
+
+        // Delete (−1): the dot is labelled/coloured by the negative net change.
+        let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
+        apply_count_deltas(
+            &mut execs,
+            vec![CountDelta { table: "users".into(), group: group("open"), delta: -1 }],
+            None, None, &mut pending, &trace_tx,
+        );
+        assert_eq!(execs["users"].circuit_aggs["s4"].value, 0);
+        let ev: serde_json::Value = serde_json::from_str(&trace_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(ev["delta"][0]["w"], -1);
+        assert_eq!(hop_outcome(&ev, "shape:s4"), Some(serde_json::json!("folded")));
+
+        // Net-zero (a row moved between groups, count unchanged): no fold trace — nothing to show.
+        let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
+        apply_count_deltas(
+            &mut execs,
+            vec![
+                CountDelta { table: "users".into(), group: group("a"), delta: 1 },
+                CountDelta { table: "users".into(), group: group("b"), delta: -1 },
+            ],
+            None, None, &mut pending, &trace_tx,
+        );
+        assert_eq!(execs["users"].circuit_aggs["s4"].value, 0);
+        assert!(trace_rx.try_recv().is_err(), "net-zero change emits no fold trace");
     }
 
     fn agg(func: AggFn, col: Option<usize>) -> AggShape {
