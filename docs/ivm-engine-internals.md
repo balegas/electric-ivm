@@ -35,8 +35,8 @@ Three layers, one idea — *maintain query results incrementally as the database
 ```
 
 **The hot path holds no copy of any table.** This is the single most important fact for
-reasoning about cost. State that scales with row count lives in Postgres — or, when the
-circuit is enabled, in its disk-spillable arrangements; the hot path keeps only per-shape
+reasoning about cost. State that scales with row count lives in Postgres — or, in the
+always-on circuit's disk-spillable arrangements; the hot path keeps only per-shape
 metadata and, for subqueries, a shared set of *inner-query result values*.
 Baseline engine RSS is ~19 MiB whether the database has 1,000 or 100,000 rows
 (measured by the shape-memory matrix benchmark in `packages/bench`).

@@ -344,11 +344,15 @@ The conformance suite runs against the always-on circuit — the harness passes 
 
 - **Observability**: `/graph` carries an `arrangements` section — the
   compiled circuit as stable-id nodes (`arr:input:<table>` per table, `arr:index:<table>:<cols>`
-  per index pipeline, `arr:counts:<table>` per counts pipeline, with seeded flags and the
-  served/fallback lookup counters) plus a `consumers` list connecting each node to the
-  shapes/subquery nodes it currently serves. The circuit is static, so the visualizer's circuit
-  view renders it as a permanent dashed lane; the consumer edges appear and disappear with the
-  shapes.
+  per index pipeline — every table's primary-key arrangement included — `arr:counts:<table>` per
+  counts pipeline, with seeded flags and the served/fallback lookup counters) plus a `consumers`
+  list connecting each node to the shapes/subquery nodes it currently serves. The circuit is
+  static; rather than drawing a separate arrangement lane, the visualizer's circuit view **folds
+  each table's arrangements onto that table's source node** — an indigo "indexed" treatment and an
+  `⧉ N idx · M cnt` badge, with the full `map_index`/`weighted_count` list in the source's detail
+  panel. The consumer edges re-anchor to the source (solid animated `serves` for circuit-served
+  shapes and aggregates, dashed `lookup` for subquery re-derivations) and appear and disappear with
+  the shapes.
 - **Limits**: circuit structure is fixed at boot (a dbsp circuit is fixed at construction) —
   new lookup columns or counts specs need a restart, and the layout fingerprint handles the
   discard/reseed; single worker; equality lookups and full scans only (no range seeks).
@@ -443,7 +447,7 @@ stream, and client, including live replication, batched mutations, NULLs, and co
 | replication ingestor | 1 task | stream pgoutput/decode/append/acknowledge |
 | subquery registry | 0 (a mutex) | the sequencer reconciles nodes + emits under it (in-memory + appends only) |
 | flip propagator | 1 task | deferred subquery query-backs; PG round-trips never hold the registry lock |
-| circuit (when enabled) | 1 OS thread | owns the `DBSPHandle`; blocking steps, fed by a bounded channel (backpressure to the sequencer) |
+| circuit (always-on) | 1 OS thread | owns the `DBSPHandle`; blocking steps, fed by a bounded channel (backpressure to the sequencer) |
 
 Threads are flat in the number of shapes *and* in the number of equality templates.
 

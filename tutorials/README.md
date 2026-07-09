@@ -67,6 +67,7 @@ Reopen `https://localhost:5543` and the warning is gone.
 1. **[Your first live shape](episodes/01-first-shape/README.md)** — create one shape with a single HTTP request, watch the engine build its pipeline, and watch one write flow through it end to end.
 2. **[Inside the pipeline](episodes/02-inside-the-pipeline/README.md)** — the same shape, exploded into the DBSP circuit the engine really executes: deltas, weights, and why an update is a retraction plus an insertion.
 3. **[Pipelines, shapes, and strangers](episodes/03-serving-model/README.md)** — step out of one shape into the app's whole query graph: deploy a static compiled pipeline for a todo model and watch the three-tier serving model at work — pipelines serve families, routing serves instances, the fallback serves strangers — with shapes latching onto the pipeline (and letting go) live on the canvas.
+4. **[Extending the pipeline (and rebuilding it)](episodes/04-extending-the-pipeline/README.md)** — add a cohort dimension the pipeline doesn't serve yet, watch its shape fall to the fallback tier, then change the config and rebuild the circuit: the arrangements reseed from Postgres, the shapes replay from the durable catalog, and that fallback shape is promoted to circuit-served — the line between what ships with a deploy and what flows at runtime, drawn by hand.
 
 Each episode picks up from the last.
 

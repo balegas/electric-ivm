@@ -78,9 +78,11 @@ psql "postgres://postgres:password@localhost:5432/electric" \
 
 ## 5. Stateless vs stateful
 
-Click the σ box: its detail panel shows what it evaluates, and note what it *doesn't* have — stored rows. σ and π are pure per-delta functions; this entire circuit keeps **no state**, which is why the engine can maintain a shape like this for next to nothing.
+Click the σ box: its detail panel shows what it evaluates, and note what it *doesn't* have — stored rows. σ and π are pure per-delta functions; this stretch of the circuit keeps **no state**, which is why the engine can maintain a shape like this for next to nothing.
 
-The interesting DBSP machinery starts when a circuit *must* remember things: equality routing uses a shared index, joins and subqueries keep **arrangements** (stateful indexes — when one feeds a join, the canvas draws that edge dashed), and aggregations keep folds. That state — and how it stays small — is where the series goes next.
+The one bit of state already on screen is easy to miss: the **source** node is tinted indigo and wears a `⧉ 1 idx` badge. That is the always-on dbsp circuit's automatic **primary-key arrangement** for `issues` — every replicated table gets one, folded right onto its source rather than drawn as a separate box. Click the source and the detail panel's **compiled dbsp arrangements** section spells it out. Nothing is served *from* it yet — no shape here needs it — so it just sits there, seeded.
+
+The interesting DBSP machinery starts when a circuit *must* remember more: equality routing uses a shared index, joins and subqueries keep **arrangements** (stateful indexes — an app configures cohort indexes and they fold onto the source too, and when one serves a subquery's re-derivations the canvas draws that lookup edge dashed, hanging off the source), and aggregations keep folds. That state — and how it stays small — is where the series goes next.
 
 ## 6. What you now know
 

@@ -87,30 +87,45 @@ curl http://localhost:7010/health
 
 Open **https://localhost:5543** and switch the canvas to the **dbsp circuit** view (the
 **Logical / dbsp circuit** toggle at the top of the left sidebar). In episode 2 this view exploded
-*one shape* into operators. Now it shows something new: a **permanent, dashed lane** — the compiled
-circuit itself — with **no shape attached to it yet**.
+*one shape* into operators. Now it shows something new: the compiled circuit itself, **with no shape
+attached to it yet** — and the compiled arrangements are drawn *folded onto the table source nodes*,
+not as a separate row of boxes.
 
-The sidebar counter reads it out:
+The sidebar counter reads the circuit out:
 
 ```
-dbsp: 3 indexes · 1 counts · 0 served · 0 fallback
+dbsp: 7 indexes · 1 counts · 0 served · 0 fallback
 ```
 
-On the lane you'll find:
+Seven, not three: the circuit gives **every** replicated table an automatic primary-key
+arrangement — four tables (`issues`, `lists`, `todos`, `list_members`), so four — and the overlay
+declared **three** app cohort indexes on top of those. The one counts pipeline is the overlay's
+`todos:list_id+done`. `served` and `fallback` are *lookup* counters — how many index lookups were
+answered from the circuit's own snapshots versus fell back to Postgres — and nothing has asked yet,
+so both sit at zero.
 
-- **an input per replicated table** — `todos`, `lists`, `list_members`, and `issues` (episode 1's
-  table is still here; nobody configured a pipeline for it, so it sits with only its primary-key
-  input — a table the circuit tier ignores). Each input's chip says `seeded` once its
-  `REPEATABLE READ` snapshot has loaded.
-- **three index pipelines** — `map_index(list_id)` on `todos`, `map_index(user_id)` and
-  `map_index(list_id)` on `list_members`, each `→ integrate_trace`. These are the cohort
-  arrangements shapes will be *served from*.
-- **one counts pipeline** — `weighted_count(list_id, done)` over `todos`: a live COUNT per
-  `(list, done)` group.
+Those arrangements don't get their own lane. Each one is **folded onto the source node of the table
+it indexes**: a source carrying arrangements turns indigo and wears a small badge — `⧉ <n> idx` (its
+index count), plus `· <m> cnt` if it also has a counts pipeline. Read the four sources:
 
-This lane doesn't come and go. It was built at boot and it stays, whether zero shapes or ten
+- **`todos`** — indigo, badge `⧉ 2 idx · 1 cnt`: its primary-key arrangement, the `list_id`
+  cohort index shapes will be *served from*, and the `(list_id, done)` counts pipeline.
+- **`list_members`** — indigo, badge `⧉ 3 idx`: its primary key plus the `user_id` and `list_id`
+  indexes the membership router reads.
+- **`issues`** and **`lists`** — indexed too, but only by the primary-key arrangement every table
+  gets (`⧉ 1 idx`): nobody configured an app pipeline for them, so they carry nothing a shape is
+  served from. `issues` (episode 1's table) is just along for the ride.
+
+The teaching contrast is in the badge, not the color: `todos` and `list_members` carry the **app
+cohort indexes** shapes latch onto; `issues` and `lists` carry only the primary-key arrangement the
+circuit hands every table. Click any source node and the detail panel spells its fold out — a
+**compiled dbsp arrangements** section listing every `map_index(cols)` and, for `todos`, the
+`weighted_count(list_id, done)` pipeline, each marked *seeded* once its `REPEATABLE READ` snapshot
+has loaded.
+
+This structure doesn't come and go. It was built at boot and it stays, whether zero shapes or ten
 thousand are open — **structure never scales with subscriptions**. Keep the tab open; the rest of
-the episode is shapes latching onto this lane and letting go.
+the episode is shapes latching onto these arrangements and letting go.
 
 ## 4. Tier 1 — the pipeline serves a family (a membership shape)
 
@@ -136,17 +151,18 @@ came from*.
 > The `+ new shape` form handles this subquery gracefully: pick `todos`, and the `WHERE` editor
 > autocompletes the whole `list_id IN (SELECT list_id FROM list_members WHERE user_id = 'alice')`
 > predicate — column names, the `IN (SELECT …)` scaffold, and all. Submit and the same shape latches
-> onto the lane on the canvas. We stay on `curl` here because §5 long-polls this shape's tail and
-> needs the `electric-handle` / `electric-offset` the create response returns — the browser keeps
-> those to itself.
+> onto the `todos` source on the canvas. We stay on `curl` here because §5 long-polls this shape's
+> tail and needs the `electric-handle` / `electric-offset` the create response returns — the browser
+> keeps those to itself.
 
-Look at the canvas. A shape node just appeared and **latched onto the static lane with a solid,
-animated `serves` edge** — from the `todos map_index(list_id)` arrangement into the shape's
-membership operator. The sidebar counter ticked to `1 served`, and the shape's row in the list wears
-a **`circuit`** badge. That backfill of four rows did **not** query Postgres: the shape was *seeded
-from the arrangement snapshots* the circuit already holds — no backfill `SELECT`, no snapshot gate.
-The pipeline was already maintaining `todos` keyed by list; the shape just selected alice's cohort
-groups {1, 2} out of it.
+Look at the canvas. A shape node just appeared and **latched onto the `todos` source node with a
+solid, animated `serves · list_id` edge** — the `list_id` arrangement is folded onto that source, so
+the serving edge originates *there* and runs into the shape's membership operator. The shape's row in
+the list wears a **`circuit`** badge, and the sidebar's `served` counter — index lookups answered
+from the circuit's snapshots rather than Postgres — starts to climb. That backfill of four rows did
+**not** query Postgres: the shape was *seeded from the arrangement snapshots* the circuit already
+holds — no backfill `SELECT`, no snapshot gate. The pipeline was already maintaining `todos` keyed by
+list; the shape just selected alice's cohort groups {1, 2} out of it.
 
 That is tier one in one picture: **the pipeline is the family, the shape is a selection of its cohort
 groups, and the selection is resolved at the delivery edge** — the edge you're looking at.
@@ -198,15 +214,16 @@ psql "postgres://postgres:password@localhost:5432/electric" \
 
 > Or do it from the canvas: open the `list_members` node, tick the `(3, alice)` row in its detail
 > panel, and delete it (`DELETE /table/list_members/rows`, by primary key). Same move-out, watched on
-> the lane — the membership row leaves, and alice's cohort group 3 unsubscribes.
+> the canvas — the membership row leaves, and alice's cohort group 3 unsubscribes.
 
 The next long-poll returns two **deletes** for todos 6 and 7 — they didn't leave Postgres, they left
 *alice's shape* when she left the list. Subscribe/unsubscribe, not recompute.
 
 ### The counts pipeline, live
 
-The other thing on the lane is the `weighted_count(list_id, done)` pipeline. Any COUNT whose
-predicate **decomposes over those group columns** is served straight from it — no per-shape fold.
+The other arrangement folded onto the `todos` source is the `weighted_count(list_id, done)` counts
+pipeline — the `· 1 cnt` half of its badge. Any COUNT whose predicate **decomposes over those
+group columns** is served straight from it — no per-shape fold.
 Ask for the open-todo count of the Groceries list (`list_id = 1 AND done = false`) with the
 extended API's `/aggregate` endpoint (a COUNT isn't an Electric shape):
 
@@ -221,9 +238,10 @@ curl -s "http://localhost:7010/shapes/$AGG_ID/rows"
 # → the count is 2  (buy milk, buy eggs)
 ```
 
-On the canvas this aggregate latches onto the **counts** pipeline with a `serves` edge (its badge
-reads `circuit`). Its value was *seeded by summing the matching groups* — here just the `(1, false)`
-group. Now close one of those todos:
+On the canvas this aggregate latches onto the **`todos` source** with a `serves` edge — the counts
+pipeline that answers it is folded onto that source, so the edge runs from there into the aggregate's
+fold (its badge reads `circuit`). Its value was *seeded by summing the matching groups* — here just
+the `(1, false)` group. Now close one of those todos:
 
 ```sh
 psql "postgres://postgres:password@localhost:5432/electric" \
@@ -246,10 +264,10 @@ curl -si -G 'http://localhost:7010/v1/shape' \
   --data-urlencode "where=list_id = 2" >/dev/null
 ```
 
-Two todos come back (4 and 5). On the canvas this shape does **not** attach to the circuit lane — it
-is routed by a `KeyRouter` on `list_id` instead, because an indexed route finds a change's shapes in
-`O(log N)`, whereas a circuit shape would scan every delta. Equality shapes are *deliberately* not
-circuit-served.
+Two todos come back (4 and 5). On the canvas this shape draws **no** serving edge back to the `todos`
+source — it is routed by a `KeyRouter` on `list_id` instead, because an indexed route finds a
+change's shapes in `O(log N)`, whereas a circuit shape would scan every delta. Equality shapes are
+*deliberately* not circuit-served.
 
 Now the punchline of routing — run that **exact** request again, as if a second client asked for the
 same view:
@@ -292,17 +310,19 @@ curl -si -G 'http://localhost:7010/v1/shape' \
 One row (`buy milk`). This predicate decomposes over **no** cohort key — it cuts across every list —
 so it matches no template. It doesn't error and it doesn't wait for a redeploy: the **fallback** picks
 it up on the spot, evaluating the predicate statelessly on every delta (episode 2's `σ`, exactly).
-On the canvas it stands alone, attached to no lane. This is "dynamic" of the third kind: a
+On the canvas it stands alone — no serving edge, latched onto no source. This is "dynamic" of the
+third kind: a
 **cross-key predicate**. The circuit sits *in front of* the fallback as an optimization — if this
 pattern turned out to matter, you'd promote it into the circuit at the next deploy. Until then it
 just works, at fallback cost.
 
 > By now the sidebar's shape list has a handful of entries — the membership shape, the aggregate, the
 > routed equality and union shapes, the fallback. Each has a **delete** button, and there's a
-> **delete-all-shapes** control alongside; use them to watch shapes **let go** of the lane in reverse.
-> Delete the membership shape and its `serves` edge detaches and the `served` counter ticks back down;
-> clear them all and the static lane sits there alone again, exactly as in §3 — structure that never
-> came and went with the subscriptions in the first place.
+> **delete-all-shapes** control alongside; use them to watch shapes **let go** of the sources in
+> reverse. Delete the membership shape and its `serves · list_id` edge detaches from the `todos`
+> source; clear them all and the source nodes sit there alone again — still indigo, still badged with
+> their folded arrangements — exactly as in §3, structure that never came and went with the
+> subscriptions in the first place.
 
 ## 8. What you now know
 
@@ -315,6 +335,16 @@ tiers: combination shapes are pure routing, membership shapes are routing driven
 cross-key predicates are fallback. When someone asks "does adding a user, or a new filter
 combination, grow the engine?" — you now know it doesn't: only new *templates* do, and those ship
 with a deploy.
+
+Which raises the obvious question: *what happens when you add one?* You left the todo pipeline
+deployed and serving; keep it running.
+
+**Next — Episode 4, [Extending the pipeline (and rebuilding it)](../04-extending-the-pipeline/README.md):**
+open a shape the pipeline can't serve, watch it fall to the fallback tier, then add its dimension to
+the config and rebuild the circuit — and see the circuit reseed, the shapes replay from the durable
+catalog, and that fallback shape get *promoted* to circuit-served, live on the canvas. That is where
+"only new templates grow the engine, and templates ship with a deploy" stops being a slogan and
+becomes something you do with your hands.
 
 For the full case study — the same three tiers carrying the flagship app's entire query graph, the
 one you've been syncing since episode 1 — read

@@ -182,6 +182,36 @@ The todo circuit above maps onto the engine's compiled template kinds directly:
 - **(A) and (D)** are equality/match-all templates: the routing tier serves them by index,
   by design.
 
+### Extending a deployed pipeline
+
+Two operations wear the word "extend"; keep them apart.
+
+- **Extend the config — a deploy, not a code change.** Adding a *cohort dimension the circuit already
+  knows how to compile* — another lookup index or another count group — is a configuration change.
+  Append the column to `ELECTRIC_IVM_DBSP_INDEXES` (a new membership/lookup cohort) or
+  `ELECTRIC_IVM_DBSP_COUNTS` (a new count group) and force-recreate the engine. On boot the circuit's
+  **layout fingerprint** changes, so the previous checkpoint is discarded and the arrangements
+  **reseed** from a fresh Postgres `REPEATABLE READ` snapshot (`arrangements.rs`) — automatic, no
+  error. Shapes are not lost: they replay from the durable shape catalog (`meta/catalog` in
+  `engine.rs`), and any shape whose predicate now decomposes over the freshly-added dimension is
+  **promoted** from the fallback tier to circuit-served on the spot — the catalog restore re-plans
+  each shape against the new arrangement set (`plan_circuit_shape`), so a membership shape keyed on
+  `todos.assignee` that fell to fallback yesterday is circuit-served the moment
+  `ELECTRIC_IVM_DBSP_INDEXES=…,todos.assignee` ships. This is the `INDEXES`/`COUNTS` half of "ship
+  structure with deploys" (recipe step 5).
+- **Add a new template *kind* — a code change.** A pipeline the circuit cannot express from config
+  (a derived-visibility join, a new delta-driven reduction) is new operators in `arrangements.rs`;
+  see "Adding a new template kind" below. Config knobs plug *columns* into existing template kinds;
+  a new kind is new operators.
+
+**Checkpoint restore vs. reseed.** With config *unchanged* and a persistent `ELECTRIC_IVM_DBSP_DIR`,
+a restart is a fast **checkpoint restore**: the layout fingerprint matches, state comes back from
+disk, and replay resumes from the checkpointed change-log offset (offset + de-dup highwater intact).
+With config *changed* (fingerprint mismatch) — or an ephemeral state dir — the restart **reseeds**
+from Postgres instead. A config change always takes the reseed path; that is the intended deploy
+story, and it costs one snapshot scan per table, not a service outage — shapes keep serving from
+their durable streams throughout.
+
 ### Adding a new template kind
 
 A new template is a few operators between an existing input and a new handle. Passive lookup
