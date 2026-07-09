@@ -50,7 +50,9 @@ function buildFull(g: EngineGraph): { nodes: Map<string, RawNode>; edges: RawEdg
 
 /** The compiled dbsp arrangement pipeline (present iff the engine runs with ELECTRIC_IVM_DBSP=1):
  *  static infrastructure — one input per table, one map_index→integrate_trace pipeline per index,
- *  one map_index(group)→weighted_count pipeline per counted table — rendered permanently. Two
+ *  one map_index(group)→weighted_count pipeline per counted table — rendered permanently. Each
+ *  table input feeds off the same per-table delta stream (`d:<table>`) the shape filters read, so
+ *  the lane is drawn descending from the table it arranges rather than floating free. Two
  *  consumer-edge kinds hang off it: dashed LOOKUP edges to subquery dependents whose flip
  *  re-derivations read an index, and solid animated SERVING edges to circuit-served shapes and
  *  aggregates whose data comes from the circuit itself. Ids come from the engine (`arr:input:…` /
@@ -69,6 +71,14 @@ function addArrangements(g: EngineGraph, nodes: Map<string, RawNode>, edges: Raw
         ref: { kind: 'op', opKind: 'arr-input', hop: inp.id, label: inp.table },
       },
     })
+    // Wire the input to its table's delta stream: the sequencer feeds every table's deltas into
+    // the circuit, so `arr:input` is a peer consumer of `d:<table>` alongside the shape filters —
+    // not a disconnected root. Guarded because the delta op exists only for tables the engine
+    // emits operators for (`operatorGraph` iterates the same table set the circuit configures).
+    const deltaId = `d:${inp.table}`
+    if (nodes.has(deltaId)) {
+      edges.push({ id: `${deltaId}~>${inp.id}~`, source: deltaId, target: inp.id, kind: 'flow' })
+    }
   }
   for (const ix of arr.indexes) {
     const label = `map_index(${ix.cols.join(', ')})`
