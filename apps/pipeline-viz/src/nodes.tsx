@@ -119,7 +119,7 @@ export function PipelineNode({ id, data }: NodeProps) {
     : null
   return (
     <div
-      className={`pnode pnode-${d.kind}${indexed ? ' pnode-indexed' : ''}${d.stack ? ' pnode-stacked' : ''}${d.selected ? ' pnode-selected' : ''}${d.dimmed ? ' pnode-dimmed' : ''}${parked ? ' pnode-parked' : ''}`}
+      className={`pnode pnode-${d.kind}${indexed ? ' pnode-indexed' : ''}${d.stack ? ' pnode-stacked' : ''}${d.selected ? ' pnode-selected' : ''}${d.dimmed ? ' pnode-dimmed' : ''}${d.faded ? ' pnode-faded' : ''}${parked ? ' pnode-parked' : ''}`}
       style={{ borderColor: color, background: indexed ? ARR_BG : meta.bg, ...stackVars }}
     >
       <Handle type="target" position={Position.Left} />

@@ -11,7 +11,7 @@ import { predicateLabel } from './predicate-label'
 import { recordShapeChanges } from './shape-change-store'
 import { shapeSql } from './shape-sql'
 import { applyStateStaggered, seedState } from './state-store'
-import { eventDecor, mergeDecor, type Decor, type FlashKind } from './trace-anim'
+import { eventDecor, fadedElements, mergeDecor, type Decor, type FlashKind } from './trace-anim'
 import type { EngineGraph, GraphShape, TraceEvent, TraceMessage } from './types'
 import { useTrace } from './useTrace'
 import { WhereEditor } from './WhereEditor'
@@ -440,13 +440,25 @@ export default function App() {
   }, [fresh, expandHop])
 
   const decorated = useMemo(() => {
+    // While a decoration animates, everything NOT on the delta's path fades into the background so
+    // the lit path pops. `fadedElements` derives those ids from the decor's involved (lit) keys —
+    // unioned across concurrent deltas by `mergeDecor`, so an element touched by EITHER stays lit —
+    // and returns empty sets when `decor` is null, i.e. nothing fades outside an animation. The
+    // `faded` flag is stamped only here (transient); it never touches the layout's node/edge data,
+    // so focus dimming and selection restore untouched the instant the decoration clears.
+    const fade = fadedElements(
+      decor,
+      nodes.map((n) => n.id),
+      edges.map((e) => e.id),
+    )
     const dn =
       decor || freshIds
         ? nodes.map((n) => {
             const df = decor?.nodes.get(n.id)
             const flash = df?.kind ?? (freshIds?.has(n.id) ? ('new' as const) : undefined)
-            if (!flash) return n
-            return { ...n, data: { ...(n.data as VizNodeData), flash, flashDelay: df?.delayMs ?? 0 } }
+            const faded = fade.nodes.has(n.id)
+            if (!flash && !faded) return n
+            return { ...n, data: { ...(n.data as VizNodeData), flash, flashDelay: df?.delayMs ?? 0, faded } }
           })
         : nodes
     // Edges ALWAYS use the pulse type — flipping an edge's `type` when a decoration appears would
@@ -459,7 +471,10 @@ export default function App() {
       // The pulse keeps the id of the event that created it — re-rendering after a merge must not
       // restart dots already in flight on other edges.
       const pulse = decor?.edges.get(e.id)
-      const data: PulseEdgeData = { pulse, baseStyle }
+      // An edge off the animating path fades with its endpoints; a pulsing edge is by definition ON
+      // the path, so the two are mutually exclusive.
+      const faded = fade.edges.has(e.id)
+      const data: PulseEdgeData = { pulse, baseStyle, faded }
       // A pulsing edge is lifted above the node cards (each edge is its own stacked svg): the
       // travelling dot + weight label must never disappear behind a component it passes.
       return { ...e, type: 'pulse', data, style: undefined, zIndex: pulse ? 1000 : undefined }

@@ -129,6 +129,26 @@ export function eventDecor(ev: TraceEvent, edges: Edge[], present: Set<string>, 
   return { nodes, edges: pulses, id, totalMs: (maxRank + 1) * STEP_MS }
 }
 
+/** While a decoration animates, the elements to FADE into the background: every rendered node/edge
+ *  that is NOT on the delta's path, so the lit path visually dominates. `decor.nodes` / `decor.edges`
+ *  are keyed by EXACTLY the involved (flashing / pulsing) ids — and because `mergeDecor` unions the
+ *  keys of concurrent events, an element involved in EITHER of two overlapping deltas stays out of the
+ *  faded set. "Not a key" therefore means "not involved". With no active decor nothing fades (empty
+ *  sets). Pure and id-only on purpose: it unit-tests without a DOM and drives both the logical and the
+ *  circuit view (whose ids the caller supplies). */
+export function fadedElements(
+  decor: Decor | null,
+  nodeIds: Iterable<string>,
+  edgeIds: Iterable<string>,
+): { nodes: Set<string>; edges: Set<string> } {
+  const nodes = new Set<string>()
+  const edges = new Set<string>()
+  if (!decor) return { nodes, edges }
+  for (const id of nodeIds) if (!decor.nodes.has(id)) nodes.add(id)
+  for (const id of edgeIds) if (!decor.edges.has(id)) edges.add(id)
+  return { nodes, edges }
+}
+
 /** Merge b over a (later events win per node/edge). */
 export function mergeDecor(a: Decor | null, b: Decor): Decor {
   if (!a) return b

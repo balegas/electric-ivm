@@ -351,6 +351,9 @@ body,
   height: 100%;
   overflow: hidden;
   box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+  /* Smooth the focus-dim and trace-animation fades (`.pnode-dimmed` / `.pnode-faded`) in and out
+     rather than snapping opacity — see the reduced-motion guard at the foot of this file. */
+  transition: opacity 0.3s ease;
 }
 .pnode-selected {
   box-shadow: 0 0 0 3px #16a34a55;
@@ -505,6 +508,15 @@ body,
 }
 .pnode-dimmed {
   opacity: 0.28;
+}
+/* Trace-animation fade: while a delta animates, every node OFF its path drops to a faint opacity so
+   the lit path dominates, then returns to full as the decoration clears. A separate flag from
+   `.pnode-dimmed` (focus/selection) so the two compose; declared AFTER it so that, during an
+   animation, an off-path node that also happens to be focus-dimmed reads at the (stronger) faded
+   level rather than fighting over the same property. The opacity transition lives on `.pnode` (so
+   both the fade-out and the fade-in animate) and is reused by the flash overlay wrapper. */
+.pnode-faded {
+  opacity: 0.2;
 }
 
 /* Detail panel — docked as a right sidebar (see .canvas), never floating over the graph. */
@@ -1547,4 +1559,19 @@ body,
   font-size: 10px;
   color: #94a3b8;
   white-space: nowrap;
+}
+
+/* Respect a reader's reduced-motion preference: the trace-animation fade should still change WHAT
+   is shown (off-path context dims so the lit path dominates) but without the animated transition —
+   the opacity snaps to its target instead of easing. Covers both the node cards (`.pnode`, opacity
+   transition inline above) and the edge paths (transition set inline in edges.tsx), overriding the
+   inline declaration with `!important`. The travelling dot and flash rings are separately gated by
+   their own animations; this block only neutralises the opacity easing added for the fade. */
+@media (prefers-reduced-motion: reduce) {
+  .pnode {
+    transition: none;
+  }
+  .react-flow__edge-path {
+    transition: none !important;
+  }
 }
