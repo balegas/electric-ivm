@@ -26,6 +26,11 @@ export interface GraphShape {
   isSubquery: boolean
   /** Present iff this shape is a scalar aggregation (COUNT/SUM/AVG/MIN/MAX over `where`). */
   aggregate: { func: string; col: string | null } | null
+  /** Present iff this shape is circuit-served (seeded + maintained by the dbsp pipeline).
+   *  `label` says which cohort form serves it — `all` / `static:<col>` / `dynamic:<col>` /
+   *  `counts`; `col` is the serving arrangement column's index; `counts` marks a counts-served
+   *  aggregate. Omitted by the engine when the shape is not circuit-served. */
+  circuit?: { label: string; col?: number; counts?: boolean }
   /** Retention lifecycle: a dormant shape keeps its stream + record but holds no routing state. */
   state: 'active' | 'deactivating' | 'dormant' | 'reactivating' | null
 }
@@ -76,9 +81,15 @@ export interface ArrangementGraph {
   fallback: number
   inputs: { id: string; table: string; seeded: boolean }[]
   indexes: { id: string; input: string; table: string; cols: string[]; seeded: boolean }[]
+  /** Counts pipelines (`map_index(group cols) → weighted_count`), one per counted table.
+   *  Omitted by the engine when no table has one. */
+  counts?: { id: string; input: string; table: string; groupCols: string[]; seeded: boolean }[]
+  /** `shape`/`node` are lookup consumers (a subquery dependent whose flip re-derivations read the
+   *  index). `circuit-shape`/`circuit-agg` are SERVING consumers — the dependent shape's data
+   *  comes from the circuit (its `index` is the serving index, counts pipeline, or table input). */
   consumers: {
     index: string
-    dependentKind: 'shape' | 'node'
+    dependentKind: 'shape' | 'node' | 'circuit-shape' | 'circuit-agg'
     dependentId: string
     connectingCol: string
   }[]

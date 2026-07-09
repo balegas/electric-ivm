@@ -819,11 +819,49 @@ body,
   border-color: #4338ca;
   border-style: dashed;
 }
+.lg-arr-counts {
+  background: #ede9fe;
+  color: #6d28d9;
+  border-color: #6d28d9;
+  border-style: dashed;
+}
+/* Edge-kind legend chips: dashed purple = an occasional lookup read against an index snapshot;
+   solid indigo = the circuit SERVING a shape (the shape's data source). */
+.lg-lookup {
+  background: transparent;
+  color: #7e22ce;
+  border-color: #7e22ce;
+  border-style: dashed;
+}
+.lg-serve {
+  background: #e0e7ff;
+  color: #4338ca;
+  border-color: #4338ca;
+}
 
 /* The compiled dbsp arrangement pipeline: static infrastructure, marked by a dashed border. */
 .pnode-arr-input,
-.pnode-arr-index {
+.pnode-arr-index,
+.pnode-arr-counts {
   border-style: dashed;
+}
+
+/* Circuit-served chip in a shape/aggregate card's tag row (mirrors the dbsp lane's identity). */
+.pnode-serve {
+  font-size: 9px;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: #e0e7ff;
+  color: #4338ca;
+  border: 1px dashed #4338ca;
+  white-space: nowrap;
+}
+
+/* Sidebar badge for circuit-served shapes. */
+.k-circuit {
+  background: #e0e7ff;
+  color: #4338ca;
 }
 
 /* Aggregation */

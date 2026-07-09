@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState, type ReactNode } from 'react'
 
 import type { NodeKind, NodeRef } from './build-graph'
 import { useLatestDelta } from './delta-store'
-import { KIND_META, fmtScalar } from './node-meta'
+import { KIND_META, fmtScalar, servingTier } from './node-meta'
 import { predicateLabel } from './predicate-label'
 import { nodeInnerSql, shapeSql } from './shape-sql'
 import { useNodeState } from './state-store'
@@ -1013,6 +1013,11 @@ export function DetailPanel({
   } else if (node.kind === 'aggshape') {
     const s = graph.shapes.find((x) => x.id === node.shapeId)
     const fn = s?.aggregate?.func.toUpperCase() ?? '?'
+    const tier = s ? servingTier(s) : null
+    // A circuit-served COUNT's value lives in the circuit's counts pipeline — surface which one.
+    const countsPipe = s?.circuit?.counts
+      ? (graph.arrangements?.counts ?? []).find((c) => c.table === s.table)
+      : undefined
     title = `Aggregation · ${node.shapeId}`
     body = (
       <>
@@ -1025,9 +1030,19 @@ export function DetailPanel({
         </div>
         <Row k="function" v={<code>{`${fn}(${s?.aggregate?.col ?? '*'})`}</code>} />
         <Row k="table" v={s?.table} />
+        {tier ? <Row k="serving tier" v={<code>{tier.label}</code>} /> : null}
+        {countsPipe ? (
+          <Row
+            k="counts pipeline"
+            v={<code>{`${countsPipe.id} · group by (${countsPipe.groupCols.join(', ')})`}</code>}
+          />
+        ) : null}
         <Row k="output" v="a single live scalar (streamed)" />
+        {tier ? <div className="dp-note">{tier.note}</div> : null}
         <InsideNote kind="agg" />
-        <AggInternalsView nodeId={stateId} />
+        {/* Fold internals exist only for fold-maintained aggregates — a circuit-served COUNT has
+            no fold executor (the deep dump 404s), its value lives in the counts pipeline. */}
+        {s && !s.circuit ? <AggInternalsView nodeId={stateId} /> : null}
         {s ? <SqlBlock sql={shapeSql(s)} /> : null}
       </>
     )
@@ -1035,11 +1050,12 @@ export function DetailPanel({
     // shape
     const s = graph.shapes.find((x) => x.id === node.shapeId)
     title = `Shape · ${node.shapeId}`
-    const kind = s?.isSubquery ? 'subquery' : s?.familyKey ? `family(${s.familyKey.join(',')})` : 'standalone'
+    const tier = s ? servingTier(s) : null
     body = (
       <>
         <Row k="table" v={s?.table} />
-        <Row k="routing" v={kind} />
+        {tier ? <Row k="serving tier" v={<code>{tier.label}</code>} /> : null}
+        {s?.circuit && s.isSubquery ? <Row k="registered as" v="subquery (membership relation)" /> : null}
         <Row k="columns" v={<ColumnList columns={s?.columns ?? null} />} />
         <Row k="changes-only feed" v={s?.changesOnly ? 'yes (no backfill)' : 'no (materialized)'} />
         <Row k="stream" v={<code>{s?.streamPath}</code>} />
@@ -1047,13 +1063,7 @@ export function DetailPanel({
         <InsideNote kind="shape" />
         {s ? <SqlBlock sql={shapeSql(s)} /> : null}
         {s ? <ShapeLiveView shape={s} /> : null}
-        <div className="dp-note">
-          {s?.isSubquery
-            ? 'Membership is driven by the shared subquery node(s) upstream plus the outer-row filter — when an inner value flips, the affected rows move in/out of this stream.'
-            : s?.familyKey
-              ? 'Fed by the shared route join upstream — the engine keeps only this shape’s routing entry and snapshot gate, no table rows.'
-              : 'Fed by its standalone filter — enter/leave falls out of filtering each delta.'}
-        </div>
+        {tier ? <div className="dp-note">{tier.note}</div> : null}
       </>
     )
   }

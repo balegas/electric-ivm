@@ -115,6 +115,14 @@ export function PipelineNode({ id, data }: NodeProps) {
         </span>
         <span className="pnode-tag-r">
           {parked ? <span className={`pnode-life pnode-life-${d.life}`}>{d.life}</span> : null}
+          {d.serve ? (
+            <span
+              className="pnode-serve"
+              title="circuit-served — this shape's data is seeded and maintained by the dbsp circuit"
+            >
+              circuit · {d.serve}
+            </span>
+          ) : null}
           {d.shared && d.shared > 1 ? <span className="pnode-shared">shared ×{d.shared}</span> : null}
         </span>
       </div>

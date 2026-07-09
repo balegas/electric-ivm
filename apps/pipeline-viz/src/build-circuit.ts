@@ -49,10 +49,13 @@ function buildFull(g: EngineGraph): { nodes: Map<string, RawNode>; edges: RawEdg
 }
 
 /** The compiled dbsp arrangement pipeline (present iff the engine runs with ELECTRIC_IVM_DBSP=1):
- *  static infrastructure — one input per table, one map_index→integrate_trace pipeline per index —
- *  rendered permanently, with dashed lookup edges to the subquery consumers each index currently
- *  serves. Ids come from the engine (`arr:input:…` / `arr:index:…`), stable across snapshots, so
- *  sticky layout keeps the lane parked while shapes come and go. */
+ *  static infrastructure — one input per table, one map_index→integrate_trace pipeline per index,
+ *  one map_index(group)→weighted_count pipeline per counted table — rendered permanently. Two
+ *  consumer-edge kinds hang off it: dashed LOOKUP edges to subquery dependents whose flip
+ *  re-derivations read an index, and solid animated SERVING edges to circuit-served shapes and
+ *  aggregates whose data comes from the circuit itself. Ids come from the engine (`arr:input:…` /
+ *  `arr:index:…` / `arr:counts:…`), stable across snapshots, so sticky layout keeps the lane
+ *  parked while shapes come and go. */
 function addArrangements(g: EngineGraph, nodes: Map<string, RawNode>, edges: RawEdge[]) {
   const arr = g.arrangements
   if (!arr) return
@@ -80,9 +83,43 @@ function addArrangements(g: EngineGraph, nodes: Map<string, RawNode>, edges: Raw
     })
     edges.push({ id: `${ix.input}~>${ix.id}~`, source: ix.input, target: ix.id, kind: 'flow' })
   }
+  for (const ct of arr.counts ?? []) {
+    // A counts pipeline COMPUTES (a maintained weighted_count per group), where an index REMEMBERS
+    // (rows) — its card carries the reduction as the headline, the grouping step as the sub line.
+    const label = `weighted_count(${ct.groupCols.join(', ')})`
+    nodes.set(ct.id, {
+      id: ct.id,
+      data: {
+        kind: 'arr-counts',
+        label,
+        sub: `map_index(${ct.groupCols.join(', ')}) · ${ct.seeded ? 'seeded' : 'seeding…'}`,
+        ref: { kind: 'op', opKind: 'arr-counts', hop: ct.id, label },
+      },
+    })
+    edges.push({ id: `${ct.input}~>${ct.id}~`, source: ct.input, target: ct.id, kind: 'flow' })
+  }
   for (const c of arr.consumers) {
-    // A lookup feeds the dependent's own operator — a shape's membership semijoin, or a nested
-    // node's inner filter: the exact operators whose flip re-derivations the index serves.
+    if (c.dependentKind === 'circuit-shape' || c.dependentKind === 'circuit-agg') {
+      // A SERVING edge: the dependent's data comes FROM the circuit (seeded there, maintained
+      // there) — not an occasional read. It lands on the dependent's own operator: the fold of a
+      // counts-served aggregate, the membership semijoin (or standalone σ) of a served shape.
+      const candidates =
+        c.dependentKind === 'circuit-agg'
+          ? [`fold:${c.dependentId}`, `snk:${c.dependentId}`]
+          : [`sj:${c.dependentId}`, `sigma:${c.dependentId}`, `snk:${c.dependentId}`]
+      const target = candidates.find((t) => nodes.has(t))
+      if (!target || !nodes.has(c.index)) continue
+      edges.push({
+        id: `${c.index}~>${target}~serves`,
+        source: c.index,
+        target,
+        label: c.connectingCol ? `serves · ${c.connectingCol}` : 'serves',
+        kind: 'serve',
+      })
+      continue
+    }
+    // A LOOKUP edge feeds the dependent's own operator — a shape's membership semijoin, or a
+    // nested node's inner filter: the exact operators whose flip re-derivations the index serves.
     const target = c.dependentKind === 'shape' ? `sj:${c.dependentId}` : `sqf:${c.dependentId}`
     if (!nodes.has(target)) continue
     edges.push({

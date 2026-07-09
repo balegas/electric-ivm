@@ -28,6 +28,7 @@ export type NodeKind =
   | 'op-sink'
   | 'arr-input'
   | 'arr-index'
+  | 'arr-counts'
 
 /** Identity of the underlying engine entity a graph node represents (used by the detail panel). */
 export type NodeRef =
@@ -54,6 +55,9 @@ export interface VizNodeData extends Record<string, unknown> {
   stateId?: string
   /** Retention lifecycle of a shape node — `dormant`/`deactivating`/`reactivating` render parked. */
   life?: string | null
+  /** Circuit placement label (`dynamic:<col>` / `counts` / …) when the shape is circuit-served —
+   *  rendered as a chip in the card's tag row. */
+  serve?: string
   ref: NodeRef
   selected?: boolean
   dimmed?: boolean
@@ -68,7 +72,9 @@ export interface RawEdge {
   source: string
   target: string
   label?: string
-  kind: 'flow' | 'route' | 'subquery' | 'state'
+  /** `serve` = a circuit SERVING edge (the target's data comes from the dbsp circuit), as opposed
+   *  to `state` (a stateful arrangement an operator occasionally reads — e.g. a lookup). */
+  kind: 'flow' | 'route' | 'subquery' | 'state' | 'serve'
 }
 
 /**
@@ -117,6 +123,7 @@ function buildFull(g: EngineGraph): { nodes: Map<string, RawNode>; edges: RawEdg
         label: `${fn}(${s.aggregate.col ?? '*'})`,
         sub: predicateLabel(s.where),
         life: s.state,
+        serve: s.circuit?.label,
         ref: { kind: 'aggshape', shapeId: s.id },
       })
       edge(tableId(s.table), shapeId, 'flow', predicateLabel(s.where) === 'match all' ? undefined : 'filter')
@@ -131,6 +138,7 @@ function buildFull(g: EngineGraph): { nodes: Map<string, RawNode>; edges: RawEdg
       idTag: s.id,
       highlight: true,
       life: s.state,
+      serve: s.circuit?.label,
       ref: { kind: 'shape', shapeId: s.id },
     })
 
@@ -241,6 +249,7 @@ const KIND_SIZE: Partial<Record<NodeKind, { w: number; h: number }>> = {
   // the compiled dbsp arrangement pipeline (static infrastructure lane)
   'arr-input': { w: 160, h: KIND_H },
   'arr-index': { w: 220, h: KIND_H },
+  'arr-counts': { w: 260, h: KIND_H },
 }
 
 /** Optional layout hooks: `measure` overrides a node's box (return null to keep the default) —
@@ -357,11 +366,22 @@ export function layout(
       id: e.id,
       source: e.source,
       target: e.target,
-      animated: e.kind === 'subquery' && !dim,
+      // Serving edges animate like subquery flips: data continuously flows FROM the circuit.
+      animated: (e.kind === 'subquery' || e.kind === 'serve') && !dim,
       style: {
-        stroke: e.kind === 'subquery' ? '#a855f7' : e.kind === 'route' ? '#0ea5e9' : e.kind === 'state' ? '#7e22ce' : '#94a3b8',
-        strokeWidth: e.kind === 'flow' ? 1.5 : 2,
-        // A dashed edge = a stateful arrangement feeding a join (not a Z-set stream).
+        stroke:
+          e.kind === 'subquery'
+            ? '#a855f7'
+            : e.kind === 'route'
+              ? '#0ea5e9'
+              : e.kind === 'serve'
+                ? '#4338ca'
+                : e.kind === 'state'
+                  ? '#7e22ce'
+                  : '#94a3b8',
+        strokeWidth: e.kind === 'flow' ? 1.5 : e.kind === 'serve' ? 2.5 : 2,
+        // A dashed edge = a stateful arrangement an operator READS (a lookup, not a stream);
+        // a solid animated indigo edge = the circuit SERVING a shape (its data source).
         ...(e.kind === 'state' ? { strokeDasharray: '6 4' } : null),
         opacity: dim ? 0.12 : 1,
       },

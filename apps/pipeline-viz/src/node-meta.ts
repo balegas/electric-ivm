@@ -1,10 +1,12 @@
 // Per-kind identity of the pipeline's nodes: the visual treatment, the dbsp reading of what the
 // node computes (formula), and the "inside this operator" explainer shown in the detail panel.
 // The copy describes what the engine ACTUALLY executes (see docs/ivm-engine-internals.md §3) —
-// this engine hand-rolls its operators rather than running a compiled dbsp circuit, and the graph
-// shows those real structures, one node per maintained thing.
+// the engine hand-rolls most operators AND compiles a real dbsp circuit (the `arr:*` lane) that
+// serves template-matching membership shapes and COUNT aggregates outright; the graph shows those
+// real structures, one node per maintained thing.
 
 import type { NodeKind } from './build-graph'
+import type { GraphShape } from './types'
 
 export interface KindMeta {
   color: string
@@ -69,8 +71,10 @@ export const KIND_META: Record<NodeKind, KindMeta> = {
       'A maintained inner set — SELECT proj FROM inner WHERE … — arranged as value → contributing ' +
       'row pks. Identical subqueries share one node (the refcount is its dependents). When a value ' +
       'enters or leaves the set, the flip propagates: dependent shapes re-derive the outer rows ' +
-      'that move in or out, and nested IN nodes reconcile recursively — all within the same batch, ' +
-      'so the processed-offset barrier still implies convergence.',
+      'that move in or out (reading the compiled dbsp arrangements when present; a circuit-served ' +
+      'dependent applies the flip inside the circuit itself), and nested IN nodes reconcile ' +
+      'recursively — all within the same batch, so the processed-offset barrier still implies ' +
+      'convergence.',
   },
   shape: {
     color: '#166534',
@@ -92,11 +96,14 @@ export const KIND_META: Record<NodeKind, KindMeta> = {
     formula: 'fold(Σ value·w over σ(where))',
     stateful: true,
     inside:
-      'A scalar aggregation maintained as an incremental fold over the matching Z-set — it stores ' +
-      'the running aggregate, never the rows. COUNT sums the weights; SUM and AVG add value·weight ' +
-      '(NULLs excluded, SQL semantics); MIN and MAX keep a value → net-weight multiset so a ' +
-      'retraction can restore the previous extreme. O(1) per change plus a log-factor for MIN/MAX; ' +
-      'a new value is emitted only when the fold’s result actually changes.',
+      'A scalar aggregation over the matching Z-set — it stores the running aggregate, never the ' +
+      'rows. Two serving tiers: a COUNT whose predicate the table’s compiled counts pipeline ' +
+      'covers is CIRCUIT-SERVED — seeded by summing the pipeline’s weighted_count groups and ' +
+      'updated from group deltas as the circuit steps, with no fold executor at all. Every other ' +
+      'aggregate is maintained as an incremental fold: COUNT sums the weights; SUM and AVG add ' +
+      'value·weight (NULLs excluded, SQL semantics); MIN and MAX keep a value → net-weight ' +
+      'multiset so a retraction can restore the previous extreme. Either way, a new value is ' +
+      'emitted only when the result actually changes.',
   },
 
   // --- circuit-view operators (the engine-emitted exploded decomposition) --------------------
@@ -187,7 +194,9 @@ export const KIND_META: Record<NodeKind, KindMeta> = {
     stateful: true,
     inside:
       'The incremental aggregation fold: running count/sum plus, for MIN/MAX, the value → ' +
-      'net-weight retraction multiset. Emits a new value only when the result actually changes.',
+      'net-weight retraction multiset. Emits a new value only when the result actually changes. ' +
+      'A COUNT served from the compiled counts pipeline (solid serving edge from arr:counts) is ' +
+      'the exception: its value lives in the circuit’s weighted_count, not in a fold here.',
   },
   'op-project': {
     color: '#475569',
@@ -234,12 +243,74 @@ export const KIND_META: Record<NodeKind, KindMeta> = {
     stateful: true,
     inside:
       'A storage-backed dbsp arrangement: the table’s rows indexed by the named columns, ' +
-      'maintained by integrate_trace and spilled to layer files as it grows. Subquery flip ' +
-      're-derivations do point lookups against its published read-only snapshot instead of ' +
-      'querying Postgres back — the dashed edges point at the consumers it currently serves. A ' +
-      'missing or unseeded index makes those consumers fall back to Postgres; correctness never ' +
-      'depends on this layer.',
+      'maintained by integrate_trace and spilled to layer files as it grows. It REMEMBERS rows; ' +
+      'two edge kinds hang off it. Dashed lookup edges: subquery flip re-derivations do point ' +
+      'lookups against its published read-only snapshot instead of querying Postgres back (a ' +
+      'missing or unseeded index makes those consumers fall back to Postgres). Solid serving ' +
+      'edges: a circuit-served shape is seeded from this index’s snapshot and maintained inside ' +
+      'the circuit — the index is its data source, not an occasional read.',
   },
+  'arr-counts': {
+    color: '#6d28d9',
+    bg: '#ede9fe',
+    tag: 'DBSP COUNTS · Σ STATE',
+    formula: 'map_index(group) · weighted_count',
+    stateful: true,
+    inside:
+      'A counts pipeline of the compiled dbsp circuit: the table’s rows grouped by the pipeline’s ' +
+      'group columns and reduced by weighted_count — it COMPUTES a maintained count per group, ' +
+      'where an index remembers rows. A bare COUNT aggregate whose predicate is an equality ' +
+      'cohort over the group columns is served from it: seeded by summing the matching groups’ ' +
+      'counts and updated from group deltas as the circuit steps — no fold executor, no Postgres. ' +
+      'The solid serving edges point at the aggregates it currently feeds.',
+  },
+}
+
+/** The serving tier of a shape/aggregate — where its data ACTUALLY comes from — with the detail
+ *  prose the panels show. Derived from the engine's own `/graph` fields (`circuit`, `familyKey`,
+ *  `isSubquery`), never guessed. */
+export function servingTier(s: GraphShape): { label: string; note: string } {
+  if (s.circuit) {
+    return {
+      label: `circuit-served · ${s.circuit.label}`,
+      note: s.circuit.counts
+        ? 'Circuit-served COUNT: the value is seeded by summing the counts pipeline’s ' +
+          'weighted_count groups and updated from group deltas as the circuit steps — no fold ' +
+          'executor runs and nothing queries Postgres.'
+        : `Circuit-served: seeded from the dbsp circuit’s arrangement snapshots and maintained ` +
+          `inside the circuit under the ${s.circuit.label} cohort constraint — deltas are routed ` +
+          `by the constraint and membership flips move rows in/out without querying anything back.`,
+    }
+  }
+  if (s.isSubquery) {
+    return {
+      label: 'subquery registry',
+      note:
+        'Membership is driven by the shared subquery node(s) upstream plus the outer-row filter — ' +
+        'when an inner value flips, the affected rows move in/out of this stream (flip ' +
+        're-derivations read the compiled dbsp arrangements when present, else Postgres).',
+    }
+  }
+  if (s.familyKey) {
+    return {
+      label: `key-routed · family(${s.familyKey.join(', ')})`,
+      note:
+        'Fed by the shared route join upstream — the engine keeps only this shape’s routing entry ' +
+        'and snapshot gate, no table rows.',
+    }
+  }
+  if (s.aggregate) {
+    return {
+      label: 'standalone fold',
+      note:
+        'Maintained by the incremental fold executor: σ(where) over each delta feeds the running ' +
+        'aggregate — the rows themselves are never stored.',
+    }
+  }
+  return {
+    label: 'standalone (stateless eval)',
+    note: 'Fed by its standalone filter — enter/leave falls out of evaluating each delta; no state is kept.',
+  }
 }
 
 /** Compact scalar for the live agg chip / stat card (rounds long floats, e.g. AVG). */

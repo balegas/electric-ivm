@@ -598,9 +598,9 @@ export default function App() {
           </div>
         ) : null}
         {graph?.arrangements ? (
-          <div className="counts" title="dbsp arrangement layer: compiled indexes, and how subquery lookups were answered (arrangement snapshot vs Postgres fallback)">
-            dbsp: {graph.arrangements.indexes.length} indexes · {graph.arrangements.served.toLocaleString()} served ·{' '}
-            {graph.arrangements.fallback.toLocaleString()} fallback
+          <div className="counts" title="dbsp circuit: compiled indexes + counts pipelines, and how lookups were answered (circuit snapshot vs Postgres fallback)">
+            dbsp: {graph.arrangements.indexes.length} indexes · {(graph.arrangements.counts ?? []).length} counts ·{' '}
+            {graph.arrangements.served.toLocaleString()} served · {graph.arrangements.fallback.toLocaleString()} fallback
           </div>
         ) : null}
         {err ? <div className="err">{err}</div> : null}
@@ -642,6 +642,11 @@ export default function App() {
                     <div className="shape-row-top">
                       <span className="shape-id">{s.id}</span>
                       <span className={`badge ${k.cls}`}>{k.label}</span>
+                      {s.circuit ? (
+                        <span className="badge k-circuit" title={`circuit-served · ${s.circuit.label}`}>
+                          circuit
+                        </span>
+                      ) : null}
                       {s.changesOnly ? <span className="badge k-feed">feed</span> : null}
                       {s.state && s.state !== 'active' ? (
                         <span className={`badge k-life k-life-${s.state}`}>{s.state}</span>
@@ -703,8 +708,13 @@ export default function App() {
             <span className="lg lg-filter">σ filter</span>
             <span className="lg lg-family">↦⋈ route join</span>
             <span className="lg lg-sqnode">IN-set arrange</span>
-            <span className="lg lg-agg">Σ fold</span>
+            <span className="lg lg-agg">Σ aggregate</span>
             <span className="lg lg-shape">shape out</span>
+            {graph?.arrangements ? (
+              <span className="lg lg-serve" title="a chip on the card: the shape's data is seeded + maintained by the dbsp circuit">
+                circuit-served
+              </span>
+            ) : null}
           </div>
         ) : (
           <div className="legend">
@@ -716,7 +726,18 @@ export default function App() {
             <span className="lg lg-join">⋈ join</span>
             <span className="lg lg-agg">Σ fold</span>
             <span className="lg lg-shape">π · sink</span>
-            {graph?.arrangements ? <span className="lg lg-arr">dbsp arrangement</span> : null}
+            {graph?.arrangements ? <span className="lg lg-arr">dbsp index</span> : null}
+            {graph?.arrangements ? <span className="lg lg-arr-counts">dbsp counts</span> : null}
+            {graph?.arrangements ? (
+              <span className="lg lg-lookup" title="dashed edge: an occasional point-read against an index snapshot">
+                ⇢ lookup (read)
+              </span>
+            ) : null}
+            {graph?.arrangements ? (
+              <span className="lg lg-serve" title="solid animated edge: the shape's data comes FROM the circuit">
+                → serves (feeds)
+              </span>
+            ) : null}
           </div>
         )}
 
