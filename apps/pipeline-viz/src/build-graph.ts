@@ -316,6 +316,31 @@ export function layout(
       neighbours.set(e.target, [...(neighbours.get(e.target) ?? []), e.source])
     }
   }
+  // A new node anchored to its sticky neighbours can still land on top of a sibling: two shapes that
+  // share one anchor (e.g. both hanging off `route by (issue_id)`) were placed in different publishes'
+  // dagre frames, so the same anchor offset drops them at the same spot. After anchoring, nudge a new
+  // node DOWN past any already-placed box it overlaps — never touching the sticky nodes, so the rest
+  // of the canvas stays put while the fresh shape falls into free space instead of stacking.
+  const NODE_GAP = 16
+  const deOverlap = (id: string, pos: { x: number; y: number }): { x: number; y: number } => {
+    const s = sizeOf(raw.nodes.get(id)!)
+    let y = pos.y
+    for (let guard = 0; guard < 400; guard++) {
+      let bumped = false
+      for (const [oid, op] of placed) {
+        if (oid === id || !raw.nodes.has(oid)) continue
+        const os = sizeOf(raw.nodes.get(oid)!)
+        const xOverlap = pos.x < op.x + os.w && pos.x + s.w > op.x
+        if (!xOverlap) continue
+        if (y < op.y + os.h + NODE_GAP && y + s.h + NODE_GAP > op.y) {
+          y = op.y + os.h + NODE_GAP // drop below the box we hit, then re-scan
+          bumped = true
+        }
+      }
+      if (!bumped) break
+    }
+    return { x: pos.x, y }
+  }
   const positionOf = (id: string): { x: number; y: number } => {
     if (!sticky) return dagrePos(id)
     const hit = placed.get(id)
@@ -334,6 +359,7 @@ export function layout(
       }
       pos = { x: base.x + dx / anchors.length, y: base.y + dy / anchors.length }
     }
+    pos = deOverlap(id, pos)
     placed.set(id, pos)
     sticky.set(id, pos)
     return pos
