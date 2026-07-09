@@ -224,13 +224,13 @@ function SourceArrangementNotes({ table, arr }: { table: string; arr: EngineGrap
     <>
       {hasIndex ? (
         <div className="dp-note dp-inside">
-          <span className="dp-inside-h">what an index remembers</span>
+          <span className="dp-inside-h">map_index</span>
           {KIND_META['arr-index'].inside}
         </div>
       ) : null}
       {hasCounts ? (
         <div className="dp-note dp-inside">
-          <span className="dp-inside-h">what a counts pipeline computes</span>
+          <span className="dp-inside-h">weighted_count</span>
           {KIND_META['arr-counts'].inside}
         </div>
       ) : null}
@@ -1054,16 +1054,17 @@ export function DetailPanel({
             <Row k="matching rows" v={live.count.toLocaleString()} />
           </>
         ) : null}
-        <InsideNote kind={node.opKind} />
-        {/* Source operator: the table's compiled arrangements (folded onto this node on the canvas)
-            as a compact list, then the row browser near the top where it is most useful, and the
-            verbose per-kind explanation cards last. */}
+        {/* "inside this operator" leads for most operators. A source has a richer panel, so its
+            explainer drops below the headline content: arrangements list → row browser → the
+            per-kind explanation cards (source, then index/counts) last. */}
+        {node.opKind !== 'op-source' ? <InsideNote kind={node.opKind} /> : null}
         {node.opKind === 'op-source' && opTable ? (
           <SourceArrangements table={opTable} arr={graph.arrangements} />
         ) : null}
         {node.opKind === 'op-source' && opTable ? (
           <TableBrowser table={opTable} />
         ) : null}
+        {node.opKind === 'op-source' ? <InsideNote kind={node.opKind} /> : null}
         {node.opKind === 'op-source' && opTable ? (
           <SourceArrangementNotes table={opTable} arr={graph.arrangements} />
         ) : null}
