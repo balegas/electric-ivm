@@ -208,13 +208,15 @@ your shapes live in the other:
 
 | | URL |
 |---|---|
-| **LinearLite** (issue tracker) | http://localhost:5174 |
-| **Pipeline explorer** | http://localhost:5180 |
+| **LinearLite** (issue tracker) | https://localhost:8443 |
+| **Pipeline explorer** | https://localhost:5443 |
 
-Both are also fronted over HTTPS/HTTP-2 (`:8443` and `:5443`, multiplexing the shape streams past the
-per-origin connection cap). `DEMO_VIZ=0` skips the explorer; `scripts/linearlite.sh start large` runs
-the same demo at a 100k-issue workload. Other entry points: `pnpm demo` (headless live-shape
-walkthrough), `pnpm demo:web` (minimal end-to-end app).
+The HTTPS/HTTP-2 fronts multiplex the shape streams over one connection (past the ~6-per-origin
+HTTP/1.1 cap); the certs come from Caddy's local CA, so run `caddy trust` once or click through the
+browser warning. Plain HTTP is also served on `:5174` (app) and `:5180` (explorer). `DEMO_VIZ=0`
+skips the explorer; `scripts/linearlite.sh start large` runs the same demo at a 100k-issue workload.
+Other entry points: `pnpm demo` (headless live-shape walkthrough), `pnpm demo:web` (minimal
+end-to-end app).
 
 ### The apps in this repo
 
