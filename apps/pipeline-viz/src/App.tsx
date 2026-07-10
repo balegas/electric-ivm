@@ -245,6 +245,15 @@ export default function App() {
     const t = setInterval(() => void seedState(), 10_000)
     return () => clearInterval(t)
   }, [load])
+  // Escape closes the detail panel (only while it's open, so it doesn't swallow Escape elsewhere).
+  useEffect(() => {
+    if (!showDetail) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setShowDetail(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [showDetail])
   useEffect(() => {
     // Hold the poll while a lifecycle settle is pending — it must not publish the intermediate
     // state (e.g. a transient subset-feed shape) that the settle exists to skip. But sustained
