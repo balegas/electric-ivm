@@ -81,11 +81,6 @@ export interface VizNodeData extends Record<string, unknown> {
   ref: NodeRef
   selected?: boolean
   dimmed?: boolean
-  /** Transient trace-animation flag (stamped only in `App`'s decorated pass, never by layout): this
-   *  node is NOT on the currently animating delta's path, so it fades into the background while the
-   *  lit path dominates. Distinct from `dimmed` (focus/selection) so the two compose and the fade
-   *  restores cleanly the moment the decoration clears. */
-  faded?: boolean
 }
 
 export interface RawNode {

@@ -14,16 +14,7 @@ import type { EdgePulse } from './trace-anim'
 export interface PulseEdgeData extends Record<string, unknown> {
   pulse?: EdgePulse | undefined
   baseStyle?: React.CSSProperties
-  /** Trace-animation flag: this edge is NOT on the currently animating delta's path, so it fades
-   *  into the background while the lit path dominates. Mutually exclusive with `pulse` (a pulsing
-   *  edge is by definition on the path). Transient — cleared the moment the decoration ends. */
-  faded?: boolean
 }
-
-/** Opacity a faded (off-path) edge drops to during a trace animation — faint enough that the lit
- *  path dominates, present enough that the surrounding pipeline stays legible as context. Matches
- *  the node fade (`.pnode-faded` in styles.css). */
-const FADED_OPACITY = 0.2
 
 /** The travelling dot + weight label, driven by requestAnimationFrame over the edge path
  *  (`getPointAtLength`). Deliberately NOT SMIL: `begin` offsets resolve against the edge-svg's
@@ -93,12 +84,6 @@ export function PulseEdge(props: EdgeProps) {
   }, [pulse?.id, pulse?.delayMs, pulse?.durMs])
 
   const show = pulse != null && staged === pulse.id
-  // Off-path fade during an animation. `Math.min` so an edge already dimmed for focus (baseStyle
-  // opacity 0.12) is never pushed BACK UP to the fade level — the stronger dim wins. The opacity
-  // transition (below) fades context out as the decoration appears and back in as it clears; a
-  // reduced-motion override in styles.css makes it instant.
-  const baseOpacity = (data.baseStyle?.opacity as number | undefined) ?? 1
-  const faded = data.faded === true && pulse == null
   return (
     <>
       <BaseEdge
@@ -106,14 +91,9 @@ export function PulseEdge(props: EdgeProps) {
         path={path}
         style={{
           ...data.baseStyle,
-          ...(pulse
-            ? { stroke: pulse.color, strokeWidth: 2.5, opacity: 1 }
-            : faded
-              ? { opacity: Math.min(FADED_OPACITY, baseOpacity) }
-              : {}),
-          // The recolor is delayed to the pulse's stage so the path lights up as the dot leaves;
-          // the opacity leg drives the smooth off-path fade in/out.
-          transition: pulse ? `stroke 0.2s ${pulse.delayMs}ms` : 'stroke 0.2s, opacity 0.3s',
+          ...(pulse ? { stroke: pulse.color, strokeWidth: 2.5, opacity: 1 } : {}),
+          // The recolor is delayed to the pulse's stage so the path lights up as the dot leaves.
+          transition: pulse ? `stroke 0.2s ${pulse.delayMs}ms` : 'stroke 0.2s',
         }}
       />
       {show ? <TravelDot key={pulse.id} pulse={pulse} path={path} /> : null}
