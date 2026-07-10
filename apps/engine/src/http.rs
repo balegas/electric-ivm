@@ -34,11 +34,12 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
         .route("/query", post(query_subset))
         .route("/tables/{name}/offset", get(table_offset))
         .route("/tables/{name}/families", get(table_families))
-        // Table schema (columns + pk) and a parameterized single-row INSERT — the visualizer's
-        // add-row action. The INSERT goes to Postgres so the change is captured by logical
-        // replication and flows through the pipeline like any other write.
+        // Table schema (columns + pk), a parameterized single-row INSERT (the visualizer's add-row
+        // action), and a by-primary-key DELETE (its delete-rows action). Both writes go to Postgres
+        // so the changes are captured by logical replication and flow through the pipeline like any
+        // other write.
         .route("/table/{table}/schema", get(get_table_schema))
-        .route("/table/{table}/rows", post(insert_table_row))
+        .route("/table/{table}/rows", post(insert_table_row).delete(delete_table_rows))
         .route("/subqueries", get(subquery_stats))
         .route("/replication/lsn", get(replication_lsn))
         .route("/metrics", get(get_metrics))
@@ -463,6 +464,28 @@ async fn insert_table_row(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let values = req.columns.or(req.values).unwrap_or_default();
     match engine.insert_row(&table, &values).await {
+        Ok(v) => Ok(Json(v)),
+        Err(e) => Err(AppError { status: StatusCode::BAD_REQUEST, msg: format!("{e:#}") }),
+    }
+}
+
+/// Body of `DELETE /table/{table}/rows`: the primary keys of the rows to delete — one
+/// `pk column → value` object per row.
+#[derive(Deserialize)]
+struct DeleteRowsReq {
+    keys: Vec<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// `DELETE /table/{table}/rows` — delete rows from the table's Postgres relation by primary key
+/// (parameterized, identifier-quoted; all keys in one statement). Like the insert, the deletes are
+/// captured by logical replication and flow through the pipeline, so the visualizer sees them
+/// animate. Bad input (unknown table, non-pk column, missing/NULL key part) is a 400.
+async fn delete_table_rows(
+    State(engine): State<Engine>,
+    Path(table): Path<String>,
+    Json(req): Json<DeleteRowsReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    match engine.delete_rows(&table, &req.keys).await {
         Ok(v) => Ok(Json(v)),
         Err(e) => Err(AppError { status: StatusCode::BAD_REQUEST, msg: format!("{e:#}") }),
     }

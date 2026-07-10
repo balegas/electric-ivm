@@ -13,9 +13,23 @@ name = "electric-ivm-engine"
 path = "src/main.rs"
 
 [dependencies]
+# Query engine, reintroduced as the storage-backed table-state layer (src/arrangements.rs):
+# one shared circuit whose arrangements spill to disk when tables grow. Version reqs kept at
+# minor-level so cargo unifies our direct deps with dbsp's own tree (so the rkyv/size-of/
+# feldera-macros derive macros match dbsp's expected rkyv 0.7).
+dbsp = "0.318"
+# default-features=false avoids rkyv's default `size_32`, which is mutually exclusive with
+# the `size_64` that dbsp selects (cargo unions features across dependents).
+rkyv = { version = "0.7", default-features = false, features = ["std", "size_64", "validation"] }
+# dbsp uses Feldera's fork of size-of. The `SizeOf` derive emits hardcoded `size_of::` paths,
+# so the crate must be in scope under the name `size_of` (dbsp renames it the same way).
+# `ordered-float` feature pulls the SizeOf impl for OrderedFloat (used by our Float cell).
+size_of = { package = "feldera-size-of", version = "0.1.7", features = ["ordered-float"] }
+feldera-macros = "0.318"
 # `OrderedFloat` gives `Value::Float` the `Eq`/`Ord`/`Hash` a bare f64 lacks (map keys:
-# aggregate multisets, routing indexes).
-ordered-float = "3"
+# aggregate multisets, routing indexes). Pinned to 3.x to match feldera-size-of's SizeOf
+# impl; rkyv_64 matches rkyv's size_64; rkyv_ck adds the validation/CheckBytes impl.
+ordered-float = { version = "3", features = ["rkyv_64", "rkyv_ck"] }
 anyhow = "1"
 
 # Service layer: control-plane HTTP + durable-streams client + async runtime.

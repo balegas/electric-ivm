@@ -1,0 +1,28 @@
+# Episode 3 overlay: configure the engine's always-on dbsp circuit to SERVE the todo model.
+#
+# The circuit is mandatory infrastructure — it always runs. What it *serves* is configured by
+# static env vars, NOT by table introspection: the INDEXES / COUNTS below tell the circuit which
+# lookup arrangements and counts pipelines to compile, and therefore which shapes it seeds and
+# maintains end to end. Declaring them is a deploy-time change, applied on top of the base stack:
+#
+#   docker compose -f compose.yaml -f episodes/03-serving-model/compose.circuit.yaml \
+#     up -d --force-recreate engine
+#
+# Compose merges this `environment` map into the base `engine` service. The base stack boots
+# cleanly from episode 1's lone `issues` table: the circuit runs, but with nothing app-specific
+# to serve (only per-table primary-key arrangements), so shapes fall through to the routing and
+# fallback tiers. The reader declares the todo-model serving config as an explicit step, which IS
+# the "structure ships with deploys" story the engine's docs describe.
+#
+# INDEXES / COUNTS below are exactly the todo-model pipeline from docs/building-app-pipelines.md:
+#   - todos.list_id            → the cohort index the membership shape is served from
+#   - list_members.user_id     → the router's filter column (who is in a list)
+#   - list_members.list_id     → the router's projection column (which list)
+#   - todos:list_id+done       → a live COUNT per (list, done) group — the open-todo badge
+
+services:
+  engine:
+    environment:
+      ELECTRIC_IVM_DBSP_DIR: /tmp/dbsp
+      ELECTRIC_IVM_DBSP_INDEXES: "todos.list_id,list_members.user_id,list_members.list_id"
+      ELECTRIC_IVM_DBSP_COUNTS: "todos:list_id+done"

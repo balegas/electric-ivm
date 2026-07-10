@@ -98,33 +98,70 @@ function chips(s: NodeStateSummary): React.ReactNode {
   }
 }
 
+// The indigo of the compiled dbsp arrangement lane (KIND_META['arr-index']): a source node whose
+// arrangements are folded onto it borrows this treatment so "indexed" reads at a glance.
+const ARR_COLOR = '#4338ca'
+const ARR_BG = '#e0e7ff'
+
 export function PipelineNode({ id, data }: NodeProps) {
   const d = data as VizNodeData
   const meta = KIND_META[d.kind]
   const parked = d.life === 'dormant' || d.life === 'deactivating' || d.life === 'reactivating'
+  // A table source with compiled arrangements folded onto it: indigo treatment + a count badge,
+  // standing in for the (decluttered-away) arrangement lane. The detail panel expands the list.
+  const indexed = d.kind === 'op-source' && d.arr && d.arr.indexes + d.arr.counts > 0 ? d.arr : null
+  const color = indexed ? ARR_COLOR : meta.color
+  // A stacked (collapsed-group) card paints two offset silhouettes behind it via box-shadow; drive
+  // their fill/border off this kind's palette so a grouped SINK reads green and a grouped IN-SET
+  // ARRANGE reads purple, instead of the one hard-coded colour a single stacked kind would fix.
+  const stackVars = d.stack
+    ? ({ '--stack-bg': meta.bg, '--stack-br': `${color}88` } as React.CSSProperties)
+    : null
   return (
     <div
-      className={`pnode pnode-${d.kind}${d.selected ? ' pnode-selected' : ''}${d.dimmed ? ' pnode-dimmed' : ''}${parked ? ' pnode-parked' : ''}`}
-      style={{ borderColor: meta.color, background: meta.bg }}
+      className={`pnode pnode-${d.kind}${indexed ? ' pnode-indexed' : ''}${d.stack ? ' pnode-stacked' : ''}${d.selected ? ' pnode-selected' : ''}${d.dimmed ? ' pnode-dimmed' : ''}${parked ? ' pnode-parked' : ''}`}
+      style={{ borderColor: color, background: indexed ? ARR_BG : meta.bg, ...stackVars }}
     >
       <Handle type="target" position={Position.Left} />
-      <div className="pnode-tag" style={{ color: meta.color }}>
+      <div className="pnode-tag" style={{ color }}>
         <span>
           {meta.tag}
           {d.idTag ? <span className="pnode-idtag">{d.idTag}</span> : null}
         </span>
         <span className="pnode-tag-r">
+          {indexed ? (
+            <span
+              className="pnode-arr"
+              title={`compiled dbsp arrangements on this table — click the source to see the ${indexed.indexes} index${indexed.indexes === 1 ? '' : 'es'}${indexed.counts ? ` and ${indexed.counts} counts pipeline${indexed.counts === 1 ? '' : 's'}` : ''}. ${indexed.seeded ? 'seeded' : 'seeding…'}`}
+            >
+              ⧉ {indexed.indexes} idx{indexed.counts ? ` · ${indexed.counts} cnt` : ''}
+            </span>
+          ) : null}
           {parked ? <span className={`pnode-life pnode-life-${d.life}`}>{d.life}</span> : null}
+          {d.serve ? (
+            <span
+              className="pnode-serve"
+              title="circuit-served — this shape's data is seeded and maintained by the dbsp circuit"
+            >
+              circuit · {d.serve}
+            </span>
+          ) : null}
           {d.shared && d.shared > 1 ? <span className="pnode-shared">shared ×{d.shared}</span> : null}
         </span>
       </div>
       <div className={`pnode-label${d.highlight ? ' pnode-highlight' : ''}`} title={d.label}>
         {d.label}
       </div>
-      {/* Operators carry their dbsp formula as the sub line; logical nodes their own sub text. */}
-      {d.sub ?? (d.kind.startsWith('op-') ? meta.formula : undefined) ? (
+      {/* Operators carry their dbsp formula as the sub line; logical nodes their own sub text. A
+          control-plane `note` takes the formula's place (and is styled as an annotation below). */}
+      {d.sub ?? (d.kind.startsWith('op-') && !d.note ? meta.formula : undefined) ? (
         <div className="pnode-sub" title={d.sub ?? meta.formula}>
           {d.sub ?? meta.formula}
+        </div>
+      ) : null}
+      {d.note ? (
+        <div className="pnode-note" title={d.note}>
+          {d.note}
         </div>
       ) : null}
       {d.stateId ? <StateChips id={d.stateId} /> : null}

@@ -2,7 +2,7 @@ import { Background, Controls, MiniMap, ReactFlow, type Edge, type Node, type No
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { buildCircuit, hopIndex } from './build-circuit'
-import { buildGraph, type NodeRef, type VizNodeData } from './build-graph'
+import { buildGraph, logicalHopRedirect, type NodeRef, type VizNodeData } from './build-graph'
 import { clearDeltas, recordDelta } from './delta-store'
 import { DetailPanel } from './DetailPanel'
 import { edgeTypes, type PulseEdgeData } from './edges'
@@ -185,9 +185,19 @@ export default function App() {
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [mode, setMode] = useState<Mode>('all')
   const [loadedAt, setLoadedAt] = useState<number>(0)
+  // Bumped by the re-tidy button to force a fresh layout even when the graph JSON is unchanged
+  // (load() skips setGraph on identical content, so clearing the sticky ref alone re-tidies nothing).
+  const [tidyNonce, setTidyNonce] = useState(0)
   const [search, setSearch] = useState('')
   const [focus, setFocus] = useState<{ id: string; ref: NodeRef } | null>(null)
+  // Clicking a node focuses it (highlights its connections) but no longer pops the detail panel;
+  // the panel opens on demand via the sidebar "Show details" button. Once open it tracks the focus.
+  const [showDetail, setShowDetail] = useState(false)
   const [view, setView] = useState<View>('logical')
+  // Collapse the fan-out of shapes that share one query template (same route join) into a single
+  // node badged with the count — on by default, since a real app opens the same handful of shapes
+  // once per user/value and the canvas would otherwise explode. Selecting a shape expands its family.
+  const [groupShapes, setGroupShapes] = useState(true)
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [sidebarW, setSidebarW] = useState(340)
   const [resizing, setResizing] = useState(false)
@@ -235,6 +245,15 @@ export default function App() {
     const t = setInterval(() => void seedState(), 10_000)
     return () => clearInterval(t)
   }, [load])
+  // Escape closes the detail panel (only while it's open, so it doesn't swallow Escape elsewhere).
+  useEffect(() => {
+    if (!showDetail) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setShowDetail(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [showDetail])
   useEffect(() => {
     // Hold the poll while a lifecycle settle is pending — it must not publish the intermediate
     // state (e.g. a transient subset-feed shape) that the settle exists to skip. But sustained
@@ -257,18 +276,33 @@ export default function App() {
     if (mode === 'select' && selected.size === 0) return { nodes: [], edges: [] }
     const sel = mode === 'all' ? 'all' : selected
     // alignSources pins every replication-source node into the leftmost rank.
-    const opts = { alignSources: true, positions: stickyPositions.current }
+    const opts = { alignSources: true, positions: stickyPositions.current, groupShapes }
     return view === 'circuit' ? buildCircuit(graph, sel, focus?.id ?? null, opts) : buildGraph(graph, sel, focus?.id ?? null, opts)
-  }, [graph, mode, selected, focus, view])
+    // tidyNonce forces a re-layout on the re-tidy button (which clears the sticky positions the memo
+    // otherwise reuses); the memo can't observe the ref clear on its own.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [graph, mode, selected, focus, view, groupShapes, tidyNonce])
 
-  // hop id → rendered node ids: identity in the logical view; in the circuit view, the operator
-  // group the ENGINE stamped with that hop (OpNode.hop) — trace flashes and fresh-structure
-  // highlights expand through this, never through client-side guessing.
+  // hop id → rendered node ids. Grouping collapses the repeated per-shape structure only in the
+  // whole-graph view (a selection always expands), so BOTH views remap under the SAME condition their
+  // builders group under: mode 'all' with the toggle on. A hop into a collapsed member then resolves
+  // to the stacked representative that stands in for it — so the path to a stacked shape lights up
+  // (node flashes, connecting edges pulse) instead of pointing at a node the render never drew.
+  // Trace flashes and fresh-structure highlights expand through this, never through client guessing.
   const expandHop = useMemo(() => {
-    if (view === 'logical' || !graph) return (h: string) => [h]
-    const idx = hopIndex(graph)
-    return (h: string) => idx.get(h) ?? []
-  }, [view, graph])
+    if (!graph) return (h: string) => [h]
+    const grouping = mode === 'all' && groupShapes
+    if (view === 'circuit') {
+      // Circuit view: the operator group the ENGINE stamped with that hop (OpNode.hop), redirected
+      // to the stacked representative when a collapsed chain swallowed it.
+      const idx = hopIndex(graph, grouping)
+      return (h: string) => idx.get(h) ?? []
+    }
+    // Logical view: a hop IS a rendered node id (identity), except a collapsed member, which the
+    // redirect points at its stacked rep — the logical mirror of the circuit view's hopIndex.
+    const redirect = logicalHopRedirect(graph, grouping)
+    return (h: string) => [redirect.get(h) ?? h]
+  }, [view, graph, mode, groupShapes])
   const expandRef = useRef(expandHop)
   expandRef.current = expandHop
 
@@ -549,7 +583,7 @@ export default function App() {
           </button>
         </div>
 
-        <div className="toolbar">
+        <div className="toolbar toolbar-eq">
           <button
             className={mode === 'all' ? 'btn btn-on' : 'btn'}
             onClick={() => {
@@ -560,14 +594,11 @@ export default function App() {
             ▦ Entire graph
           </button>
           <button
-            className="btn"
-            disabled={selected.size === 0}
-            onClick={() => {
-              setSelected(new Set())
-              setMode('all')
-            }}
+            className={groupShapes ? 'btn btn-on' : 'btn'}
+            title="Collapse shapes that share one query template (same route join) into a single node with a count — selecting a shape expands its family"
+            onClick={() => setGroupShapes((g) => !g)}
           >
-            Clear
+            ⊞ Group shapes
           </button>
         </div>
         <div className="toolbar">
@@ -576,6 +607,7 @@ export default function App() {
             title="Refresh + re-tidy the layout (node positions are otherwise sticky)"
             onClick={() => {
               stickyPositions.current.clear()
+              setTidyNonce((n) => n + 1) // force a fresh layout even if the graph content is unchanged
               void load()
             }}
           >
@@ -595,6 +627,12 @@ export default function App() {
           <div className="counts">
             {graph.shapes.length} shapes · {graph.tables.length} tables · {graph.subqueryNodes.length} subquery
             nodes
+          </div>
+        ) : null}
+        {graph?.arrangements ? (
+          <div className="counts" title="dbsp circuit: compiled indexes + counts pipelines, and how lookups were answered (circuit snapshot vs Postgres fallback)">
+            dbsp: {graph.arrangements.indexes.length} indexes · {(graph.arrangements.counts ?? []).length} counts ·{' '}
+            {graph.arrangements.served.toLocaleString()} served · {graph.arrangements.fallback.toLocaleString()} fallback
           </div>
         ) : null}
         {err ? <div className="err">{err}</div> : null}
@@ -622,8 +660,9 @@ export default function App() {
                     onClick={(e) => {
                       const additive = e.metaKey || e.ctrlKey || e.shiftKey
                       toggle(s.id, additive)
-                      // A plain click also opens the detail panel for this shape (SQL + live contents);
-                      // additive clicks just build up the multi-select without stealing focus.
+                      // A plain click focuses this shape (and, if the detail panel is open, it tracks
+                      // the focus); it no longer pops the panel. Additive clicks just build up the
+                      // multi-select without stealing focus. Double-click (below) opens the panel.
                       if (!additive) {
                         setFocus({
                           id: `shape:${s.id}`,
@@ -631,15 +670,42 @@ export default function App() {
                         })
                       }
                     }}
+                    onDoubleClick={() => {
+                      setFocus({
+                        id: `shape:${s.id}`,
+                        ref: s.aggregate ? { kind: 'aggshape', shapeId: s.id } : { kind: 'shape', shapeId: s.id },
+                      })
+                      setShowDetail(true)
+                    }}
                     title={shapeSql(s)}
                   >
                     <div className="shape-row-top">
                       <span className="shape-id">{s.id}</span>
                       <span className={`badge ${k.cls}`}>{k.label}</span>
+                      {s.circuit ? (
+                        <span className="badge k-circuit" title={`circuit-served · ${s.circuit.label}`}>
+                          circuit
+                        </span>
+                      ) : null}
                       {s.changesOnly ? <span className="badge k-feed">feed</span> : null}
                       {s.state && s.state !== 'active' ? (
                         <span className={`badge k-life k-life-${s.state}`}>{s.state}</span>
                       ) : null}
+                      <span
+                        className="shape-detail"
+                        role="button"
+                        title="Show details — SQL, live contents, internals"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          setFocus({
+                            id: `shape:${s.id}`,
+                            ref: s.aggregate ? { kind: 'aggshape', shapeId: s.id } : { kind: 'shape', shapeId: s.id },
+                          })
+                          setShowDetail(true)
+                        }}
+                      >
+                        ⓘ
+                      </span>
                       <span
                         className="shape-del"
                         role="button"
@@ -697,8 +763,13 @@ export default function App() {
             <span className="lg lg-filter">σ filter</span>
             <span className="lg lg-family">↦⋈ route join</span>
             <span className="lg lg-sqnode">IN-set arrange</span>
-            <span className="lg lg-agg">Σ fold</span>
+            <span className="lg lg-agg">Σ aggregate</span>
             <span className="lg lg-shape">shape out</span>
+            {graph?.arrangements ? (
+              <span className="lg lg-serve" title="a chip on the card: the shape's data is seeded + maintained by the dbsp circuit">
+                circuit-served
+              </span>
+            ) : null}
           </div>
         ) : (
           <div className="legend">
@@ -710,6 +781,18 @@ export default function App() {
             <span className="lg lg-join">⋈ join</span>
             <span className="lg lg-agg">Σ fold</span>
             <span className="lg lg-shape">π · sink</span>
+            {graph?.arrangements ? <span className="lg lg-arr">dbsp index</span> : null}
+            {graph?.arrangements ? <span className="lg lg-arr-counts">dbsp counts</span> : null}
+            {graph?.arrangements ? (
+              <span className="lg lg-lookup" title="dashed edge: an occasional point-read against an index snapshot">
+                ⇢ lookup (read)
+              </span>
+            ) : null}
+            {graph?.arrangements ? (
+              <span className="lg lg-serve" title="solid animated edge: the shape's data comes FROM the circuit">
+                → serves (feeds)
+              </span>
+            ) : null}
           </div>
         )}
 
@@ -742,7 +825,14 @@ export default function App() {
             fitView
             minZoom={0.1}
             onNodeClick={(_e, n) => setFocus({ id: n.id, ref: (n.data as VizNodeData).ref })}
-            onPaneClick={() => setFocus(null)}
+            onNodeDoubleClick={(_e, n) => {
+              setFocus({ id: n.id, ref: (n.data as VizNodeData).ref })
+              setShowDetail(true)
+            }}
+            onPaneClick={() => {
+              setFocus(null)
+              setShowDetail(false)
+            }}
             proOptions={{ hideAttribution: true }}
           >
             <Background gap={20} color="#eef2f7" />
@@ -752,13 +842,13 @@ export default function App() {
         )}
         <div className="stamp">
           {loadedAt ? `updated ${new Date(loadedAt).toLocaleTimeString()}` : ''}
-          {focus ? ' · click a node for details' : ''}
+          {focus ? ' · focused — click ⓘ on a shape (or double-click a node) for the panel' : ''}
         </div>
-        {focus && graph ? (
+        {showDetail && focus && graph ? (
           <DetailPanel
             node={focus.ref}
             graph={graph}
-            onClose={() => setFocus(null)}
+            onClose={() => setShowDetail(false)}
             onSelectShape={(id) => toggle(id, false)}
           />
         ) : null}

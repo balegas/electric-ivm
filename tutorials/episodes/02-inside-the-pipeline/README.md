@@ -50,6 +50,8 @@ psql "postgres://postgres:password@localhost:5432/electric" \
   -c "INSERT INTO issues VALUES (7, 'review this tutorial', 'todo', 2)"
 ```
 
+> As in episode 1, you can drive this write from the canvas instead — the `issues` table node's **add-row** form does the same insert. (The updates in §4 stay on `psql`: the table node writes and deletes rows, but changing a column in place is `UPDATE`'s job — which is exactly the point §4 makes.)
+
 The green dot is labeled **`+1`**, and that label is the core of DBSP: a change is a **weighted row**. `+1` means "this row is now present"; `−1` means "this row is no longer present". Every operator in the circuit consumes a stream of weighted rows and emits one — σ passes or drops them, π folds them into feed envelopes, the sink appends those to your shape's stream. Nothing anywhere re-reads the table.
 
 ## 4. An update is a retraction plus an insertion
@@ -76,12 +78,14 @@ psql "postgres://postgres:password@localhost:5432/electric" \
 
 ## 5. Stateless vs stateful
 
-Click the σ box: its detail panel shows what it evaluates, and note what it *doesn't* have — stored rows. σ and π are pure per-delta functions; this entire circuit keeps **no state**, which is why the engine can maintain a shape like this for next to nothing.
+Click the σ box: its detail panel shows what it evaluates, and note what it *doesn't* have — stored rows. σ and π are pure per-delta functions; this stretch of the circuit keeps **no state**, which is why the engine can maintain a shape like this for next to nothing.
 
-The interesting DBSP machinery starts when a circuit *must* remember things: equality routing uses a shared index, joins and subqueries keep **arrangements** (stateful indexes — when one feeds a join, the canvas draws that edge dashed), and aggregations keep folds. That state — and how it stays small — is where the series goes next.
+The one bit of state already on screen is easy to miss: the **source** node is tinted indigo and wears a `⧉ 1 idx` badge. That is the always-on dbsp circuit's automatic **primary-key arrangement** for `issues` — every replicated table gets one, folded right onto its source rather than drawn as a separate box. Click the source and the detail panel's **compiled dbsp arrangements** section spells it out. Nothing is served *from* it yet — no shape here needs it — so it just sits there, seeded.
+
+The interesting DBSP machinery starts when a circuit *must* remember more: equality routing uses a shared index, joins and subqueries keep **arrangements** (stateful indexes — an app configures cohort indexes and they fold onto the source too, and when one serves a subquery's re-derivations the canvas draws that lookup edge dashed, hanging off the source), and aggregations keep folds. That state — and how it stays small — is where the series goes next.
 
 ## 6. What you now know
 
 Shapes compile to circuits of operators that pass weighted row-changes; an update is a retraction plus an insertion; and a predicate like yours needs no state at all. When a reader asks you "how does the engine know a row *left* a query result without re-running it?", you now know the answer: the `−1` told it.
 
-**Next — Episode 3, Shapes as resources:** creating shapes with the extended API, reading feeds straight from the durable-streams log, and what happens when two clients ask for the same shape (spoiler: one pipeline, on screen).
+**Next — Episode 3, Pipelines, shapes, and strangers:** step out of one shape and into the app's whole query graph — the engine's static compiled pipeline, the three-tier serving model, and shapes latching onto that pipeline (and letting go) live on the canvas. That's where "two clients, one pipeline" turns out to live.

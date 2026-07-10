@@ -2,8 +2,8 @@ import { useEffect, useMemo, useState, type ReactNode } from 'react'
 
 import type { NodeKind, NodeRef } from './build-graph'
 import { useLatestDelta } from './delta-store'
-import { KIND_META, fmtScalar } from './node-meta'
-import { predicateLabel } from './predicate-label'
+import { KIND_META, fmtScalar, servingTier } from './node-meta'
+import { predicateLabel, predicateTemplateLabel } from './predicate-label'
 import { nodeInnerSql, shapeSql } from './shape-sql'
 import { useNodeState } from './state-store'
 import type { AggregateDump, EngineGraph, FamilyDump, GraphShape, NodeIndex } from './types'
@@ -181,6 +181,63 @@ function SinkView({ shape }: { shape: GraphShape | undefined }) {
 
 const BROWSE_PAGE = 25
 
+/** The compiled dbsp arrangements folded onto a table's SOURCE node, as a compact list. On the
+ *  canvas the arrangement lane is collapsed onto the source (a count badge) to keep the graph
+ *  legible; here, where a click affords the room, the indexes and counts pipelines are spelled out.
+ *  The prose that explains what each KIND does lives in [`SourceArrangementNotes`], rendered lower
+ *  so the row browser stays near the top. Read straight from `graph.arrangements`. */
+function SourceArrangements({ table, arr }: { table: string; arr: EngineGraph['arrangements'] }) {
+  if (!arr) return null
+  const indexes = arr.indexes.filter((i) => i.table === table)
+  const counts = (arr.counts ?? []).filter((c) => c.table === table)
+  if (indexes.length === 0 && counts.length === 0) return null
+  return (
+    <>
+      <div className="dp-sec">compiled dbsp arrangements</div>
+      <div className="dp-list dp-index">
+        {indexes.map((i) => (
+          <div key={i.id} className="dp-item">
+            <code>map_index({i.cols.join(', ')})</code>
+            <span className="dp-item-sub">integrate_trace · {i.seeded ? 'seeded' : 'seeding…'}</span>
+          </div>
+        ))}
+        {counts.map((c) => (
+          <div key={c.id} className="dp-item">
+            <code>weighted_count({c.groupCols.join(', ')})</code>
+            <span className="dp-item-sub">counts pipeline · {c.seeded ? 'seeded' : 'seeding…'}</span>
+          </div>
+        ))}
+      </div>
+    </>
+  )
+}
+
+/** The "what this kind does" prose for a source's folded arrangements — one headed card per kind
+ *  the table actually has. Rendered BELOW the row browser (verbose reference, not the headline), and
+ *  headed like `InsideNote` so the panel's explanation cards read consistently. */
+function SourceArrangementNotes({ table, arr }: { table: string; arr: EngineGraph['arrangements'] }) {
+  if (!arr) return null
+  const hasIndex = arr.indexes.some((i) => i.table === table)
+  const hasCounts = (arr.counts ?? []).some((c) => c.table === table)
+  if (!hasIndex && !hasCounts) return null
+  return (
+    <>
+      {hasIndex ? (
+        <div className="dp-note dp-inside">
+          <span className="dp-inside-h">map_index</span>
+          {KIND_META['arr-index'].inside}
+        </div>
+      ) : null}
+      {hasCounts ? (
+        <div className="dp-note dp-inside">
+          <span className="dp-inside-h">weighted_count</span>
+          {KIND_META['arr-counts'].inside}
+        </div>
+      ) : null}
+    </>
+  )
+}
+
 /** Paginated browser over a table's rows via the engine's one-shot subset query
  *  (`POST /query` with limit/offset) — each page is fetched on demand, no shape is
  *  created and nothing is materialized, so large tables never load upfront.
@@ -189,7 +246,12 @@ const BROWSE_PAGE = 25
  *  editable row aligned to the table's columns; submitting inserts into Postgres via
  *  the engine (`POST /engine/table/{table}/rows`), then reloads the current page so the
  *  new row shows. The insert is captured by logical replication, so the pipeline animates
- *  on its own. Blank inputs are omitted (column default / NULL). */
+ *  on its own. Blank inputs are omitted (column default / NULL).
+ *
+ *  Delete too: when the schema exposes a primary key, each row gets a checkbox (plus a
+ *  page-wide one in the header); `− delete n rows` removes the selected rows from Postgres
+ *  in one request (`DELETE /engine/table/{table}/rows` with their primary keys), so the
+ *  deletes replicate and flow through the pipeline like any other write. */
 function TableBrowser({ table }: { table: string }) {
   const [page, setPage] = useState(0)
   const [rows, setRows] = useState<Record<string, unknown>[]>([])
@@ -208,12 +270,28 @@ function TableBrowser({ table }: { table: string }) {
   const [insertErr, setInsertErr] = useState<string | null>(null)
   const [okFlash, setOkFlash] = useState(false)
 
+  // Row-selection + delete state. Each selected row is its serialized primary key — a JSON
+  // object built in the schema's pk-column order, so the string is stable and parses straight
+  // back into the DELETE request's key format.
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [deleting, setDeleting] = useState(false)
+  const [deleteErr, setDeleteErr] = useState<string | null>(null)
+  const [delFlash, setDelFlash] = useState(0)
+
   useEffect(() => {
     setPage(0)
     setAdding(false)
     setValues({})
     setInsertErr(null)
+    setSelected(new Set())
+    setDeleteErr(null)
   }, [table])
+
+  // Selection is per page: rows off-screen should never be part of a delete.
+  useEffect(() => {
+    setSelected(new Set())
+    setDeleteErr(null)
+  }, [page])
 
   // Fetch the column list once per table (used for the header and the inline editor).
   useEffect(() => {
@@ -289,6 +367,69 @@ function TableBrowser({ table }: { table: string }) {
     return m
   }, [schema])
 
+  // Selection needs the primary key: without one there is no safe row identity to delete by.
+  const pkCols = useMemo(() => schema?.primaryKey ?? [], [schema])
+  const canSelect = pkCols.length > 0
+
+  /** A row's selection key: its primary key as JSON, in pk-column order (null ⇒ not selectable). */
+  const rowKey = (r: Record<string, unknown>): string | null => {
+    const key: Record<string, unknown> = {}
+    for (const c of pkCols) {
+      const v = r[c]
+      if (v === null || v === undefined) return null
+      key[c] = v
+    }
+    return JSON.stringify(key)
+  }
+
+  const pageKeys = canSelect ? rows.map(rowKey).filter((k): k is string => k !== null) : []
+  const allSelected = pageKeys.length > 0 && pageKeys.every((k) => selected.has(k))
+
+  const toggleRow = (key: string) => {
+    setSelected((s) => {
+      const next = new Set(s)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+  const toggleAll = () => {
+    setSelected((s) => {
+      const next = new Set(s)
+      if (allSelected) pageKeys.forEach((k) => next.delete(k))
+      else pageKeys.forEach((k) => next.add(k))
+      return next
+    })
+  }
+
+  const deleteSelected = async () => {
+    if (selected.size === 0 || deleting) return
+    setDeleting(true)
+    setDeleteErr(null)
+    try {
+      // One request for the whole selection — the engine deletes all keys in a single
+      // statement, so a multi-row delete reaches the pipeline as one replication batch.
+      const keys = [...selected].map((k) => JSON.parse(k) as Record<string, unknown>)
+      const r = await fetch(`/engine/table/${encodeURIComponent(table)}/rows`, {
+        method: 'DELETE',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ keys }),
+      })
+      if (!r.ok) {
+        const eb = (await r.json().catch(() => null)) as { error?: string } | null
+        throw new Error(eb?.error ?? `delete → ${r.status}`)
+      }
+      setSelected(new Set())
+      setDelFlash(keys.length)
+      setTimeout(() => setDelFlash(0), 1600)
+      setNonce((n) => n + 1)
+    } catch (e) {
+      setDeleteErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setDeleting(false)
+    }
+  }
+
   const openEditor = () => {
     setValues({})
     setInsertErr(null)
@@ -363,23 +504,54 @@ function TableBrowser({ table }: { table: string }) {
           <table className="dp-table">
             <thead>
               <tr>
+                {canSelect ? (
+                  <th className="dp-selcol">
+                    <input
+                      type="checkbox"
+                      className="dp-sel-cb"
+                      title="select all rows on this page"
+                      checked={allSelected}
+                      disabled={deleting || pageKeys.length === 0}
+                      onChange={toggleAll}
+                    />
+                  </th>
+                ) : null}
                 {columns.map((c) => (
                   <th key={c}>{c}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {rows.map((r, i) => (
-                <tr key={`${page}:${i}`}>
-                  {columns.map((c) => (
-                    <td key={c} title={String(r[c] ?? '')}>
-                      {fmtCell(r[c])}
-                    </td>
-                  ))}
-                </tr>
-              ))}
+              {rows.map((r, i) => {
+                const key = canSelect ? rowKey(r) : null
+                const isSel = key !== null && selected.has(key)
+                return (
+                  <tr key={`${page}:${i}`} className={isSel ? 'dp-row-sel' : undefined}>
+                    {canSelect ? (
+                      <td className="dp-selcol">
+                        {key !== null ? (
+                          <input
+                            type="checkbox"
+                            className="dp-sel-cb"
+                            title="select row for delete"
+                            checked={isSel}
+                            disabled={deleting}
+                            onChange={() => toggleRow(key)}
+                          />
+                        ) : null}
+                      </td>
+                    ) : null}
+                    {columns.map((c) => (
+                      <td key={c} title={String(r[c] ?? '')}>
+                        {fmtCell(r[c])}
+                      </td>
+                    ))}
+                  </tr>
+                )
+              })}
               {adding ? (
                 <tr className="dp-addrow-tr">
+                  {canSelect ? <td className="dp-selcol" /> : null}
                   {columns.map((c, i) => {
                     const info = colInfo.get(c)
                     return (
@@ -411,6 +583,7 @@ function TableBrowser({ table }: { table: string }) {
         </div>
       ) : null}
       {insertErr ? <div className="dp-err">{insertErr}</div> : null}
+      {deleteErr ? <div className="dp-err">{deleteErr}</div> : null}
       <div className="dp-addrow-bar">
         {adding ? (
           <>
@@ -426,7 +599,22 @@ function TableBrowser({ table }: { table: string }) {
             <button className="dp-addrow-open" disabled={loading} title="insert a row into this table" onClick={openEditor}>
               + add row
             </button>
+            {selected.size > 0 ? (
+              <button
+                className="dp-delrow-btn"
+                disabled={deleting}
+                title="delete the selected rows from this table"
+                onClick={() => void deleteSelected()}
+              >
+                {deleting ? 'deleting…' : `− delete ${selected.size} row${selected.size === 1 ? '' : 's'}`}
+              </button>
+            ) : null}
             {okFlash ? <span className="dp-addrow-ok">✓ inserted</span> : null}
+            {delFlash > 0 ? (
+              <span className="dp-delrow-ok">
+                ✓ deleted {delFlash} row{delFlash === 1 ? '' : 's'}
+              </span>
+            ) : null}
           </>
         )}
       </div>
@@ -709,7 +897,9 @@ export function DetailPanel({
             ? `filter:${node.shapeId}`
             : node.kind === 'sqnode'
               ? `node:${node.sig}`
-              : `shape:${node.shapeId}`
+              : node.kind === 'shapegroup' || node.kind === 'sqgroup'
+                ? '' // a collapsed group carries no single engine state id
+                : `shape:${node.shapeId}`
   const live = useNodeState(stateId)
 
   let title = ''
@@ -829,6 +1019,74 @@ export function DetailPanel({
         </div>
       </>
     )
+  } else if (node.kind === 'shapegroup') {
+    const members = graph.shapes.filter(
+      (s) => s.table === node.table && s.familyKey && !s.isSubquery && s.familyKey.join(',') === node.keyCols.join(','),
+    )
+    title = `Shapes · route by (${node.keyCols.join(', ')})`
+    body = (
+      <>
+        <Row k="table" v={node.table} />
+        <Row k="query template" v={<code>{node.keyCols.map((c) => `${c} = ?`).join(' AND ')}</code>} />
+        <Row k="grouped shapes" v={members.length} />
+        <div className="dp-note">
+          One node per query family — these {members.length} equality shapes share the same route join,
+          one routing entry each; shape cardinality is unbounded over the one template. Turn off “group
+          shapes”, or click a member below, to see them individually.
+        </div>
+        <div className="dp-sec">shapes in this group</div>
+        <div className="dp-list">
+          {members.map((s) => (
+            <div key={s.id} className="dp-item">
+              <ShapeLink id={s.id} onSelect={onSelectShape} />
+              <span className="dp-item-sub">{predicateLabel(s.where)}</span>
+            </div>
+          ))}
+        </div>
+      </>
+    )
+  } else if (node.kind === 'sqgroup') {
+    // A stacked group of subquery shapes with one pipeline shape but distinct bindings. The members
+    // and their subquery nodes are re-derived from the ids the node carries, so each instance's
+    // materialized contents (distinct values / refcount) stay inspectable behind the collapsed card.
+    const members = graph.shapes.filter((s) => node.shapeIds.includes(s.id))
+    const nodes = graph.subqueryNodes.filter((n) => node.sigs.includes(n.sig))
+    const template = predicateTemplateLabel(members[0]?.where ?? null)
+    title = `Subquery shapes · ${node.outerTable}`
+    body = (
+      <>
+        <Row k="outer table" v={node.outerTable} />
+        <Row k="pipeline template" v={<code>{template}</code>} />
+        <Row k="inner set" v={<code>{`distinct ${node.projCol} FROM ${node.innerTable}`}</code>} />
+        <Row k="grouped instances" v={members.length} />
+        <div className="dp-note">
+          One card per subquery PIPELINE — these {members.length} shapes share the same maintained
+          structure and differ only in their bound parameter (and thus their inner set). Turn off
+          “group shapes”, or click a member below, to see them individually.
+        </div>
+        <div className="dp-sec">shapes in this group</div>
+        <div className="dp-list">
+          {members.map((s) => (
+            <div key={s.id} className="dp-item">
+              <ShapeLink id={s.id} onSelect={onSelectShape} />
+              <span className="dp-item-sub">{predicateLabel(s.where)}</span>
+            </div>
+          ))}
+        </div>
+        <div className="dp-sec">inner-set instances · distinct values / refcount</div>
+        <div className="dp-list dp-index">
+          {nodes.map((n) => (
+            <div key={n.sig} className="dp-item">
+              <code className="dp-key">{n.innerTable}</code>
+              <span className="dp-badge-n">
+                {n.distinctValues} value{n.distinctValues === 1 ? '' : 's'} · ref {n.refcount}
+              </span>
+            </div>
+          ))}
+          {nodes.length === 0 ? <div className="dp-empty-idx">no maintained inner nodes</div> : null}
+        </div>
+      </>
+    )
   } else if (node.kind === 'op') {
     const meta = KIND_META[node.opKind]
     title = `Operator · ${node.label}`
@@ -866,10 +1124,19 @@ export function DetailPanel({
             <Row k="matching rows" v={live.count.toLocaleString()} />
           </>
         ) : null}
-        <InsideNote kind={node.opKind} />
-        {/* Source operator: same write + browse affordances as the logical table node. */}
+        {/* "inside this operator" leads for most operators. A source has a richer panel, so its
+            explainer drops below the headline content: arrangements list → row browser → the
+            per-kind explanation cards (source, then index/counts) last. */}
+        {node.opKind !== 'op-source' ? <InsideNote kind={node.opKind} /> : null}
+        {node.opKind === 'op-source' && opTable ? (
+          <SourceArrangements table={opTable} arr={graph.arrangements} />
+        ) : null}
         {node.opKind === 'op-source' && opTable ? (
           <TableBrowser table={opTable} />
+        ) : null}
+        {node.opKind === 'op-source' ? <InsideNote kind={node.opKind} /> : null}
+        {node.opKind === 'op-source' && opTable ? (
+          <SourceArrangementNotes table={opTable} arr={graph.arrangements} />
         ) : null}
         {/* Δ change operator: the reconstructed Z-set of the most recent change on this table. */}
         {node.opKind === 'op-delta' && opTable ? <DeltaView table={opTable} /> : null}
@@ -882,6 +1149,11 @@ export function DetailPanel({
   } else if (node.kind === 'aggshape') {
     const s = graph.shapes.find((x) => x.id === node.shapeId)
     const fn = s?.aggregate?.func.toUpperCase() ?? '?'
+    const tier = s ? servingTier(s) : null
+    // A circuit-served COUNT's value lives in the circuit's counts pipeline — surface which one.
+    const countsPipe = s?.circuit?.counts
+      ? (graph.arrangements?.counts ?? []).find((c) => c.table === s.table)
+      : undefined
     title = `Aggregation · ${node.shapeId}`
     body = (
       <>
@@ -894,9 +1166,19 @@ export function DetailPanel({
         </div>
         <Row k="function" v={<code>{`${fn}(${s?.aggregate?.col ?? '*'})`}</code>} />
         <Row k="table" v={s?.table} />
+        {tier ? <Row k="serving tier" v={<code>{tier.label}</code>} /> : null}
+        {countsPipe ? (
+          <Row
+            k="counts pipeline"
+            v={<code>{`${countsPipe.id} · group by (${countsPipe.groupCols.join(', ')})`}</code>}
+          />
+        ) : null}
         <Row k="output" v="a single live scalar (streamed)" />
+        {tier ? <div className="dp-note">{tier.note}</div> : null}
         <InsideNote kind="agg" />
-        <AggInternalsView nodeId={stateId} />
+        {/* Fold internals exist only for fold-maintained aggregates — a circuit-served COUNT has
+            no fold executor (the deep dump 404s), its value lives in the counts pipeline. */}
+        {s && !s.circuit ? <AggInternalsView nodeId={stateId} /> : null}
         {s ? <SqlBlock sql={shapeSql(s)} /> : null}
       </>
     )
@@ -904,11 +1186,12 @@ export function DetailPanel({
     // shape
     const s = graph.shapes.find((x) => x.id === node.shapeId)
     title = `Shape · ${node.shapeId}`
-    const kind = s?.isSubquery ? 'subquery' : s?.familyKey ? `family(${s.familyKey.join(',')})` : 'standalone'
+    const tier = s ? servingTier(s) : null
     body = (
       <>
         <Row k="table" v={s?.table} />
-        <Row k="routing" v={kind} />
+        {tier ? <Row k="serving tier" v={<code>{tier.label}</code>} /> : null}
+        {s?.circuit && s.isSubquery ? <Row k="registered as" v="subquery (membership relation)" /> : null}
         <Row k="columns" v={<ColumnList columns={s?.columns ?? null} />} />
         <Row k="changes-only feed" v={s?.changesOnly ? 'yes (no backfill)' : 'no (materialized)'} />
         <Row k="stream" v={<code>{s?.streamPath}</code>} />
@@ -916,13 +1199,7 @@ export function DetailPanel({
         <InsideNote kind="shape" />
         {s ? <SqlBlock sql={shapeSql(s)} /> : null}
         {s ? <ShapeLiveView shape={s} /> : null}
-        <div className="dp-note">
-          {s?.isSubquery
-            ? 'Membership is driven by the shared subquery node(s) upstream plus the outer-row filter — when an inner value flips, the affected rows move in/out of this stream.'
-            : s?.familyKey
-              ? 'Fed by the shared route join upstream — the engine keeps only this shape’s routing entry and snapshot gate, no table rows.'
-              : 'Fed by its standalone filter — enter/leave falls out of filtering each delta.'}
-        </div>
+        {tier ? <div className="dp-note">{tier.note}</div> : null}
       </>
     )
   }

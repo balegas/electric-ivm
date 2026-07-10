@@ -22,8 +22,8 @@ Three layers, one idea — *maintain query results incrementally as the database
                   INGESTOR (replication.rs) ── decode commits → envelopes (old+new, commit LSN)
                      │  append
                      ▼
-                  DURABLE STREAMS   table/<name>   (the change log)
-                     │  tail (one task per table)
+                  DURABLE STREAMS   changes   (the single ordered change log)
+                     │  tail (one LSN-ordered sequencer, all tables)
                      ▼
                   ENGINE  ── route/filter each delta to matching shapes ──┐
                      │  append matched upsert/delete                      │
@@ -34,23 +34,32 @@ Three layers, one idea — *maintain query results incrementally as the database
                   CLIENT  stream-db + TanStack DB → live materialized set  │
 ```
 
-**The engine holds no copy of any table.** This is the single most important fact for
-reasoning about cost. State that scales with row count lives in Postgres; the engine keeps
-only per-shape metadata and, for subqueries, a shared set of *inner-query result values*.
+**The hot path holds no copy of any table.** This is the single most important fact for
+reasoning about cost. State that scales with row count lives in Postgres — or, in the
+always-on circuit's disk-spillable arrangements; the hot path keeps only per-shape
+metadata and, for subqueries, a shared set of *inner-query result values*.
 Baseline engine RSS is ~19 MiB whether the database has 1,000 or 100,000 rows
 (measured by the shape-memory matrix benchmark in `packages/bench`).
 
-### What dbsp is, and isn't, here
+### What dbsp is here
 
-The repo is named after [`dbsp`](https://crates.io/crates/dbsp) and the data model borrows
-its vocabulary — rows carry signed weights and a change is a **Z-set delta**. But there is
-**no running dbsp circuit, no per-shape thread, and no dbsp dependency**: the delta value
-types (`Row`, a positional `Vec<Value>`; `Tup2<Row, ZWeight>`; and `ZWeight`, a signed `i64`
-multiplicity) are defined locally in `value.rs`. The live-maintenance path is plain Rust: key
-routing and stateless tri-valued predicate evaluation. (An earlier design did run a shared
-dbsp join per equality template; it was removed to drop the table-copy-per-template memory —
-a structural rejection made at defaults, before dbsp's storage spilling, shared circuits, or
-multi-worker tuning were exercised. See `reduce-engine-memory-design.md`.)
+The data model is [`dbsp`](https://crates.io/crates/dbsp)'s: rows carry signed weights and a
+change is a **Z-set delta** (`Row`, a positional `Vec<Value>`; `Tup2<Row, ZWeight>`; and
+`ZWeight`, a signed `i64` multiplicity). The engine runs dbsp at exactly one place — **one
+shared, storage-enabled circuit per engine** (always-on infrastructure, `src/arrangements.rs`)
+that maintains **table arrangements** (pk + declared lookup columns) whose batches spill to
+disk as tables grow, plus **counts pipelines** (a live COUNT per group). It serves subquery
+flip re-derivations from local snapshots instead of Postgres query-backs (with automatic
+Postgres fallback), and serves membership shapes and decomposable COUNT aggregates end to end
+(for shapes whose connecting columns are arrangement-indexed). See `ARCHITECTURE.md` §6b.
+
+There are deliberately **no per-shape circuits and no per-shape threads**: the routing and
+fallback tiers are plain Rust — key routing and stateless tri-valued predicate evaluation.
+A shape whose predicate an index can route (equality templates, conjunct-indexed standalone
+predicates) is *cheaper* outside the circuit: the index finds a change's shapes in
+`O(log N)`, whereas a circuit shape pays a linear scan of every delta. Circuit structure
+must never scale with shapes, users, or parameter combinations — only with the app's query
+*templates*.
 
 ### A change is a Z-set delta
 
@@ -75,7 +84,7 @@ The engine creates a `pgoutput` logical-replication slot (+ a `<slot>_pub` publi
 **streams** it over the walsender protocol (push delivery — no poll interval). It buffers each
 transaction between `Begin` and `Commit` and stamps every change with its transaction's
 **COMMIT LSN** (not the per-change record LSN). It appends the resulting `Envelope`s (with
-`old` + `new`) to the `table/<name>` durable stream, and only **then** acknowledges the commit
+`old` + `new`) to the `changes` durable stream, and only **then** acknowledges the commit
 to Postgres (`confirmed_flush_lsn`). A failed append tears the connection down unacknowledged;
 the server resends from the confirmed position (append-then-acknowledge).
 
@@ -202,7 +211,12 @@ every change, so a deployment leaning on many such shapes still degrades linearl
 ### 3.3 Subqueries → shared inner-set nodes (`subquery.rs`)
 
 A subquery shape's `WHERE` contains `col [NOT] IN (SELECT proj FROM inner WHERE …)`, possibly
-nested. Subqueries are inherently cross-table (a change to `inner` moves rows of the outer
+nested. Single-level non-negated membership subqueries over arrangement-indexed columns are
+served by the always-on circuit instead — seeded from arrangement snapshots, maintained by
+cohort routing in the sequencer (`ARCHITECTURE.md` §6b). The registry described here serves
+everything else: nested, negated, and multi-subquery predicates, and any subquery whose columns
+are not arrangement-indexed. Subqueries are
+inherently cross-table (a change to `inner` moves rows of the outer
 table), so they route through one shared `Arc<Mutex<SubqueryRegistry>>` the sequencer calls.
 
 **Node — the shared, maintained inner set.** A `SubqueryNode` materializes
@@ -387,31 +401,38 @@ dominate.
 
 ### 4.5 Disk
 
-The engine does **not** page state to disk, and does not need to: there is no table-scale
-resident state to spill. Per-shape routing metadata, subquery contributor sets, and running
-aggregates are the only retained structures, and they are small (§4.2).
+Disk holds exactly one kind of engine state: the circuit's. The circuit is always on, and
+dbsp spills arrangement batches to Snappy-compressed layer files as tables grow and
+checkpoints the circuit periodically, so table-scale state is disk-resident and RAM-bounded
+(`ELECTRIC_IVM_DBSP_MIN_STORAGE_KB` / `_CACHE_MIB` / `_MAX_RSS_MB`; `ARCHITECTURE.md` §6b).
+The hot path itself pages nothing: per-shape routing metadata, subquery contributor sets, and
+running aggregates are its only retained structures, and they are small (§4.2).
 
 What IS durable is the **shape catalog** (`meta/catalog`, an append-only durable stream of
 create/join/leave/drop events plus change-log offset checkpoints): at boot the engine replays
 it and re-registers its shapes itself, so a restart is not a client re-registration storm.
 Plain/routed shapes resume with passthrough gates and replay the change log from the persisted
 offset (crash-window re-emission is idempotent absolute upserts); aggregates re-seed their fold
-from a fresh Postgres snapshot whose gate then skips the replayed history. Subquery shapes are
+from a fresh Postgres snapshot whose gate then skips the replayed history. Circuit-served
+shapes re-register against the restored circuit without reseeding (the circuit checkpoints
+its own state and replay position — `ARCHITECTURE.md` §6b). Registry subquery shapes are
 deliberately NOT restored — their inner-node contributor state is not persisted, and a
 fresh-seeded node cannot detect flips that happened while the engine was down (stale move-outs
 would persist forever) — so they are dropped loudly and clients recreate them. The catalog
 stream is never compacted (append-only); if event volume ever matters, snapshot+truncate or an
 embedded KV (redb/lmdb/sled) is the natural next step.
 
-In short: **disk is not a tuning lever; the memory story is "keep nothing big resident," and
-the engine does.**
+In short: **the memory story is "keep nothing big resident"** — the hot path holds nothing
+table-scale, and the circuit spills what is.
 
 ---
 
 ## 5. Worked example: LinearLite per-user visibility
 
 The flagship example (`examples/linearlite`, verified in-browser at 100k issues) makes a user
-see only issues in projects they're a member of. That is a subquery shape:
+see only issues in projects they're a member of. With the demo's default circuit config this
+shape is circuit-served (`docs/linearlite-circuit-design.md`); the walkthrough below traces
+the registry path — what the same shape costs with the circuit off. It is a subquery shape:
 
 ```jsonc
 // issues visible to user u
@@ -471,6 +492,7 @@ bounded keyset range query folded into the `WHERE`, so the engine never holds a 
 |---|---|
 | `apps/engine/src/engine.rs` | the LSN-ordered sequencer (+ global (lsn,seq) de-dup), delta computation, key routing + standalone + aggregation fan-out, shape sharing/lifecycle, per-txn reliable flush |
 | `apps/engine/src/subquery.rs` | cross-table subquery registry: shared nodes, edges, flips, absolute emission, atomic create/rollback |
+| `apps/engine/src/arrangements.rs` | the circuit: storage-backed table arrangements + counts pipelines, checkpoints, snapshot lookups |
 | `apps/engine/src/replication.rs` | Postgres logical-replication ingestor (streaming pgoutput, buffer per-txn, stamp commit LSN + xid + seq, append, acknowledge) |
 | `apps/engine/src/pg.rs` | connect/introspect, `REPLICA IDENTITY FULL`, slot create, predicate-pushdown backfill + `SnapshotGate`, subset query-back |
 | `apps/engine/src/predicate.rs` | predicate compile, three-valued `matches`/`matches_ctx`, `equality_template`, subquery signatures |

@@ -117,6 +117,10 @@ export function eventDecor(ev: TraceEvent, edges: Edge[], present: Set<string>, 
   const id = decorSeq++
   const pulses = new Map<string, EdgePulse>()
   for (const e of edges) {
+    // A `state` edge is a READ (a join/filter consulting an arrangement), not a data stream — its
+    // endpoints share a trace hop and both flash, but a travelling delta dot along it reads as data
+    // flowing from the arrangement, which it isn't. Flash the nodes, don't pulse the edge.
+    if ((e.data as { kind?: string } | undefined)?.kind === 'state') continue
     if (nodes.has(e.source) && nodes.has(e.target)) {
       // The dot leaves when its source rank flashes and arrives at the target's rank.
       pulses.set(e.id, { id, color, label, delayMs: (ranks.get(e.source) ?? 0) * STEP_MS, durMs: STEP_MS })

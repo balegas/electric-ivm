@@ -61,6 +61,9 @@ async fn main() -> Result<()> {
     let engine = match &config.pg_url {
         Some(url) if !url.is_empty() => {
             let engine = Engine::new_pg(DsClient::new(ds_url.clone()), url.clone());
+            // The dbsp arrangement circuit is mandatory infrastructure — always configured.
+            tracing::info!("dbsp arrangements: dir {}", config.dbsp.dir.display());
+            engine.set_dbsp_config(config.dbsp.clone());
             engine
                 .setup_postgres(&config.tables, &config.slot)
                 .await

@@ -20,7 +20,7 @@ Three tools, and you'll use all three in most episodes:
 
 - **the shell** (`curl`) — you create and read shapes over plain HTTP. No SDK, no client library; just requests you can read.
 - **`psql`** — you make changes the ordinary way, from your host, with SQL `INSERT`/`UPDATE`/`DELETE` straight against the tutorial's Postgres, exactly as a real app would.
-- **the pipeline visualizer** — a browser view that draws the engine's *actual* running pipeline. The nodes, counters, and edges you see aren't a diagram someone drew; they come from the engine's own introspection endpoints. When you write a row, you watch the change travel the pipeline live. Open it over HTTPS (`https://localhost:5543`) — the page holds several live streams at once, and browsers throttle those over plain HTTP.
+- **the pipeline visualizer** — a browser view that draws the engine's *actual* running pipeline. The nodes, counters, and edges you see aren't a diagram someone drew; they come from the engine's own introspection endpoints. When you write a row, you watch the change travel the pipeline live. It isn't view-only, either: from the browser you can **create a shape** (a table picker plus a schema-aware `WHERE` editor), delete shapes, and **add or delete rows** on any table node — the very actions the episodes drive with `curl` and `psql`, routed through the viz's engine proxy. The episodes still *lead* with `curl` and `psql`, because those teach the wire protocol and the real-app write path; the viz is the convenience alongside them, and each episode points it out where it fits. Open it over HTTPS (`https://localhost:5543`) — the page holds several live streams at once, and browsers throttle those over plain HTTP.
 
 Everything runs locally in Docker — one Postgres, the engine, a durable-streams log, and the visualizer — so you can break things freely and reset to a clean slate whenever you like.
 
@@ -66,8 +66,10 @@ Reopen `https://localhost:5543` and the warning is gone.
 
 1. **[Your first live shape](episodes/01-first-shape/README.md)** — create one shape with a single HTTP request, watch the engine build its pipeline, and watch one write flow through it end to end.
 2. **[Inside the pipeline](episodes/02-inside-the-pipeline/README.md)** — the same shape, exploded into the DBSP circuit the engine really executes: deltas, weights, and why an update is a retraction plus an insertion.
+3. **[Pipelines, shapes, and strangers](episodes/03-serving-model/README.md)** — step out of one shape into the app's whole query graph: deploy a static compiled pipeline for a todo model and watch the three-tier serving model at work — pipelines serve families, routing serves instances, the fallback serves strangers — with shapes latching onto the pipeline (and letting go) live on the canvas.
+4. **[Extending the pipeline (and rebuilding it)](episodes/04-extending-the-pipeline/README.md)** — add a cohort dimension the pipeline doesn't serve yet, watch its shape fall to the fallback tier, then change the config and rebuild the circuit: the arrangements reseed from Postgres, the shapes replay from the durable catalog, and that fallback shape is promoted to circuit-served — the line between what ships with a deploy and what flows at runtime, drawn by hand.
 
-More episodes build on these — subqueries across tables, live aggregations, and shared pipelines. Each one picks up from the last.
+Each episode picks up from the last.
 
 ## Resetting
 

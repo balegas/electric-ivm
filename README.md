@@ -52,11 +52,18 @@ scales with the size of the *change*, not the size of the *data*.
 
 electric-ivm is built on this model. Every replicated change becomes a Z-set delta (Postgres's
 `REPLICA IDENTITY FULL` supplies the old row, so updates retract precisely), and every shape,
-subquery, and aggregation is an incremental operator over those deltas. The engine implements the
-operators directly in Rust — stateless filters, key routers, shared inner-set nodes, running
-folds — rather than running a general dbsp circuit, so it keeps **no copy of any table**: engine
-RSS is ~19 MiB whether the database has 1k or 100k rows, +~0.8 KiB per shape
-(measured by the shape-memory matrix benchmark in `packages/bench`).
+subquery, and aggregation is an incremental operator over those deltas. The engine serves them
+from **three tiers**. One shared, storage-enabled dbsp **circuit** — always-on infrastructure —
+maintains per-table arrangements and counts pipelines whose state spills to disk as tables
+grow; it seeds and maintains membership (visibility-subquery) shapes and decomposable COUNT
+aggregates entirely from local snapshots — no Postgres backfill. Equality and template shapes
+go to the **routing tier** — key routers and conjunct indexes in plain Rust — because an
+indexed route beats a linear delta scan. Everything else lands on the **fallback**: stateless
+three-valued filters and the shared subquery registry, which serves any predicate. The hot
+path keeps **no copy of any table**: engine RSS is ~19 MiB whether the database has 1k or
+100k rows, +~0.8 KiB per shape (measured by the shape-memory matrix benchmark in
+`packages/bench`); the circuit's table state is disk-spillable and bounded — see
+`docs/ARCHITECTURE.md` §6b.
 
 ## A shape as a DBSP pipeline
 
@@ -120,6 +127,34 @@ projection) share one maintained pipeline and one output stream, ref-counted —
 subquery inner sets and identical aggregations. A thousand clients opening the same shape cost the
 engine one maintenance path and one append per change.
 
+## Designing the pipeline for your app
+
+The full treatment is `docs/building-app-pipelines.md`; the model in three sentences:
+**the circuit serves query families, routing serves query instances, the fallback serves query
+strangers.** A pipeline is compiled at deploy time and keyed by the app's *access cohort*; a
+shape is a selection/union of cohort groups from one pipeline's output, materialized at the
+delivery edge — so shape cardinality is unbounded while the circuit never grows. Anything that
+matches no template falls back to the engine's dynamic path (stateless eval, key routers,
+subquery registry), which serves any predicate.
+
+A todo app — `lists`, `todos(list_id, done, assignee)`, `list_members(list_id, user_id)` —
+compiles to five pipelines:
+
+```text
+lists ────────────────────────────────────────▶ lists_all            one global feed
+list_members ─ map_index(user_id) ────────────▶ memberships_by_user  per-user feed = THE ROUTER
+todos ─┬─ map_index(list_id) ─────────────────▶ todos_by_list        per-list cohort feed
+       ├─ map_index(assignee) ────────────────▶ todos_by_assignee    per-user feed (cohort of one)
+       └─ map_index((list_id, done))
+          .aggregate_linear(count) ───────────▶ open_counts          per-(list, done) live counts
+```
+
+"Todos of all my lists" is the union of `todos_by_list` groups for the user's memberships;
+joining a list is a `memberships_by_user` delta that subscribes the client to one more group
+and replays its log — move-in with no computation. `todos WHERE list_id IN (3,7,9)` is three
+routing entries over the same pipeline; a thousand such combinations cost the circuit nothing.
+`title LIKE '%urgent%'` matches no template and is served by the fallback, immediately.
+
 ## The system
 
 ```
@@ -164,12 +199,24 @@ on `PATH` (`initdb`/`pg_ctl` — the demos boot their own ephemeral cluster).
 
 ```bash
 pnpm install
-pnpm engine:build
-
-pnpm demo               # headless live-shape demo
-pnpm demo:linearlite    # LinearLite (issue tracker) on electric-ivm — the flagship demo
-scripts/linearlite.sh start large   # same, at a 100k-issue workload + the pipeline explorer
+pnpm demo:linearlite    # the flagship demo — builds the engine on first run
 ```
+
+One command boots everything (ephemeral Postgres, durable-streams, the engine) and serves the
+**LinearLite app and the pipeline explorer side by side** — write in one, watch the circuit maintain
+your shapes live in the other:
+
+| | URL |
+|---|---|
+| **LinearLite** (issue tracker) | https://localhost:8443 |
+| **Pipeline explorer** | https://localhost:5443 |
+
+The HTTPS/HTTP-2 fronts multiplex the shape streams over one connection (past the ~6-per-origin
+HTTP/1.1 cap); the certs come from Caddy's local CA, so run `caddy trust` once or click through the
+browser warning. Plain HTTP is also served on `:5174` (app) and `:5180` (explorer). `DEMO_VIZ=0`
+skips the explorer; `scripts/linearlite.sh start large` runs the same demo at a 100k-issue workload.
+Other entry points: `pnpm demo` (headless live-shape walkthrough), `pnpm demo:web` (minimal
+end-to-end app).
 
 ### The apps in this repo
 
@@ -206,8 +253,10 @@ ELECTRIC_IVM_ENGINE_URL=http://127.0.0.1:<engine-port> VIZ_PORT=5180 \
 ```
 
 **`examples/linearlite` — the flagship demo app (TS).** A Linear-style issue tracker synced
-entirely through shapes (visibility subqueries, live counts, subset pagination):
-`pnpm demo:linearlite`, or `scripts/linearlite.sh start large` for a 100k-issue workload.
+entirely through shapes (visibility subqueries, live counts, subset pagination). The demo
+launches the engine with the full circuit configuration by default (arrangements, counts, and
+serving — see `docs/linearlite-circuit-design.md`): `pnpm demo:linearlite`, or
+`scripts/linearlite.sh start large` for a 100k-issue workload.
 
 **`examples/web` — the minimal example (TS).** The smallest end-to-end app using the extended
 client: `pnpm demo:web`. (`pnpm demo` runs the even smaller headless todos walkthrough.)
