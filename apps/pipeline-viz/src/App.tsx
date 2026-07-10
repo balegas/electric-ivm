@@ -185,6 +185,9 @@ export default function App() {
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [mode, setMode] = useState<Mode>('all')
   const [loadedAt, setLoadedAt] = useState<number>(0)
+  // Bumped by the re-tidy button to force a fresh layout even when the graph JSON is unchanged
+  // (load() skips setGraph on identical content, so clearing the sticky ref alone re-tidies nothing).
+  const [tidyNonce, setTidyNonce] = useState(0)
   const [search, setSearch] = useState('')
   const [focus, setFocus] = useState<{ id: string; ref: NodeRef } | null>(null)
   // Clicking a node focuses it (highlights its connections) but no longer pops the detail panel;
@@ -266,7 +269,10 @@ export default function App() {
     // alignSources pins every replication-source node into the leftmost rank.
     const opts = { alignSources: true, positions: stickyPositions.current, groupShapes }
     return view === 'circuit' ? buildCircuit(graph, sel, focus?.id ?? null, opts) : buildGraph(graph, sel, focus?.id ?? null, opts)
-  }, [graph, mode, selected, focus, view, groupShapes])
+    // tidyNonce forces a re-layout on the re-tidy button (which clears the sticky positions the memo
+    // otherwise reuses); the memo can't observe the ref clear on its own.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [graph, mode, selected, focus, view, groupShapes, tidyNonce])
 
   // hop id → rendered node ids. Grouping collapses the repeated per-shape structure only in the
   // whole-graph view (a selection always expands), so BOTH views remap under the SAME condition their
@@ -579,16 +585,6 @@ export default function App() {
             ▦ Entire graph
           </button>
           <button
-            className="btn"
-            disabled={selected.size === 0}
-            onClick={() => {
-              setSelected(new Set())
-              setMode('all')
-            }}
-          >
-            Clear
-          </button>
-          <button
             className={groupShapes ? 'btn btn-on' : 'btn'}
             title="Collapse shapes that share one query template (same route join) into a single node with a count — selecting a shape expands its family"
             onClick={() => setGroupShapes((g) => !g)}
@@ -602,6 +598,7 @@ export default function App() {
             title="Refresh + re-tidy the layout (node positions are otherwise sticky)"
             onClick={() => {
               stickyPositions.current.clear()
+              setTidyNonce((n) => n + 1) // force a fresh layout even if the graph content is unchanged
               void load()
             }}
           >
