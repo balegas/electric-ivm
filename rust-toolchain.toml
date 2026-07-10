@@ -1,2 +1,6 @@
+# Pinned: rustc stable 1.97.0 ICEs (rustc_next_trait_solver panic in
+# structural_traits.rs) while compiling dbsp 0.318.0 (edition 2024, backend-mode).
+# 1.96.0 is the last known-good stable. Do NOT float back to "stable" until the
+# upstream ICE is fixed. See PR #24.
 [toolchain]
-channel = "stable"
+channel = "1.96.0"

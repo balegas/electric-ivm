@@ -16,7 +16,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to 1.96.0: stable 1.97.0 ICEs compiling dbsp 0.318.0 (rustc
+      # next-trait-solver panic in structural_traits.rs). Keep in sync with
+      # rust-toolchain.toml; do not float back to @stable until upstream is fixed.
+      - uses: dtolnay/rust-toolchain@1.96.0
       - uses: Swatinem/rust-cache@v2
 
       - name: Rust engine tests
