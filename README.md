@@ -199,12 +199,22 @@ on `PATH` (`initdb`/`pg_ctl` — the demos boot their own ephemeral cluster).
 
 ```bash
 pnpm install
-pnpm engine:build
-
-pnpm demo               # headless live-shape demo
-pnpm demo:linearlite    # LinearLite (issue tracker) on electric-ivm — the flagship demo
-scripts/linearlite.sh start large   # same, at a 100k-issue workload + the pipeline explorer
+pnpm demo:linearlite    # the flagship demo — builds the engine on first run
 ```
+
+One command boots everything (ephemeral Postgres, durable-streams, the engine) and serves the
+**LinearLite app and the pipeline explorer side by side** — write in one, watch the circuit maintain
+your shapes live in the other:
+
+| | URL |
+|---|---|
+| **LinearLite** (issue tracker) | http://localhost:5174 |
+| **Pipeline explorer** | http://localhost:5180 |
+
+Both are also fronted over HTTPS/HTTP-2 (`:8443` and `:5443`, multiplexing the shape streams past the
+per-origin connection cap). `DEMO_VIZ=0` skips the explorer; `scripts/linearlite.sh start large` runs
+the same demo at a 100k-issue workload. Other entry points: `pnpm demo` (headless live-shape
+walkthrough), `pnpm demo:web` (minimal end-to-end app).
 
 ### The apps in this repo
 
