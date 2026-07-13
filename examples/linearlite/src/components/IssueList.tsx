@@ -1,5 +1,5 @@
 import { ilike, or } from '@tanstack/db'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useMemo } from 'react'
 
 import type { AggregateDef, Predicate } from '@electric-ivm/protocol'
 
@@ -125,88 +125,6 @@ function ListChrome({
   )
 }
 
-interface FeedState {
-  rows: Issue[]
-  loadMore: () => void
-  hasMore: boolean
-}
-
-/**
- * One project's subset feed (`project_id = P`), paginated + live. Renders nothing — it reports its
- * loaded rows + paging controls up to {@link BrowseList} via `register`. Kept mounted for every project
- * the user belongs to (regardless of the active filter) so switching project/status is instant client
- * work and the underlying engine feed is reused across users and filter changes.
- */
-function ProjectSubsetFeed({
-  projectId,
-  orderCol,
-  desc,
-  register,
-}: {
-  projectId: number
-  orderCol: 'created' | 'modified'
-  desc: boolean
-  register: (projectId: number, state: FeedState | null) => void
-}): JSX.Element | null {
-  const { rows, loadMore, hasMore } = useSubset<Issue>(
-    projectIssuesSubsetDef(projectId, { col: orderCol, desc }),
-    (b) =>
-      b
-        .orderBy(({ t }: { t: Issue }) => t[orderCol], desc ? 'desc' : 'asc')
-        .orderBy(({ t }: { t: Issue }) => t.id, 'asc')
-        .select(({ t }: { t: Issue }) => t),
-    [orderCol, desc],
-  )
-  // Report state up; on unmount (lost membership) clear this feed from the merge.
-  useEffect(() => {
-    register(projectId, { rows, loadMore, hasMore })
-    return () => register(projectId, null)
-  }, [projectId, rows, loadMore, hasMore, register])
-  return null
-}
-
-/** Feed-map key for the all-visible-issues subquery feed. */
-const VISIBLE_FEED = -1
-
-/**
- * The all-issues browse feed as **one subquery-backed subset**: `project_id IN (SELECT project_id
- * FROM project_members WHERE user_id = me)`. Visibility is evaluated by the engine's shared
- * subquery node — membership changes re-scope the feed server-side — instead of the client merging
- * one per-project feed. Paginated + live-tailed like any subset.
- */
-function VisibleIssuesFeed({
-  userId,
-  userName,
-  orderCol,
-  desc,
-  register,
-}: {
-  userId: number
-  userName: string
-  orderCol: 'created' | 'modified'
-  desc: boolean
-  register: (feedKey: number, state: FeedState | null) => void
-}): JSX.Element | null {
-  const { rows, loadMore, hasMore } = useSubset<Issue>(
-    issuesSubsetDef(
-      { userId, userName, statuses: [], priorities: [], projectId: null, myTasksOnly: false },
-      { col: orderCol, desc },
-      LIST_COLUMNS,
-    ),
-    (b) =>
-      b
-        .orderBy(({ t }: { t: Issue }) => t[orderCol], desc ? 'desc' : 'asc')
-        .orderBy(({ t }: { t: Issue }) => t.id, 'asc')
-        .select(({ t }: { t: Issue }) => t),
-    [userId, orderCol, desc],
-  )
-  useEffect(() => {
-    register(VISIBLE_FEED, { rows, loadMore, hasMore })
-    return () => register(VISIBLE_FEED, null)
-  }, [rows, loadMore, hasMore, register])
-  return null
-}
-
 /**
  * Browse the visible issues. The all-projects view is **one subquery-backed subset** — the engine
  * evaluates `project_id IN (SELECT project_id FROM project_members WHERE user_id = me)` through its
@@ -214,6 +132,12 @@ function VisibleIssuesFeed({
  * Selecting a single project uses that project's plain `project_id = P` subset (shared across users).
  * Status/priority/my-tasks selection and ordering happen on the client over the loaded window, so
  * switching filters is instant with no new engine request.
+ *
+ * Exactly one subset feed drives the view at a time, so it is consumed directly with `useSubset`
+ * (the hook re-keys on the def, so switching project/user/order swaps the engine feed). Do NOT
+ * mirror the feed's rows into component state via an effect: the live tail applies row changes
+ * one-by-one, and an effect→setState per row forms an unbroken nested-update chain that trips
+ * React's "Maximum update depth exceeded" warning during membership Join/Leave churn.
  */
 function BrowseList({ filters, setFilters }: { filters: Filters; setFilters: (f: Filters) => void }): JSX.Element {
   const { myProjectIds, currentUserId, currentUserName } = useCurrentUser()
@@ -221,22 +145,26 @@ function BrowseList({ filters, setFilters }: { filters: Filters; setFilters: (f:
   const orderCol: 'created' | 'modified' = filters.orderBy === 'modified' ? 'modified' : 'created'
   const desc = filters.dir === 'desc'
 
-  const [feeds, setFeeds] = useState<Map<number, FeedState>>(new Map())
-  const register = useCallback((projectId: number, state: FeedState | null) => {
-    setFeeds((prev) => {
-      const next = new Map(prev)
-      if (state) next.set(projectId, state)
-      else next.delete(projectId)
-      return next
-    })
-  }, [])
-
-  // Which feed drives the current view: the selected project's subset, else the visibility subquery.
-  const activeIds = filters.projectId ? [filters.projectId] : [VISIBLE_FEED]
+  // The active feed: the selected project's subset, else the all-visible-issues subquery subset.
+  const def = filters.projectId
+    ? projectIssuesSubsetDef(filters.projectId, { col: orderCol, desc })
+    : issuesSubsetDef(
+        { userId: currentUserId, userName: currentUserName, statuses: [], priorities: [], projectId: null, myTasksOnly: false },
+        { col: orderCol, desc },
+        LIST_COLUMNS,
+      )
+  const { rows, loading, loadMore, hasMore } = useSubset<Issue>(
+    def,
+    (b) =>
+      b
+        .orderBy(({ t }: { t: Issue }) => t[orderCol], desc ? 'desc' : 'asc')
+        .orderBy(({ t }: { t: Issue }) => t.id, 'asc')
+        .select(({ t }: { t: Issue }) => t),
+    [orderCol, desc],
+  )
 
   const rendered = useMemo(() => {
-    let all: Issue[] = []
-    for (const pid of activeIds) all = all.concat(feeds.get(pid)?.rows ?? [])
+    let all: Issue[] = [...rows]
     if (filters.statuses.length) all = all.filter((i) => filters.statuses.includes(i.status))
     if (filters.priorities.length) all = all.filter((i) => filters.priorities.includes(i.priority))
     if (filters.myTasksOnly) all = all.filter((i) => i.username === currentUserName)
@@ -248,15 +176,7 @@ function BrowseList({ filters, setFilters }: { filters: Filters; setFilters: (f:
       return (desc ? -d : d) || a.id - b.id
     })
     return all
-  }, [feeds, activeIds, filters.statuses, filters.priorities, filters.myTasksOnly, filters.orderBy, orderCol, desc, currentUserName])
-
-  const hasMore = activeIds.some((pid) => feeds.get(pid)?.hasMore)
-  const loadMore = () => {
-    for (const pid of activeIds) {
-      const f = feeds.get(pid)
-      if (f?.hasMore) f.loadMore()
-    }
-  }
+  }, [rows, filters.statuses, filters.priorities, filters.myTasksOnly, filters.orderBy, orderCol, desc, currentUserName])
 
   // The header count is a real **server-maintained COUNT aggregation** over the visible+filtered set —
   // the true total, updating live on writes — not the length of the client-loaded (paginated) window.
@@ -268,36 +188,16 @@ function BrowseList({ filters, setFilters }: { filters: Filters; setFilters: (f:
   const agg = useAggregate(aggDef)
 
   return (
-    <>
-      {filters.projectId ? (
-        <ProjectSubsetFeed
-          key={filters.projectId}
-          projectId={filters.projectId}
-          orderCol={orderCol}
-          desc={desc}
-          register={register}
-        />
-      ) : (
-        <VisibleIssuesFeed
-          key={currentUserId}
-          userId={currentUserId}
-          userName={currentUserName}
-          orderCol={orderCol}
-          desc={desc}
-          register={register}
-        />
-      )}
-      <ListChrome
-        filters={filters}
-        setFilters={setFilters}
-        rows={rendered}
-        count={aggDef ? agg.value : 0}
-        loading={feeds.size === 0}
-        onEndReached={() => {
-          if (hasMore) loadMore()
-        }}
-      />
-    </>
+    <ListChrome
+      filters={filters}
+      setFilters={setFilters}
+      rows={rendered}
+      count={aggDef ? agg.value : 0}
+      loading={loading}
+      onEndReached={() => {
+        if (hasMore) loadMore()
+      }}
+    />
   )
 }
 
