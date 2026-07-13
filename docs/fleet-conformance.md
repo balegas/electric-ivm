@@ -43,7 +43,7 @@ engine internals happens in the engine itself (preferred) or the entrypoint.
 | `ELECTRIC_INSECURE` | Accepted. `true` → no auth (our current behavior). |
 | `ELECTRIC_SECRET` | Accepted; if set, require `secret`/`api_secret` query param on `/v1/shape` (401 otherwise). |
 | `ELECTRIC_STORAGE_DIR` | Root dir for durable-streams file storage (default `./persistent`). |
-| `ELECTRIC_STORAGE` | `MEMORY` → in-memory durable-streams; `FAST_FILE` (default) → file-backed under `$ELECTRIC_STORAGE_DIR/shapes`. |
+| `ELECTRIC_STORAGE` | `MEMORY` (default) → in-memory durable-streams; `FAST_FILE` → file-backed under `$ELECTRIC_STORAGE_DIR/shapes`. |
 | `ELECTRIC_LOG_LEVEL` | error/warning/info/debug → engine log filter (default info). |
 | `ELECTRIC_REPLICATION_STREAM_ID` | Suffix for slot name: `electric_slot_<id>` (default `default`). |
 | `ELECTRIC_DB_POOL_SIZE` | Sizes the engine's shared Postgres pool (backfills, query-backs, subset queries; default 20). |
