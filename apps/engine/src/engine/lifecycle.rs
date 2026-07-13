@@ -65,107 +65,10 @@ impl Engine {
         let id = format!("s{num_id}");
         st.next_shape_id += 1;
         let stream_path = format!("shape/{id}");
-        self.ds.ensure_stream(&stream_path).await?;
+        // NOTE: the stream itself is created AFTER the state lock is released (per path below):
+        // the PUT is a storage round-trip with a durability fsync, and holding the global lock
+        // across it serializes concurrent shape creations.
 
-        // Circuit-served path: when the predicate decomposes over the compiled arrangements, the
-        // shape is seeded from snapshots inside the sequencer — no Postgres backfill, no gate.
-        // Bookkeeping (catalog/sharing/lives) matches the legacy path exactly. `changes_only`
-        // feeds stay on the legacy (passthrough) path.
-        if !changes_only {
-            let arr = self.arrangements.lock().unwrap().clone();
-            if let Some(arr) = arr {
-                if let Some(plan) = plan_circuit_shape(where_.as_ref(), &ts, &st.tables, &arr) {
-                    let residual = match plan.residual.as_ref() {
-                        Some(r) => Some(Arc::new(CompiledPredicate::compile(r, &ts)?)),
-                        None => None,
-                    };
-                    let placement = match &plan.constraint {
-                        PlannedConstraint::All => CircuitPlacement { label: "all".into(), col: None, counts: false },
-                        PlannedConstraint::Static { col, .. } => CircuitPlacement {
-                            label: format!("static:{}", ts.columns[*col].0), col: Some(*col), counts: false,
-                        },
-                        PlannedConstraint::Dynamic { col, .. } => CircuitPlacement {
-                            label: format!("dynamic:{}", ts.columns[*col].0), col: Some(*col), counts: false,
-                        },
-                    };
-                    let cmd_tx = self.ensure_sequencer(&mut st).cmd_tx.clone();
-                    let (ready_tx2, ready_rx2) = tokio::sync::oneshot::channel();
-                    cmd_tx
-                        .send(SequencerCmd::CreateCircuitShape {
-                            table: table.to_string(),
-                            shape_id: id.clone(),
-                            num_id,
-                            stream_path: stream_path.clone(),
-                            constraint: plan.constraint,
-                            residual,
-                            out_cols: out_cols.clone(),
-                            seed: true,
-                            ready: ready_tx2,
-                        })
-                        .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
-                    let rec = ShapeRecord {
-                        id: id.clone(),
-                        table: table.to_string(),
-                        stream_path: stream_path.clone(),
-                        changes_only,
-                        where_json: where_.clone(),
-                        columns: col_names,
-                        family_key: None,
-                        // Truthful metadata: the field describes the predicate, not the
-                        // executor — a circuit-served membership shape is still a subquery.
-                        is_subquery: where_.as_ref().is_some_and(predicate_has_subquery),
-                        aggregate: None,
-                    };
-                    st.shapes.insert(id.clone(), rec.clone());
-                    st.circuit_placement.insert(id.clone(), placement);
-                    let _ = self.catalog_tx.send(CatalogEvent::Created { rec: rec.clone(), sig: feed_sig.clone() });
-                    self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
-                    self.ensure_retention_sweeper();
-                    let (share_tx, share_rx) = tokio::sync::watch::channel(None);
-                    if let Some(sig) = feed_sig {
-                        st.feed_by_sig.insert(sig.clone(), id.clone());
-                        st.feed_shares.insert(id.clone(), FeedShare { sig, refcount: 1, ready: share_rx });
-                    }
-                    drop(st);
-                    return match ready_rx2
-                        .await
-                        .unwrap_or_else(|_| Err("sequencer dropped the ready channel".to_string()))
-                    {
-                        Ok(_seeded) => {
-                            let _ = share_tx.send(Some(true));
-                            trace_lifecycle(
-                                &self.trace_tx,
-                                crate::trace::GraphLifecycle::ShapeAdded {
-                                    shape: rec.id.clone(),
-                                    table: rec.table.clone(),
-                                },
-                            );
-                            crate::statsd::create_snapshot_task(created_at.elapsed());
-                            Ok(rec)
-                        }
-                        Err(e) => {
-                            let mut st = self.state.lock().await;
-                            st.shapes.remove(&id);
-                            st.circuit_placement.remove(&id);
-                            let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
-                            if let Some(share) = st.feed_shares.remove(&id) {
-                                st.feed_by_sig.remove(&share.sig);
-                            }
-                            if let Some(seq) = st.sequencer.as_ref() {
-                                let _ = seq.cmd_tx.send(SequencerCmd::RemoveShape {
-                                    table: rec.table.clone(),
-                                    shape_id: id.clone(),
-                                });
-                            }
-                            drop(st);
-                            let _ = share_tx.send(Some(false));
-                            let _ = self.ds.delete_stream(&rec.stream_path).await;
-                            bail!("shape '{id}' creation failed: {e}")
-                        }
-                    };
-                }
-            }
-        }
 
         // Subquery shapes (`col IN (SELECT …)`) are maintained by the cross-table registry, not by a
         // tailer's local routing. Ensure a tailer exists for the outer table AND every referenced inner
@@ -204,15 +107,18 @@ impl Engine {
                 st.feed_by_sig.insert(sig.clone(), id.clone());
                 st.feed_shares.insert(id.clone(), FeedShare { sig, refcount: 1, ready: ready_rx });
             }
-            // Release the engine-state lock before the registry's PG backfill (so offset polling etc.
-            // aren't blocked); the registry has its own lock.
+            // Release the engine-state lock before the registry work. Creation is three-phase:
+            // begin (brief registry lock: nodes/edges/pending buffer registered) → Postgres
+            // seeding + backfill with NO lock held (concurrent creates parallelize on the
+            // shared pool) → finish (brief lock: install seeds, gated replay of buffered
+            // deltas, register the shape). Replay flips propagate through the worker pool.
             drop(st);
-            let res = self
-                .subqueries
-                .lock()
-                .await
-                .create_subquery_shape(&id, table, &stream_path, &where_json, out_cols, changes_only)
-                .await;
+            let res = async {
+                self.ds.ensure_stream(&stream_path).await?;
+                self.create_subquery_three_phase(&id, table, &stream_path, &where_json, out_cols, changes_only)
+                    .await
+            }
+            .await;
             match res {
                 Ok(()) => {
                     let _ = ready_tx.send(Some(true));
@@ -289,11 +195,14 @@ impl Engine {
         // snapshot is readable when we return (the Electric adapter folds the stream immediately).
         // The sequencer keeps processing all tables meanwhile, buffering this shape's deltas.
         drop(st);
-        let outcome = backfill_and_activate(
+        let outcome = match self.ds.ensure_stream(&rec.stream_path).await {
+            Err(e) => Err(format!("creating shape stream: {e:#}")),
+            Ok(()) => backfill_and_activate(
             &self.ds, &self.pg_url, &cmd_tx, &ts, table, &id, &rec.stream_path, &pred,
             out_cols.as_ref(), changes_only, false, ack_rx,
         )
-        .await;
+        .await,
+        };
         match outcome {
             Ok(()) => {
                 let _ = share_tx.send(Some(true));
@@ -975,4 +884,116 @@ impl Engine {
         });
     }
 
+}
+
+impl Engine {
+    /// Orchestrate the registry's three-phase subquery-shape creation (see
+    /// `SubqueryRegistry::begin_create`): the Postgres seeding queries and the outer backfill
+    /// run WITHOUT the registry lock, so concurrent creates parallelize on the shared pool
+    /// (`ELECTRIC_DB_POOL_SIZE`) instead of serializing behind one create's round-trips.
+    /// A begin-conflict (sharing a node another create is still seeding) retries briefly.
+    async fn create_subquery_three_phase(
+        &self,
+        id: &str,
+        table: &str,
+        stream_path: &str,
+        where_json: &PredicateJson,
+        out_cols: Option<Arc<Vec<usize>>>,
+        changes_only: bool,
+    ) -> Result<()> {
+        // Phase A (brief lock), with conflict retry.
+        let begin = {
+            let mut attempt = 0u32;
+            loop {
+                let res = self.subqueries.lock().await.begin_create(
+                    id, table, stream_path, where_json, out_cols.clone(), changes_only,
+                );
+                match res {
+                    Ok(b) => break b,
+                    Err(e) if e.to_string().contains("subquery create conflict") && attempt < 100 => {
+                        attempt += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        };
+        // Phase B (no registry lock): seed fresh nodes + backfill the shape, all from pooled PG.
+        let phase_b = async {
+            let mut node_seeds = Vec::with_capacity(begin.seeds.len());
+            for (sig, inner_table, inner_where) in &begin.seeds {
+                let ts = begin
+                    .schemas
+                    .get(inner_table)
+                    .cloned()
+                    .with_context(|| format!("seed: unknown inner table '{inner_table}'"))?;
+                let wsql = inner_where
+                    .as_ref()
+                    .map(|w| crate::sql::predicate_json_to_sql(w, 1, &begin.schemas, inner_table));
+                let client = crate::pg::pool_for(
+                    self.pg_url.as_deref().context("subquery work requires postgres")?,
+                )
+                .get()
+                .await?;
+                let bf = crate::pg::backfill_where(&client, &ts, wsql).await?;
+                node_seeds.push((sig.clone(), bf.rows, bf.gate));
+            }
+            let outer_ts = begin
+                .schemas
+                .get(table)
+                .cloned()
+                .with_context(|| format!("unknown outer table '{table}'"))?;
+            let (outer_gate, seeded) = if changes_only {
+                (crate::pg::SnapshotGate::passthrough(), 0u64)
+            } else {
+                let (wsql, params) =
+                    crate::sql::predicate_json_to_sql(where_json, 1, &begin.schemas, table);
+                let client = crate::pg::pool_for(
+                    self.pg_url.as_deref().context("subquery work requires postgres")?,
+                )
+                .get()
+                .await?;
+                let bf = crate::pg::backfill_where(&client, &outer_ts, Some((wsql, params))).await?;
+                let out: Vec<(Row, ZWeight)> = bf.rows.iter().map(|r| (r.clone(), 1)).collect();
+                let mut seeded = 0u64;
+                if !out.is_empty() {
+                    let envs = translate_output(
+                        &outer_ts,
+                        out,
+                        None,
+                        None,
+                        out_cols.as_deref().map(Vec::as_slice),
+                    );
+                    self.ds.append(stream_path, &envs).await?;
+                    seeded = envs.len() as u64;
+                }
+                (bf.gate, seeded)
+            };
+            Ok::<_, anyhow::Error>((node_seeds, outer_gate, seeded))
+        }
+        .await;
+        // Phase C (brief lock): install + gated replay, or exact rollback on a phase-B failure.
+        match phase_b {
+            Ok((node_seeds, outer_gate, seeded)) => {
+                let work = self
+                    .subqueries
+                    .lock()
+                    .await
+                    .finish_create(id, node_seeds, outer_gate, seeded)
+                    .await?;
+                if !work.is_empty() {
+                    // Replay flips propagate exactly like live ones (barrier-covered).
+                    self.pending_flips.fetch_add(1, Ordering::SeqCst);
+                    if self.flip_tx.send(FlipWork { work, txid: None }).is_err() {
+                        self.pending_flips.fetch_sub(1, Ordering::SeqCst);
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => {
+                self.subqueries.lock().await.abort_create(id);
+                Err(e)
+            }
+        }
+    }
 }

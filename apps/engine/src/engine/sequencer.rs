@@ -68,22 +68,6 @@ pub(crate) enum SequencerCmd {
         resp: tokio::sync::oneshot::Sender<Option<(String, crate::pg::SnapshotGate)>>,
     },
     RemoveShape { table: String, shape_id: String },
-    /// Create a **circuit-served** shape: seeded from arrangement snapshots inside the
-    /// sequencer (between transactions, so the read is consistent with the processed offset by
-    /// construction — no Postgres backfill, no snapshot gate), then updated by routing each
-    /// transaction's deltas through (cohort groups ∧ residual predicate).
-    CreateCircuitShape {
-        table: String,
-        shape_id: String,
-        num_id: u64,
-        stream_path: String,
-        constraint: PlannedConstraint,
-        residual: Option<Arc<CompiledPredicate>>,
-        out_cols: Option<Arc<Vec<usize>>>,
-        /// `false` on catalog restore: the stream is already complete up to the resume offset.
-        seed: bool,
-        ready: tokio::sync::oneshot::Sender<std::result::Result<u64, String>>,
-    },
     /// Create a **circuit-served** COUNT aggregate over the table's counts pipeline: seeded by
     /// summing matching groups, then updated from the pipeline's per-transaction group deltas.
     CreateCircuitAgg {
@@ -116,7 +100,6 @@ pub(crate) fn spawn_sequencer(
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
     arr: Option<crate::arrangements::Arrangements>,
     arr_gates: HashMap<String, crate::pg::SnapshotGate>,
-    pg_url: Option<String>,
 ) -> SequencerHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let processed = Arc::new(std::sync::Mutex::new(start_offset.clone()));
@@ -135,7 +118,6 @@ pub(crate) fn spawn_sequencer(
         trace_tx,
         arr,
         arr_gates,
-        pg_url,
     ));
     SequencerHandle { cmd_tx, processed, stats, node_states }
 }
@@ -164,7 +146,6 @@ pub(crate) async fn publish_all(
             &exec.families,
             &exec.family_of,
             &exec.aggregates,
-            &exec.circuit_shapes,
             &exec.circuit_aggs,
             emitted,
         ));
@@ -197,8 +178,6 @@ pub(crate) struct TableExec {
     /// stops being a linear per-change term. Match-all / un-indexable predicates land on the
     /// index's scan list and stay always-candidates.
     pub(crate) agg_index: StandaloneIndex,
-    /// Circuit-served shapes on this table (see [`CircuitShape`]).
-    pub(crate) circuit_shapes: HashMap<String, CircuitShape>,
     /// Circuit-served COUNT aggregates on this table (see [`CircuitAgg`]).
     pub(crate) circuit_aggs: HashMap<String, CircuitAgg>,
     pub(crate) pending: HashMap<String, PendingShape>,
@@ -215,7 +194,6 @@ impl TableExec {
             family_of: HashMap::new(),
             aggregates: HashMap::new(),
             agg_index: StandaloneIndex::default(),
-            circuit_shapes: HashMap::new(),
             circuit_aggs: HashMap::new(),
             pending: HashMap::new(),
             envelopes_total: 0,
@@ -266,7 +244,6 @@ pub(crate) async fn sequencer_loop(
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
     arr: Option<crate::arrangements::Arrangements>,
     arr_gates: HashMap<String, crate::pg::SnapshotGate>,
-    pg_url: Option<String>,
 ) {
     let mut execs: HashMap<String, TableExec> = HashMap::new();
     let mut offset = start_offset;
@@ -282,15 +259,6 @@ pub(crate) async fn sequencer_loop(
     // increasing on the single ordered log, so anything at/below the highwater has already been
     // applied and is skipped. Envelopes without both stamps (library mode) bypass this.
     let mut highwater: Option<(u64, u64)> = None;
-    // Dynamic circuit shapes watching a membership relation: inner table → [(outer table,
-    // shape id)]. A membership delta re-derives the watchers' groups (move-in/move-out).
-    let mut router_watch: HashMap<String, Vec<(String, String)>> = HashMap::new();
-
-    // A restored arrangement checkpoint may trail the shape catalog's offset: replay the gap
-    // into the arrangements before live processing (single feeder ⇒ in-order application).
-    if let Some(arr) = &arr {
-        arrangements_catch_up(&ds, &tables, arr, &arr_gates).await;
-    }
 
     loop {
         let off = offset.clone();
@@ -361,13 +329,8 @@ pub(crate) async fn sequencer_loop(
                 Some(SequencerCmd::RemoveShape { table, shape_id }) => {
                     if let Some(exec) = execs.get_mut(&table) {
                         exec.pending.remove(&shape_id);
-                        if exec.circuit_shapes.remove(&shape_id).is_some()
-                            || exec.circuit_aggs.remove(&shape_id).is_some()
-                        {
-                            // Circuit-served: drop any router watches pointing at it.
-                            for watchers in router_watch.values_mut() {
-                                watchers.retain(|(_, sid)| sid != &shape_id);
-                            }
+                        if exec.circuit_aggs.remove(&shape_id).is_some() {
+                            // a circuit-served COUNT — nothing else to unwind
                         } else if exec.aggregates.remove(&shape_id).is_some() {
                             // an aggregation shape — drop its conjunct-index entry too
                             exec.agg_index.remove(&shape_id);
@@ -389,22 +352,6 @@ pub(crate) async fn sequencer_loop(
                         }
                     }
                     emitted.remove(&shape_id);
-                    publish_all(&execs, &offset, &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
-                }
-                Some(SequencerCmd::CreateCircuitShape {
-                    table, shape_id, num_id, stream_path, constraint, residual, out_cols, seed, ready,
-                }) => {
-                    let res = create_circuit_shape(
-                        &ds, arr.as_ref(), &mut execs, &mut router_watch, &tables,
-                        &table, &shape_id, num_id, &stream_path, constraint, residual, out_cols, seed,
-                    )
-                    .await;
-                    if let Ok(n) = &res {
-                        if *n > 0 {
-                            emitted.insert(shape_id.clone(), *n);
-                        }
-                    }
-                    let _ = ready.send(res.map_err(|e| format!("{e:#}")));
                     publish_all(&execs, &offset, &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
                 }
                 Some(SequencerCmd::CreateCircuitAgg { table, shape_id, stream_path, constraints, ready }) => {
@@ -442,25 +389,20 @@ pub(crate) async fn sequencer_loop(
                         while j < envs.len() && envs[j].headers.txid == txid && envs[j].headers.lsn == lsn {
                             j += 1;
                         }
-                        // Feed this transaction into the dbsp arrangements and step the circuit
-                        // BEFORE fanning it out: flip re-derivations enqueued by this txn's
-                        // subquery reconciliation must observe post-txn table state (the same
-                        // read-your-committed-writes guarantee a Postgres query-back gives).
-                        // The arrangement layer re-checks its own (lsn, seq) highwater, so
-                        // feeding pre-dedup envelopes is safe.
+                        // Feed this transaction into the dbsp counts pipelines and step the
+                        // circuit BEFORE fanning it out, so circuit-served aggregates emit
+                        // within the transaction that changed them. The counts layer re-checks
+                        // its own (lsn, seq) highwater, so feeding pre-dedup envelopes is safe.
                         let txn_count_deltas = if let Some(arr) = &arr {
                             let deltas: Vec<_> = envs[i..j]
                                 .iter()
-                                .filter_map(|env| stamped_delta_for_arrangements(&tables, &arr_gates, env))
+                                .filter_map(|env| stamped_delta_for_arrangements(&tables, arr, &arr_gates, env))
                                 .collect();
-                            arr.apply_batch(deltas, None).await
+                            arr.apply_batch(deltas).await
                         } else {
                             Vec::new()
                         };
                         let mut txn_pending: HashMap<String, Vec<Envelope>> = HashMap::new();
-                        // Membership deltas collected during the row loop; processed after it
-                        // (move-ins/outs read post-transaction snapshots).
-                        let mut txn_member_deltas: Vec<(String, Vec<Tup2<Row, ZWeight>>)> = Vec::new();
                         for env in envs[i..j].iter() {
                             // Skip redelivered changes (see `highwater` above).
                             let pos = match (env.headers.lsn.as_deref(), env.headers.seq) {
@@ -493,50 +435,11 @@ pub(crate) async fn sequencer_loop(
                             {
                                 tracing::error!("process_envelope failed: {e:#}");
                             }
-                            // Circuit-served shapes: route the delta through (groups ∧ residual).
-                            // Dynamic groups are the OLD (pre-membership-change) set here; group
-                            // transitions themselves are handled after the row loop via move-in/out
-                            // reads of the post-transaction snapshot, so rows are never dropped or
-                            // double-emitted across a membership change within the transaction.
-                            if !exec.circuit_shapes.is_empty() {
-                                if let Ok((delta, txid_e, lsn_e)) = apply_envelope(&exec.ts, env) {
-                                    for cs in exec.circuit_shapes.values() {
-                                        let out: Vec<(Row, ZWeight)> = delta
-                                            .iter()
-                                            .filter(|Tup2(r, _)| cs.matches(r))
-                                            .map(|Tup2(r, w)| (r.clone(), *w))
-                                            .collect();
-                                        if !out.is_empty() {
-                                            let envs2 = translate_output(
-                                                &exec.ts, out, txid_e.clone(), lsn_e.clone(),
-                                                cs.out_cols.as_deref().map(Vec::as_slice),
-                                            );
-                                            txn_pending.entry(cs.stream_path.clone()).or_default().extend(envs2);
-                                        }
-                                    }
-                                }
-                            }
-                            if router_watch.contains_key(&env.type_) {
-                                if let Ok((delta, _, _)) = apply_envelope(&exec.ts, env) {
-                                    if !delta.is_empty() {
-                                        txn_member_deltas.push((env.type_.clone(), delta));
-                                    }
-                                }
-                            }
                             exec.envelopes_total += 1;
                             touched = true;
                             if let Some(p) = pos {
                                 highwater = Some(p);
                             }
-                        }
-                        // Membership-driven move-in/out for dynamic circuit shapes (reads the
-                        // post-transaction snapshots — the circuit stepped before the row loop).
-                        if !txn_member_deltas.is_empty() {
-                            process_router_deltas(
-                                &arr, &pg_url, &mut execs, &router_watch, txn_member_deltas,
-                                txid.clone(), lsn.clone(), &mut txn_pending,
-                            )
-                            .await;
                         }
                         // Counts pipeline → circuit-served aggregates.
                         if !txn_count_deltas.is_empty() {
@@ -556,11 +459,6 @@ pub(crate) async fn sequencer_loop(
                     }
                     // Publish the processed offset only after the whole batch is fanned out + flushed.
                     if let Some(n) = next {
-                        // Record the batch-boundary offset for arrangement checkpoints (deltas
-                        // were already applied per transaction above).
-                        if let Some(arr) = &arr {
-                            arr.apply_batch(Vec::new(), Some(n.clone())).await;
-                        }
                         *processed.lock().unwrap() = n.clone();
                         if n != ckpt_offset && last_ckpt.elapsed() >= std::time::Duration::from_secs(2) {
                             ckpt_offset = n.clone();

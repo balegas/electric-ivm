@@ -21,7 +21,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use crate::value::{Tup2, ZWeight};
 
-use crate::ds::DsClient;
+use crate::ds::{DsClient, Envelope};
 use crate::predicate::{
     CompiledPredicate, PredicateJson, SubqueryCollector, SubqueryEval, SubquerySig, subquery_sig,
 };
@@ -60,6 +60,11 @@ pub struct SubqueryNode {
     /// The node's backfill-snapshot fence: inner deltas already visible to the seed snapshot are
     /// skipped (xid visibility, LSN fallback — see [`crate::pg::SnapshotGate`]).
     pub gate: crate::pg::SnapshotGate,
+    /// `Some` while the node is being seeded (three-phase create): raw inner-table deltas that
+    /// arrive mid-seed are buffered here and replayed through the seed gate at install — never
+    /// applied to a half-seeded set (a snapshot row landing after a fresher delta would be a
+    /// stale overwrite). `None` = live.
+    pub(crate) seed_buffer: Option<Vec<Tup2<Row, ZWeight>>>,
     /// projected value -> set of contributing inner-row pks (stringified).
     contributors: HashMap<Value, HashSet<String>>,
     /// inner-row pk -> its current projected value (reverse index, for O(1) reconciliation).
@@ -84,6 +89,7 @@ impl SubqueryNode {
             pred,
             where_json: None,
             gate: crate::pg::SnapshotGate::passthrough(),
+            seed_buffer: None,
             contributors: HashMap::new(),
             pk_value: HashMap::new(),
             refcount: 0,
@@ -195,6 +201,30 @@ pub struct NodeStat {
     pub refcount: usize,
 }
 
+/// A subquery shape between `begin_create` and `finish_create`: registration exists (so its
+/// nodes are refcounted, its edges recorded, and its deltas buffered) but seeding/backfill runs
+/// outside the registry lock.
+pub struct PendingSubqueryShape {
+    pub shape_id: String,
+    pub outer_table: String,
+    pub stream_path: String,
+    pub pred: Arc<CompiledPredicate>,
+    pub out_cols: Option<Arc<Vec<usize>>>,
+    pub changes_only: bool,
+    /// This create's node-refcount log (for exact rollback on failure).
+    collect_log: Vec<SubquerySig>,
+    /// Outer-table deltas buffered while the backfill runs; replayed through the gate at install.
+    buffer: Vec<Tup2<Row, ZWeight>>,
+}
+
+/// What phase B (Postgres I/O, run WITHOUT the registry lock) needs from `begin_create`.
+pub struct BeginCreate {
+    /// Fresh nodes this create must seed: `(sig, inner_table, inner where-JSON)`.
+    pub seeds: Vec<(SubquerySig, String, Option<PredicateJson>)>,
+    /// Schema map snapshot for SQL emission.
+    pub schemas: SchemaMap,
+}
+
 /// The cross-table registry of subquery nodes + shapes + edges. Implements [`SubqueryEval`] so a
 /// predicate's subquery leaves resolve against the maintained node sets. One per engine, behind a
 /// `tokio::Mutex`; every table tailer calls [`on_table_delta`](Self::on_table_delta).
@@ -207,6 +237,9 @@ pub struct SubqueryRegistry {
     pub shapes: HashMap<String, SubqueryShape>,
     /// Nodes created but not yet seeded from Postgres (deepest-first).
     pending_seed: Vec<SubquerySig>,
+    /// Shapes between `begin_create` and `finish_create` (the three-phase create): their
+    /// outer-table deltas are buffered here and replayed through the shape's gate at install.
+    pending_shapes: Vec<PendingSubqueryShape>,
     /// Every node-refcount increment made by the in-flight `create_subquery_shape` (one entry per
     /// `collect()` call). On failure the create is rolled back exactly: each logged sig is decremented
     /// once, and nodes that return to zero are removed. The registry mutex is held for the whole
@@ -215,9 +248,11 @@ pub struct SubqueryRegistry {
     ds: DsClient,
     pg_url: Option<String>,
     schemas: SchemaMap,
-    /// Optional dbsp arrangement layer: flip re-derivations are served from local indexed
-    /// snapshots when the needed index exists, falling back to Postgres otherwise.
-    arrangements: Option<crate::arrangements::Arrangements>,
+    /// Ordered emission lanes (see `engine::emission`): membership envelopes are enqueued
+    /// under this registry's lock — per-stream enqueue order = eval order — and land on their
+    /// streams asynchronously, covered by the `pendingFlips` barrier. `None` (unit tests)
+    /// falls back to a direct reliable append.
+    lanes: Option<crate::engine::emission::EmissionLanes>,
 }
 
 impl SubqueryRegistry {
@@ -227,16 +262,30 @@ impl SubqueryRegistry {
             edges: Vec::new(),
             shapes: HashMap::new(),
             pending_seed: Vec::new(),
+            pending_shapes: Vec::new(),
             collect_log: Vec::new(),
             ds,
             pg_url,
             schemas: Arc::new(HashMap::new()),
-            arrangements: None,
+            lanes: None,
         }
     }
 
-    pub fn set_arrangements(&mut self, arrangements: crate::arrangements::Arrangements) {
-        self.arrangements = Some(arrangements);
+    pub(crate) fn set_lanes(&mut self, lanes: crate::engine::emission::EmissionLanes) {
+        self.lanes = Some(lanes);
+    }
+
+    /// Deliver membership envelopes to a shape stream in **evaluation order**: enqueue on the
+    /// stream's emission lane while the caller holds this registry's lock (per-stream FIFO ⇒
+    /// append order = eval order — the "data in the right place" invariant). Without lanes
+    /// (unit tests) this awaits a direct reliable append, the pre-lane behavior.
+    async fn deliver(&self, stream_path: &str, envs: Vec<Envelope>) {
+        match &self.lanes {
+            Some(l) => l.enqueue(stream_path, envs),
+            None => {
+                self.ds.append_reliable(stream_path, &envs).await;
+            }
+        }
     }
 
     /// Check out a pooled Postgres connection. All subquery PG access funnels through the shared
@@ -257,6 +306,7 @@ impl SubqueryRegistry {
     pub fn touches(&self, table: &str) -> bool {
         self.nodes.values().any(|n| n.inner_table == table)
             || self.shapes.values().any(|s| s.outer_table == table)
+            || self.pending_shapes.iter().any(|p| p.outer_table == table)
     }
 
     /// Number of maintained nodes (shared inner sets).
@@ -355,7 +405,14 @@ impl SubqueryRegistry {
     /// increment, node, edge, and pending-seed entry made by this call is rolled back, so a failed
     /// create leaves the registry exactly as it was — no half-registered node that would silently
     /// serve wrong (unseeded) membership to a later identical create.
-    pub async fn create_subquery_shape(
+    /// Phase A of the three-phase create (call under the registry lock; brief, in-memory):
+    /// compile the predicate (discovering/refcounting nodes — fresh ones start buffering),
+    /// record edges, and register a pending shape that buffers its outer-table deltas from this
+    /// moment on (no delta can fall between registration and the phase-B snapshot). Returns
+    /// what phase B needs, or `Err` **without side effects** if the predicate shares a node
+    /// another in-flight create is still seeding (caller retries — evaluating against a
+    /// half-seeded set would be unsound).
+    pub fn begin_create(
         &mut self,
         shape_id: &str,
         outer_table: &str,
@@ -363,24 +420,151 @@ impl SubqueryRegistry {
         where_json: &PredicateJson,
         out_cols: Option<Arc<Vec<usize>>>,
         changes_only: bool,
-    ) -> Result<()> {
+    ) -> Result<BeginCreate> {
+        let outer_ts =
+            self.schemas.get(outer_table).cloned().context("subquery shape: unknown outer table")?;
+        // Conflict pre-check: compiling refs nodes; a referenced node mid-seed belongs to a
+        // concurrent create. Compile on a scratch collector first so a conflict has no effects.
         let edges_checkpoint = self.edges.len();
         self.collect_log.clear();
-        let res = self
-            .create_subquery_shape_inner(shape_id, outer_table, stream_path, where_json, out_cols, changes_only)
-            .await;
-        if res.is_err() {
-            self.rollback_create(edges_checkpoint);
+        let pred = match CompiledPredicate::compile_with(where_json, &outer_ts, self) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                let log = std::mem::take(&mut self.collect_log);
+                self.rollback_refs(edges_checkpoint, log);
+                return Err(e);
+            }
+        };
+        let log = std::mem::take(&mut self.collect_log);
+        // A shared (not fresh-this-create) node still seeding ⇒ conflict: roll back and retry.
+        let fresh: Vec<SubquerySig> = std::mem::take(&mut self.pending_seed);
+        let conflicted = log.iter().any(|sig| {
+            !fresh.contains(sig)
+                && self.nodes.get(sig).is_some_and(|n| n.seed_buffer.is_some())
+        });
+        if conflicted {
+            // Put fresh sigs back for the rollback's decref cascade bookkeeping.
+            self.rollback_refs(edges_checkpoint, log);
+            anyhow::bail!("subquery create conflict: shares a node another create is seeding");
         }
-        res
+        // Fresh nodes start buffering their inner-table deltas.
+        let mut seeds = Vec::with_capacity(fresh.len());
+        for sig in &fresh {
+            if let Some(n) = self.nodes.get_mut(sig) {
+                n.seed_buffer = Some(Vec::new());
+                seeds.push((sig.clone(), n.inner_table.clone(), n.where_json.clone()));
+            }
+        }
+        // Shape-level edges.
+        for leaf in collect_in_leaves(&pred) {
+            self.edges.push(Edge {
+                node_sig: leaf.sig,
+                dependent: Dependent::Shape(shape_id.to_string()),
+                connecting_col: leaf.col,
+                negated: leaf.negated,
+                null_sensitive: leaf.null_sensitive,
+            });
+        }
+        // Pending shape: outer-table deltas buffer from HERE (before the phase-B snapshot).
+        self.pending_shapes.push(PendingSubqueryShape {
+            shape_id: shape_id.to_string(),
+            outer_table: outer_table.to_string(),
+            stream_path: stream_path.to_string(),
+            pred,
+            out_cols,
+            changes_only,
+            collect_log: log,
+            buffer: Vec::new(),
+        });
+        Ok(BeginCreate { seeds, schemas: self.schemas.clone() })
     }
 
-    /// Undo an in-flight create: drop the edges it appended and decrement each logged node refcount
-    /// once, removing nodes that return to zero (with their pending-seed entries and any stray edges).
-    fn rollback_create(&mut self, edges_checkpoint: usize) {
-        self.edges.truncate(edges_checkpoint);
-        let log = std::mem::take(&mut self.collect_log);
-        for sig in log {
+    /// Phase C (under the registry lock; brief, in-memory + lane enqueues): install the seeds,
+    /// replay every buffered delta through the seed gates, register the shape, and return the
+    /// flips the replays produced (the caller enqueues them for propagation). `seeded` counts
+    /// the phase-B snapshot envelopes (for the shape's emitted counter).
+    pub async fn finish_create(
+        &mut self,
+        shape_id: &str,
+        node_seeds: Vec<(SubquerySig, Vec<Row>, crate::pg::SnapshotGate)>,
+        outer_gate: crate::pg::SnapshotGate,
+        seeded: u64,
+    ) -> Result<VecDeque<(SubquerySig, Flip)>> {
+        let idx = self
+            .pending_shapes
+            .iter()
+            .position(|p| p.shape_id == shape_id)
+            .context("finish_create: pending shape vanished")?;
+        let pending = self.pending_shapes.remove(idx);
+        let mut work: VecDeque<(SubquerySig, Flip)> = VecDeque::new();
+        // 1. Install node seeds, then replay each node's buffered deltas through its gate.
+        for (sig, rows, gate) in node_seeds {
+            let (ts, proj_col) = {
+                let n = self.nodes.get(&sig).context("finish_create: node vanished")?;
+                (
+                    self.schemas.get(&n.inner_table).cloned().context("unknown inner table")?,
+                    n.proj_col,
+                )
+            };
+            if let Some(n) = self.nodes.get_mut(&sig) {
+                n.gate = gate;
+                for r in &rows {
+                    let pk = ts.key_string(r).unwrap_or_default();
+                    let pv = r.0.get(proj_col).cloned().unwrap_or(Value::Null);
+                    n.reconcile_row(&pk, Some(pv)); // initial state: flips are meaningless
+                }
+            }
+            let buffered = self
+                .nodes
+                .get_mut(&sig)
+                .and_then(|n| n.seed_buffer.take())
+                .unwrap_or_default();
+            if !buffered.is_empty() {
+                // Replay through the gate: only deltas the snapshot could NOT contain apply.
+                // (Buffered stamps aren't retained; the gate's xid test is per-eval at the
+                // node phase — here we re-evaluate membership by identity, which is idempotent
+                // against the seed for snapshot-visible rows, so replaying all is convergent.)
+                let evals = self.node_present_values(&sig, &ts, &buffered);
+                for f in self.apply_node_flips(&sig, evals) {
+                    work.push_back((sig.clone(), f));
+                }
+            }
+        }
+        // 2. Register the shape, then replay its buffered outer deltas through the gate
+        //    (absolute emission; idempotent against the backfill for snapshot-visible rows).
+        let ts = self
+            .schemas
+            .get(&pending.outer_table)
+            .cloned()
+            .context("finish_create: unknown outer table")?;
+        self.shapes.insert(
+            shape_id.to_string(),
+            SubqueryShape {
+                shape_id: shape_id.to_string(),
+                outer_table: pending.outer_table.clone(),
+                stream_path: pending.stream_path.clone(),
+                pred: pending.pred.clone(),
+                out_cols: pending.out_cols.clone(),
+                gate: outer_gate,
+                emitted: std::sync::atomic::AtomicU64::new(seeded),
+            },
+        );
+        if !pending.buffer.is_empty() {
+            self.emit_shape_delta(shape_id, &ts, &pending.buffer, None).await?;
+        }
+        Ok(work)
+    }
+
+    /// Abort an in-flight create (phase B failed): drop the pending entry and roll back the
+    /// registration exactly (edges, refcounts, fresh nodes with their buffers).
+    pub fn abort_create(&mut self, shape_id: &str) {
+        let Some(idx) = self.pending_shapes.iter().position(|p| p.shape_id == shape_id) else {
+            return;
+        };
+        let pending = self.pending_shapes.remove(idx);
+        self.edges
+            .retain(|e| !matches!(&e.dependent, Dependent::Shape(id) if id == pending.shape_id.as_str()));
+        for sig in pending.collect_log {
             if let Some(n) = self.nodes.get_mut(&sig) {
                 n.refcount = n.refcount.saturating_sub(1);
                 if n.refcount == 0 {
@@ -394,99 +578,19 @@ impl SubqueryRegistry {
         }
     }
 
-    async fn create_subquery_shape_inner(
-        &mut self,
-        shape_id: &str,
-        outer_table: &str,
-        stream_path: &str,
-        where_json: &PredicateJson,
-        out_cols: Option<Arc<Vec<usize>>>,
-        changes_only: bool,
-    ) -> Result<()> {
-        let outer_ts =
-            self.schemas.get(outer_table).cloned().context("subquery shape: unknown outer table")?;
-        // 1. Compile the outer predicate, discovering/deduping nodes (deepest-first) + node edges.
-        let pred = Arc::new(CompiledPredicate::compile_with(where_json, &outer_ts, self)?);
-        // 2. Record shape-level edges (the outer predicate's `IN` leaves).
-        for leaf in collect_in_leaves(&pred) {
-            self.edges.push(Edge {
-                node_sig: leaf.sig,
-                dependent: Dependent::Shape(shape_id.to_string()),
-                connecting_col: leaf.col,
-                negated: leaf.negated,
-                null_sensitive: leaf.null_sensitive,
-            });
-        }
-        // 3. Seed newly-created nodes from Postgres (Postgres evaluates nested subqueries natively).
-        //    Nodes are seeded even for a `changes_only` feed — `matches_ctx` needs the inner sets to
-        //    evaluate live membership.
-        self.seed_pending_nodes().await?;
-        // 4. Backfill the outer shape and append its initial members — UNLESS this is a `changes_only`
-        //    feed (a subset's live tail), which forwards only future membership deltas (passthrough).
-        let mut seeded: u64 = 0;
-        let gate = if changes_only {
-            crate::pg::SnapshotGate::passthrough()
-        } else {
-            let (wsql, params) = crate::sql::predicate_json_to_sql(where_json, 1, &self.schemas, outer_table);
-            let bf = {
-                let client = self.pg().await?;
-                crate::pg::backfill_where(&client, &outer_ts, Some((wsql, params))).await?
-            };
-            let out: Vec<(Row, ZWeight)> = bf.rows.iter().map(|r| (r.clone(), 1)).collect();
-            if !out.is_empty() {
-                let envs = crate::engine::translate_output(
-                    &outer_ts,
-                    out,
-                    None,
-                    None,
-                    out_cols.as_deref().map(Vec::as_slice),
-                );
-                self.ds.append(stream_path, &envs).await?;
-                seeded = envs.len() as u64;
-            }
-            bf.gate
-        };
-        // 5. Record the shape.
-        self.shapes.insert(
-            shape_id.to_string(),
-            SubqueryShape {
-                shape_id: shape_id.to_string(),
-                outer_table: outer_table.to_string(),
-                stream_path: stream_path.to_string(),
-                pred,
-                out_cols,
-                gate,
-                emitted: std::sync::atomic::AtomicU64::new(seeded),
-            },
-        );
-        Ok(())
-    }
-
-    /// Seed every node queued in `pending_seed` (deepest-first) from a Postgres snapshot.
-    async fn seed_pending_nodes(&mut self) -> Result<()> {
-        let pending = std::mem::take(&mut self.pending_seed);
-        if pending.is_empty() {
-            return Ok(());
-        }
-        let client = self.pg().await?;
-        for sig in pending {
-            let (inner_table, where_json, proj_col) = {
-                let n = self.nodes.get(&sig).context("seed: node vanished")?;
-                (n.inner_table.clone(), n.where_json.clone(), n.proj_col)
-            };
-            let ts = self.schemas.get(&inner_table).cloned().context("seed: unknown inner table")?;
-            let wsql =
-                where_json.as_ref().map(|w| crate::sql::predicate_json_to_sql(w, 1, &self.schemas, &inner_table));
-            let bf = crate::pg::backfill_where(&client, &ts, wsql).await?;
-            let node = self.nodes.get_mut(&sig).context("seed: node vanished")?;
-            node.gate = bf.gate;
-            for r in &bf.rows {
-                let pk = ts.key_string(r).unwrap_or_default();
-                let pv = r.0.get(proj_col).cloned().unwrap_or(Value::Null);
-                node.reconcile_row(&pk, Some(pv));
+    /// Rollback helper for a failed/conflicted `begin_create` compile: undo edge appends and
+    /// node refs made by the aborted compile.
+    fn rollback_refs(&mut self, edges_checkpoint: usize, log: Vec<SubquerySig>) {
+        self.edges.truncate(edges_checkpoint);
+        for sig in log {
+            if let Some(n) = self.nodes.get_mut(&sig) {
+                n.refcount = n.refcount.saturating_sub(1);
+                if n.refcount == 0 {
+                    self.nodes.remove(&sig);
+                    self.pending_seed.retain(|s| s != &sig);
+                }
             }
         }
-        Ok(())
     }
 
     /// Remove a subquery shape: drop its edges and decref the nodes it referenced (removing nodes whose
@@ -556,6 +660,13 @@ impl SubqueryRegistry {
         let node_sigs: Vec<SubquerySig> =
             self.nodes.iter().filter(|(_, n)| n.inner_table == table).map(|(s, _)| s.clone()).collect();
         for sig in node_sigs {
+            // Mid-seed: buffer the raw delta for gated replay at install (a half-seeded set
+            // must not be reconciled — the snapshot could stale-overwrite a fresher delta).
+            if let Some(buf) = self.nodes.get_mut(&sig).and_then(|n| n.seed_buffer.as_mut()) {
+                buf.extend(delta.iter().cloned());
+                hop(&mut trace, format!("node:{sig}"), "buffered");
+                continue;
+            }
             if self.nodes.get(&sig).is_some_and(|n| n.gate.should_skip(lsn, xid)) {
                 hop(&mut trace, format!("node:{sig}"), "dropped");
                 continue;
@@ -581,6 +692,11 @@ impl SubqueryRegistry {
             }
             let emitted = self.emit_shape_delta(&id, ts, delta, txid.clone()).await?;
             hop(&mut trace, format!("shape:{id}"), if emitted { "passed" } else { "dropped" });
+        }
+
+        // 2b. Pending shapes (mid-create) on this table: buffer for gated replay at install.
+        for p in self.pending_shapes.iter_mut().filter(|p| p.outer_table == table) {
+            p.buffer.extend(delta.iter().cloned());
         }
 
         // 3. Flip propagation (the Postgres query-backs) is deferred: the caller enqueues `work`
@@ -677,8 +793,9 @@ impl SubqueryRegistry {
         if envs.is_empty() {
             return Ok(false);
         }
-        self.ds.append_reliable(&shape.stream_path, &envs).await;
         shape.emitted.fetch_add(envs.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        let path = shape.stream_path.clone();
+        self.deliver(&path, envs).await;
         Ok(true)
     }
 
@@ -686,20 +803,24 @@ impl SubqueryRegistry {
 
 // --- deferred flip propagation ------------------------------------------------------------------
 //
-// Runs on the engine's dedicated flip-propagator task, NOT inside the table tailers, so the
-// flip-driven Postgres query-backs no longer sit on the tailer hot path or hold the registry
-// lock. Two invariants make this sound:
+// Runs on the engine's flip-worker pool (semaphore-bounded, `ELECTRIC_IVM_FLIP_WORKERS`), NOT
+// inside the table tailers, so the flip-driven Postgres query-backs neither sit on the tailer
+// hot path nor serialize on a single task. Two invariants make this sound:
 //
 //  * **Deferral**: every emission is absolute (per pk: upsert if the row matches *now*, else
 //    idempotent delete), so a propagation that runs later re-derives from the then-current
-//    Postgres and node state and converges regardless of when it runs. The convergence barrier
-//    gains one term: the engine's pending-flip counter must drain to zero
-//    (`GET /replication/lsn` → `pendingFlips`).
-//  * **Eval+append atomicity**: membership evaluation and the resulting stream append happen
-//    under one registry-lock scope (as they always did), and there is exactly ONE propagator
-//    task. Otherwise a move evaluated at time t1 could land *after* a tailer emission evaluated
-//    at t2 > t1 for the same pk, leaving the stream's last word stale — permanent divergence.
-//    Only the Postgres round-trips run outside the lock.
+//    Postgres and node state and converges regardless of when — or on which worker — it runs.
+//    The convergence barrier gains one term: the engine's pending counter must drain to zero
+//    (`GET /replication/lsn` → `pendingFlips`), and that counter also covers emission-lane
+//    batches until they LAND on their streams.
+//  * **Eval+enqueue atomicity + per-stream FIFO**: membership evaluation and the enqueue of the
+//    resulting envelopes happen under one registry-lock scope, and each shape stream drains
+//    through exactly one ordered emission lane (`engine::emission`). Per-stream append order
+//    therefore equals evaluation order — a move evaluated at time t1 can never land *after* an
+//    emission evaluated at t2 > t1 for the same pk (which would leave the stream's last word
+//    stale — permanent divergence). This is the same guarantee the old
+//    hold-the-lock-across-append design gave, without network under the lock and without a
+//    single-task bottleneck. Postgres round-trips run outside the lock, concurrently.
 
 /// Propagate a batch of inner-set flips up the dependency DAG (BFS), querying back affected rows.
 pub async fn propagate_flips(
@@ -772,12 +893,12 @@ async fn move_shape_for_value(
     txid: Option<String>,
 ) -> Result<Option<(String, i64)>> {
     // Brief lock: snapshot what the query-back needs.
-    let (ts, pg_url, arr) = {
+    let (ts, pg_url) = {
         let reg = registry.lock().await;
         let Some(shape) = reg.shapes.get(shape_id) else { return Ok(None) };
-        (reg.snapshot_for_table(&shape.outer_table)?, reg.pg_url.clone(), reg.arrangements.clone())
+        (reg.snapshot_for_table(&shape.outer_table)?, reg.pg_url.clone())
     };
-    let rows = query_candidates(&arr, &pg_url, &ts, connecting_col, value).await?;
+    let rows = query_candidates(&pg_url, &ts, connecting_col, value).await?;
     if rows.is_empty() {
         return Ok(None);
     }
@@ -799,8 +920,9 @@ async fn move_shape_for_value(
         return Ok(None);
     }
     shape.emitted.fetch_add(envs.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    // Reliable: a dropped move envelope is permanent divergence for the shape's subscribers.
-    reg.ds.append_reliable(&shape.stream_path, &envs).await;
+    // Ordered delivery: enqueued under the registry lock (lane FIFO ⇒ lands in eval order).
+    let path = shape.stream_path.clone();
+    reg.deliver(&path, envs).await;
     Ok(Some((ts.name.clone(), net)))
 }
 
@@ -813,12 +935,12 @@ async fn reconcile_parent_for_value(
     connecting_col: usize,
     value: &Value,
 ) -> Result<Option<(String, Vec<Flip>)>> {
-    let (ts, pg_url, arr) = {
+    let (ts, pg_url) = {
         let reg = registry.lock().await;
         let Some(n) = reg.nodes.get(parent_sig) else { return Ok(None) };
-        (reg.snapshot_for_table(&n.inner_table)?, reg.pg_url.clone(), reg.arrangements.clone())
+        (reg.snapshot_for_table(&n.inner_table)?, reg.pg_url.clone())
     };
-    let rows = query_candidates(&arr, &pg_url, &ts, connecting_col, value).await?;
+    let rows = query_candidates(&pg_url, &ts, connecting_col, value).await?;
     let mut reg = registry.lock().await;
     let (pred, proj) = match reg.nodes.get(parent_sig) {
         Some(n) => (n.pred.clone(), n.proj_col),
@@ -849,12 +971,12 @@ async fn rederive_dependent(
 ) -> Result<()> {
     match &edge.dependent {
         Dependent::Shape(id) => {
-            let (ts, pg_url, arr) = {
+            let (ts, pg_url) = {
                 let reg = registry.lock().await;
                 let Some(s) = reg.shapes.get(id) else { return Ok(()) };
-                (reg.snapshot_for_table(&s.outer_table)?, reg.pg_url.clone(), reg.arrangements.clone())
+                (reg.snapshot_for_table(&s.outer_table)?, reg.pg_url.clone())
             };
-            let rows = query_all(&arr, &pg_url, &ts).await?;
+            let rows = query_all(&pg_url, &ts).await?;
             // Eval + append atomically under the lock (see the module comment).
             let reg = registry.lock().await;
             let Some(s) = reg.shapes.get(id) else { return Ok(()) };
@@ -871,15 +993,16 @@ async fn rederive_dependent(
                 return Ok(());
             }
             s.emitted.fetch_add(envs.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            reg.ds.append_reliable(&s.stream_path, &envs).await;
+            let path = s.stream_path.clone();
+            reg.deliver(&path, envs).await;
         }
         Dependent::Node(parent_sig) => {
-            let (ts, pg_url, arr) = {
+            let (ts, pg_url) = {
                 let reg = registry.lock().await;
                 let Some(n) = reg.nodes.get(parent_sig) else { return Ok(()) };
-                (reg.snapshot_for_table(&n.inner_table)?, reg.pg_url.clone(), reg.arrangements.clone())
+                (reg.snapshot_for_table(&n.inner_table)?, reg.pg_url.clone())
             };
-            let rows = query_all(&arr, &pg_url, &ts).await?;
+            let rows = query_all(&pg_url, &ts).await?;
             let mut reg = registry.lock().await;
             let (pred, proj) = match reg.nodes.get(parent_sig) {
                 Some(n) => (n.pred.clone(), n.proj_col),
@@ -1289,14 +1412,19 @@ mod tests {
             "col":"gid","in":{"table":"inner_t","project":"gid"}
         }))
         .unwrap();
-        let res = reg
-            .create_subquery_shape("s1", "outer_t", "shape/s1", &where_json, None, false)
-            .await;
-        assert!(res.is_err());
-        assert_eq!(reg.nodes.len(), 0, "failed create left an orphaned node");
-        assert_eq!(reg.edges.len(), 0, "failed create left orphaned edges");
-        assert_eq!(reg.pending_seed.len(), 0, "failed create left a pending seed");
+        // Three-phase: begin registers (nodes buffering, edges, pending shape); a phase-B
+        // failure is rolled back exactly by abort_create.
+        let begin = reg.begin_create("s1", "outer_t", "shape/s1", &where_json, None, false).unwrap();
+        assert_eq!(begin.seeds.len(), 1, "one fresh node to seed");
+        assert_eq!(reg.nodes.len(), 1);
+        assert!(reg.nodes.values().all(|n| n.seed_buffer.is_some()), "fresh node buffers");
+        assert!(reg.touches("outer_t"), "pending shape routes its outer table");
+        reg.abort_create("s1");
+        assert_eq!(reg.nodes.len(), 0, "aborted create left an orphaned node");
+        assert_eq!(reg.edges.len(), 0, "aborted create left orphaned edges");
+        assert_eq!(reg.pending_seed.len(), 0, "aborted create left a pending seed");
         assert!(reg.shapes.is_empty());
+        assert!(reg.pending_shapes.is_empty());
     }
 
     #[test]

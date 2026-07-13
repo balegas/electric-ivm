@@ -22,6 +22,7 @@ use crate::value::{Row, Value};
 
 mod catalog;
 mod circuit_serving;
+pub(crate) mod emission;
 mod executors;
 mod introspection;
 mod lifecycle;
@@ -125,20 +126,44 @@ struct SubqueryHandle {
     pending_flips: Arc<std::sync::atomic::AtomicI64>,
 }
 
-/// Spawn the engine's single flip-propagator task (one per engine: propagation order and
-/// eval+append atomicity are what keep deferred moves convergent — see `subquery.rs`).
+/// Spawn the flip-propagation dispatcher: FlipWork batches run **concurrently**, bounded by a
+/// semaphore (`ELECTRIC_IVM_FLIP_WORKERS`, default 8) — the Postgres round-trips are the
+/// dominant cost and are independent across batches. Correctness does not depend on
+/// propagation order: membership evaluation happens under the registry lock and the resulting
+/// envelopes are **enqueued under that same lock** into per-stream FIFO emission lanes
+/// (`engine::emission`), so per-shape append order equals eval order regardless of which
+/// worker ran the query-back; absolute per-pk emission makes concurrent re-derivations
+/// convergent (see `subquery.rs`).
 fn spawn_flip_propagator(
     registry: Arc<Mutex<SubqueryRegistry>>,
     mut rx: mpsc::UnboundedReceiver<FlipWork>,
     pending: Arc<std::sync::atomic::AtomicI64>,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
 ) {
+    let workers: usize = std::env::var("ELECTRIC_IVM_FLIP_WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8)
+        .max(1);
     tokio::spawn(async move {
+        let sem = Arc::new(tokio::sync::Semaphore::new(workers));
         while let Some(fw) = rx.recv().await {
-            if let Err(e) = crate::subquery::propagate_flips(&registry, fw.work, fw.txid, &trace_tx).await {
-                tracing::error!("subquery flip propagation failed: {e:#}");
-            }
-            pending.fetch_sub(1, Ordering::SeqCst);
+            let permit = sem.clone().acquire_owned().await.expect("flip semaphore");
+            let registry = registry.clone();
+            let pending = pending.clone();
+            let trace_tx = trace_tx.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    crate::subquery::propagate_flips(&registry, fw.work, fw.txid, &trace_tx).await
+                {
+                    tracing::error!("subquery flip propagation failed: {e:#}");
+                }
+                // Decremented only after propagation finished enqueueing every resulting
+                // batch — each batch carries its own pending increment until it lands, so
+                // the barrier never reads zero with effects in flight.
+                pending.fetch_sub(1, Ordering::SeqCst);
+                drop(permit);
+            });
         }
     });
 }
@@ -283,6 +308,15 @@ impl Engine {
         let trace_tx = tokio::sync::broadcast::channel(crate::trace::CHANNEL_CAP).0;
         let (flip_tx, flip_rx) = mpsc::unbounded_channel();
         let pending_flips = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        // Ordered emission lanes for subquery-shape appends (network out from under the
+        // registry lock; per-stream FIFO keeps append order = eval order). They share the
+        // pendingFlips counter so the convergence barrier covers queued batches.
+        let lanes = emission::EmissionLanes::spawn(
+            ds.clone(),
+            std::env::var("ELECTRIC_IVM_EMIT_LANES").ok().and_then(|v| v.parse().ok()).unwrap_or(8),
+            pending_flips.clone(),
+        );
+        subqueries.try_lock().expect("fresh registry").set_lanes(lanes);
         spawn_flip_propagator(subqueries.clone(), flip_rx, pending_flips.clone(), trace_tx.clone());
         let (catalog_tx, catalog_rx) = mpsc::unbounded_channel();
         spawn_catalog_writer(ds.clone(), catalog_rx);
@@ -325,25 +359,22 @@ impl Engine {
         *self.dbsp_cfg.lock().unwrap() = Some(cfg);
     }
 
-    /// The arrangement layer's lookup counters (served, fallback), if it is running.
-    pub fn arrangement_counters(&self) -> Option<(u64, u64)> {
-        self.arrangements.lock().unwrap().as_ref().map(|a| a.counters())
-    }
-
-    /// Start the dbsp arrangement layer and seed it, when configured. Fresh state seeds every
-    /// table from one Postgres snapshot per table (capturing the gate that fences the live
+    /// Start the dbsp counts layer and seed it, when configured. Seeds each counts pipeline
+    /// from one group-aggregated Postgres snapshot per table (capturing the gate that fences the live
     /// feed); restored state skips seeding — the sequencer replays the change-log gap instead.
     async fn maybe_start_arrangements(&self, schemas: &HashMap<String, TableSchema>) -> Result<()> {
         let Some(cfg) = self.dbsp_cfg.lock().unwrap().clone() else { return Ok(()) };
-        let mut specs: Vec<crate::arrangements::IndexSpec> = schemas
-            .values()
-            .map(|ts| crate::arrangements::IndexSpec { table: ts.name.clone(), cols: vec![ts.pk_index] })
-            .collect();
-        for (t, c) in &cfg.indexes {
-            match schemas.get(t).and_then(|ts| ts.index.get(c)) {
-                Some(&i) => specs.push(crate::arrangements::IndexSpec { table: t.clone(), cols: vec![i] }),
-                None => tracing::warn!("ELECTRIC_IVM_DBSP_INDEXES: unknown column {t}.{c}; skipping"),
-            }
+        if !cfg.indexes.is_empty() {
+            tracing::warn!(
+                "ELECTRIC_IVM_DBSP_INDEXES is deprecated and ignored: row data lives in Postgres \
+                 (lookups are pooled queries); the circuit holds counts pipelines only"
+            );
+        }
+        if cfg.cache_mib.is_some() || cfg.max_rss_bytes.is_some() {
+            tracing::warn!(
+                "ELECTRIC_IVM_DBSP_{{CACHE_MIB,MIN_STORAGE_KB,MAX_RSS_MB,CHECKPOINT_SECS,DIR}} are \
+                 deprecated no-ops: the circuit is in-memory counts only (no storage layer)"
+            );
         }
         let mut counts: Vec<crate::arrangements::CountSpec> = Vec::new();
         for (t, cols) in &cfg.counts {
@@ -360,38 +391,28 @@ impl Engine {
                 None => tracing::warn!("ELECTRIC_IVM_DBSP_COUNTS: unknown column in {t}:{cols:?}; skipping"),
             }
         }
-        let arr_cfg = crate::arrangements::ArrangementsConfig {
-            dir: cfg.dir.clone(),
-            cache_mib: cfg.cache_mib,
-            min_storage_bytes: cfg.min_storage_bytes,
-            max_rss_bytes: cfg.max_rss_bytes,
-            checkpoint_every: cfg.checkpoint_every,
-            ..crate::arrangements::ArrangementsConfig::default()
-        };
-        let chunk = arr_cfg.seed_chunk_rows;
-        let arr = crate::arrangements::Arrangements::start(arr_cfg, specs, counts)?;
-        if arr.restored_offset().is_none() {
-            let url = self.pg_url.clone().context("arrangements need a pg_url to seed")?;
-            let client = crate::pg::connect(&url).await?;
-            let mut gates = HashMap::new();
-            for ts in schemas.values() {
-                let bf = crate::pg::backfill(&client, ts, None).await?;
-                let total = bf.rows.len();
-                for rows in bf.rows.chunks(chunk) {
-                    arr.seed_chunk(&ts.name, rows.to_vec()).await?;
-                }
-                gates.insert(ts.name.clone(), bf.gate);
-                arr.finish_seed(&ts.name);
-                tracing::info!("arrangements: seeded '{}' ({total} rows)", ts.name);
-            }
-            *self.arr_gates.write().unwrap() = gates;
-        } else {
-            tracing::info!(
-                "arrangements: restored from checkpoint; replaying change log from {:?}",
-                arr.restored_offset()
-            );
+        if counts.is_empty() {
+            return Ok(()); // nothing for the circuit to maintain
         }
-        self.subqueries.lock().await.set_arrangements(arr.clone());
+        let arr = crate::arrangements::Arrangements::start(counts.clone())?;
+        // Seed each counts pipeline from ONE group-aggregated query per table — O(groups),
+        // not O(rows); row data stays in Postgres. State is in-memory only, so this runs on
+        // every boot; the seed's SnapshotGate fences change-log replay exactly like a shape
+        // backfill.
+        let url = self.pg_url.clone().context("counts pipelines need a pg_url to seed")?;
+        let client = crate::pg::connect(&url).await?;
+        let mut gates = HashMap::new();
+        for spec in &counts {
+            let ts = schemas.get(&spec.table).expect("resolved above");
+            let (groups, gate) =
+                crate::pg::backfill_group_counts(&client, ts, &spec.group_cols).await?;
+            let total = groups.len();
+            arr.seed_groups(&spec.table, groups).await?;
+            gates.insert(spec.table.clone(), gate);
+            arr.finish_seed(&spec.table);
+            tracing::info!("arrangements: seeded counts for '{}' ({total} groups)", spec.table);
+        }
+        *self.arr_gates.write().unwrap() = gates;
         *self.arrangements.lock().unwrap() = Some(arr);
         Ok(())
     }
@@ -428,7 +449,6 @@ impl Engine {
                 self.trace_tx.clone(),
                 self.arrangements.lock().unwrap().clone(),
                 self.arr_gates.read().unwrap().clone(),
-                self.pg_url.clone(),
             ));
         }
         st.sequencer.as_ref().expect("sequencer just spawned")

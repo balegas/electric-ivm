@@ -265,14 +265,11 @@ try {
   execFileSync('cargo', ['build', '-p', 'electric-ivm-engine'], { cwd: repoRoot(), stdio: 'inherit' })
   // dbsp pipeline: the demo runs the engine with the circuit serving the app's query graph —
   // cohort indexes for every lookup/membership column LinearLite uses, and a counts pipeline
-  // for the browse header's live COUNT. State is ephemeral (a fresh temp dir per launch, like
-  // Postgres itself). Pre-set ELECTRIC_IVM_DBSP* env vars win over these defaults.
-  const dbspDir = mkdtempSync(join(tmpdir(), 'el-linearlite-dbsp-'))
+  // for the browse header's live COUNT. Counts state is in-memory (reseeded each boot from a
+  // group-aggregated Postgres snapshot); row data lives in Postgres — membership shapes are
+  // registry-served with pooled query-backs. Pre-set ELECTRIC_IVM_DBSP* env vars win.
   engineProc = spawn(join(repoRoot(), 'target', 'debug', 'electric-ivm-engine'), [], {
     env: {
-      ELECTRIC_IVM_DBSP_DIR: dbspDir,
-      ELECTRIC_IVM_DBSP_INDEXES:
-        'issues.project_id,project_members.user_id,project_members.project_id,comments.issue_id',
       ELECTRIC_IVM_DBSP_COUNTS: 'issues:project_id+status+priority+username',
       ...process.env,
       ELECTRIC_IVM_DS_URL: dsUrl,
