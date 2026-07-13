@@ -491,6 +491,42 @@ bounded keyset range query folded into the `WHERE`, so the engine never holds a 
 
 ---
 
+## 6b. Design decision: no interpreted operator graph in the dynamic tier
+
+*(July 2026, closing the structural-debt epic. Context: after the engine.rs split and the
+membership/aggregate kernel unifications, the remaining critique of the dynamic tier was that
+`process_envelope` is a fixed sequence of executor loops rather than a composable, interpreted
+dataflow graph — and that the visualizer's operator graph is derived presentation, not the
+execution model.)*
+
+**Decision: the dynamic tier stays flat — indexed executors + shared kernels, no hand-rolled
+interpreted operator graph.** Rationale:
+
+- **dbsp is already the composition engine.** New template *kinds* (joins, reductions,
+  derived-visibility pipelines) are new operators in `arrangements.rs`, where dbsp provides
+  compositional correctness, arrangement sharing, and spilling. A dynamic-tier interpreter
+  would be a second dataflow engine beside the real one, with none of its guarantees.
+- **Flatness is the design, not debt.** The engine's central performance idea is that routing
+  is *not* dataflow: an index finds a change's shapes in `O(log N)`, whereas graph-shaped
+  evaluation passes deltas per node — the per-shape linear scan this design exists to avoid
+  (§1, the same argument that keeps equality shapes out of the circuit).
+- **No variation to abstract over.** The executor kinds (filter, router, fold, membership,
+  subquery hook) have been stable; they grow in *count* (solved by the conjunct indexes), not
+  in *kind*. The hard correctness — gates, absolute emission, the `(lsn,seq)` highwater,
+  per-txn flush — is cross-cutting and would not be simplified by node interfaces.
+- **The composability mechanism is the kernel pattern.** When two paths must agree on an
+  invariant, extract ONE implementation plus a cross-path regression test —
+  `engine/membership.rs` (flip detection, query-backs, absolute-emission fold) and
+  `engine/output.rs::agg_envelope` (the aggregate wire format) are the pattern to follow.
+
+**Revisit iff** runtime-defined per-shape pipelines enter the roadmap (user-supplied computed
+projections / chained transforms that cannot compile to deploy-time circuit templates) — that
+is the one workload where an interpreted, per-shape mini-graph earns its indirection.
+Optional follow-up, independent of this decision: derive the visualizer's `OpNode`s from the
+executors via a trait so presentation cannot drift from execution.
+
+---
+
 ## 7. File map
 
 | path | role |
