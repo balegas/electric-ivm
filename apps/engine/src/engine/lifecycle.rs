@@ -943,8 +943,8 @@ impl Engine {
                 .get(table)
                 .cloned()
                 .with_context(|| format!("unknown outer table '{table}'"))?;
-            let (outer_gate, seeded) = if changes_only {
-                (crate::pg::SnapshotGate::passthrough(), 0u64)
+            let (outer_gate, seeded, seeded_pks) = if changes_only {
+                (crate::pg::SnapshotGate::passthrough(), 0u64, HashSet::new())
             } else {
                 let (wsql, params) =
                     crate::sql::predicate_json_to_sql(where_json, 1, &begin.schemas, table);
@@ -954,6 +954,8 @@ impl Engine {
                 .get()
                 .await?;
                 let bf = crate::pg::backfill_where(&client, &outer_ts, Some((wsql, params))).await?;
+                let seeded_pks: HashSet<String> =
+                    bf.rows.iter().map(|r| outer_ts.key_string(r).unwrap_or_default()).collect();
                 let out: Vec<(Row, ZWeight)> = bf.rows.iter().map(|r| (r.clone(), 1)).collect();
                 let mut seeded = 0u64;
                 if !out.is_empty() {
@@ -967,19 +969,19 @@ impl Engine {
                     self.ds.append(stream_path, &envs).await?;
                     seeded = envs.len() as u64;
                 }
-                (bf.gate, seeded)
+                (bf.gate, seeded, seeded_pks)
             };
-            Ok::<_, anyhow::Error>((node_seeds, outer_gate, seeded))
+            Ok::<_, anyhow::Error>((node_seeds, outer_gate, seeded, seeded_pks))
         }
         .await;
         // Phase C (brief lock): install + gated replay, or exact rollback on a phase-B failure.
         match phase_b {
-            Ok((node_seeds, outer_gate, seeded)) => {
+            Ok((node_seeds, outer_gate, seeded, seeded_pks)) => {
                 let work = self
                     .subqueries
                     .lock()
                     .await
-                    .finish_create(id, node_seeds, outer_gate, seeded)
+                    .finish_create(id, node_seeds, outer_gate, seeded, seeded_pks)
                     .await?;
                 if !work.is_empty() {
                     // Replay flips propagate exactly like live ones (barrier-covered).
