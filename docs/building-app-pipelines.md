@@ -117,7 +117,7 @@ configuration: **lookup arrangements** (`ELECTRIC_IVM_DBSP_INDEXES`) that serve 
 re-derivations and shape seeding from local snapshots, and **counts pipelines**
 (`ELECTRIC_IVM_DBSP_COUNTS`) that maintain a live COUNT per group. The sequencer serves
 membership shapes and decomposable COUNT aggregates from that state end to end, for shapes whose
-connecting columns are arrangement-indexed (`engine.rs`; `ARCHITECTURE.md` §6b). New template
+connecting columns are arrangement-indexed (`engine/circuit_serving.rs`; `ARCHITECTURE.md` §6b). New template
 kinds extend the same skeleton; the feed, stepping, checkpoint, and restore plumbing in
 `arrangements.rs` is reused unchanged.
 
@@ -170,7 +170,7 @@ The todo circuit above maps onto the engine's compiled template kinds directly:
 - **(E) open_counts is a counts pipeline** — `ELECTRIC_IVM_DBSP_COUNTS=todos:list_id+done`
   compiles exactly `map_index((list_id, done)).weighted_count()` (`arrangements.rs`). Its
   per-step group deltas are drained after each transaction (`apply_count_deltas`,
-  `engine.rs`) and any COUNT aggregate whose predicate decomposes over the group columns is
+  `engine/circuit_serving.rs`) and any COUNT aggregate whose predicate decomposes over the group columns is
   seeded by summing groups and updated live. The badge for list L is the `(L, false)` group;
   a dashboard sums the user's groups — one pipeline serves every filter combination.
 - **(B)+(C) is a circuit-served membership shape** — with
@@ -178,7 +178,7 @@ The todo circuit above maps onto the engine's compiled template kinds directly:
   declared, the shape `todos WHERE list_id IN (SELECT list_id FROM list_members WHERE
   user_id = $me)` is seeded from the arrangement snapshots and maintained by cohort routing
   in the sequencer: the `list_members` deltas refcount the shape's cohort groups, and
-  move-in/move-out read the post-transaction snapshots (`CohortGroups`, `engine.rs`).
+  move-in/move-out read the post-transaction snapshots (`CohortGroups`, `engine/executors.rs`).
 - **(A) and (D)** are equality/match-all templates: the routing tier serves them by index,
   by design.
 
@@ -193,7 +193,7 @@ Two operations wear the word "extend"; keep them apart.
   **layout fingerprint** changes, so the previous checkpoint is discarded and the arrangements
   **reseed** from a fresh Postgres `REPEATABLE READ` snapshot (`arrangements.rs`) — automatic, no
   error. Shapes are not lost: they replay from the durable shape catalog (`meta/catalog` in
-  `engine.rs`), and any shape whose predicate now decomposes over the freshly-added dimension is
+  `engine/catalog.rs`), and any shape whose predicate now decomposes over the freshly-added dimension is
   **promoted** from the fallback tier to circuit-served on the spot — the catalog restore re-plans
   each shape against the new arrangement set (`plan_circuit_shape`), so a membership shape keyed on
   `todos.assignee` that fell to fallback yesterday is circuit-served the moment

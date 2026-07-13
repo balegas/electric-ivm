@@ -661,19 +661,10 @@ impl SubqueryRegistry {
     ) -> Result<bool> {
         let Some(shape) = self.shapes.get(shape_id) else { return Ok(false) };
         let pred = shape.pred.clone();
-        // Per touched pk, take the row's latest state: the `+1` row if present (insert/update), else the
-        // `-1` row (delete). `is_new` distinguishes "row still exists" from "row was deleted".
-        let mut by_pk: HashMap<String, (Row, bool)> = HashMap::new();
-        for Tup2(row, w) in delta {
-            let pk = ts.key_string(row).unwrap_or_default();
-            if *w > 0 {
-                by_pk.insert(pk, (row.clone(), true));
-            } else {
-                by_pk.entry(pk).or_insert_with(|| (row.clone(), false));
-            }
-        }
-        let out: Vec<(Row, ZWeight)> = by_pk
-            .into_values()
+        // Per touched pk, take the row's latest state (shared kernel fold): `is_new`
+        // distinguishes "row still exists" from "row was deleted".
+        let out: Vec<(Row, ZWeight)> = crate::engine::membership::latest_rows_by_pk(ts, delta)
+            .into_iter()
             .map(|(row, is_new)| {
                 let member = is_new && pred.matches_ctx(&row, self);
                 (row, if member { 1 } else { -1 })
@@ -914,43 +905,9 @@ async fn rederive_dependent(
     Ok(())
 }
 
-/// Query candidate rows where `col = value`: from the dbsp arrangement snapshot when a
-/// `(table, [col])` index exists (no I/O beyond dbsp's own storage), else from Postgres on a
-/// pooled connection (no registry lock held).
-async fn query_candidates(
-    arr: &Option<crate::arrangements::Arrangements>,
-    pg_url: &Option<String>,
-    ts: &TableSchema,
-    col: usize,
-    value: &Value,
-) -> Result<Vec<Row>> {
-    if let Some(a) = arr {
-        if let Some(rows) = a.lookup(&ts.name, &[col], &Row(vec![value.clone()])) {
-            return Ok(rows);
-        }
-    }
-    let url = pg_url.as_deref().context("subquery work requires postgres")?;
-    let client = crate::pg::pool_for(url).get().await?;
-    let where_sql = value_eq_sql(&ts.columns[col].0, value, ts.pg_types.get(col).and_then(|o| o.as_deref()));
-    Ok(crate::pg::backfill_where(&client, ts, Some(where_sql)).await?.rows)
-}
-
-/// Query all rows of `ts` (full re-derive): from the dbsp arrangement scan when available,
-/// else from Postgres on a pooled connection (no registry lock held).
-async fn query_all(
-    arr: &Option<crate::arrangements::Arrangements>,
-    pg_url: &Option<String>,
-    ts: &TableSchema,
-) -> Result<Vec<Row>> {
-    if let Some(a) = arr {
-        if let Some(rows) = a.scan(&ts.name) {
-            return Ok(rows);
-        }
-    }
-    let url = pg_url.as_deref().context("subquery work requires postgres")?;
-    let client = crate::pg::pool_for(url).get().await?;
-    Ok(crate::pg::backfill_where(&client, ts, None).await?.rows)
-}
+// Candidate-row resolution (arrangement snapshot → pooled Postgres fallback) is the shared
+// membership kernel's — one implementation for this registry and for circuit cohort serving.
+use crate::engine::membership::{query_rows_all as query_all, query_rows_by_col as query_candidates};
 
 /// Net membership change carried by a batch of parent-node flips (enters +1, leaves −1), for the
 /// trace dot's label/colour.
@@ -1121,23 +1078,6 @@ pub fn referenced_tables(p: &PredicateJson) -> Vec<String> {
     }
     go(p, &mut out);
     out
-}
-
-/// Build a `WHERE col = value` fragment + params for a move query-back (the LIVE re-derive path).
-/// Text is parameterized; other scalars are inlined (mirrors the SQL emitter). A text param is cast to
-/// the column's native Postgres type (`$1::text::uuid`) when known — same as the backfill emitters, so
-/// a uuid/timestamptz column doesn't hit tokio-postgres's `String -> uuid` refusal (which used to fail
-/// this path SILENTLY, dropping live subquery move-ins) — else the `col::text = $1` fallback. NULL
-/// never reaches here (handled by full re-derive).
-fn value_eq_sql(col: &str, value: &Value, pg_type: Option<&str>) -> (String, Vec<String>) {
-    let name = crate::pg::quote_ident(col);
-    match value {
-        Value::Null => (format!("{name} IS NULL"), Vec::new()),
-        Value::Int(i) => (format!("{name} = {i}"), Vec::new()),
-        Value::Float(f) => (format!("{name} = {}", f.0), Vec::new()),
-        Value::Bool(b) => (format!("{name} = {}", if *b { "true" } else { "false" }), Vec::new()),
-        Value::Text(s) => (crate::sql::text_param_cmp(&name, "=", 1, pg_type), vec![s.clone()]),
-    }
 }
 
 #[cfg(test)]

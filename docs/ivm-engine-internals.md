@@ -63,7 +63,7 @@ must never scale with shapes, users, or parameter combinations — only with the
 
 ### A change is a Z-set delta
 
-Every table change is converted (`apply_envelope`, `engine.rs`) into weighted rows:
+Every table change is converted (`apply_envelope`, `engine/output.rs`) into weighted rows:
 
 | operation | delta |
 |---|---|
@@ -115,7 +115,7 @@ fsync). An LSN fence silently drops rows committed-but-invisible during the snap
 duplicates at the exact boundary; the xid gate decides both cases. Guarded by
 `conformance-concurrency.test.ts` + `pg.rs` unit tests.
 
-### 2.3 Tail and fan-out (`engine.rs`)
+### 2.3 Tail and fan-out (`engine/sequencer.rs`)
 
 There is **one sequencer task for all tables** (`sequencer_loop`) — the LSN-ordered executor.
 It long-polls the single `changes` log (whole commits, in commit order) and for each change:
@@ -278,7 +278,7 @@ fetched by a keyed query-back on flip.
 ### 3.5 Full shape de-duplication (the sharing layer above the strategies)
 
 Independent of strategy, any two **equal** shapes share ONE shape id, ONE maintained
-routing/registry entry, and ONE durable stream, ref-counted (`engine.rs::feed_by_sig` /
+routing/registry entry, and ONE durable stream, ref-counted (`engine/mod.rs::feed_by_sig` /
 `feed_shares`). The signature is `(kind, table, canonical predicate, sorted projection,
 changes_only)` — canonicalization is order-insensitive, so `a AND b` ≡ `b AND a`; aggregations
 key on `(table, predicate, fn, column)` in their own namespace. Consequences:
@@ -490,10 +490,10 @@ bounded keyset range query folded into the `WHERE`, so the engine never holds a 
 
 | path | role |
 |---|---|
-| `apps/engine/src/engine.rs` | the LSN-ordered sequencer (+ global (lsn,seq) de-dup), delta computation, key routing + standalone + aggregation fan-out, shape sharing/lifecycle, per-txn reliable flush |
+| `apps/engine/src/engine/` | the engine module: `mod.rs` (the `Engine` handle + shared state), `sequencer.rs` (the LSN-ordered sequencer, (lsn,seq) de-dup, per-txn reliable flush), `lifecycle.rs` (shape creation/sharing/retention), `circuit_serving.rs` (circuit-tier serving), `executors.rs` (routers, filters, folds), `planning.rs` (circuit placement), `catalog.rs` (durable catalog + restore), `introspection.rs` (graph/state DTOs + builders), `membership.rs` (the shared membership kernel: flip detection, arrangement→Postgres query-backs — used by both circuit cohort serving and the subquery registry), `output.rs` (envelope ⇄ delta codec) |
 | `apps/engine/src/subquery.rs` | cross-table subquery registry: shared nodes, edges, flips, absolute emission, atomic create/rollback |
 | `apps/engine/src/arrangements.rs` | the circuit: storage-backed table arrangements + counts pipelines, checkpoints, snapshot lookups |
-| `apps/engine/src/replication.rs` | Postgres logical-replication ingestor (streaming pgoutput, buffer per-txn, stamp commit LSN + xid + seq, append, acknowledge) |
+| `apps/engine/src/replication.rs` | Postgres logical-replication ingestor (streaming pgoutput via the `pgoutput.rs` decoder, buffer per-txn, stamp commit LSN + xid + seq, append, acknowledge) |
 | `apps/engine/src/pg.rs` | connect/introspect, `REPLICA IDENTITY FULL`, slot create, predicate-pushdown backfill + `SnapshotGate`, subset query-back |
 | `apps/engine/src/predicate.rs` | predicate compile, three-valued `matches`/`matches_ctx`, `equality_template`, subquery signatures |
 | `apps/engine/src/sql.rs` / `where_sql.rs` | predicate → SQL (backfill pushdown); SQL `WHERE` → predicate (Electric path) |
@@ -502,6 +502,11 @@ bounded keyset range query folded into the `WHERE`, so the engine never holds a 
 | `apps/engine/src/ds.rs` | durable-streams HTTP client + `Envelope` |
 | `apps/engine/src/electric.rs` / `http.rs` | `/v1/shape` Electric adapter + control-plane HTTP |
 | `apps/engine/src/metrics.rs` / `mem.rs` | counters, latency histograms, OTel memory/cardinality gauges |
+| `apps/engine/src/retention.rs` | shape retention: the active / dormant / evicted lifecycle + layered dormant-only eviction |
+| `apps/engine/src/config.rs` | boot config: `ELECTRIC_IVM_*` env + Electric fleet-surface mapping |
+| `apps/engine/src/params.rs` | Electric `params[N]` / `$N` substitution for `/v1/shape` |
+| `apps/engine/src/statsd.rs` | StatsD (datadog wire) telemetry for the benchmarking fleet |
+| `apps/engine/src/trace.rs` | per-envelope pipeline trace broadcast (`GET /trace` SSE, feeds the explorer) |
 
 ## 8. Related documents
 

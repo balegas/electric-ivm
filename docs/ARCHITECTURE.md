@@ -22,7 +22,7 @@ The as-built system architecture. Companion documents:
                                DURABLE STREAMS  changes            (ONE ordered change log, commit order)
                                   │ tail (single LSN-ordered sequencer; global (lsn,seq) de-dup)
                                   ▼
-                               ENGINE (engine.rs)
+                               ENGINE (engine/)
                                   │ Z-set delta → key routing ⊕ stateless filters
                                   │              ⊕ subquery registry ⊕ aggregations
                                   │ reliable append (retry-until-landed)
@@ -518,16 +518,21 @@ predicate (which recreates the feed per click) — see AGENTS.md "gotchas".
 
 | path | role |
 |------|------|
-| `apps/engine/src/engine.rs` | the LSN-ordered sequencer, delta computation, routing + standalone + aggregation fan-out, shape sharing/lifecycle, reliable per-txn flush |
+| `apps/engine/src/engine/` | the engine module: `mod.rs` (the `Engine` handle + shared state), `sequencer.rs` (the LSN-ordered sequencer, (lsn,seq) de-dup, per-txn reliable flush), `lifecycle.rs` (shape creation/sharing/retention), `circuit_serving.rs` (circuit-tier serving), `executors.rs` (routers, filters, folds), `planning.rs` (circuit placement), `catalog.rs` (durable catalog + restore), `introspection.rs` (graph/state DTOs + builders), `membership.rs` (the shared membership kernel: flip detection, arrangement→Postgres query-backs — used by both circuit cohort serving and the subquery registry), `output.rs` (envelope ⇄ delta codec) |
 | `apps/engine/src/subquery.rs` | subquery registry: shared nodes, edges, flips, absolute emission, atomic create/rollback |
 | `apps/engine/src/arrangements.rs` | the circuit: storage-backed table arrangements + counts pipelines, checkpoints, snapshot lookups (§6b) |
-| `apps/engine/src/replication.rs` | ingestor: streaming pgoutput, per-txn buffering, (lsn, xid, seq) stamping, append-then-acknowledge |
+| `apps/engine/src/replication.rs` | ingestor: streaming pgoutput (decoder: `pgoutput.rs`), per-txn buffering, (lsn, xid, seq) stamping, append-then-acknowledge |
 | `apps/engine/src/pg.rs` | connect/introspect, slot + REPLICA IDENTITY, backfill (+ `SnapshotGate`), subset query-back, value normalization |
 | `apps/engine/src/predicate.rs` | predicate compile, three-valued eval, equality templates, subquery signatures |
 | `apps/engine/src/sql.rs` / `where_sql.rs` | predicate → SQL (pushdown) / SQL `WHERE` → predicate (Electric path) |
 | `apps/engine/src/electric.rs` | Electric `/v1/shape` adapter (handles, offsets, TTL eviction) |
 | `apps/engine/src/ds.rs` | durable-streams client: `append`, `append_reliable`, `delete_stream`, reads |
 | `apps/engine/src/http.rs` | control-plane HTTP |
+| `apps/engine/src/retention.rs` | shape retention: the active / dormant / evicted lifecycle + layered dormant-only eviction |
+| `apps/engine/src/config.rs` | boot config: `ELECTRIC_IVM_*` env + Electric fleet-surface mapping |
+| `apps/engine/src/params.rs` | Electric `params[N]` / `$N` substitution for `/v1/shape` |
+| `apps/engine/src/statsd.rs` | StatsD (datadog wire) telemetry for the benchmarking fleet |
+| `apps/engine/src/trace.rs` | per-envelope pipeline trace broadcast (`GET /trace` SSE, feeds the explorer) |
 | `apps/api/src/core.ts` | extended API core (writes, shape/subset/aggregate forwarding) |
 | `packages/client/src/index.ts` | client: shapes/aggregations, tracked lifecycles, `awaitTxId` |
 | `packages/client/src/subset.ts` | subset queries: page merge, LSN watermarks, tombstones, feed lifecycle |
