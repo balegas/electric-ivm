@@ -2,7 +2,7 @@ import type { AggregateSubscription, SubsetSubscription } from '@electric-ivm/cl
 import type { AggregateDef, Row, ShapeDef, SubsetDef } from '@electric-ivm/protocol'
 import { createCollection, type Collection } from '@tanstack/db'
 import { useLiveQuery } from '@tanstack/react-db'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { client } from '../electric'
 
 // Always-ready, empty placeholder collection. While a shape's real collection is still being created
@@ -131,8 +131,17 @@ export function useSubset<T extends Row = Row>(
     [src, ...deps],
   )
 
+  // One page in flight at a time: `onEndReached` fires on every rows-length change while the tail
+  // streams rows in, so an unguarded loadMore fans out into dozens of duplicate same-boundary page
+  // fetches (tRPC batches them into one oversized request URL → HTTP 431). Dropped calls are safe —
+  // the next length change re-triggers paging if the end is still in view.
+  const loadingMoreRef = useRef(false)
   const loadMore = useCallback(() => {
-    void sub?.loadMore()
+    if (!sub || loadingMoreRef.current) return
+    loadingMoreRef.current = true
+    void sub.loadMore().finally(() => {
+      loadingMoreRef.current = false
+    })
   }, [sub])
 
   return {
