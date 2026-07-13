@@ -24,7 +24,11 @@ COPY apps/engine apps/engine
 RUN touch apps/engine/src/main.rs apps/engine/src/lib.rs \
  && cargo build --release -p electric-ivm-engine
 
-# --- stage 2: node deps for the durable-streams server ----------------------
+# --- stage 2: build the durable-streams-server binary (see docker/Dockerfile.ds) --------------
+FROM rust:1.83-slim AS ds-build
+RUN cargo install durable-streams --version 0.1.4 --locked
+
+# --- stage 3: node deps for the durable-streams server ----------------------
 FROM node:22-slim AS node-deps
 # python3 + a C++ toolchain so node-gyp can build the durable-streams native deps (lmdb, and the
 # optional msgpackr-extract accelerator) when a prebuilt isn't available for the target arch. This
@@ -37,7 +41,7 @@ COPY . .
 # The server is run at runtime with tsx (a direct devDependency, on PATH via /repo/node_modules/.bin).
 RUN pnpm install --frozen-lockfile
 
-# --- stage 3: runtime -------------------------------------------------------
+# --- stage 4: runtime -------------------------------------------------------
 FROM node:22-slim
 # curl is MANDATORY: the fleet health check shells out to it. ca-certificates for good measure.
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
@@ -51,9 +55,10 @@ ENV APP_ROOT=/app \
 
 COPY --from=node-deps /repo /repo
 COPY --from=engine-build /repo/target/release/electric-ivm-engine /usr/local/bin/electric-ivm-engine
+COPY --from=ds-build /usr/local/cargo/bin/durable-streams-server /usr/local/bin/durable-streams-server
 COPY docker/electric-entrypoint.sh /usr/local/bin/electric-entrypoint.sh
 
-RUN chmod +x /usr/local/bin/electric-entrypoint.sh /usr/local/bin/electric-ivm-engine \
+RUN chmod +x /usr/local/bin/electric-entrypoint.sh /usr/local/bin/electric-ivm-engine /usr/local/bin/durable-streams-server \
  && mkdir -p /app \
  && chown -R node:node /app
 

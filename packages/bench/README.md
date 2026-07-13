@@ -26,6 +26,15 @@ pnpm bench:fleet          # from the repo root — auto-clones the fleet repo on
 | `EXTERNAL_ELECTRIC_URL` | *(unset)* | run against an external Electric-compatible server instead of booting our stack (requires `EXTERNAL_DATABASE_URL`) |
 | `EXTERNAL_DATABASE_URL` | *(unset)* | the external target's Postgres; benchmark tables are dropped/recreated there |
 
+**macOS latency note:** the stack boots the real `durable-streams-server` binary (`@electric-ivm/ds-rust`)
+instead of an in-process store. That binary's `--durability memory` mode is Linux-only (a zero-copy
+socket→file path); on macOS every append falls back to disk-durable `wal` mode, which inflates
+latency on shape-creation-heavy benchmarks (e.g. `concurrent_shape_creation_with_subqueries` p50
+206ms → 1700ms+ in local testing). This is a platform artifact, not an engine regression — verified
+by running the same workload in a Linux container with `ELECTRIC_STORAGE=MEMORY`, which reproduced
+the original numbers (p50 ~318ms). Don't read macOS-local numbers on these benchmarks as regressions;
+compare against the hosted fleet (Linux) instead.
+
 ## Shape-memory matrix (`src/shape-mem-matrix.ts`)
 
 How engine memory evolves as shapes are created, across deployment sizes: seeds N issues + a
