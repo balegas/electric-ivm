@@ -1,18 +1,14 @@
-//! The shared membership kernel — the ONE implementation of the mechanics that both
-//! membership-serving paths must agree on. Two subsystems maintain "rows enter/leave a shape
-//! because a *related* table changed": the subquery registry (`crate::subquery` — nested,
-//! negated, multi-subquery predicates) and circuit cohort serving (`circuit_serving` —
-//! single-level non-negated membership on arrangement-indexed columns). They deliberately keep
-//! different membership *state* (identity-reconciled contributor pk-sets vs. exactly-once
-//! refcounted groups), but the surrounding mechanics are identical and live here so they cannot
-//! drift:
+//! The shared membership kernel — the mechanics of "rows enter/leave a shape because a
+//! *related* table changed", used by the subquery registry (the one membership
+//! implementation; row data lives in Postgres):
 //!
-//!  * **flip detection** over a refcounted group map ([`fold_refcount_flips`]);
-//!  * **candidate-row resolution** with arrangement-snapshot → pooled-Postgres fallback
-//!    ([`query_rows_by_col`], [`query_rows_all`]) — the fallback is what makes a missed or
-//!    unseeded arrangement lookup a slow path instead of a silent move-miss;
+//!  * **candidate-row resolution** from pooled Postgres ([`query_rows_by_col`],
+//!    [`query_rows_all`]) — parallel across the flip-worker pool, bounded by
+//!    `ELECTRIC_DB_POOL_SIZE`;
 //!  * the **latest-row-per-pk fold** used before an absolute membership evaluation
-//!    ([`latest_rows_by_pk`]).
+//!    ([`latest_rows_by_pk`]);
+//!  * [`fold_refcount_flips`], the reference refcount fold the flip-semantics regression test
+//!    pins `SubqueryNode::reconcile_row` against.
 //!
 //! Emission itself is already shared: both paths hand their decided `(Row, ±1)` sets to
 //! [`super::output::translate_output`], whose per-pk grouping (net positive → `upsert`, else
@@ -27,6 +23,8 @@ use crate::subquery::{Flip, FlipDir};
 /// went `≤0 → >0`, `Leave` = `>0 → ≤0`; values whose refcount changes without crossing zero
 /// produce no flip. Callers must feed exactly-once deltas (the sequencer's `(lsn, seq)`
 /// highwater guarantees this) — refcounts, unlike the registry's pk-sets, are not idempotent.
+#[allow(dead_code)] // retained as the reference implementation the flip-semantics regression
+// test pins `SubqueryNode::reconcile_row` against (the two must agree on flips forever).
 pub(crate) fn fold_refcount_flips(
     groups: &mut HashMap<Value, i64>,
     contributions: impl IntoIterator<Item = (Value, ZWeight)>,
@@ -49,22 +47,16 @@ pub(crate) fn fold_refcount_flips(
     flips
 }
 
-/// Query candidate rows where `col = value`: from the dbsp arrangement snapshot when a
-/// `(table, [col])` index exists and is seeded (no I/O beyond dbsp's own storage), else from
-/// Postgres on a pooled connection. Never silently empty: if neither source is available this
-/// is an error, not a skipped move.
+/// Query candidate rows where `col = value` from Postgres on a pooled connection — row data
+/// lives in Postgres, never engine-side. Concurrency is bounded by the shared pool
+/// (`ELECTRIC_DB_POOL_SIZE`); reads see PG-current state, which converges under absolute
+/// per-pk emission exactly as deferred flip propagation always has.
 pub(crate) async fn query_rows_by_col(
-    arr: &Option<crate::arrangements::Arrangements>,
     pg_url: &Option<String>,
     ts: &TableSchema,
     col: usize,
     value: &Value,
 ) -> Result<Vec<Row>> {
-    if let Some(a) = arr {
-        if let Some(rows) = a.lookup(&ts.name, &[col], &Row(vec![value.clone()])) {
-            return Ok(rows);
-        }
-    }
     let url = pg_url.as_deref().context("membership query-back requires postgres")?;
     let client = crate::pg::pool_for(url).get().await?;
     let where_sql =
@@ -72,18 +64,8 @@ pub(crate) async fn query_rows_by_col(
     Ok(crate::pg::backfill_where(&client, ts, Some(where_sql)).await?.rows)
 }
 
-/// Query all rows of `ts` (full re-derive): from the dbsp arrangement scan when available, else
-/// from Postgres on a pooled connection.
-pub(crate) async fn query_rows_all(
-    arr: &Option<crate::arrangements::Arrangements>,
-    pg_url: &Option<String>,
-    ts: &TableSchema,
-) -> Result<Vec<Row>> {
-    if let Some(a) = arr {
-        if let Some(rows) = a.scan(&ts.name) {
-            return Ok(rows);
-        }
-    }
+/// Query all rows of `ts` (full re-derive) from Postgres on a pooled connection.
+pub(crate) async fn query_rows_all(pg_url: &Option<String>, ts: &TableSchema) -> Result<Vec<Row>> {
     let url = pg_url.as_deref().context("membership query-back requires postgres")?;
     let client = crate::pg::pool_for(url).get().await?;
     Ok(crate::pg::backfill_where(&client, ts, None).await?.rows)

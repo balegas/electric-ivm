@@ -128,21 +128,16 @@ impl Engine {
                     st.next_shape_id = st.next_shape_id.max(num + 1);
                 }
                 if rec.is_subquery {
-                    // Circuit-served subquery shapes need no registry state: they re-register
-                    // against the arrangements (seed=false) like any other circuit shape.
-                    let circuit_ok = self.arrangements.lock().unwrap().clone().is_some_and(|arr| {
-                        compiled.get(&rec.table).is_some_and(|ts| {
-                            plan_circuit_shape(rec.where_json.as_ref(), ts, compiled, &arr).is_some()
-                        })
-                    });
-                    if !circuit_ok {
-                        tracing::warn!(
-                            "restore: dropping subquery shape {id} (inner-node state is not persisted);                          subscribers observe the deleted stream and recreate"
-                        );
-                        let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
-                        dead_streams.push(rec.stream_path.clone());
-                        continue;
-                    }
+                    // Subquery shapes are registry-served and their inner-node contributor
+                    // state is not persisted: a fresh-seeded node cannot detect flips that
+                    // happened during downtime (stale move-outs would persist forever), so
+                    // they are dropped loudly and clients recreate them.
+                    tracing::warn!(
+                        "restore: dropping subquery shape {id} (inner-node state is not persisted); subscribers observe the deleted stream and recreate"
+                    );
+                    let _ = self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
+                    dead_streams.push(rec.stream_path.clone());
+                    continue;
                 }
                 st.shapes.insert(id.clone(), rec.clone());
                 if let Some(sig) = sig {
@@ -254,52 +249,6 @@ impl Engine {
                             );
                             return Ok(());
                         }
-                    }
-                }
-                None => {
-                    if let Some(plan) = {
-                        let st = self.state.lock().await;
-                        plan_circuit_shape(rec.where_json.as_ref(), ts, &st.tables, &arr)
-                    } {
-                        let residual = match plan.residual.as_ref() {
-                            Some(r) => Some(Arc::new(CompiledPredicate::compile(r, ts)?)),
-                            None => None,
-                        };
-                        let placement = match &plan.constraint {
-                            PlannedConstraint::All => {
-                                CircuitPlacement { label: "all".into(), col: None, counts: false }
-                            }
-                            PlannedConstraint::Static { col, .. } => CircuitPlacement {
-                                label: format!("static:{}", ts.columns[*col].0),
-                                col: Some(*col),
-                                counts: false,
-                            },
-                            PlannedConstraint::Dynamic { col, .. } => CircuitPlacement {
-                                label: format!("dynamic:{}", ts.columns[*col].0),
-                                col: Some(*col),
-                                counts: false,
-                            },
-                        };
-                        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-                        cmd_tx
-                            .send(SequencerCmd::CreateCircuitShape {
-                                table: rec.table.clone(),
-                                shape_id: rec.id.clone(),
-                                num_id,
-                                stream_path: rec.stream_path.clone(),
-                                constraint: plan.constraint,
-                                residual,
-                                out_cols: out_cols.clone(),
-                                seed: false,
-                                ready: ready_tx,
-                            })
-                            .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
-                        ready_rx
-                            .await
-                            .unwrap_or_else(|_| Err("sequencer dropped".to_string()))
-                            .map_err(|e| anyhow::anyhow!(e))?;
-                        self.state.lock().await.circuit_placement.insert(rec.id.clone(), placement);
-                        return Ok(());
                     }
                 }
                 _ => {}

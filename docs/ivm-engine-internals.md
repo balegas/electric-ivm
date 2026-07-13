@@ -34,10 +34,10 @@ Three layers, one idea — *maintain query results incrementally as the database
                   CLIENT  stream-db + TanStack DB → live materialized set  │
 ```
 
-**The hot path holds no copy of any table.** This is the single most important fact for
-reasoning about cost. State that scales with row count lives in Postgres — or, in the
-always-on circuit's disk-spillable arrangements; the hot path keeps only per-shape
-metadata and, for subqueries, a shared set of *inner-query result values*.
+**The engine holds no copy of any table.** This is the single most important fact for
+reasoning about cost. State that scales with row count lives in Postgres, full stop; the
+engine keeps only per-shape metadata, the counts pipelines' (group → count) relations, and,
+for subqueries, a shared set of *inner-query result values*.
 Baseline engine RSS is ~19 MiB whether the database has 1,000 or 100,000 rows
 (measured by the shape-memory matrix benchmark in `packages/bench`).
 
@@ -46,12 +46,11 @@ Baseline engine RSS is ~19 MiB whether the database has 1,000 or 100,000 rows
 The data model is [`dbsp`](https://crates.io/crates/dbsp)'s: rows carry signed weights and a
 change is a **Z-set delta** (`Row`, a positional `Vec<Value>`; `Tup2<Row, ZWeight>`; and
 `ZWeight`, a signed `i64` multiplicity). The engine runs dbsp at exactly one place — **one
-shared, storage-enabled circuit per engine** (always-on infrastructure, `src/arrangements.rs`)
-that maintains **table arrangements** (pk + declared lookup columns) whose batches spill to
-disk as tables grow, plus **counts pipelines** (a live COUNT per group). It serves subquery
-flip re-derivations from local snapshots instead of Postgres query-backs (with automatic
-Postgres fallback), and serves membership shapes and decomposable COUNT aggregates end to end
-(for shapes whose connecting columns are arrangement-indexed). See `ARCHITECTURE.md` §6b.
+shared, in-memory circuit per engine** (`src/arrangements.rs`) holding **counts pipelines**
+(a live COUNT per group projection, O(distinct groups) state, reseeded each boot from a
+group-aggregated Postgres snapshot). Row data lives in Postgres: subquery flip re-derivations
+and membership move-ins are pooled, parallel Postgres query-backs (`engine/membership.rs`).
+See `ARCHITECTURE.md` §6b.
 
 There are deliberately **no per-shape circuits and no per-shape threads**: the routing and
 fallback tiers are plain Rust — key routing and stateless tri-valued predicate evaluation.
@@ -211,13 +210,9 @@ every change, so a deployment leaning on many such shapes still degrades linearl
 ### 3.3 Subqueries → shared inner-set nodes (`subquery.rs`)
 
 A subquery shape's `WHERE` contains `col [NOT] IN (SELECT proj FROM inner WHERE …)`, possibly
-nested. Single-level non-negated membership subqueries over arrangement-indexed columns are
-served by the always-on circuit instead — seeded from arrangement snapshots, maintained by
-cohort routing in the sequencer (`ARCHITECTURE.md` §6b). The registry described here serves
-everything else: nested, negated, and multi-subquery predicates, and any subquery whose columns
-are not arrangement-indexed. Subqueries are
-inherently cross-table (a change to `inner` moves rows of the outer
-table), so they route through one shared `Arc<Mutex<SubqueryRegistry>>` the sequencer calls.
+nested. The registry serves every subquery form — it is the one membership implementation.
+Subqueries are inherently cross-table (a change to `inner` moves rows of the outer table), so
+they route through one shared `Arc<Mutex<SubqueryRegistry>>` the sequencer calls.
 
 **Node — the shared, maintained inner set.** A `SubqueryNode` materializes
 `SELECT proj FROM inner WHERE pred` as a value set, keyed by a canonical signature
@@ -246,10 +241,12 @@ subqueries).
 2. **For each flipped value `v` of node `N`:** for every edge on `N`, the affected dependent
    rows are exactly those with `col = v`. Query them (`SELECT … WHERE col = v`) and either
    reconcile a parent node (recurse) or re-evaluate the outer shape predicate. This propagation
-   runs **deferred, on the engine's single flip-propagator task** — the sequencer only collects the
-   flips; the query-backs neither block it nor hold the registry lock (evaluation and the
-   resulting append still happen atomically under it). The in-flight flip count is the extra
-   convergence-barrier term (`GET /replication/lsn` → `pendingFlips`).
+   runs **deferred, on a semaphore-bounded worker pool** (`ELECTRIC_IVM_FLIP_WORKERS`) — the
+   sequencer only collects the flips; the query-backs run concurrently against pooled Postgres
+   and never hold the registry lock. Evaluation and the **enqueue** of the resulting envelopes
+   happen atomically under the lock, and per-stream FIFO emission lanes make append order equal
+   eval order per shape. The in-flight count (flips + enqueued-but-unlanded batches) is the
+   extra convergence-barrier term (`GET /replication/lsn` → `pendingFlips`).
 3. **`table` is a SubqueryShape's outer table:** evaluate the shape filter on the delta with
    `matches_ctx` (subquery leaves consult node sets) — the normal enter/leave/update path.
 
@@ -406,29 +403,26 @@ dominate.
 
 ### 4.5 Disk
 
-Disk holds exactly one kind of engine state: the circuit's. The circuit is always on, and
-dbsp spills arrangement batches to Snappy-compressed layer files as tables grow and
-checkpoints the circuit periodically, so table-scale state is disk-resident and RAM-bounded
-(`ELECTRIC_IVM_DBSP_MIN_STORAGE_KB` / `_CACHE_MIB` / `_MAX_RSS_MB`; `ARCHITECTURE.md` §6b).
-The hot path itself pages nothing: per-shape routing metadata, subquery contributor sets, and
-running aggregates are its only retained structures, and they are small (§4.2).
+The engine holds **no disk state of its own**: row data lives in Postgres, and the circuit's
+counts pipelines are in-memory (O(distinct groups)), reseeded on boot from a group-aggregated
+Postgres snapshot (`ARCHITECTURE.md` §6b). Per-shape routing metadata, subquery contributor
+sets, and running aggregates are the only retained structures, and they are small (§4.2).
 
 What IS durable is the **shape catalog** (`meta/catalog`, an append-only durable stream of
 create/join/leave/drop events plus change-log offset checkpoints): at boot the engine replays
 it and re-registers its shapes itself, so a restart is not a client re-registration storm.
 Plain/routed shapes resume with passthrough gates and replay the change log from the persisted
 offset (crash-window re-emission is idempotent absolute upserts); aggregates re-seed their fold
-from a fresh Postgres snapshot whose gate then skips the replayed history. Circuit-served
-shapes re-register against the restored circuit without reseeding (the circuit checkpoints
-its own state and replay position — `ARCHITECTURE.md` §6b). Registry subquery shapes are
+from a fresh Postgres snapshot whose gate then skips the replayed history (circuit-served
+COUNTs re-seed from the reseeded counts pipelines). Subquery shapes are
 deliberately NOT restored — their inner-node contributor state is not persisted, and a
 fresh-seeded node cannot detect flips that happened while the engine was down (stale move-outs
 would persist forever) — so they are dropped loudly and clients recreate them. The catalog
 stream is never compacted (append-only); if event volume ever matters, snapshot+truncate or an
 embedded KV (redb/lmdb/sled) is the natural next step.
 
-In short: **the memory story is "keep nothing big resident"** — the hot path holds nothing
-table-scale, and the circuit spills what is.
+In short: **the memory story is "keep nothing big resident"** — nothing the engine holds
+scales with table size; everything row-scale lives in Postgres.
 
 ---
 
@@ -531,9 +525,9 @@ executors via a trait so presentation cannot drift from execution.
 
 | path | role |
 |---|---|
-| `apps/engine/src/engine/` | the engine module: `mod.rs` (the `Engine` handle + shared state), `sequencer.rs` (the LSN-ordered sequencer, (lsn,seq) de-dup, per-txn reliable flush), `lifecycle.rs` (shape creation/sharing/retention), `circuit_serving.rs` (circuit-tier serving), `executors.rs` (routers, filters, folds), `planning.rs` (circuit placement), `catalog.rs` (durable catalog + restore), `introspection.rs` (graph/state DTOs + builders), `membership.rs` (the shared membership kernel: flip detection, arrangement→Postgres query-backs — used by both circuit cohort serving and the subquery registry), `output.rs` (envelope ⇄ delta codec) |
+| `apps/engine/src/engine/` | the engine module: `mod.rs` (the `Engine` handle + shared state), `sequencer.rs` (the LSN-ordered sequencer, (lsn,seq) de-dup, per-txn reliable flush), `lifecycle.rs` (shape creation/sharing/retention), `circuit_serving.rs` (circuit-tier serving), `executors.rs` (routers, filters, folds), `planning.rs` (circuit placement), `catalog.rs` (durable catalog + restore), `introspection.rs` (graph/state DTOs + builders), `membership.rs` (the shared membership kernel: flip detection, pooled Postgres query-backs), `emission.rs` (per-stream ordered emission lanes), `output.rs` (envelope ⇄ delta codec) |
 | `apps/engine/src/subquery.rs` | cross-table subquery registry: shared nodes, edges, flips, absolute emission, atomic create/rollback |
-| `apps/engine/src/arrangements.rs` | the circuit: storage-backed table arrangements + counts pipelines, checkpoints, snapshot lookups |
+| `apps/engine/src/arrangements.rs` | the circuit: in-memory dbsp counts pipelines, group-aggregated boot seeding |
 | `apps/engine/src/replication.rs` | Postgres logical-replication ingestor (streaming pgoutput via the `pgoutput.rs` decoder, buffer per-txn, stamp commit LSN + xid + seq, append, acknowledge) |
 | `apps/engine/src/pg.rs` | connect/introspect, `REPLICA IDENTITY FULL`, slot create, predicate-pushdown backfill + `SnapshotGate`, subset query-back |
 | `apps/engine/src/predicate.rs` | predicate compile, three-valued `matches`/`matches_ctx`, `equality_template`, subquery signatures |

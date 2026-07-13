@@ -137,10 +137,9 @@ fn node_states_cover_every_node_kind() {
     emitted.insert("s1".to_string(), 4u64);
     emitted.insert("s2".to_string(), 7u64);
 
-    let circuit_shapes = HashMap::new();
     let circuit_aggs = HashMap::new();
     let m = build_node_states(
-        &ts, "12", 42, &shapes, &families, &family_of, &aggregates, &circuit_shapes, &circuit_aggs, &emitted,
+        &ts, "12", 42, &shapes, &families, &family_of, &aggregates, &circuit_aggs, &emitted,
     );
 
     assert_eq!(
@@ -252,102 +251,68 @@ async fn graph_omits_arrangements_when_off() {
 
 /// With the dbsp layer running, `/graph` carries the compiled pipeline — one input per table,
 /// one index pipeline per spec (stable ids using column NAMES), seeded flags, lookup
-/// counters — and connects each registered subquery dependent to the index that serves its
-/// flip re-derivations. Dependents without a matching index yield no consumer, and seeding
-/// flips the flags on the next snapshot.
+/// pipelines and their consumers (circuit-served COUNT aggregates via placements). Row
+/// arrangements no longer exist, so `indexes` is always empty and seeding flags flip on the
+/// next snapshot after `finish_seed`.
 #[tokio::test(flavor = "multi_thread")]
-async fn graph_includes_arrangement_pipeline_and_consumers() {
+async fn graph_includes_counts_pipeline_and_consumers() {
     let ts = users(); // columns sorted: active(0), id(1), name(2); pk = id
-    let dir = std::env::temp_dir().join(format!("arr-graph-test-{}", uuid::Uuid::new_v4()));
-    let arr = crate::arrangements::Arrangements::start(
-        crate::arrangements::ArrangementsConfig {
-            dir: dir.clone(),
-            checkpoint_every: None,
-            ..crate::arrangements::ArrangementsConfig::default()
-        },
-        vec![
-            crate::arrangements::IndexSpec { table: "users".into(), cols: vec![1] }, // pk (id)
-            crate::arrangements::IndexSpec { table: "users".into(), cols: vec![2] }, // name
-        ],
-        vec![],
-    )
+    let arr = crate::arrangements::Arrangements::start(vec![crate::arrangements::CountSpec {
+        table: "users".into(),
+        group_cols: vec![0], // active
+    }])
     .unwrap();
 
     let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
     engine.state.lock().await.tables.insert("users".into(), ts.clone());
     *engine.arrangements.lock().unwrap() = Some(arr.clone());
-
-    // Register one subquery node, one dependent shape, and three edges: two on indexed
-    // columns (name → shape, id → parent node) and one on an unindexed column (active).
-    {
-        let mut reg = engine.subqueries.lock().await;
-        let sig: crate::predicate::SubquerySig = "users|name|".into();
-        let pred = Arc::new(CompiledPredicate::compile_opt(None, &ts).unwrap());
-        let mut node = crate::subquery::SubqueryNode::new(sig.clone(), "users".into(), 2, 1, pred.clone());
-        node.refcount = 1;
-        reg.nodes.insert(sig.clone(), node);
-        reg.shapes.insert(
-            "s1".into(),
-            crate::subquery::SubqueryShape {
-                shape_id: "s1".into(),
-                outer_table: "users".into(),
-                stream_path: "shape/s1".into(),
-                pred,
-                out_cols: None,
-                gate: crate::pg::SnapshotGate::passthrough(),
-                emitted: std::sync::atomic::AtomicU64::new(0),
-            },
-        );
-        let edge = |dependent, connecting_col| crate::subquery::Edge {
-            node_sig: sig.clone(),
-            dependent,
-            connecting_col,
-            negated: false,
-            null_sensitive: false,
-        };
-        reg.edges.push(edge(crate::subquery::Dependent::Shape("s1".into()), 2)); // name: indexed
-        reg.edges.push(edge(crate::subquery::Dependent::Node(sig.clone()), 1)); // id: indexed
-        reg.edges.push(edge(crate::subquery::Dependent::Shape("s1".into()), 0)); // active: not indexed
-    }
+    // A counts-served aggregate placement: the consumer edge for the visualizer.
+    engine.state.lock().await.circuit_placement.insert(
+        "s9".into(),
+        CircuitPlacement { label: "counts".into(), col: None, counts: true },
+    );
+    engine.state.lock().await.shapes.insert(
+        "s9".into(),
+        ShapeRecord {
+            id: "s9".into(),
+            table: "users".into(),
+            stream_path: "shape/s9".into(),
+            changes_only: false,
+            where_json: None,
+            columns: None,
+            family_key: None,
+            is_subquery: false,
+            aggregate: Some(AggInfo { func: AggFn::Count, col: None }),
+        },
+    );
 
     let g = engine.graph().await;
     let a = g.arrangements.as_ref().expect("arrangements section present");
     assert_eq!(a.inputs.len(), 1);
     assert_eq!(a.inputs[0].id, "arr:input:users");
     assert!(!a.inputs[0].seeded, "unseeded until finish_seed");
-    let index_ids: Vec<&str> = a.indexes.iter().map(|i| i.id.as_str()).collect();
-    assert_eq!(index_ids, vec!["arr:index:users:id", "arr:index:users:name"]);
-    assert!(a.indexes.iter().all(|i| i.input == "arr:input:users" && !i.seeded));
-    assert_eq!(a.indexes[1].cols, vec!["name".to_string()]);
-    // Exactly the two indexed dependents become consumers (sorted by index id).
-    assert_eq!(a.consumers.len(), 2, "unindexed 'active' edge must not appear: {:?}", a.consumers);
-    assert_eq!(a.consumers[0].index, "arr:index:users:id");
-    assert_eq!(a.consumers[0].dependent_kind, "node");
-    assert_eq!(a.consumers[1].index, "arr:index:users:name");
-    assert_eq!(a.consumers[1].dependent_kind, "shape");
-    assert_eq!(a.consumers[1].dependent_id, "s1");
-    assert_eq!(a.consumers[1].connecting_col, "name");
+    assert!(a.indexes.is_empty(), "row arrangements no longer exist");
+    assert_eq!(a.counts.len(), 1);
+    assert_eq!(a.counts[0].id, "arr:counts:users");
+    assert_eq!(a.counts[0].group_cols, vec!["active".to_string()]);
+    assert_eq!(a.consumers.len(), 1);
+    assert_eq!(a.consumers[0].index, "arr:counts:users");
+    assert_eq!(a.consumers[0].dependent_kind, "circuit-agg");
+    assert_eq!(a.consumers[0].dependent_id, "s9");
     // Wire format: camelCase keys under the `arrangements` section.
     let v = serde_json::to_value(&g).unwrap();
-    assert_eq!(v["arrangements"]["indexes"][1]["id"], "arr:index:users:name");
-    assert_eq!(v["arrangements"]["consumers"][1]["dependentKind"], "shape");
-    assert_eq!(v["arrangements"]["consumers"][1]["connectingCol"], "name");
-    assert_eq!(v["arrangements"]["served"], 0);
-    assert_eq!(v["arrangements"]["fallback"], 0);
+    assert_eq!(v["arrangements"]["counts"][0]["id"], "arr:counts:users");
+    assert_eq!(v["arrangements"]["consumers"][0]["dependentKind"], "circuit-agg");
 
-    // Seed the table: the next snapshot reports seeded (and served counts a lookup).
-    arr.seed_chunk("users", vec![Row(vec![Value::Bool(true), Value::Int(1), Value::Text("a".into())])])
-        .await
-        .unwrap();
+    // Seed the counts: the next snapshot reports seeded.
+    arr.seed_groups("users", vec![(Row(vec![Value::Bool(true)]), 3)]).await.unwrap();
     arr.finish_seed("users");
-    assert!(arr.lookup("users", &[2], &Row(vec![Value::Text("a".into())])).is_some());
+    assert_eq!(arr.count_groups("users"), Some(vec![(Row(vec![Value::Bool(true)]), 3)]));
     let g2 = engine.graph().await;
     let a2 = g2.arrangements.as_ref().unwrap();
-    assert!(a2.inputs[0].seeded && a2.indexes.iter().all(|i| i.seeded));
-    assert_eq!(a2.served, 1);
+    assert!(a2.inputs[0].seeded && a2.counts[0].seeded);
 
     arr.shutdown().await;
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// Wire format: summaries are kind-tagged camelCase objects, and a `StateEvent` wraps them
@@ -409,115 +374,6 @@ fn dump_node_family_and_aggregate() {
     assert_eq!(v["multisetLen"], 2);
     assert_eq!(v["multiset"][0]["value"], 3);
     assert_eq!(v["multiset"][0]["weight"], 1);
-}
-
-/// Planner coverage: which predicates are circuit-servable, and how they decompose.
-#[tokio::test(flavor = "multi_thread")]
-async fn circuit_shape_planner() {
-    let ts = users(); // columns sorted: active(0), id(1), name(2); pk = id
-    let members: TableSchema = {
-        let def: TableDef = serde_json::from_value(serde_json::json!({
-            "columns": { "id": {"type":"int"}, "user_id": {"type":"int"}, "proj": {"type":"int"} },
-            "primaryKey": "id"
-        }))
-        .unwrap();
-        TableSchema::from_def("members", &def).unwrap()
-    };
-    let dir = std::env::temp_dir().join(format!("plan-test-{}", uuid::Uuid::new_v4()));
-    let arr = crate::arrangements::Arrangements::start(
-        crate::arrangements::ArrangementsConfig {
-            dir: dir.clone(),
-            checkpoint_every: None,
-            ..crate::arrangements::ArrangementsConfig::default()
-        },
-        vec![
-            crate::arrangements::IndexSpec { table: "users".into(), cols: vec![1] }, // id (pk)
-            crate::arrangements::IndexSpec { table: "users".into(), cols: vec![2] }, // name
-            crate::arrangements::IndexSpec { table: "members".into(), cols: vec![ *members.index.get("user_id").unwrap() ] },
-        ],
-        vec![],
-    )
-    .unwrap();
-    let mut schemas = HashMap::new();
-    schemas.insert("users".to_string(), ts.clone());
-    schemas.insert("members".to_string(), members.clone());
-    let p = |j: serde_json::Value| -> PredicateJson { serde_json::from_value(j).unwrap() };
-
-    // match-all and static equality stay on the legacy tiers (KeyRouter/standalone route
-    // them by index; a circuit shape would scan linearly per delta): no plan.
-    assert!(plan_circuit_shape(None, &ts, &schemas, &arr).is_none());
-    assert!(plan_circuit_shape(
-        Some(&p(serde_json::json!({"col":"name","op":"eq","value":"a"}))),
-        &ts, &schemas, &arr,
-    )
-    .is_none());
-    assert!(plan_circuit_shape(
-        Some(&p(serde_json::json!({"and":[
-            {"or":[{"col":"name","op":"eq","value":"a"},{"col":"name","op":"eq","value":"b"}]},
-            {"col":"active","op":"eq","value":true}
-        ]}))),
-        &ts, &schemas, &arr,
-    )
-    .is_none());
-
-    // single-level dynamic IN over indexed columns
-    let plan = plan_circuit_shape(
-        Some(&p(serde_json::json!({"col":"name","in":{"table":"members","project":"proj",
-            "where":{"col":"user_id","op":"eq","value":7}}}))),
-        &ts, &schemas, &arr,
-    )
-    .unwrap();
-    match &plan.constraint {
-        PlannedConstraint::Dynamic { col, inner_table, inner_key, .. } => {
-            assert_eq!(*col, 2);
-            assert_eq!(inner_table, "members");
-            assert_eq!(inner_key, &Value::Int(7));
-        }
-        other => panic!("expected Dynamic, got {other:?}"),
-    }
-
-    // dynamic IN + residual conjuncts (the board/search template): Dynamic + residual
-    let plan = plan_circuit_shape(
-        Some(&p(serde_json::json!({"and":[
-            {"col":"name","in":{"table":"members","project":"proj",
-                "where":{"col":"user_id","op":"eq","value":7}}},
-            {"col":"active","op":"eq","value":true}
-        ]}))),
-        &ts, &schemas, &arr,
-    )
-    .unwrap();
-    assert!(matches!(plan.constraint, PlannedConstraint::Dynamic { .. }));
-    assert!(plan.residual.is_some());
-
-    // negated IN → registry fallback
-    assert!(plan_circuit_shape(
-        Some(&p(serde_json::json!({"col":"name","negated":true,"in":{"table":"members","project":"proj",
-            "where":{"col":"user_id","op":"eq","value":7}}}))),
-        &ts, &schemas, &arr,
-    )
-    .is_none());
-
-    // nested IN (inner where is itself a subquery) → registry fallback
-    assert!(plan_circuit_shape(
-        Some(&p(serde_json::json!({"col":"name","in":{"table":"members","project":"proj",
-            "where":{"col":"proj","in":{"table":"members","project":"proj",
-                "where":{"col":"user_id","op":"eq","value":1}}}}}))),
-        &ts, &schemas, &arr,
-    )
-    .is_none());
-
-    // two IN leaves → fallback (the constraint slot takes one; the second cannot be residual)
-    assert!(plan_circuit_shape(
-        Some(&p(serde_json::json!({"and":[
-            {"col":"name","in":{"table":"members","project":"proj","where":{"col":"user_id","op":"eq","value":1}}},
-            {"col":"name","in":{"table":"members","project":"proj","where":{"col":"user_id","op":"eq","value":2}}}
-        ]}))),
-        &ts, &schemas, &arr,
-    )
-    .is_none());
-
-    arr.shutdown().await;
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -1071,4 +927,76 @@ fn agg_index_candidates_prune() {
     idx.remove("agg-eq");
     let c: HashSet<String> = idx.candidates(&[Tup2(row("alice"), 1)]).into_iter().collect();
     assert!(!c.contains("agg-eq"));
+}
+
+// --- emission lanes: per-stream ordering + barrier accounting --------------------------------
+
+/// THE ordering regression test for the emission lanes: batches enqueued for one stream land
+/// in enqueue order (append order = evaluation order — the "data in the right place"
+/// invariant), interleaved streams don't perturb each other, and the shared pending counter
+/// (the pendingFlips barrier term) drains to zero only after every append has landed.
+#[tokio::test(flavor = "multi_thread")]
+async fn emission_lanes_order_and_barrier() {
+    use axum::extract::State;
+    use std::sync::Mutex as StdMutex;
+
+    // Minimal durable-streams stub: record every POST body per path, in arrival order.
+    type Log = Arc<StdMutex<Vec<(String, String)>>>;
+    let log: Log = Arc::new(StdMutex::new(Vec::new()));
+    let app = axum::Router::new()
+        .route(
+            "/{*path}",
+            axum::routing::post(
+                |State(log): State<Log>, axum::extract::Path(path): axum::extract::Path<String>, body: String| async move {
+                    log.lock().unwrap().push((path, body));
+                    axum::http::StatusCode::NO_CONTENT
+                },
+            ),
+        )
+        .with_state(log.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let ds = crate::ds::DsClient::new(&format!("http://{addr}"));
+    let pending = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let lanes = emission::EmissionLanes::spawn(ds, 4, pending.clone());
+
+    // Same stream always hashes to the same lane (structural precondition for ordering).
+    assert_eq!(lanes.lane_for("shape/a"), lanes.lane_for("shape/a"));
+
+    let env = |i: usize| Envelope {
+        type_: "t".into(),
+        key: format!("{i}"),
+        value: None,
+        old: None,
+        headers: EnvelopeHeaders { operation: "upsert".into(), txid: None, offset: None, lsn: None, seq: None },
+    };
+    // Interleave two streams; per-stream order must survive whatever lane assignment they get.
+    for i in 0..50 {
+        lanes.enqueue("shape/a", vec![env(i)]);
+        lanes.enqueue("shape/b", vec![env(i)]);
+    }
+    assert!(pending.load(Ordering::SeqCst) > 0, "barrier must cover queued batches");
+
+    // Drain: the barrier is the only signal a caller has — poll it like the harness does.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while pending.load(Ordering::SeqCst) != 0 {
+        assert!(std::time::Instant::now() < deadline, "lanes did not drain");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    let entries = log.lock().unwrap().clone();
+    assert_eq!(entries.len(), 100);
+    for stream in ["shape/a", "shape/b"] {
+        let keys: Vec<usize> = entries
+            .iter()
+            .filter(|(p, _)| p == stream)
+            .map(|(_, body)| {
+                let v: Vec<serde_json::Value> = serde_json::from_str(body).unwrap();
+                v[0]["key"].as_str().unwrap().parse::<usize>().unwrap()
+            })
+            .collect();
+        assert_eq!(keys, (0..50).collect::<Vec<_>>(), "{stream} landed out of enqueue order");
+    }
 }

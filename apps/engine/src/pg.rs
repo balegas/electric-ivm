@@ -411,6 +411,65 @@ async fn backfill_where_in_txn(
     Ok(Backfill { rows: out, seed_lsn, gate })
 }
 
+/// Group-count seed for a counts pipeline: `SELECT <group cols>, count(*) … GROUP BY` under a
+/// `REPEATABLE READ` snapshot — O(distinct groups) rather than O(rows) — with the same
+/// visibility fences as a row backfill. Returned rows are full-width with only the group
+/// columns populated (the counts pipeline projects exactly those positions); text-mapped
+/// columns are cast `::text` for live-path byte identity.
+pub async fn backfill_group_counts(
+    client: &Client,
+    ts: &TableSchema,
+    group_cols: &[usize],
+) -> Result<(Vec<(Row, i64)>, SnapshotGate)> {
+    client
+        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .await
+        .context("begin counts seed snapshot")?;
+    let result = group_counts_in_txn(client, ts, group_cols).await;
+    client.batch_execute("COMMIT").await.ok();
+    result
+}
+
+async fn group_counts_in_txn(
+    client: &Client,
+    ts: &TableSchema,
+    group_cols: &[usize],
+) -> Result<(Vec<(Row, i64)>, SnapshotGate)> {
+    let fence = client
+        .query_one("select pg_current_wal_lsn()::text, pg_current_snapshot()::text", &[])
+        .await?;
+    let seed_lsn: String = fence.get(0);
+    let snap: String = fence.get(1);
+    let gate = SnapshotGate::parse(&snap, &seed_lsn);
+    let mut args = Vec::new();
+    let mut by = Vec::new();
+    for &i in group_cols {
+        let (name, ty) = ts.columns.get(i).with_context(|| format!("group col {i} out of range"))?;
+        let lit = format!("'{}'", name.replace('\'', "''"));
+        let qi = quote_ident(name);
+        match ty {
+            ColumnType::Text => args.push(format!("{lit}, t.{qi}::text")),
+            _ => args.push(format!("{lit}, to_jsonb(t.{qi})")),
+        }
+        by.push(format!("t.{qi}"));
+    }
+    let q = format!(
+        "select jsonb_build_object({}), count(*)::bigint from {} t group by {}",
+        args.join(", "),
+        quote_ident(&ts.name),
+        by.join(", ")
+    );
+    let rows = client.query(&q, &[]).await.with_context(|| format!("counts seed select {}", ts.name))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let j: serde_json::Value = r.get(0);
+        let obj = j.as_object().context("counts seed expr did not return an object")?;
+        // Missing (non-group) columns default to Null — the pipeline projects only group cols.
+        out.push((ts.row_from_json(obj)?, r.get::<_, i64>(1)));
+    }
+    Ok((out, gate))
+}
+
 /// The per-row JSON projection used by backfill and subset query-backs. Text-mapped columns are cast
 /// with `::text` so the value is Postgres's *text output* — the same representation `test_decoding`
 /// prints on the live path. `to_jsonb(t)` would instead give e.g. ISO-8601 `T`-form timestamps and

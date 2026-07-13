@@ -53,17 +53,17 @@ scales with the size of the *change*, not the size of the *data*.
 electric-ivm is built on this model. Every replicated change becomes a Z-set delta (Postgres's
 `REPLICA IDENTITY FULL` supplies the old row, so updates retract precisely), and every shape,
 subquery, and aggregation is an incremental operator over those deltas. The engine serves them
-from **three tiers**. One shared, storage-enabled dbsp **circuit** — always-on infrastructure —
-maintains per-table arrangements and counts pipelines whose state spills to disk as tables
-grow; it seeds and maintains membership (visibility-subquery) shapes and decomposable COUNT
-aggregates entirely from local snapshots — no Postgres backfill. Equality and template shapes
-go to the **routing tier** — key routers and conjunct indexes in plain Rust — because an
-indexed route beats a linear delta scan. Everything else lands on the **fallback**: stateless
-three-valued filters and the shared subquery registry, which serves any predicate. The hot
-path keeps **no copy of any table**: engine RSS is ~19 MiB whether the database has 1k or
-100k rows, +~0.8 KiB per shape (measured by the shape-memory matrix benchmark in
-`packages/bench`); the circuit's table state is disk-spillable and bounded — see
-`docs/ARCHITECTURE.md` §6b.
+from **three tiers**. One shared dbsp **circuit** — always-on infrastructure — maintains
+in-memory **counts pipelines** (a live COUNT per group, reseeded on boot from one
+group-aggregated Postgres snapshot per table) and serves decomposable COUNT aggregates from
+them. Equality and template shapes go to the **routing tier** — key routers and conjunct
+indexes in plain Rust — because an indexed route beats a linear delta scan. Everything else
+lands on the **fallback**: stateless three-valued filters and the shared subquery registry,
+which serves any predicate — including every membership (visibility) subquery, with pooled
+Postgres query-backs. The engine keeps **no copy of any table**: engine RSS is ~19 MiB
+whether the database has 1k or 100k rows, +~0.8 KiB per shape (measured by the shape-memory
+matrix benchmark in `packages/bench`); the circuit's state is O(distinct count groups), in
+memory — see `docs/ARCHITECTURE.md` §6b.
 
 ## A shape as a DBSP pipeline
 
@@ -150,8 +150,9 @@ todos ─┬─ map_index(list_id) ───────────────
 ```
 
 "Todos of all my lists" is the union of `todos_by_list` groups for the user's memberships;
-joining a list is a `memberships_by_user` delta that subscribes the client to one more group
-and replays its log — move-in with no computation. `todos WHERE list_id IN (3,7,9)` is three
+joining a list is a `memberships_by_user` delta that flips the list into the user's inner set
+and pulls its todos in — move-in driven by the membership delta, one bounded query-back.
+`todos WHERE list_id IN (3,7,9)` is three
 routing entries over the same pipeline; a thousand such combinations cost the circuit nothing.
 `title LIKE '%urgent%'` matches no template and is served by the fallback, immediately.
 
@@ -203,7 +204,7 @@ pnpm demo:linearlite    # the flagship demo — builds the engine on first run
 ```
 
 One command boots everything (ephemeral Postgres, durable-streams, the engine) and serves the
-**LinearLite app and the pipeline explorer side by side** — write in one, watch the circuit maintain
+**LinearLite app and the pipeline explorer side by side** — write in one, watch the engine maintain
 your shapes live in the other:
 
 | | URL |
@@ -254,8 +255,8 @@ ELECTRIC_IVM_ENGINE_URL=http://127.0.0.1:<engine-port> VIZ_PORT=5180 \
 
 **`examples/linearlite` — the flagship demo app (TS).** A Linear-style issue tracker synced
 entirely through shapes (visibility subqueries, live counts, subset pagination). The demo
-launches the engine with the full circuit configuration by default (arrangements, counts, and
-serving — see `docs/linearlite-circuit-design.md`): `pnpm demo:linearlite`, or
+launches the engine with the circuit's counts pipeline configured by default (the live
+browse-header COUNT — see `docs/linearlite-circuit-design.md`): `pnpm demo:linearlite`, or
 `scripts/linearlite.sh start large` for a 100k-issue workload.
 
 **`examples/web` — the minimal example (TS).** The smallest end-to-end app using the extended

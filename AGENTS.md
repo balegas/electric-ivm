@@ -11,7 +11,7 @@ the project is growing toward).
 
 | Path | What |
 |---|---|
-| `apps/engine` | Rust engine. Key files: `engine/` (the engine module — `sequencer.rs` the LSN-ordered sequencer, `lifecycle.rs` shape creation/sharing/retention, `circuit_serving.rs` circuit-tier serving, `executors.rs` routers/filters/folds, `planning.rs` circuit placement, `catalog.rs` durable catalog, `introspection.rs` graph/state, `membership.rs` the shared membership kernel (flips, query-backs), `output.rs` envelope codec, `mod.rs` the `Engine` handle), `arrangements.rs` (the circuit: table arrangements + counts pipelines, checkpoints), `subquery.rs` (cross-table registry: shared inner-set nodes, flips, absolute emission), `replication.rs` (streaming pgoutput ingestor) + `pgoutput.rs` (message decoder), `pg.rs` (backfill + `SnapshotGate`), `electric.rs` (`/v1/shape`), `where_sql.rs`/`sql.rs` (SQL⇄predicate), `ds.rs` (streams client incl. `append_reliable`). |
+| `apps/engine` | Rust engine. Key files: `engine/` (the engine module — `sequencer.rs` the LSN-ordered sequencer, `lifecycle.rs` shape creation/sharing/retention, `circuit_serving.rs` circuit-tier serving, `executors.rs` routers/filters/folds, `planning.rs` circuit placement, `catalog.rs` durable catalog, `introspection.rs` graph/state, `membership.rs` the shared membership kernel (flips, query-backs), `output.rs` envelope codec, `mod.rs` the `Engine` handle), `arrangements.rs` (the circuit: in-memory counts pipelines, group-aggregated boot seeding), `subquery.rs` (cross-table registry: shared inner-set nodes, flips, absolute emission), `replication.rs` (streaming pgoutput ingestor) + `pgoutput.rs` (message decoder), `pg.rs` (backfill + `SnapshotGate`), `electric.rs` (`/v1/shape`), `where_sql.rs`/`sql.rs` (SQL⇄predicate), `ds.rs` (streams client incl. `append_reliable`). |
 | `apps/api` | tRPC API (`router.ts`) over the engine + durable-streams (`core.ts`). |
 | `packages/protocol` | Shared types + the change-event envelope (`types.ts`, `envelope.ts`). |
 | `packages/client` | Browser client: `shape()`, `subset()` (see `subset.ts` — LSN watermarks + tombstones), `aggregate()`. All lifecycles tracked; `close()` is one-shot and deletes server-side with retry. |
@@ -62,13 +62,12 @@ The recipe for capturing an app's query set in one circuit:
    the cohort key **partitions** the table (a row lives in exactly one group) — overlapping
    groups would double-emit and need dedup at the edge. Genuinely per-user predicates
    (`username = $me`) get their own keyed feed — same pattern, cohort of size one.
-3. **Visibility relations become the delivery router**, not a join input: a membership
-   table's deltas drive subscribe/unsubscribe to cohort groups, and move-in/move-out read
-   the post-transaction arrangement snapshots (no Postgres snapshot, no xmin fencing, no
-   flip query-backs).
-4. **Linear operators are free** (filter / project / `map_index`); **joins and aggregates
-   knowingly** — a join stores both inputs (acceptable with storage-backed spilling; see
-   `ARCHITECTURE.md` §6b), and `aggregate_linear` (COUNT/SUM) is cheap. Aggregate at the
+3. **Visibility relations drive membership through the registry**: a membership table's
+   deltas flip shared inner-set nodes, and move-in/move-out are parallel pooled Postgres
+   query-backs with absolute per-pk emission through ordered lanes (row data lives in
+   Postgres — there are no local row snapshots to read).
+4. **Linear operators are free** (filter / project / `map_index`); **aggregates knowingly** —
+   counts pipelines hold O(distinct groups) in memory (`ARCHITECTURE.md` §6b). Aggregate at the
    finest useful group grain and let the reader sum groups, so one pipeline serves every
    filter combination.
 5. **Structure ships with deploys.** New templates = circuit rebuild + reseed (layout

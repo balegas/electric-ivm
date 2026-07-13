@@ -426,50 +426,27 @@ pub(crate) fn circuit_ops(
     (ops, edges)
 }
 
-/// The compiled dbsp arrangement pipeline as graph nodes, plus its live consumers. The circuit is
-/// static (built at boot), so the inputs/indexes are stable across snapshots — stable ids let the
-/// visualizer keep them parked while shapes come and go. `dependents` is each registered subquery
-/// edge resolved to `(kind, id, queried table, connecting-column index)`; a dependent becomes a
-/// consumer of the `(table, [col])` index iff that index exists in the compiled circuit — exactly
-/// the condition under which `query_candidates` serves its flip re-derivations from the layer.
+/// The compiled dbsp counts pipelines as graph nodes, plus their live consumers
+/// (circuit-served COUNT aggregates). Row arrangements no longer exist — row data lives in
+/// Postgres — so `indexes` is always empty and the lookup counters are gone (kept as zeros
+/// for payload stability with the visualizer).
 pub(crate) fn arrangement_graph(
     arr: &crate::arrangements::Arrangements,
-    dependents: &[(&'static str, String, String, usize)],
     placements: &[(String, String, CircuitPlacement)],
     col_name: &impl Fn(&str, usize) -> String,
 ) -> ArrangementGraph {
-    let (served, fallback) = arr.counters();
-    let specs = arr.index_specs(); // sorted: deterministic node order across snapshots
     let input_id = |table: &str| format!("arr:input:{table}");
-    let index_id = |table: &str, cols: &[usize]| {
-        let names: Vec<String> = cols.iter().map(|&c| col_name(table, c)).collect();
-        format!("arr:index:{table}:{}", names.join(","))
-    };
-
-    let mut inputs: Vec<ArrInput> = Vec::new();
-    for spec in &specs {
-        if !inputs.iter().any(|i| i.table == spec.table) {
-            inputs.push(ArrInput {
-                id: input_id(&spec.table),
-                table: spec.table.clone(),
-                seeded: arr.is_seeded(&spec.table),
-            });
-        }
-    }
-    let indexes: Vec<ArrIndex> = specs
+    let count_specs = arr.count_specs(); // sorted: deterministic node order across snapshots
+    let inputs: Vec<ArrInput> = count_specs
         .iter()
-        .map(|spec| ArrIndex {
-            id: index_id(&spec.table, &spec.cols),
-            input: input_id(&spec.table),
-            table: spec.table.clone(),
-            cols: spec.cols.iter().map(|&c| col_name(&spec.table, c)).collect(),
-            seeded: arr.is_seeded(&spec.table),
+        .map(|c| ArrInput {
+            id: input_id(&c.table),
+            table: c.table.clone(),
+            seeded: arr.is_seeded(&c.table),
         })
         .collect();
-
-    let counts: Vec<ArrCounts> = arr
-        .count_specs()
-        .into_iter()
+    let counts: Vec<ArrCounts> = count_specs
+        .iter()
         .map(|c| ArrCounts {
             id: format!("arr:counts:{}", c.table),
             input: input_id(&c.table),
@@ -478,51 +455,20 @@ pub(crate) fn arrangement_graph(
             seeded: arr.is_seeded(&c.table),
         })
         .collect();
-
-    let mut consumers: Vec<ArrConsumer> = dependents
+    let mut consumers: Vec<ArrConsumer> = placements
         .iter()
-        .filter(|(_, _, table, col)| arr.has_index(table, &[*col]))
-        .map(|(kind, dep_id, table, col)| ArrConsumer {
-            index: index_id(table, &[*col]),
-            dependent_kind: kind.to_string(),
-            dependent_id: dep_id.clone(),
-            connecting_col: col_name(table, *col),
+        .filter(|(_, _, p)| p.counts)
+        .map(|(id, table, _)| ArrConsumer {
+            index: format!("arr:counts:{table}"),
+            dependent_kind: "circuit-agg".to_string(),
+            dependent_id: id.clone(),
+            connecting_col: String::new(),
         })
         .collect();
-    // Circuit-served shapes/aggregates: pipeline → shape edges tracking shape lifecycle.
-    for (id, table, p) in placements {
-        if p.counts {
-            consumers.push(ArrConsumer {
-                index: format!("arr:counts:{table}"),
-                dependent_kind: "circuit-agg".to_string(),
-                dependent_id: id.clone(),
-                connecting_col: String::new(),
-            });
-        } else {
-            let index = match p.col {
-                Some(col) if arr.has_index(table, &[col]) => index_id(table, &[col]),
-                _ => input_id(table), // `all`-constraint shapes hang off the table input
-            };
-            consumers.push(ArrConsumer {
-                index,
-                dependent_kind: "circuit-shape".to_string(),
-                dependent_id: id.clone(),
-                connecting_col: p.col.map(|c| col_name(table, c)).unwrap_or_default(),
-            });
-        }
-    }
     consumers.sort();
     consumers.dedup();
-
-    ArrangementGraph { served, fallback, inputs, indexes, counts, consumers }
+    ArrangementGraph { served: 0, fallback: 0, inputs, indexes: Vec::new(), counts, consumers }
 }
-
-// ---------------------------------------------------------------------------------------------
-// Circuit-served shapes: the template tier. A shape whose predicate decomposes into
-// (cohort constraint over an arrangement-indexed column) ∧ (residual row predicate) is served
-// from the dbsp circuit: seeded from snapshots, updated by routing deltas, moved in/out by the
-// membership relation. Anything else stays on the dynamic path (standalone/family/registry).
-// ---------------------------------------------------------------------------------------------
 
 /// Rebuild the tailer's full per-node state map from its live structures. Pure so it's unit-testable;
 /// cost is O(shapes on this table) small clones, the same order as the fan-out work per batch.
@@ -535,7 +481,6 @@ pub(crate) fn build_node_states(
     families: &HashMap<Vec<usize>, KeyRouter>,
     family_of: &HashMap<String, (Vec<usize>, u64, Row)>,
     aggregates: &HashMap<String, AggShape>,
-    circuit_shapes: &HashMap<String, CircuitShape>,
     circuit_aggs: &HashMap<String, CircuitAgg>,
     emitted: &HashMap<String, u64>,
 ) -> HashMap<String, NodeStateSummary> {
@@ -572,10 +517,6 @@ pub(crate) fn build_node_states(
                 multiset_len: agg.multiset.len(),
             },
         );
-    }
-    for (sid, cs) in circuit_shapes {
-        let n = emitted_of(&cs.stream_path);
-        out.insert(format!("shape:{sid}"), NodeStateSummary::Shape { emitted: n });
     }
     for (sid, agg) in circuit_aggs {
         out.insert(
@@ -652,7 +593,7 @@ pub(crate) fn stats_of(exec: &TableExec) -> TableStats {
     TableStats {
         families: fams,
         standalone: exec.shapes.len(),
-        circuit: exec.circuit_shapes.len() + exec.circuit_aggs.len(),
+        circuit: exec.circuit_aggs.len(),
     }
 }
 
@@ -808,7 +749,7 @@ impl Engine {
             .lock()
             .unwrap()
             .clone()
-            .map(|arr| arrangement_graph(&arr, &dependents, &placements, &col_name));
+            .map(|arr| arrangement_graph(&arr, &placements, &col_name));
         EngineGraph { tables, shapes, subquery_nodes, subquery_edges, operators, op_edges, arrangements }
     }
 

@@ -1,61 +1,7 @@
 //! Per-shape executor structures: standalone filters + their conjunct index, key routers,
-//! aggregate folds, and the circuit-shape wrappers. Pure data + delta math; no engine state.
+//! aggregate folds, and the circuit-served COUNT wrapper. Pure data + delta math; no engine state.
 
 use super::*;
-
-/// Live group membership of a circuit-served shape. (`All`/`Static` mirror the planner's
-/// reserved variants; `inner_table` is kept for dumps/introspection.)
-#[allow(dead_code)]
-pub(crate) enum CohortGroups {
-    All,
-    Static {
-        col: usize,
-        keys: std::collections::HashSet<Value>,
-    },
-    Dynamic {
-        col: usize,
-        inner_table: String,
-        inner_proj: usize,
-        inner_col: usize,
-        inner_key: Value,
-        /// Projected value → number of contributing inner rows (refcounted: two membership
-        /// rows yielding the same value must both leave before the group does).
-        groups: HashMap<Value, i64>,
-    },
-}
-
-impl CohortGroups {
-    /// Does `row` fall in this shape's groups? (`NULL` cohort values never match.)
-    pub(crate) fn admits(&self, row: &Row) -> bool {
-        match self {
-            CohortGroups::All => true,
-            CohortGroups::Static { col, keys } => {
-                row.0.get(*col).is_some_and(|v| v != &Value::Null && keys.contains(v))
-            }
-            CohortGroups::Dynamic { col, groups, .. } => {
-                row.0.get(*col).is_some_and(|v| v != &Value::Null && groups.contains_key(v))
-            }
-        }
-    }
-}
-
-/// A shape served from the circuit: seeded from arrangement snapshots, updated by routing each
-/// transaction's deltas through (cohort groups ∧ residual). No Postgres, no snapshot gate —
-/// consistency comes from creating/reading inside the sequencer, between transactions.
-pub(crate) struct CircuitShape {
-    #[allow(dead_code)] // kept for dumps/introspection parity with the other executors
-    pub(crate) num_id: u64,
-    pub(crate) stream_path: String,
-    pub(crate) groups: CohortGroups,
-    pub(crate) residual: Option<Arc<CompiledPredicate>>,
-    pub(crate) out_cols: Option<Arc<Vec<usize>>>,
-}
-
-impl CircuitShape {
-    pub(crate) fn matches(&self, row: &Row) -> bool {
-        self.groups.admits(row) && self.residual.as_ref().is_none_or(|p| p.matches(row))
-    }
-}
 
 /// A COUNT aggregate served from the counts pipeline: `value` = Σ counts of matching groups.
 pub(crate) struct CircuitAgg {
