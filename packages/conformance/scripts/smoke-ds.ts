@@ -4,7 +4,7 @@
 //     materialized TanStack collection.
 // Run: pnpm --filter @electric-ivm/conformance exec tsx src/smoke-ds.ts
 
-import { DurableStreamTestServer } from '@durable-streams/server'
+import { DurableStreamTestServer } from '@electric-ivm/ds-rust'
 import { createStreamDB, createStateSchema } from '@durable-streams/state/db'
 import { z } from 'zod'
 

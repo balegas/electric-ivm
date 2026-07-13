@@ -11,7 +11,7 @@ the project is growing toward).
 
 | Path | What |
 |---|---|
-| `apps/engine` | Rust engine. Key files: `engine.rs` (the LSN-ordered sequencer, routing, circuit serving, shape sharing/lifecycle, aggregations), `arrangements.rs` (the circuit: table arrangements + counts pipelines, checkpoints), `subquery.rs` (cross-table registry: shared inner-set nodes, flips, absolute emission), `replication.rs` (streaming pgoutput ingestor) + `pgoutput.rs` (message decoder), `pg.rs` (backfill + `SnapshotGate`), `electric.rs` (`/v1/shape`), `where_sql.rs`/`sql.rs` (SQL⇄predicate), `ds.rs` (streams client incl. `append_reliable`). |
+| `apps/engine` | Rust engine. Key files: `engine/` (the engine module — `sequencer.rs` the LSN-ordered sequencer, `lifecycle.rs` shape creation/sharing/retention, `circuit_serving.rs` circuit-tier serving, `executors.rs` routers/filters/folds, `planning.rs` circuit placement, `catalog.rs` durable catalog, `introspection.rs` graph/state, `membership.rs` the shared membership kernel (flips, query-backs), `output.rs` envelope codec, `mod.rs` the `Engine` handle), `arrangements.rs` (the circuit: table arrangements + counts pipelines, checkpoints), `subquery.rs` (cross-table registry: shared inner-set nodes, flips, absolute emission), `replication.rs` (streaming pgoutput ingestor) + `pgoutput.rs` (message decoder), `pg.rs` (backfill + `SnapshotGate`), `electric.rs` (`/v1/shape`), `where_sql.rs`/`sql.rs` (SQL⇄predicate), `ds.rs` (streams client incl. `append_reliable`). |
 | `apps/api` | tRPC API (`router.ts`) over the engine + durable-streams (`core.ts`). |
 | `packages/protocol` | Shared types + the change-event envelope (`types.ts`, `envelope.ts`). |
 | `packages/client` | Browser client: `shape()`, `subset()` (see `subset.ts` — LSN watermarks + tombstones), `aggregate()`. All lifecycles tracked; `close()` is one-shot and deletes server-side with retry. |
@@ -122,8 +122,9 @@ pattern-based). Ports: `DEMO_HTTPS_PORT` (8443), `DEMO_VIZ_PORT` (5180), `DEMO_V
 
 `packages/loadgen` — `USERS=100 SEED_ISSUES=20000 DURATION_S=90 pnpm --filter @electric-ivm/loadgen
 loadgen`; `SWEEP_USERS=…` for comparison tables; Docker client scaling in `packages/loadgen/docker/`.
-Use `DS_MEMORY=1` at high concurrency (the file-backed test server fsyncs per append — the ceiling is
-storage, not the engine).
+The streams layer is the Rust durable-streams server (group-commit WAL — appends batch under
+concurrency); `DS_MEMORY=1` still removes durability entirely for max-throughput runs
+(`--durability memory`, Linux-only).
 
 ## Demo + visualizer: start, drive, verify (agent runbook)
 
@@ -182,19 +183,30 @@ knobs (`ELECTRIC_IVM_SHAPE_IDLE_SECS=1 ELECTRIC_IVM_RETENTION_SWEEP_SECS=1 …`)
 
 ### Testing checklist before claiming done
 
+**This is a task-completion requirement, not a suggestion: an engine-touching task is not
+"done" until all three suites below have run green, and agents must run them (or report exactly
+which ran and why the rest could not) before closing the task.**
+
 ```bash
 pnpm engine:test                          # Rust unit + integration (fast)
-ELECTRIC_IVM_ENGINE_PREBUILT=1 pnpm test  # full vitest suite (set the var iff you already built)
-./electric-conformance/run.sh oracle      # Electric's own oracle vs /v1/shape (needs elixir + ../electric)
+ELECTRIC_IVM_ENGINE_PREBUILT=1 pnpm test  # full vitest suite incl. oracle conformance (set the var iff you already built)
+ASDF_ELIXIR_VERSION=1.18.4-otp-28 ASDF_ERLANG_VERSION=28.1 \
+  ./electric-conformance/run.sh oracle    # Electric's own oracle vs /v1/shape (needs elixir + ../electric)
 ```
 
-For anything touching the circuit (`arrangements.rs`, circuit serving in `engine.rs`), run the
-conformance suite. The circuit is always-on infrastructure now — there is no off mode — so the
-suite exercises it on every run. The `ELECTRIC_IVM_DBSP_INDEXES`/`_COUNTS` tunables decide which
-shapes the circuit actually serves versus which fall through to the routing/fallback tiers.
+The vitest suite includes `packages/conformance` — the engine-vs-oracle harness — and runs
+against the always-on circuit on every run (there is no off mode). The
+`ELECTRIC_IVM_DBSP_INDEXES`/`_COUNTS` tunables decide which shapes the circuit actually serves
+versus which fall through to the routing/fallback tiers. The `electric-conformance` line is
+Electric's *own* oracle suite pointed at our `/v1/shape` — a separate tier from our conformance
+package; run both. (The ASDF pins matter: `../electric` asks for an Elixir that may not be
+installed locally.)
 
-Then, for anything touching the engine's live path, shapes, or the visualizer: **drive the demo as
-above** — the suites don't render a canvas or exercise the browser.
+**E2E (browser) tier:** for anything touching the engine's live path, shapes, or the visualizer,
+finish by **driving the demo as above** (Playwright MCP runbook, §"Demo + visualizer") — the
+suites don't render a canvas or exercise the browser, so a green run does not prove the live
+UI path. A quick pass = boot `pnpm demo:linearlite`, drive a write, verify the shape stream and
+canvas update, screenshot.
 
 ## Invariants (violate these and conformance will catch you — eventually)
 
@@ -276,9 +288,11 @@ above** — the suites don't render a canvas or exercise the browser.
   visualizer needs its Caddy front too** (`https://localhost:5443`, auto-started by the demo): its
   `/trace` SSE + engine polling compete for the same connection budget, so open it over HTTPS in a
   browser — plain `http://localhost:5180` is for `curl` only. See `.claude/skills/run-linearlite`.
-- **Under load the durable-streams *test server* is the ceiling, not the engine** (fsync per append
-  file-backed; `ECONNRESET` under burst). `DS_MEMORY=1` + staggered ramps; a production
-  durable-streams backend lifts the ceiling.
+- **The durable-streams server is the Rust binary** (crates.io `durable-streams`, spawned by the
+  drop-in wrapper `packages/ds-rust`; self-provisions via `cargo install`, override with
+  `DS_RUST_BIN`). Appends are group-commit WAL `fdatasync` — no per-append fsync ceiling like the
+  old Node test server. `DS_MEMORY=1` still works (ephemeral data dir; `--durability memory` is
+  Linux-only, macOS falls back to `wal`).
 - **Docker + pnpm:** scripts that import workspace deps must live in a workspace package
   (`docker/package.json`) — running `tsx docker/x.ts` from the repo root can't resolve them.
 - **Verify against the live stack, not just types.** A headless `tsx` script driving the real client

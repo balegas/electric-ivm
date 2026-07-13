@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { DurableStreamTestServer } from '@durable-streams/server'
+import { DurableStreamTestServer } from '@electric-ivm/ds-rust'
 import { type ApiServer, createApiServer } from '@electric-ivm/api'
 import { changeEventToDML, tableDDL } from '@electric-ivm/protocol'
 import pgpkg from 'pg'

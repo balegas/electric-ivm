@@ -15,7 +15,7 @@ import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { DurableStreamTestServer } from '@durable-streams/server'
+import { DurableStreamTestServer } from '@electric-ivm/ds-rust'
 import { createApiServer } from '@electric-ivm/api'
 import { createClient } from '@electric-ivm/client'
 import type { Row, Schema } from '@electric-ivm/protocol'

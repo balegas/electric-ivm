@@ -11,7 +11,7 @@
     "@electric-ivm/protocol": "workspace:*",
     "@electric-ivm/api": "workspace:*",
     "@electric-ivm/client": "workspace:*",
-    "@durable-streams/server": "^0.3.7",
+    "@electric-ivm/ds-rust": "workspace:*",
     "@durable-streams/state": "^0.3.1",
     "@tanstack/db": "^0.6.12",
     "@tanstack/react-db": "^0.1.90",

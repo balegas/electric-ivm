@@ -11,7 +11,7 @@ Services (see `compose.yaml`):
 | service | image | role | port |
 |---|---|---|---|
 | `postgres` | `postgres:16` (`wal_level=logical`) | system of record | 5432 |
-| `ds` | `docker/Dockerfile.node` | durable-streams server (the log) | 8791 |
+| `ds` | `docker/Dockerfile.ds` | durable-streams server (the log; Rust binary from crates.io `durable-streams`) | 8791 |
 | `engine` | `docker/Dockerfile.engine` | Rust engine: replication ingest, shape/subquery/aggregation maintenance, control-plane HTTP **and Electric-compatible `GET /v1/shape`** | 7010 |
 | `api` | `docker/Dockerfile.node` | extended tRPC API for `@electric-ivm/client` (shapes, subset queries, aggregations) | 8790 |
 
@@ -87,11 +87,12 @@ docker pull ghcr.io/balegas/electric-ivm/electric:main   # single fleet image
 
 ```bash
 docker build -f docker/Dockerfile.engine -t electric-ivm-engine .   # Rust engine (multi-stage)
-docker build -f docker/Dockerfile.node   -t electric-ivm-node .     # ds server + API (CMD selects)
+docker build -f docker/Dockerfile.node   -t electric-ivm-node .     # API server
+docker build -f docker/Dockerfile.ds     -t electric-ivm-ds .       # durable-streams server (Rust)
 ```
 
 The engine image is a plain-HTTP binary (no TLS backend compiled in) on `debian:bookworm-slim`; the
-node image runs the durable-streams server (`docker/ds-server.ts`) or the API (`docker/api-server.ts`)
+node image runs the API (`docker/api-server.ts`); the ds image runs the Rust `durable-streams-server` binary
 via `tsx`.
 
 ## Env knobs

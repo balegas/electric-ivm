@@ -38,8 +38,7 @@ services:
   ds:
     build:
       context: ..
-      dockerfile: docker/Dockerfile.node
-    command: ["pnpm", "run", "ds"]
+      dockerfile: docker/Dockerfile.ds
     environment:
       DS_PORT: 8791
       DS_DATA_DIR: /data
@@ -48,7 +47,7 @@ services:
     volumes:
       - ds-data:/data
     healthcheck:
-      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:8791').then(()=>process.exit(0),()=>process.exit(1))\""]
+      test: ["CMD-SHELL", "curl -s -o /dev/null http://127.0.0.1:8791"]
       interval: 3s
       timeout: 3s
       retries: 20

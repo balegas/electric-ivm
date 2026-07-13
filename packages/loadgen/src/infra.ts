@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import type { DurableStreamTestServer } from '@durable-streams/server'
+import type { DurableStreamTestServer } from '@electric-ivm/ds-rust'
 import { type ApiServer, createApiServer } from '@electric-ivm/api'
 import type { Schema } from '@electric-ivm/protocol'
 import { faker } from '@faker-js/faker'
@@ -187,10 +187,10 @@ export async function bootInfra(seedIssues: number, opts: InfraOpts = {}, log = 
     await seed(pg, seedIssues, log)
 
     // 3. durable-streams (file-backed → disk measurable), engine (Postgres mode), API.
-    // Lazily loaded so `client` mode (Docker replicas) never pulls the native LMDB dependency.
-    const { DurableStreamTestServer } = await import('@durable-streams/server')
-    // File-backed (LMDB) makes disk measurable but fsyncs each append — a bottleneck at high concurrency.
-    // In-memory removes that ceiling (ds disk then reads 0).
+    // Lazily loaded so `client` mode (Docker replicas) skips the server dependency entirely.
+    const { DurableStreamTestServer } = await import('@electric-ivm/ds-rust')
+    // The Rust server's WAL group-commits appends; a fixed dataDir makes disk measurable.
+    // In-memory mode (ephemeral dir, --durability memory on Linux) removes durability cost (ds disk then reads 0).
     ds = new DurableStreamTestServer(
       opts.dsInMemory ? { port: opts.dsPort ?? 0, host: bindHost } : { port: opts.dsPort ?? 0, host: bindHost, dataDir: dsDir },
     )

@@ -63,12 +63,12 @@ importers:
 
   docker:
     dependencies:
-      '@durable-streams/server':
-        specifier: ^0.3.7
-        version: 0.3.7(@tanstack/db@0.6.12(typescript@5.9.3))
       '@electric-ivm/api':
         specifier: workspace:*
         version: link:../apps/api
+      '@electric-ivm/ds-rust':
+        specifier: workspace:*
+        version: link:../packages/ds-rust
     devDependencies:
       tsx:
         specifier: ^4.19.2
@@ -76,15 +76,15 @@ importers:
 
   examples:
     dependencies:
-      '@durable-streams/server':
-        specifier: ^0.3.7
-        version: 0.3.7(@tanstack/db@0.6.12(typescript@5.9.3))
       '@electric-ivm/api':
         specifier: workspace:*
         version: link:../apps/api
       '@electric-ivm/client':
         specifier: workspace:*
         version: link:../packages/client
+      '@electric-ivm/ds-rust':
+        specifier: workspace:*
+        version: link:../packages/ds-rust
       '@electric-ivm/protocol':
         specifier: workspace:*
         version: link:../packages/protocol
@@ -94,9 +94,6 @@ importers:
 
   examples/linearlite:
     dependencies:
-      '@durable-streams/server':
-        specifier: ^0.3.7
-        version: 0.3.7(@tanstack/db@0.6.12(typescript@5.9.3))
       '@durable-streams/state':
         specifier: ^0.3.1
         version: 0.3.1(@tanstack/db@0.6.12(typescript@5.9.3))
@@ -106,6 +103,9 @@ importers:
       '@electric-ivm/client':
         specifier: workspace:*
         version: link:../../packages/client
+      '@electric-ivm/ds-rust':
+        specifier: workspace:*
+        version: link:../../packages/ds-rust
       '@electric-ivm/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol
@@ -158,9 +158,6 @@ importers:
 
   examples/web:
     dependencies:
-      '@durable-streams/server':
-        specifier: ^0.3.7
-        version: 0.3.7(@tanstack/db@0.6.12(typescript@5.9.3))
       '@durable-streams/state':
         specifier: ^0.3.1
         version: 0.3.1(@tanstack/db@0.6.12(typescript@5.9.3))
@@ -170,6 +167,9 @@ importers:
       '@electric-ivm/client':
         specifier: workspace:*
         version: link:../../packages/client
+      '@electric-ivm/ds-rust':
+        specifier: workspace:*
+        version: link:../../packages/ds-rust
       '@electric-ivm/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol
@@ -216,15 +216,15 @@ importers:
 
   packages/bench:
     dependencies:
-      '@durable-streams/server':
-        specifier: ^0.3.7
-        version: 0.3.7(@tanstack/db@0.6.12(typescript@5.9.3))
       '@electric-ivm/api':
         specifier: workspace:*
         version: link:../../apps/api
       '@electric-ivm/client':
         specifier: workspace:*
         version: link:../client
+      '@electric-ivm/ds-rust':
+        specifier: workspace:*
+        version: link:../ds-rust
       '@electric-ivm/protocol':
         specifier: workspace:*
         version: link:../protocol
@@ -264,9 +264,6 @@ importers:
       '@durable-streams/client':
         specifier: ^0.2.6
         version: 0.2.6
-      '@durable-streams/server':
-        specifier: ^0.3.7
-        version: 0.3.7(@tanstack/db@0.6.12(typescript@5.9.3))
       '@durable-streams/state':
         specifier: ^0.3.1
         version: 0.3.1(@tanstack/db@0.6.12(typescript@5.9.3))
@@ -276,6 +273,9 @@ importers:
       '@electric-ivm/client':
         specifier: workspace:*
         version: link:../client
+      '@electric-ivm/ds-rust':
+        specifier: workspace:*
+        version: link:../ds-rust
       '@electric-ivm/oracle':
         specifier: workspace:*
         version: link:../oracle
@@ -305,17 +305,19 @@ importers:
         specifier: ^8.11.10
         version: 8.20.0
 
+  packages/ds-rust: {}
+
   packages/loadgen:
     dependencies:
-      '@durable-streams/server':
-        specifier: ^0.3.7
-        version: 0.3.7(@tanstack/db@0.6.12(typescript@5.9.3))
       '@electric-ivm/api':
         specifier: workspace:*
         version: link:../../apps/api
       '@electric-ivm/client':
         specifier: workspace:*
         version: link:../client
+      '@electric-ivm/ds-rust':
+        specifier: workspace:*
+        version: link:../ds-rust
       '@electric-ivm/protocol':
         specifier: workspace:*
         version: link:../protocol
@@ -453,10 +455,6 @@ packages:
     resolution: {integrity: sha512-uHKKbWpsKLhFMeGjG0PgM6LXE3oEIi7FHKlJZkmYGxcqd4Yjjd/QEvnQnDzteRP4Av1uJVM8qjTL7kfKsgeS/w==}
     engines: {node: '>=18.0.0'}
     hasBin: true
-
-  '@durable-streams/server@0.3.7':
-    resolution: {integrity: sha512-3vF1EjCn+DhqZn5f7/aqW/E9sN4UGUhhYVn5LoeD7lP7sAdCy1M5sFCdI+tUe6B+5l7ORKNxU9lhgY7HfYa+Zw==}
-    engines: {node: '>=18.0.0'}
 
   '@durable-streams/state@0.3.1':
     resolution: {integrity: sha512-HYhw520Bfl9+L3MJgWpzLQjByP5y/uNNasOqSSFfyWhFxZeaKHM6Go2P79YFfTJPmXh4ZHEh1jOgIfrumqT6hA==}
@@ -787,9 +785,6 @@ packages:
     resolution: {integrity: sha512-bsxD8WLS5lIj7aaoCx1YJkktqYj5vlBUE6HWzu2Q51ksrGJ0H737ECCKlFU7Yf8Br45z9t99frBp/J7kzbMPAg==}
     engines: {node: ^20.19.0 || ^22.13.0 || ^23.5.0 || >=24.0.0, npm: '>=10'}
 
-  '@harperfast/extended-iterable@1.0.3':
-    resolution: {integrity: sha512-sSAYhQca3rDWtQUHSAPeO7axFIUJOI6hn1gjRC5APVE1a90tuyT8f5WIgRsFhhWA7htNkju2veB9eWL6YHi/Lw==}
-
   '@jridgewell/gen-mapping@0.3.13':
     resolution: {integrity: sha512-2kkt/7niJ6MgEPxF0bYdQ6etZaA+fQvDcLKckhy1yIQOzaoKjBBjSj63/aLVjYE3qhRt5dvM+uUyfCg6UKCBbA==}
 
@@ -806,77 +801,8 @@ packages:
   '@jridgewell/trace-mapping@0.3.31':
     resolution: {integrity: sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==}
 
-  '@lmdb/lmdb-darwin-arm64@3.5.6':
-    resolution: {integrity: sha512-mY5FG4TjPAkY4P0w+OhHaUka5mDh2TX2WKYIwuKzJ1zeW3VvRgxdam/lGJTquI+bthTx5CSHDW+BAQCnNAzkEA==}
-    cpu: [arm64]
-    os: [darwin]
-
-  '@lmdb/lmdb-darwin-x64@3.5.6':
-    resolution: {integrity: sha512-foa+pwitysO8k+xhs7psBFfTKnVgR69NlZRRTHaFVDqphh7AdGpLeyRzKw/ofatr/sN6TiHRRW6mmop0ZrrppQ==}
-    cpu: [x64]
-    os: [darwin]
-
-  '@lmdb/lmdb-linux-arm64@3.5.6':
-    resolution: {integrity: sha512-HmiyFFdJa38s1heCMSooSPaBSFTHJ3C+ERPp28xAPlDX1YiALJVOgbry065nXd8Y7KISWjnw05zpG1RX8IfftA==}
-    cpu: [arm64]
-    os: [linux]
-
-  '@lmdb/lmdb-linux-arm@3.5.6':
-    resolution: {integrity: sha512-QR4YRyR5h5Z8eGXrNQjiyo2NNDfqi3tCc9dQG5Is1blCt+qWw1ZoBWhlWAr5d+jshkifMIJjVHzHGKbkKzF8Tw==}
-    cpu: [arm]
-    os: [linux]
-
-  '@lmdb/lmdb-linux-x64@3.5.6':
-    resolution: {integrity: sha512-ADzCuCF2cTNiX9kDScqcz1fjnAkxPpQNneV3KFTdV3wWtVlI2sTGzySoMTgDpinkMMFj1NTJlxA6XR8fwc4hlA==}
-    cpu: [x64]
-    os: [linux]
-
-  '@lmdb/lmdb-win32-arm64@3.5.6':
-    resolution: {integrity: sha512-J7A9aEQsQiv0TYtBGL7NDIPp2lOS8nnl+zm4sWZm1xlsTTaQ4PgD096Adzdrk27rw3UxCkDXdCUa4ax41oztBQ==}
-    cpu: [arm64]
-    os: [win32]
-
-  '@lmdb/lmdb-win32-x64@3.5.6':
-    resolution: {integrity: sha512-1g7G0knRX2iV/voDu54yxrGqw5Dk0w2oIYb7dgJq8IkOi+m7wbD8Q3QpPFjh0C01G58S88dqGn03len6UPCXsg==}
-    cpu: [x64]
-    os: [win32]
-
   '@microsoft/fetch-event-source@2.0.1':
     resolution: {integrity: sha512-W6CLUJ2eBMw3Rec70qrsEW0jOm/3twwJv21mrmj2yORiaVmVYGS4sSS5yUwvQc1ZlDLYGPnClVWmUUMagKNsfA==}
-
-  '@msgpackr-extract/msgpackr-extract-darwin-arm64@3.0.4':
-    resolution: {integrity: sha512-LCkGo6JDfaBhgST7UpPWgNgLINpcpabaHfyz5OBx75nUYxBsaEPxjnyNjWpeb/xBup/682QnBfRBy2/LvPutZQ==}
-    cpu: [arm64]
-    os: [darwin]
-
-  '@msgpackr-extract/msgpackr-extract-darwin-x64@3.0.4':
-    resolution: {integrity: sha512-zExlW9zUJKZH/tOtVMttwjKa4Xm/3KcNjnE3dPN92uCktwavMxpgCA3MoJK/DOnTWsQgo224OaST27/mPNAf+w==}
-    cpu: [x64]
-    os: [darwin]
-
-  '@msgpackr-extract/msgpackr-extract-linux-arm64@3.0.4':
-    resolution: {integrity: sha512-dgX0P/9wGPJeHFBG+ZmhgE6bmtMt7NP5CRBGyyktpopdk/mW4POnrpQsSLtKI1dwpc+pPLuXHDh6vvskyQE/sw==}
-    cpu: [arm64]
-    os: [linux]
-
-  '@msgpackr-extract/msgpackr-extract-linux-arm@3.0.4':
-    resolution: {integrity: sha512-Tg3yX65f5GbtXLkrYEHE5oibZG9epyYWas7FogTTEJeDEF9JlXJzKgXaNhT3UXlTOeA+AfZpYZYZ0uPj7Cfquw==}
-    cpu: [arm]
-    os: [linux]
-
-  '@msgpackr-extract/msgpackr-extract-linux-x64@3.0.4':
-    resolution: {integrity: sha512-8TNXMEjJc3QEy7R/x1INhgiU+XakDAFUzBhaz7+Rbrs8NH5UQeHQxxmzsSBJGyV6I1jW79undiQm8tOI+D+8FQ==}
-    cpu: [x64]
-    os: [linux]
-
-  '@msgpackr-extract/msgpackr-extract-win32-x64@3.0.4':
-    resolution: {integrity: sha512-CmCXPQrkbwExx3j946/PtHWHbYJiCRBRDl4BlkRQcJB/YOwQxJRTpoo7aTsortjgoJ1x7opzTSxn7C+ASSLVjQ==}
-    cpu: [x64]
-    os: [win32]
-
-  '@neophi/sieve-cache@1.5.0':
-    resolution: {integrity: sha512-9T3nD5q51X1d4QYW6vouKW9hBSb2Tb/wB/2XoTr4oP5SCGtp3a7aTHHewQFylred1B21/Bhev6gy4x01FPBcbQ==}
-    engines: {node: '>=18'}
 
   '@rolldown/pluginutils@1.0.0-beta.27':
     resolution: {integrity: sha512-+d0F4MKMCbeVUJwG96uQ4SgAznZNSq93I3V+9NHA4OpvqG8mRCpGdKmK8l/dl02h2CCDHwW2FqilnTyDcAnqjA==}
@@ -1249,10 +1175,6 @@ packages:
     resolution: {integrity: sha512-h5k/5U50IJJFpzfL6nO9jaaumfjO/f2NjK/oYB2Djzm4p9L+3T9qWpZqZ2hAbLPuuYq9wrU08WQyBTL5GbPk5Q==}
     engines: {node: '>=6'}
 
-  detect-libc@2.1.2:
-    resolution: {integrity: sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ==}
-    engines: {node: '>=8'}
-
   electron-to-chromium@1.5.380:
     resolution: {integrity: sha512-W6d5AbuEoRayO447cqrg6lKJIlscgRnnxOZl/08kfV71BQDoEBC7Wwis68z87LjyK6f4kWyTaubuDbhHKrZkbA==}
 
@@ -1321,10 +1243,6 @@ packages:
     engines: {node: '>=6'}
     hasBin: true
 
-  lmdb@3.5.6:
-    resolution: {integrity: sha512-j3uE8ReKNyUWDjhfEFSJqE/1DLtfTR5Z8yFzVHvBjAk37wNg7HdScjcv8ttPHRvrdgPQMPWxFFI0SsdBzI5lBw==}
-    hasBin: true
-
   loose-envify@1.4.0:
     resolution: {integrity: sha512-lyuxPGr/Wfhrlem2CL/UcnUc1zcqKAImBDzukY7Y5F/yQiNdko6+fRLevlw1HgMySw7f611UIY408EtxRSoK3Q==}
     hasBin: true
@@ -1341,31 +1259,14 @@ packages:
   ms@2.1.3:
     resolution: {integrity: sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA==}
 
-  msgpackr-extract@3.0.4:
-    resolution: {integrity: sha512-4kmO/MdyUIkLIvTPr8VHLil4AtoKIoniWPIEk5+CDy0xnWC84azhSFmuJ7PxZdsYtiP5kEeQsORAVIeMgxT+Hw==}
-    hasBin: true
-
-  msgpackr@1.12.1:
-    resolution: {integrity: sha512-4EUH9tQHnMmEgzW/MdAP0KIfa1T9AF+htl0ffe2n5vb2EKn9y2co8ccpgWko6S52Jy1PQZKwRnx5/KkYjtd9MQ==}
-
   nanoid@3.3.15:
     resolution: {integrity: sha512-y7Wygv/7mEOvxTuEQDB8StXdMRBWf1kR/tlhAzBRUFkB2jfcLOAxO/SHmOO2zgz1pVgK29/kyupn059/bCHdjA==}
     engines: {node: ^10 || ^12 || ^13.7 || ^14 || >=15.0.1}
     hasBin: true
 
-  node-addon-api@6.1.0:
-    resolution: {integrity: sha512-+eawOlIgy680F0kBzPUNFhMZGtJ1YmqM6l4+Crf4IkImjYrO/mqPwRMh352g23uIaQKFItcQ64I7KMaJxHgAVA==}
-
-  node-gyp-build-optional-packages@5.2.2:
-    resolution: {integrity: sha512-s+w+rBWnpTMwSFbaE0UXsRlg7hU4FjekKU4eyAih5T8nJuNZT1nNsskXpxmeqSK9UzkBl6UgRlnKc8hz8IEqOw==}
-    hasBin: true
-
   node-releases@2.0.50:
     resolution: {integrity: sha512-J6l92tKHX6w8Jy5nO1Vuc01NoIiRGi/d6qBKVxh+IQ8Cr3b6HbVNfKiF8ZpFKufTwpwxMmce2W3iQZ861ZRyTg==}
     engines: {node: '>=18'}
-
-  ordered-binary@1.6.1:
-    resolution: {integrity: sha512-QkCdPooczexPLiXIrbVOPYkR3VO3T6v2OyKRkR1Xbhpy7/LAVXwahnRCgRp78Oe/Ehf0C/HATAxfSr6eA1oX+w==}
 
   pathe@2.0.3:
     resolution: {integrity: sha512-WUjGcAqP1gQacoQe+OBJsFA7Ld4DyXuUIjZ5cc75cLHvJ7dtNsTugphxIADwspS+AraAUePCKrSVtPLFj/F88w==}
@@ -1649,9 +1550,6 @@ packages:
       jsdom:
         optional: true
 
-  weak-lru-cache@1.2.2:
-    resolution: {integrity: sha512-DEAoo25RfSYMuTGc9vPJzZcZullwIqRDSI9LOy+fkCJPi6hykCnfKaXTuPBDuXAUcqHXyOgFtHNp/kB2FjYHbw==}
-
   why-is-node-running@2.3.0:
     resolution: {integrity: sha512-hUrmaWBdVDcxvYqnyh09zunKzROWjbZTiNy8dBEjkS7ehEDQibXJ7XvlmtbwuTclUiIyN+CyXQD4Vmko8fNm8w==}
     engines: {node: '>=8'}
@@ -1806,15 +1704,6 @@ snapshots:
     dependencies:
       '@microsoft/fetch-event-source': 2.0.1
       fastq: 1.20.1
-
-  '@durable-streams/server@0.3.7(@tanstack/db@0.6.12(typescript@5.9.3))':
-    dependencies:
-      '@durable-streams/client': 0.2.6
-      '@durable-streams/state': 0.3.1(@tanstack/db@0.6.12(typescript@5.9.3))
-      '@neophi/sieve-cache': 1.5.0
-      lmdb: 3.5.6
-    transitivePeerDependencies:
-      - '@tanstack/db'
 
   '@durable-streams/state@0.3.1(@tanstack/db@0.6.12(typescript@5.9.3))':
     dependencies:
@@ -1983,8 +1872,6 @@ snapshots:
 
   '@faker-js/faker@10.5.0': {}
 
-  '@harperfast/extended-iterable@1.0.3': {}
-
   '@jridgewell/gen-mapping@0.3.13':
     dependencies:
       '@jridgewell/sourcemap-codec': 1.5.5
@@ -2004,48 +1891,7 @@ snapshots:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.5.5
 
-  '@lmdb/lmdb-darwin-arm64@3.5.6':
-    optional: true
-
-  '@lmdb/lmdb-darwin-x64@3.5.6':
-    optional: true
-
-  '@lmdb/lmdb-linux-arm64@3.5.6':
-    optional: true
-
-  '@lmdb/lmdb-linux-arm@3.5.6':
-    optional: true
-
-  '@lmdb/lmdb-linux-x64@3.5.6':
-    optional: true
-
-  '@lmdb/lmdb-win32-arm64@3.5.6':
-    optional: true
-
-  '@lmdb/lmdb-win32-x64@3.5.6':
-    optional: true
-
   '@microsoft/fetch-event-source@2.0.1': {}
-
-  '@msgpackr-extract/msgpackr-extract-darwin-arm64@3.0.4':
-    optional: true
-
-  '@msgpackr-extract/msgpackr-extract-darwin-x64@3.0.4':
-    optional: true
-
-  '@msgpackr-extract/msgpackr-extract-linux-arm64@3.0.4':
-    optional: true
-
-  '@msgpackr-extract/msgpackr-extract-linux-arm@3.0.4':
-    optional: true
-
-  '@msgpackr-extract/msgpackr-extract-linux-x64@3.0.4':
-    optional: true
-
-  '@msgpackr-extract/msgpackr-extract-win32-x64@3.0.4':
-    optional: true
-
-  '@neophi/sieve-cache@1.5.0': {}
 
   '@rolldown/pluginutils@1.0.0-beta.27': {}
 
@@ -2396,8 +2242,6 @@ snapshots:
 
   deep-eql@5.0.2: {}
 
-  detect-libc@2.1.2: {}
-
   electron-to-chromium@1.5.380: {}
 
   es-module-lexer@1.7.0: {}
@@ -2491,23 +2335,6 @@ snapshots:
 
   json5@2.2.3: {}
 
-  lmdb@3.5.6:
-    dependencies:
-      '@harperfast/extended-iterable': 1.0.3
-      msgpackr: 1.12.1
-      node-addon-api: 6.1.0
-      node-gyp-build-optional-packages: 5.2.2
-      ordered-binary: 1.6.1
-      weak-lru-cache: 1.2.2
-    optionalDependencies:
-      '@lmdb/lmdb-darwin-arm64': 3.5.6
-      '@lmdb/lmdb-darwin-x64': 3.5.6
-      '@lmdb/lmdb-linux-arm': 3.5.6
-      '@lmdb/lmdb-linux-arm64': 3.5.6
-      '@lmdb/lmdb-linux-x64': 3.5.6
-      '@lmdb/lmdb-win32-arm64': 3.5.6
-      '@lmdb/lmdb-win32-x64': 3.5.6
-
   loose-envify@1.4.0:
     dependencies:
       js-tokens: 4.0.0
@@ -2524,33 +2351,9 @@ snapshots:
 
   ms@2.1.3: {}
 
-  msgpackr-extract@3.0.4:
-    dependencies:
-      node-gyp-build-optional-packages: 5.2.2
-    optionalDependencies:
-      '@msgpackr-extract/msgpackr-extract-darwin-arm64': 3.0.4
-      '@msgpackr-extract/msgpackr-extract-darwin-x64': 3.0.4
-      '@msgpackr-extract/msgpackr-extract-linux-arm': 3.0.4
-      '@msgpackr-extract/msgpackr-extract-linux-arm64': 3.0.4
-      '@msgpackr-extract/msgpackr-extract-linux-x64': 3.0.4
-      '@msgpackr-extract/msgpackr-extract-win32-x64': 3.0.4
-    optional: true
-
-  msgpackr@1.12.1:
-    optionalDependencies:
-      msgpackr-extract: 3.0.4
-
   nanoid@3.3.15: {}
 
-  node-addon-api@6.1.0: {}
-
-  node-gyp-build-optional-packages@5.2.2:
-    dependencies:
-      detect-libc: 2.1.2
-
   node-releases@2.0.50: {}
-
-  ordered-binary@1.6.1: {}
 
   pathe@2.0.3: {}
 
@@ -2803,8 +2606,6 @@ snapshots:
       - terser
       - tsx
       - yaml
-
-  weak-lru-cache@1.2.2: {}
 
   why-is-node-running@2.3.0:
     dependencies:

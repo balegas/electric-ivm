@@ -8,7 +8,7 @@
     "api": "tsx api-server.ts"
   },
   "dependencies": {
-    "@durable-streams/server": "^0.3.7",
+    "@electric-ivm/ds-rust": "workspace:*",
     "@electric-ivm/api": "workspace:*"
   },
   "devDependencies": {

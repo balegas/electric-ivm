@@ -62,9 +62,15 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 
 ```bash
 pnpm engine:test                          # Rust unit + integration (fast)
-ELECTRIC_IVM_ENGINE_PREBUILT=1 pnpm test  # full vitest suite (boots its own Postgres)
+ELECTRIC_IVM_ENGINE_PREBUILT=1 pnpm test  # full vitest suite incl. oracle conformance (boots its own Postgres)
+ASDF_ELIXIR_VERSION=1.18.4-otp-28 ASDF_ERLANG_VERSION=28.1 \
+  ./electric-conformance/run.sh oracle    # Electric's own oracle vs /v1/shape (needs elixir + ../electric)
 pnpm demo:linearlite                      # demo stack: PG + engine + LinearLite + pipeline visualizer
 ```
+
+**Finishing an engine-touching task requires all three suites green, plus driving the demo
+(browser e2e) for live-path/visualizer changes — see "Testing checklist before claiming done"
+in AGENTS.md.**
 
 Full commands, the demo/visualizer runbook (incl. driving the visualizer with the Playwright MCP),
 invariants, and gotchas live in **AGENTS.md** — read it before touching the engine or the apps.
