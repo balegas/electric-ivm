@@ -11,7 +11,7 @@
     "sweep": "tsx src/sweep.ts"
   },
   "dependencies": {
-    "@durable-streams/server": "^0.3.7",
+    "@electric-ivm/ds-rust": "workspace:*",
     "@electric-ivm/api": "workspace:*",
     "@electric-ivm/client": "workspace:*",
     "@electric-ivm/protocol": "workspace:*",

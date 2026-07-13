@@ -480,7 +480,9 @@ is **storage throughput** (the single-process durable-streams test server), not 
 1. Multi-stream append (one request, many streams) — fan-out to M streams is M HTTP requests today.
 2. HTTP/2 multiplexing / persistent pipelined connections to storage.
 3. Shard the sequencer's fan-out (partition a table's shapes/key-space across tasks).
-4. A production durable-streams backend (the test server fsyncs per append when file-backed).
+4. ~~A production durable-streams backend (the old Node test server fsynced per append).~~ Done:
+   the streams layer is the Rust `durable-streams` server (group-commit WAL; `packages/ds-rust`
+   wrapper).
 
 **Standalone evaluation (O(K) per change)**
 5. ~~Predicate indexing by `(column, op)` — turn O(K) into output-sensitive.~~ Done: standalone

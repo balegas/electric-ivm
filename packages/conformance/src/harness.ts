@@ -12,7 +12,7 @@ import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { DurableStreamTestServer } from '@durable-streams/server'
+import { DurableStreamTestServer } from '@electric-ivm/ds-rust'
 import { type ApiServer, createApiServer } from '@electric-ivm/api'
 import { createClient, type ElectricIvmClient, type ShapeMaterialization } from '@electric-ivm/client'
 import { createPgOracle, createPgTables, type Oracle } from '@electric-ivm/oracle'
@@ -272,7 +272,13 @@ export async function applyOp(h: Harness, table: string, ev: ChangeEvent): Promi
 async function changesTail(dsUrl: string): Promise<string | null> {
   const res = await fetch(`${dsUrl}/changes`, { method: 'HEAD' })
   if (!res.ok) return null
-  return res.headers.get('stream-next-offset')
+  const off = res.headers.get('stream-next-offset')
+  // An empty stream has nothing to reach. Servers differ in how they spell "empty": the Node
+  // test server reports -1 (which the engine's initial "-1" trivially satisfies), the Rust
+  // server reports the zero offset (all-zero epoch_byte) — which the engine's "-1" would
+  // lexicographically never reach. Normalize both to "no tail".
+  if (off === null || off === '-1' || /^0+(_0+)?$/.test(off)) return null
+  return off
 }
 
 async function engineChangesOffset(engineUrl: string): Promise<string | null> {

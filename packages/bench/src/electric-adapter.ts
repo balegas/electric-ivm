@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { DurableStreamTestServer } from '@durable-streams/server'
+import { DurableStreamTestServer } from '@electric-ivm/ds-rust'
 import pgpkg from 'pg'
 
 const here = dirname(fileURLToPath(import.meta.url))

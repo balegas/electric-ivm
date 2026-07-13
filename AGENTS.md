@@ -122,8 +122,9 @@ pattern-based). Ports: `DEMO_HTTPS_PORT` (8443), `DEMO_VIZ_PORT` (5180), `DEMO_V
 
 `packages/loadgen` — `USERS=100 SEED_ISSUES=20000 DURATION_S=90 pnpm --filter @electric-ivm/loadgen
 loadgen`; `SWEEP_USERS=…` for comparison tables; Docker client scaling in `packages/loadgen/docker/`.
-Use `DS_MEMORY=1` at high concurrency (the file-backed test server fsyncs per append — the ceiling is
-storage, not the engine).
+The streams layer is the Rust durable-streams server (group-commit WAL — appends batch under
+concurrency); `DS_MEMORY=1` still removes durability entirely for max-throughput runs
+(`--durability memory`, Linux-only).
 
 ## Demo + visualizer: start, drive, verify (agent runbook)
 
@@ -287,9 +288,11 @@ canvas update, screenshot.
   visualizer needs its Caddy front too** (`https://localhost:5443`, auto-started by the demo): its
   `/trace` SSE + engine polling compete for the same connection budget, so open it over HTTPS in a
   browser — plain `http://localhost:5180` is for `curl` only. See `.claude/skills/run-linearlite`.
-- **Under load the durable-streams *test server* is the ceiling, not the engine** (fsync per append
-  file-backed; `ECONNRESET` under burst). `DS_MEMORY=1` + staggered ramps; a production
-  durable-streams backend lifts the ceiling.
+- **The durable-streams server is the Rust binary** (crates.io `durable-streams`, spawned by the
+  drop-in wrapper `packages/ds-rust`; self-provisions via `cargo install`, override with
+  `DS_RUST_BIN`). Appends are group-commit WAL `fdatasync` — no per-append fsync ceiling like the
+  old Node test server. `DS_MEMORY=1` still works (ephemeral data dir; `--durability memory` is
+  Linux-only, macOS falls back to `wal`).
 - **Docker + pnpm:** scripts that import workspace deps must live in a workspace package
   (`docker/package.json`) — running `tsx docker/x.ts` from the repo root can't resolve them.
 - **Verify against the live stack, not just types.** A headless `tsx` script driving the real client

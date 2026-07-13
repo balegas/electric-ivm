@@ -1,6 +1,6 @@
-# electric-ivm NODE image: one image for the two JS services, selected by CMD —
-#   - durable-streams server:  tsx docker/ds-server.ts   (the log between Postgres/engine/clients)
-#   - tRPC API server:         tsx docker/api-server.ts  (the extended read/write/shape/subset/aggregate API)
+# electric-ivm NODE image: the JS API service —
+#   - tRPC API server:  tsx docker/api-server.ts  (the extended read/write/shape/subset/aggregate API)
+# (The durable-streams server is the Rust binary now — see docker/Dockerfile.ds.)
 #
 # Build context is the repo root (a .dockerignore prunes node_modules/target/.git):
 #   docker build -f docker/Dockerfile.node -t electric-ivm-node .
@@ -11,9 +11,7 @@ RUN corepack enable
 WORKDIR /repo
 
 COPY . .
-# The durable-streams server needs its native deps (lmdb, msgpackr) built, so scripts run here
-# (unlike the loadgen client image, which skips them).
 RUN pnpm install
 
 WORKDIR /repo/docker
-CMD ["pnpm", "run", "ds"]
+CMD ["pnpm", "run", "api"]

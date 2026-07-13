@@ -1,0 +1,16 @@
+# electric-ivm DS image: the Rust durable-streams server (https://crates.io/crates/durable-streams)
+# — the log between Postgres/engine/clients. Replaces the Node test server for the `ds` service.
+#
+#   docker build -f docker/Dockerfile.ds -t electric-ivm-ds .
+#
+# Env → flags (mirrors the old ds-server.ts contract):
+#   DS_PORT (8791) · BIND_HOST (0.0.0.0) · DS_DATA_DIR (/data) · DS_MEMORY=1 (--durability memory)
+
+FROM rust:1.83-slim AS builder
+RUN cargo install durable-streams --version 0.1.4 --locked
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /usr/local/cargo/bin/durable-streams-server /usr/local/bin/durable-streams-server
+ENV DS_PORT=8791 BIND_HOST=0.0.0.0 DS_DATA_DIR=/data
+CMD ["sh", "-c", "mkdir -p \"$DS_DATA_DIR\" && exec durable-streams-server --host \"$BIND_HOST\" --port \"$DS_PORT\" --data-dir \"$DS_DATA_DIR\" ${DS_MEMORY:+--durability memory}"]

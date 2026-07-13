@@ -8,7 +8,7 @@
     "vite": "vite"
   },
   "dependencies": {
-    "@durable-streams/server": "^0.3.7",
+    "@electric-ivm/ds-rust": "workspace:*",
     "@durable-streams/state": "^0.3.1",
     "@electric-ivm/api": "workspace:*",
     "@electric-ivm/client": "workspace:*",

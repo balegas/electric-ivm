@@ -11,7 +11,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { type ApiServer, createApiServer } from '@electric-ivm/api'
-import { DurableStreamTestServer } from '@durable-streams/server'
+import { DurableStreamTestServer } from '@electric-ivm/ds-rust'
 import { changeEventToDML } from '@electric-ivm/protocol'
 import { faker } from '@faker-js/faker'
 import pgpkg from 'pg'
