@@ -99,3 +99,23 @@ pub(crate) fn translate_output(
     }
     envs
 }
+
+/// The aggregate wire envelope — ONE `"agg"`-keyed row `{ value, n }`, upserted when the value
+/// changes. Shared by the in-engine fold ([`super::executors::AggShape`]) and circuit-served
+/// counts ([`super::executors::CircuitAgg`]) so the two aggregate tiers cannot drift apart on
+/// the wire format.
+pub(crate) fn agg_envelope(
+    table: &str,
+    value: serde_json::Value,
+    n: i64,
+    txid: Option<String>,
+    lsn: Option<String>,
+) -> Envelope {
+    Envelope {
+        type_: table.to_string(),
+        key: "agg".into(),
+        value: Some(serde_json::json!({ "value": value, "n": n })),
+        old: None,
+        headers: EnvelopeHeaders { operation: "upsert".into(), txid, offset: None, lsn, seq: None },
+    }
+}

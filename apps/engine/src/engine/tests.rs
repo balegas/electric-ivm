@@ -680,6 +680,7 @@ async fn trace_family_route_and_filter_drop() {
     );
 
     let mut shape_index = StandaloneIndex::default();
+    let agg_index = StandaloneIndex::default();
     shape_index.insert("s9", &shapes["s9"].pred);
 
     let mut aggregates: HashMap<String, AggShape> = HashMap::new();
@@ -689,7 +690,7 @@ async fn trace_family_route_and_filter_drop() {
 
     // Insert routed to key 'a' -> family hop routed with the key, shape s7 reached, filter s9 drops.
     process_envelope(
-        &ts, &shapes, &shape_index, &families, &mut aggregates,
+        &ts, &shapes, &shape_index, &families, &mut aggregates, &agg_index,
         env("insert", "1", Some(serde_json::json!({"id":1,"name":"a","active":true})), None),
         &mut pending, &subqueries, &trace_tx,
     )
@@ -710,7 +711,7 @@ async fn trace_family_route_and_filter_drop() {
 
     // Insert whose key matches no routed shape -> family hop dropped, no shapes reached.
     process_envelope(
-        &ts, &shapes, &shape_index, &families, &mut aggregates,
+        &ts, &shapes, &shape_index, &families, &mut aggregates, &agg_index,
         env("insert", "2", Some(serde_json::json!({"id":2,"name":"zzz","active":true})), None),
         &mut pending, &subqueries, &trace_tx,
     )
@@ -726,7 +727,7 @@ async fn trace_family_route_and_filter_drop() {
     // Nobody subscribed -> nothing is built or sent (receiver dropped).
     drop(trace_rx);
     process_envelope(
-        &ts, &shapes, &shape_index, &families, &mut aggregates,
+        &ts, &shapes, &shape_index, &families, &mut aggregates, &agg_index,
         env("insert", "3", Some(serde_json::json!({"id":3,"name":"a","active":true})), None),
         &mut pending, &subqueries, &trace_tx,
     )
@@ -742,6 +743,7 @@ async fn trace_aggregate_fold() {
     let ts = users();
     let shapes: HashMap<String, StandaloneShape> = HashMap::new();
     let shape_index = StandaloneIndex::default();
+    let agg_index = StandaloneIndex::default();
     let families: HashMap<Vec<usize>, KeyRouter> = HashMap::new();
     let mut aggregates: HashMap<String, AggShape> = HashMap::new();
     aggregates.insert("s4".into(), agg(AggFn::Count, None)); // COUNT(*) WHERE active = true
@@ -750,7 +752,7 @@ async fn trace_aggregate_fold() {
     let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
 
     process_envelope(
-        &ts, &shapes, &shape_index, &families, &mut aggregates,
+        &ts, &shapes, &shape_index, &families, &mut aggregates, &agg_index,
         env("insert", "1", Some(serde_json::json!({"id":1,"name":"a","active":true})), None),
         &mut pending, &subqueries, &trace_tx,
     )
@@ -762,7 +764,7 @@ async fn trace_aggregate_fold() {
     assert_eq!(ev["shapes"].as_array().unwrap(), &vec![serde_json::json!("s4")]);
 
     process_envelope(
-        &ts, &shapes, &shape_index, &families, &mut aggregates,
+        &ts, &shapes, &shape_index, &families, &mut aggregates, &agg_index,
         env("insert", "2", Some(serde_json::json!({"id":2,"name":"b","active":false})), None),
         &mut pending, &subqueries, &trace_tx,
     )
@@ -1018,4 +1020,55 @@ fn membership_latest_rows_by_pk() {
     assert_eq!(out.len(), 2);
     assert_eq!(out[0], (row(1, "new"), true));  // update → latest row, still exists
     assert_eq!(out[1], (row(2, "gone"), false)); // delete → old row, gone
+}
+
+// --- aggregate tier: shared envelope + conjunct-index pruning --------------------------------
+
+/// Both aggregate tiers (in-engine fold and circuit-served counts) emit through ONE envelope
+/// builder — same key, same `{value, n}` payload shape, same operation. This is the wire-format
+/// contract a client materializes one row from.
+#[test]
+fn agg_envelope_shared_wire_format() {
+    let ts = users();
+    let mut a = agg(AggFn::Count, None);
+    a.apply(&vec![Tup2(active(1), 1), Tup2(active(2), 1)]);
+    let fold_env = a.envelope(&ts, Some("t1".into()), Some("0/1".into()));
+    let circuit = CircuitAgg { stream_path: "shape/x".into(), constraints: vec![None], value: 2 };
+    let circuit_env = circuit.envelope("users", Some("t1".into()), Some("0/1".into()));
+    for env in [&fold_env, &circuit_env] {
+        assert_eq!(env.key, "agg");
+        assert_eq!(env.headers.operation, "upsert");
+        let v = env.value.as_ref().unwrap();
+        assert_eq!(v["value"], serde_json::json!(2));
+        assert_eq!(v["n"], serde_json::json!(2));
+    }
+    assert_eq!(fold_env.value, circuit_env.value);
+}
+
+/// The aggregate conjunct index prunes exactly like the standalone one: an equality-conjunct
+/// aggregate is a candidate only for deltas satisfying its leaf; match-all aggregates stay on
+/// the scan list (always candidates).
+#[test]
+fn agg_index_candidates_prune() {
+    let ts = users(); // cols sorted: active(0), id(1), name(2)
+    let mut idx = StandaloneIndex::default();
+    let eq_pred = CompiledPredicate::compile(
+        &serde_json::from_value(serde_json::json!({"col":"name","op":"eq","value":"alice"}))
+            .unwrap(),
+        &ts,
+    )
+    .unwrap();
+    idx.insert("agg-eq", &eq_pred);
+    idx.insert("agg-all", &CompiledPredicate::MatchAll);
+    let row = |name: &str| Row(vec![Value::Bool(true), Value::Int(1), Value::Text(name.into())]);
+    // A bob-row delta: only the match-all aggregate is a candidate.
+    let c: HashSet<String> = idx.candidates(&[Tup2(row("bob"), 1)]).into_iter().collect();
+    assert!(c.contains("agg-all") && !c.contains("agg-eq"));
+    // An alice-row delta: both are candidates.
+    let c: HashSet<String> = idx.candidates(&[Tup2(row("alice"), 1)]).into_iter().collect();
+    assert!(c.contains("agg-all") && c.contains("agg-eq"));
+    // Removal cleans the index.
+    idx.remove("agg-eq");
+    let c: HashSet<String> = idx.candidates(&[Tup2(row("alice"), 1)]).into_iter().collect();
+    assert!(!c.contains("agg-eq"));
 }

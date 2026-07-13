@@ -192,6 +192,11 @@ pub(crate) struct TableExec {
     pub(crate) families: HashMap<Vec<usize>, KeyRouter>,
     pub(crate) family_of: HashMap<String, (Vec<usize>, u64, Row)>,
     pub(crate) aggregates: HashMap<String, AggShape>,
+    /// Necessary-conjunct index over the aggregates' predicates (same structure as
+    /// `shape_index`): per change only candidate aggregates are folded, so aggregate count
+    /// stops being a linear per-change term. Match-all / un-indexable predicates land on the
+    /// index's scan list and stay always-candidates.
+    pub(crate) agg_index: StandaloneIndex,
     /// Circuit-served shapes on this table (see [`CircuitShape`]).
     pub(crate) circuit_shapes: HashMap<String, CircuitShape>,
     /// Circuit-served COUNT aggregates on this table (see [`CircuitAgg`]).
@@ -209,6 +214,7 @@ impl TableExec {
             families: HashMap::new(),
             family_of: HashMap::new(),
             aggregates: HashMap::new(),
+            agg_index: StandaloneIndex::default(),
             circuit_shapes: HashMap::new(),
             circuit_aggs: HashMap::new(),
             pending: HashMap::new(),
@@ -363,7 +369,8 @@ pub(crate) async fn sequencer_loop(
                                 watchers.retain(|(_, sid)| sid != &shape_id);
                             }
                         } else if exec.aggregates.remove(&shape_id).is_some() {
-                            // an aggregation shape — nothing else to unwind
+                            // an aggregation shape — drop its conjunct-index entry too
+                            exec.agg_index.remove(&shape_id);
                         } else if exec.shapes.remove(&shape_id).map(|_| exec.shape_index.remove(&shape_id)).is_none()
                             && let Some((key_cols, num_id, key_tuple)) = exec.family_of.remove(&shape_id)
                             && let Some(router) = exec.families.get_mut(&key_cols)
@@ -479,7 +486,8 @@ pub(crate) async fn sequencer_loop(
                             }
                             if let Err(e) = process_envelope(
                                 &exec.ts, &exec.shapes, &exec.shape_index, &exec.families,
-                                &mut exec.aggregates, env.clone(), &mut txn_pending, &subq, &trace_tx,
+                                &mut exec.aggregates, &exec.agg_index, env.clone(), &mut txn_pending,
+                                &subq, &trace_tx,
                             )
                             .await
                             {
@@ -698,6 +706,7 @@ pub(crate) async fn activate_shape(
             }
             *emitted.entry(shape_id.to_string()).or_insert(0) += outs.len() as u64;
             ds.append(&p.stream_path, &outs).await?;
+            exec.agg_index.insert(shape_id, &agg.pred);
             exec.aggregates.insert(shape_id.to_string(), agg);
         }
     }
@@ -874,6 +883,7 @@ pub(crate) async fn process_envelope(
     shape_index: &StandaloneIndex,
     families: &HashMap<Vec<usize>, KeyRouter>,
     aggregates: &mut HashMap<String, AggShape>,
+    agg_index: &StandaloneIndex,
     env: Envelope,
     pending: &mut HashMap<String, Vec<Envelope>>,
     subq: &SubqueryHandle,
@@ -1027,9 +1037,19 @@ pub(crate) async fn process_envelope(
             }
         }
     }
-    // Scalar aggregations: fold this delta into each running aggregate; emit the new value when it
-    // changes. Skips changes already counted in the seed (the aggregate's snapshot gate).
+    // Scalar aggregations: fold this delta into each *candidate* aggregate (necessary-conjunct
+    // index — a non-candidate's predicate provably matches no delta row, so skipping it leaves
+    // the fold unchanged); emit the new value when it changes. Skips changes already counted in
+    // the seed (the aggregate's snapshot gate). Under an attached trace subscriber the index is
+    // bypassed (like the standalone tier) so every aggregate node reports a folded/dropped hop.
+    let agg_candidates: Option<HashSet<String>> =
+        if tr.is_none() { Some(agg_index.candidates(&delta).into_iter().collect()) } else { None };
     for (sid, agg) in aggregates.iter_mut() {
+        if let Some(c) = &agg_candidates {
+            if !c.contains(sid) {
+                continue;
+            }
+        }
         if agg.gate.should_skip(lsn_u64, xid) {
             if let Some((hops, _)) = tr.as_mut() {
                 hops.push(crate::trace::TraceHop::new(format!("shape:{sid}"), "dropped"));

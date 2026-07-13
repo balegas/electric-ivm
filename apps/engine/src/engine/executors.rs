@@ -73,15 +73,9 @@ impl CircuitAgg {
         })
     }
 
-    /// Same wire format as [`AggShape::envelope`]: one `"agg"` row `{value, n}`.
+    /// The shared aggregate wire envelope (see [`super::output::agg_envelope`]).
     pub(crate) fn envelope(&self, table: &str, txid: Option<String>, lsn: Option<String>) -> Envelope {
-        Envelope {
-            type_: table.to_string(),
-            key: "agg".into(),
-            value: Some(serde_json::json!({ "value": self.value, "n": self.value })),
-            old: None,
-            headers: EnvelopeHeaders { operation: "upsert".into(), txid, offset: None, lsn, seq: None },
-        }
+        super::output::agg_envelope(table, serde_json::json!(self.value), self.value, txid, lsn)
     }
 }
 
@@ -371,15 +365,10 @@ impl AggShape {
         }
     }
 
-    /// The output envelope carrying the current aggregate (key `"agg"`, so the client materializes one row).
+    /// The shared aggregate wire envelope (see [`super::output::agg_envelope`]) carrying the
+    /// current value (key `"agg"`, so the client materializes one row).
     pub(crate) fn envelope(&self, ts: &TableSchema, txid: Option<String>, lsn: Option<String>) -> Envelope {
-        Envelope {
-            type_: ts.name.clone(),
-            key: "agg".into(),
-            value: Some(serde_json::json!({ "value": self.value(), "n": self.count })),
-            old: None,
-            headers: EnvelopeHeaders { operation: "upsert".into(), txid, offset: None, lsn, seq: None },
-        }
+        super::output::agg_envelope(&ts.name, self.value(), self.count, txid, lsn)
     }
 }
 

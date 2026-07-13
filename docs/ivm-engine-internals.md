@@ -304,6 +304,11 @@ aggregates ignore NULL values, `COUNT(col)` counts non-NULLs (`COUNT(*)` counts 
 divides by the non-NULL count, and SUM/AVG/MIN/MAX over zero non-NULL values are NULL. The feed
 is a single-row stream (`{ value, n }`, key `"agg"`), emitted only when the value changes.
 State: O(1) (+ O(distinct values) for MIN/MAX). Identical aggregations share one fold (§3.5).
+Per-change cost is output-sensitive like the standalone tier: aggregates are indexed by a
+necessary conjunct (`engine/sequencer.rs::TableExec::agg_index`), so only candidate aggregates
+are folded per change — match-all / un-indexable predicates stay on the always-candidate scan
+list. Both aggregate tiers (this fold and circuit-served counts) emit through one shared wire
+envelope (`engine/output.rs::agg_envelope`).
 
 ---
 
