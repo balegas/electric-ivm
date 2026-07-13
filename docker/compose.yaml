@@ -41,6 +41,9 @@ services:
     environment:
       DS_PORT: 8791
       DS_DATA_DIR: /data
+      # In-memory durability by default (no fsync-per-append cost); set DS_MEMORY= (empty) for a
+      # deployment that must survive a restart without replaying from Postgres.
+      DS_MEMORY: "${DS_MEMORY-1}"
     ports:
       - "${DS_PORT:-8791}:8791"
     volumes:

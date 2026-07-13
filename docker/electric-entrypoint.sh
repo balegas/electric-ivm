@@ -32,9 +32,10 @@ if [ -z "$PG_URL" ]; then
   exit 64
 fi
 
-# Storage mode: MEMORY -> in-memory ds; anything else (default FAST_FILE) -> file-backed under
-# $ELECTRIC_STORAGE_DIR/shapes.
-STORAGE="${ELECTRIC_STORAGE:-FAST_FILE}"
+# Storage mode: MEMORY (default) -> in-memory ds, no fsync-per-append cost; FAST_FILE -> file-backed
+# under $ELECTRIC_STORAGE_DIR/shapes, durable across restarts. Set ELECTRIC_STORAGE=FAST_FILE
+# explicitly for a deployment that must survive a restart without replaying from Postgres.
+STORAGE="${ELECTRIC_STORAGE:-MEMORY}"
 if [ "$STORAGE" = "MEMORY" ]; then
   export DS_MEMORY=1
   STORAGE_DESC="MEMORY (in-memory durable-streams)"

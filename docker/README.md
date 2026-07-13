@@ -46,7 +46,7 @@ supervises both: if either exits, the other is killed and the container exits wi
 | `ELECTRIC_PORT` | HTTP port for `/v1/shape` + `/v1/health` (default `3000`, bind `0.0.0.0`). |
 | `ELECTRIC_INSTANCE_ID` | Tags every StatsD metric `instance_id:<value>`. |
 | `ELECTRIC_STATSD_HOST` | StatsD sink `host[:port]` (default port 8125); absent → StatsD off. |
-| `ELECTRIC_STORAGE` | `MEMORY` → in-memory durable-streams; else (`FAST_FILE`, default) → file-backed under `$ELECTRIC_STORAGE_DIR/shapes`. |
+| `ELECTRIC_STORAGE` | `MEMORY` (default) → in-memory durable-streams; `FAST_FILE` → file-backed under `$ELECTRIC_STORAGE_DIR/shapes`, durable across restarts. |
 | `ELECTRIC_STORAGE_DIR` | Root dir for file storage (default `./persistent`, anchored at `/app`). |
 | `ELECTRIC_LOG_LEVEL`, `ELECTRIC_INSECURE`, `ELECTRIC_SECRET`, `ELECTRIC_REPLICATION_STREAM_ID`, … | Accepted (see the spec's env table). |
 
