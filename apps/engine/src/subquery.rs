@@ -187,6 +187,18 @@ pub struct SubqueryShape {
     /// Envelopes appended to this shape's stream (backfill + live), for the visualizer's per-node
     /// state. Atomic because the append paths hold `&self`.
     pub emitted: std::sync::atomic::AtomicU64,
+    /// Pks this shape has told its stream are members (seeded from the backfill, updated by every
+    /// emission below). A delta computing "not a member" for a pk absent here is a true no-op —
+    /// this shape never claimed it, so a delete would be spurious, not idempotent — and is
+    /// dropped rather than delivered. Without this, every outer-table write wakes every
+    /// subquery shape on that table's live long-poll (durable-streams sees a real, non-empty
+    /// append), even when the row never matched: the client-side key-set filter in
+    /// `electric.rs::apply_changes` suppresses the bogus delete from the visible message, but by
+    /// then the long-poll has already resolved with an empty "up-to-date" — burning a full
+    /// round-trip per irrelevant write, per concurrently-live shape on the table. Purely local
+    /// bookkeeping (this shape's own emission history), so it carries none of the cross-table
+    /// race the absolute/idempotent emission scheme (see `emit_shape_delta`) exists to avoid.
+    known_members: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// A `TableSchema` lookup shared with the engine's compiled schema.
@@ -482,13 +494,16 @@ impl SubqueryRegistry {
     /// Phase C (under the registry lock; brief, in-memory + lane enqueues): install the seeds,
     /// replay every buffered delta through the seed gates, register the shape, and return the
     /// flips the replays produced (the caller enqueues them for propagation). `seeded` counts
-    /// the phase-B snapshot envelopes (for the shape's emitted counter).
+    /// the phase-B snapshot envelopes (for the shape's emitted counter). `seeded_pks` is the
+    /// backfilled outer rows' pks, seeding `known_members` so a later delta that finds one of
+    /// them no longer matching correctly emits a delete (not silently dropped as "never known").
     pub async fn finish_create(
         &mut self,
         shape_id: &str,
         node_seeds: Vec<(SubquerySig, Vec<Row>, crate::pg::SnapshotGate)>,
         outer_gate: crate::pg::SnapshotGate,
         seeded: u64,
+        seeded_pks: std::collections::HashSet<String>,
     ) -> Result<VecDeque<(SubquerySig, Flip)>> {
         let idx = self
             .pending_shapes
@@ -547,6 +562,7 @@ impl SubqueryRegistry {
                 out_cols: pending.out_cols.clone(),
                 gate: outer_gate,
                 emitted: std::sync::atomic::AtomicU64::new(seeded),
+                known_members: std::sync::Mutex::new(seeded_pks),
             },
         );
         if !pending.buffer.is_empty() {
@@ -786,6 +802,7 @@ impl SubqueryRegistry {
                 (row, if member { 1 } else { -1 })
             })
             .collect();
+        let out = filter_known_members(ts, out, &shape.known_members);
         if out.is_empty() {
             return Ok(false);
         }
@@ -799,6 +816,30 @@ impl SubqueryRegistry {
         Ok(true)
     }
 
+}
+
+/// Drop deletes (`w <= 0`) for pks this shape's `known_members` doesn't hold — this shape never
+/// told its stream that pk was a member, so a delete for it is a true no-op, not an idempotent
+/// one, and delivering it would needlessly wake every live long-poll on this shape (durable-streams
+/// treats any non-empty append as new data). Updates `known_members` to match what's kept: an
+/// emitted insert/update adds its pk, an emitted delete removes it.
+fn filter_known_members(
+    ts: &TableSchema,
+    out: Vec<(Row, ZWeight)>,
+    known_members: &std::sync::Mutex<std::collections::HashSet<String>>,
+) -> Vec<(Row, ZWeight)> {
+    let mut known = known_members.lock().unwrap();
+    out.into_iter()
+        .filter(|(row, w)| {
+            let pk = ts.key_string(row).unwrap_or_default();
+            if *w > 0 {
+                known.insert(pk);
+                true
+            } else {
+                known.remove(&pk)
+            }
+        })
+        .collect()
 }
 
 // --- deferred flip propagation ------------------------------------------------------------------
@@ -913,6 +954,10 @@ async fn move_shape_for_value(
             (r, w)
         })
         .collect();
+    let out = filter_known_members(&ts, out, &shape.known_members);
+    if out.is_empty() {
+        return Ok(None);
+    }
     // Net membership change this move applies (enters +1, leaves −1), for the trace dot.
     let net: i64 = out.iter().map(|(_, w)| *w as i64).sum();
     let envs = crate::engine::translate_output(&ts, out, txid, None, shape.out_cols.as_deref().map(Vec::as_slice));
@@ -987,6 +1032,10 @@ async fn rederive_dependent(
                     (r, w)
                 })
                 .collect();
+            let out = filter_known_members(&ts, out, &s.known_members);
+            if out.is_empty() {
+                return Ok(());
+            }
             let envs =
                 crate::engine::translate_output(&ts, out, txid, None, s.out_cols.as_deref().map(Vec::as_slice));
             if envs.is_empty() {
@@ -1425,6 +1474,51 @@ mod tests {
         assert_eq!(reg.pending_seed.len(), 0, "aborted create left a pending seed");
         assert!(reg.shapes.is_empty());
         assert!(reg.pending_shapes.is_empty());
+    }
+
+    /// `filter_known_members` is the fix for the live-poll wake-storm bug: a subquery shape's
+    /// `emit_shape_delta`/`move_shape_for_value`/`rederive_dependent` compute an *absolute*
+    /// membership weight (+1/-1) for every touched pk, regardless of whether that shape ever had
+    /// the pk — by design (see `emit_shape_delta`'s doc comment), since a delete is "idempotent by
+    /// pk" from a correctness standpoint. But delivering that idempotent-but-spurious delete to the
+    /// shape's durable-stream still counts as new data to a live long-poll: durable-streams wakes on
+    /// any non-empty append, and every OTHER write to the same outer table — matching this shape's
+    /// predicate or not — would resolve this shape's live poll early with an empty "up-to-date"
+    /// (electric.rs's client-side key-set filter drops the bogus delete before it reaches the
+    /// client, but by then the round-trip is already spent). Never-known pks must be dropped before
+    /// they reach `deliver()`, not just before they reach the client.
+    #[test]
+    fn filter_known_members_drops_deletes_for_never_known_pks() {
+        use crate::schema::TableDef;
+        let def: TableDef = serde_json::from_value(serde_json::json!({
+            "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id"
+        }))
+        .unwrap();
+        let ts = crate::schema::TableSchema::from_def("t", &def).unwrap();
+        let known: std::sync::Mutex<std::collections::HashSet<String>> = std::sync::Mutex::new(HashSet::new());
+        let row = |id: i64| Row(vec![Value::Int(id), Value::Int(0)]);
+        let pk1 = ts.key_string(&row(1)).unwrap();
+
+        // A "leave" for a pk this shape never claimed as a member is a true no-op: this shape's
+        // stream never told anyone pk 1 was there, so a delete for it is spurious, not idempotent —
+        // it must be dropped, not delivered (the bug this test guards).
+        let out = filter_known_members(&ts, vec![(row(1), -1)], &known);
+        assert!(out.is_empty(), "delete for a never-known pk must be dropped");
+        assert!(known.lock().unwrap().is_empty());
+
+        // An "enter" is always kept and recorded as known.
+        let out = filter_known_members(&ts, vec![(row(1), 1)], &known);
+        assert_eq!(out.len(), 1, "insert must be kept");
+        assert!(known.lock().unwrap().contains(&pk1));
+
+        // Now that pk 1 is known, a genuine "leave" is kept and clears the record.
+        let out = filter_known_members(&ts, vec![(row(1), -1)], &known);
+        assert_eq!(out.len(), 1, "delete for a known pk must be kept");
+        assert!(!known.lock().unwrap().contains(&pk1));
+
+        // Deleting the same (now-unknown-again) pk a second time is dropped once more.
+        let out = filter_known_members(&ts, vec![(row(1), -1)], &known);
+        assert!(out.is_empty(), "repeat delete for an already-removed pk must be dropped");
     }
 
     #[test]
