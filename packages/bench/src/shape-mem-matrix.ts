@@ -205,7 +205,9 @@ const visibilityWhere = (userId: number) => ({
 function shapesForUser(userId: number, issues: number): object[] {
   const out: object[] = []
   // 1 visibility subquery (one shared inner node per user, contributors = the user's memberships).
-  out.push({ table: 'issues', where: visibilityWhere(userId), changesOnly: true })
+  // MATRIX_MATERIALIZED=1: visibility shapes backfill (populates the per-feed key sets — the
+  // O(feed size) memory term), at the cost of one backfill query per user shape.
+  out.push({ table: 'issues', where: visibilityWhere(userId), changesOnly: process.env.MATRIX_MATERIALIZED !== '1' })
   // 5 board columns — all share ONE family (key column `status`).
   for (const s of STATUSES) out.push({ table: 'issues', where: { col: 'status', op: 'eq', value: s }, changesOnly: true })
   // "My tasks" — shares one family (key column `username`).
