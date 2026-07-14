@@ -15,14 +15,23 @@ import type { TraceEvent } from './types'
 
 export type FlashKind = 'pass' | 'drop' | 'fold'
 
-/** One dot-travel / one rank of node flashes. Deliberately unhurried — the point of the
- *  animation is READING the propagation, not signalling that something happened. */
-export const STEP_MS = 750
+/** One dot-travel / one rank of node flashes, at the default 1× speed. Deliberately unhurried —
+ *  the point of the animation is READING the propagation, not signalling that something happened.
+ *  The sidebar speed scrubber scales this per call via `eventDecor`'s `speed` param. */
+export const BASE_STEP_MS = 750
+
+/** The per-rank stage duration at a given speed multiplier (2× speed == half the step time). */
+export function rankDelayMs(rank: number, speed: number): number {
+  return (rank * BASE_STEP_MS) / speed
+}
 
 export interface NodeFlash {
   kind: FlashKind
   /** Stage offset: when this node's flash animation begins. */
   delayMs: number
+  /** The rank this delay was computed from — lets a later replay re-derive delayMs at whatever
+   *  speed is active THEN, instead of replaying frozen at the speed captured live. */
+  rank: number
 }
 
 export interface Decor {
@@ -87,8 +96,9 @@ function stageRanks(flashed: Set<string>, edges: Edge[]): Map<string, number> {
 }
 
 /** Compute the staged flash/pulse decoration for one trace event against the rendered edge list.
- *  Nodes not present in the rendered graph are silently skipped (e.g. other selections). */
-export function eventDecor(ev: TraceEvent, edges: Edge[], present: Set<string>, expand: HopExpand): Decor {
+ *  Nodes not present in the rendered graph are silently skipped (e.g. other selections). `speed`
+ *  scales every stage's timing (2× runs twice as fast); defaults to the normal 1× pace. */
+export function eventDecor(ev: TraceEvent, edges: Edge[], present: Set<string>, expand: HopExpand, speed = 1): Decor {
   const kinds = new Map<string, FlashKind>()
   for (const hop of ev.hops) {
     const flash: FlashKind = outcomeFlash[hop.outcome] ?? 'pass'
@@ -111,10 +121,11 @@ export function eventDecor(ev: TraceEvent, edges: Edge[], present: Set<string>, 
   for (const [id, kind] of kinds) {
     const r = ranks.get(id) ?? 0
     maxRank = Math.max(maxRank, r)
-    nodes.set(id, { kind, delayMs: r * STEP_MS })
+    nodes.set(id, { kind, delayMs: rankDelayMs(r, speed), rank: r })
   }
 
   const id = decorSeq++
+  const stepMs = rankDelayMs(1, speed)
   const pulses = new Map<string, EdgePulse>()
   for (const e of edges) {
     // A `state` edge is a READ (a join/filter consulting an arrangement), not a data stream — its
@@ -123,10 +134,10 @@ export function eventDecor(ev: TraceEvent, edges: Edge[], present: Set<string>, 
     if ((e.data as { kind?: string } | undefined)?.kind === 'state') continue
     if (nodes.has(e.source) && nodes.has(e.target)) {
       // The dot leaves when its source rank flashes and arrives at the target's rank.
-      pulses.set(e.id, { id, color, label, delayMs: (ranks.get(e.source) ?? 0) * STEP_MS, durMs: STEP_MS })
+      pulses.set(e.id, { id, color, label, delayMs: rankDelayMs(ranks.get(e.source) ?? 0, speed), durMs: stepMs })
     }
   }
-  return { nodes, edges: pulses, id, totalMs: (maxRank + 1) * STEP_MS }
+  return { nodes, edges: pulses, id, totalMs: rankDelayMs(maxRank + 1, speed) }
 }
 
 /** Merge b over a (later events win per node/edge). */

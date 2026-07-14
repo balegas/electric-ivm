@@ -10,9 +10,9 @@ import { PipelineNode } from './nodes'
 import { predicateLabel } from './predicate-label'
 import { recordShapeChanges } from './shape-change-store'
 import { shapeSql } from './shape-sql'
-import { applyStateStaggered, seedState } from './state-store'
-import { eventDecor, mergeDecor, type Decor, type FlashKind } from './trace-anim'
-import type { EngineGraph, GraphShape, TraceEvent, TraceMessage } from './types'
+import { applyStateStaggered, getAuthoritative, replayStateTransition, seedState } from './state-store'
+import { eventDecor, mergeDecor, rankDelayMs, type Decor, type FlashKind, type HopExpand } from './trace-anim'
+import type { EngineGraph, GraphShape, NodeStateSummary, TraceEvent, TraceMessage } from './types'
 import { useTrace } from './useTrace'
 import { WhereEditor } from './WhereEditor'
 
@@ -24,11 +24,24 @@ const DECOR_TTL_MS = 1100
 /** How many trace events the activity log retains (newest first). */
 const LOG_CAP = 50
 
-/** One activity-log entry: a captured trace event, replayable on click. */
+/** One activity-log entry: a captured trace event, replayable on click. `snapshot` is the
+ *  rendered-graph context (edges/present-node-ids/hop-expansion) AS IT WAS the moment this event
+ *  was captured — replay uses it instead of the live current graph, so an entry animates the same
+ *  way every time even after the topology has since changed (a shape created/dropped, a node
+ *  collapsed/expanded, a view switch). Without this, replay silently re-derives the path against
+ *  today's graph, which can show a different path, a different-length animation, or nothing at
+ *  all if the original nodes/edges no longer exist. */
 interface LogEntry {
   key: number
   at: number
   ev: TraceEvent
+  snapshot: { edges: Edge[]; present: Set<string>; expand: HopExpand }
+  /** Per-state-id chip transition captured for this entry, so replay can restage the count/value
+   *  change alongside the flash/pulse animation — not just derive it fresh from current truth.
+   *  `after` fills in once the state push that follows this delta arrives; null until then (or if
+   *  this delta touched no stateful chip). `rank` (not a baked ms delay) so a replay re-derives the
+   *  actual delay at whatever speed the scrubber is set to when replayed, not when captured. */
+  countReplay: { before: Map<string, NodeStateSummary>; rank: Map<string, number>; after: Map<string, NodeStateSummary> | null }
 }
 /** How long newly created nodes/paths stay highlighted after a graph change. */
 const FRESH_TTL_MS = 2500
@@ -198,6 +211,12 @@ export default function App() {
   // node badged with the count — on by default, since a real app opens the same handful of shapes
   // once per user/value and the canvas would otherwise explode. Selecting a shape expands its family.
   const [groupShapes, setGroupShapes] = useState(true)
+  // Playback speed for the flash/pulse animation (both live and activity-log replay) — 1 is the
+  // normal unhurried pace, >1 faster, <1 slower. A ref mirrors it for the stable `applyEventDecor`
+  // callback below (same pattern as edgesRef/presentRef/expandRef).
+  const [speed, setSpeed] = useState(1)
+  const speedRef = useRef(speed)
+  speedRef.current = speed
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [sidebarW, setSidebarW] = useState(340)
   const [resizing, setResizing] = useState(false)
@@ -332,11 +351,19 @@ export default function App() {
   // so the chip ticks up in step with the animation. Stale entries sit in the past → reveal now.
   const arrivalRef = useRef(new Map<string, number>())
 
-  // Apply one trace event's staged decoration against the CURRENT render (used by both the live
-  // stream and activity-log replays). The decor stays up for the whole staged run + a tail.
-  const applyEventDecor = useCallback((ev: TraceEvent) => {
-    const d = eventDecor(ev, edgesRef.current, presentRef.current, expandRef.current)
-    if (d.nodes.size === 0 && d.edges.size === 0) return
+  // Apply one trace event's staged decoration. Live events (no snapshot) decorate against the
+  // CURRENT render; activity-log replays pass the snapshot captured when the event first arrived,
+  // so a replay always animates the same way regardless of how the graph has changed since. The
+  // decor stays up for the whole staged run + a tail.
+  const applyEventDecor = useCallback((ev: TraceEvent, snapshot?: { edges: Edge[]; present: Set<string>; expand: HopExpand }): Decor | null => {
+    const d = eventDecor(
+      ev,
+      snapshot?.edges ?? edgesRef.current,
+      snapshot?.present ?? presentRef.current,
+      snapshot?.expand ?? expandRef.current,
+      speedRef.current,
+    )
+    if (d.nodes.size === 0 && d.edges.size === 0) return null
     // Record when the dot reaches each node (rank delay == arrival), keyed by the node's state-summary
     // id. The state event that immediately follows this delta reveals those chips on that schedule.
     const now = Date.now()
@@ -347,6 +374,7 @@ export default function App() {
     setDecor((prev) => mergeDecor(prev, d))
     if (decorTimer.current) clearTimeout(decorTimer.current)
     decorTimer.current = setTimeout(() => setDecor(null), d.totalMs + DECOR_TTL_MS)
+    return d
   }, [])
 
   // Activity log: the last LOG_CAP trace events, newest first — each entry replays its animation
@@ -354,6 +382,19 @@ export default function App() {
   const [log, setLog] = useState<LogEntry[]>([])
   const [logOpen, setLogOpen] = useState(false)
   const logSeq = useRef(1)
+
+  const replayEntry = useCallback(
+    (e: LogEntry) => {
+      applyEventDecor(e.ev, e.snapshot)
+      if (e.countReplay.after) {
+        const speed = speedRef.current
+        replayStateTransition(e.countReplay.before, e.countReplay.after, (sid) => rankDelayMs(e.countReplay.rank.get(sid) ?? 0, speed))
+      }
+    },
+    [applyEventDecor],
+  )
+  // Log entry awaiting the state push that follows its delta, to fill in `countReplay.after`.
+  const pendingAfterKeyRef = useRef<number | null>(null)
 
   const lifecycleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const onTrace = useCallback(
@@ -369,6 +410,23 @@ export default function App() {
             const at = arrivalRef.current.get(id)
             return at === undefined ? 0 : Math.max(0, at - now)
           })
+          // This push follows the delta that just logged an activity entry — fill in that entry's
+          // "after" chip values so a later replay can restage the exact before → after transition.
+          const pendingKey = pendingAfterKeyRef.current
+          if (pendingKey !== null) {
+            pendingAfterKeyRef.current = null
+            setLog((prev) =>
+              prev.map((e) => {
+                if (e.key !== pendingKey) return e
+                const after = new Map<string, NodeStateSummary>()
+                for (const sid of e.countReplay.before.keys()) {
+                  const a = ev.nodes[sid]
+                  if (a !== undefined) after.set(sid, a)
+                }
+                return { ...e, countReplay: { ...e.countReplay, after } }
+              }),
+            )
+          }
           return
         }
         // Structure changed (shape created/dropped) — refresh once the churn settles instead of
@@ -383,14 +441,29 @@ export default function App() {
         }, LIFECYCLE_SETTLE_MS)
         return
       }
-      setLog((prev) => [{ key: logSeq.current++, at: Date.now(), ev }, ...prev].slice(0, LOG_CAP))
+      const snapshot = { edges: edgesRef.current, present: presentRef.current, expand: expandRef.current }
+      const key = logSeq.current++
+      const d = applyEventDecor(ev)
+      // Snapshot each touched chip's CURRENT truth as "before" now, ahead of the state push this
+      // delta is about to trigger — that push fills in "after" (see the state branch above).
+      const countReplay: LogEntry['countReplay'] = { before: new Map(), rank: new Map(), after: null }
+      if (d) {
+        for (const [nodeId, flash] of d.nodes) {
+          const sid = stateIdOfNode.current.get(nodeId)
+          if (!sid) continue
+          const b = getAuthoritative(sid)
+          if (b !== undefined) countReplay.before.set(sid, b)
+          countReplay.rank.set(sid, flash.rank)
+        }
+      }
+      setLog((prev) => [{ key, at: Date.now(), ev, snapshot, countReplay }, ...prev].slice(0, LOG_CAP))
+      if (countReplay.before.size > 0) pendingAfterKeyRef.current = key
       // Capture this change's Z-set as the latest delta for its table — the Δ change operator's
       // panel (and its inline peek) reconstruct the weighted rows from it.
       recordDelta(ev)
       // Bump the change tick for every shape this event touched, so a SINK/shape-out row preview
       // refetches immediately (reuses this one SSE — no second connection).
       recordShapeChanges(ev.shapes)
-      applyEventDecor(ev)
     },
     [load, applyEventDecor],
   )
@@ -623,6 +696,25 @@ export default function App() {
           </button>
         </div>
 
+        <div className="speed-ctl" title="Speed of the flash/pulse animation — live changes and activity-log replays both follow it">
+          <span className="speed-label">Speed</span>
+          <input
+            className="speed-slider"
+            type="range"
+            min={0.25}
+            max={2}
+            step={0.25}
+            value={speed}
+            onChange={(e) => setSpeed(Number(e.target.value))}
+          />
+          <span className="speed-val">{speed.toFixed(2)}×</span>
+          {speed !== 1 ? (
+            <button className="btn btn-icon speed-reset" title="Reset to 1×" onClick={() => setSpeed(1)}>
+              ↺
+            </button>
+          ) : null}
+        </div>
+
         {graph ? (
           <div className="counts">
             {graph.shapes.length} shapes · {graph.tables.length} tables · {graph.subqueryNodes.length} subquery
@@ -743,7 +835,7 @@ export default function App() {
                       key={e.key}
                       className="log-row"
                       title="Replay this change's animation on the canvas"
-                      onClick={() => applyEventDecor(e.ev)}
+                      onClick={() => replayEntry(e)}
                     >
                       <span className="log-time">{new Date(e.at).toLocaleTimeString()}</span>
                       <span className="log-table">{e.ev.table}</span>

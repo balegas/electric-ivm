@@ -570,13 +570,34 @@ export function layout(
     return pos
   }
 
-  // Connection highlight: when a node is focused, neighbours stay lit and the rest dims.
+  // Connection highlight: when a node is focused, its lineage stays lit — every ancestor back to
+  // the root table, every descendant down to a shape sink — and the rest dims. Two SEPARATE
+  // directional walks from the focus itself, not one flood-fill: walking ancestors only ever
+  // follows edges backward, so reaching a shared upstream node (e.g. the source table) does NOT
+  // then fan back out forward into that node's OTHER children — an unrelated sibling shape stays
+  // dim. Same for the descendant walk in the forward direction.
   let lit: Set<string> | null = null
   if (focus && raw.nodes.has(focus)) {
     lit = new Set([focus])
-    for (const e of raw.edges) {
-      if (e.source === focus) lit.add(e.target)
-      if (e.target === focus) lit.add(e.source)
+    const ancestors = [focus]
+    while (ancestors.length > 0) {
+      const id = ancestors.pop()!
+      for (const e of raw.edges) {
+        if (e.target === id && !lit.has(e.source)) {
+          lit.add(e.source)
+          ancestors.push(e.source)
+        }
+      }
+    }
+    const descendants = [focus]
+    while (descendants.length > 0) {
+      const id = descendants.pop()!
+      for (const e of raw.edges) {
+        if (e.source === id && !lit.has(e.target)) {
+          lit.add(e.target)
+          descendants.push(e.target)
+        }
+      }
     }
   }
 

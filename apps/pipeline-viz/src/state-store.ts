@@ -124,3 +124,57 @@ export async function seedState(): Promise<void> {
 export function useNodeState(id: string): NodeStateSummary | undefined {
   return useSyncExternalStore(subscribe, () => displayed.get(id))
 }
+
+/** Current authoritative value for one node, or undefined if unknown. NOT reactive (doesn't
+ *  subscribe) — for capturing a "before" snapshot when an activity-log entry is recorded, so its
+ *  chip transition can be replayed later even after the real truth has moved on. */
+export function getAuthoritative(id: string): NodeStateSummary | undefined {
+  return authoritative.get(id)
+}
+
+/** Replay-only staged reveal: stages `before` → `after` on the given schedule, exactly like a live
+ *  change, but WITHOUT touching `authoritative` — a rewind-and-replay of a historical chip
+ *  transition, not a new fact. Once every staged reveal has fired, each touched id snaps back to
+ *  whatever `authoritative` actually is *now* (real truth may have moved on since this event was
+ *  captured), so a replay never leaves a stale historical number stuck on screen. */
+export function replayStateTransition(
+  before: Map<string, NodeStateSummary>,
+  after: Map<string, NodeStateSummary>,
+  delayMs: (id: string) => number,
+): void {
+  const ids = new Set([...before.keys(), ...after.keys()])
+  if (ids.size === 0) return
+  let changed = false
+  for (const id of ids) {
+    clearTimer(id)
+    const b = before.get(id)
+    if (b !== undefined && !sameSummary(displayed.get(id), b)) {
+      displayed.set(id, b)
+      changed = true
+    }
+  }
+  if (changed) notify()
+  let maxDelay = 0
+  for (const id of ids) {
+    const d = Math.max(0, delayMs(id))
+    maxDelay = Math.max(maxDelay, d)
+    const a = after.get(id)
+    timers.set(
+      id,
+      setTimeout(() => {
+        timers.delete(id)
+        if (a !== undefined && !sameSummary(displayed.get(id), a)) {
+          displayed.set(id, a)
+          notify()
+        }
+      }, d),
+    )
+  }
+  setTimeout(() => {
+    let snapChanged = false
+    for (const id of ids) {
+      if (reveal(id)) snapChanged = true
+    }
+    if (snapChanged) notify()
+  }, maxDelay + 50)
+}

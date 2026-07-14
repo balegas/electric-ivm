@@ -1124,17 +1124,12 @@ export function DetailPanel({
             <Row k="matching rows" v={live.count.toLocaleString()} />
           </>
         ) : null}
-        {/* "inside this operator" leads for most operators. A source has a richer panel, so its
-            explainer drops below the headline content: arrangements list → row browser → the
-            per-kind explanation cards (source, then index/counts) last. */}
-        {node.opKind !== 'op-source' ? <InsideNote kind={node.opKind} /> : null}
         {node.opKind === 'op-source' && opTable ? (
           <SourceArrangements table={opTable} arr={graph.arrangements} />
         ) : null}
         {node.opKind === 'op-source' && opTable ? (
           <TableBrowser table={opTable} />
         ) : null}
-        {node.opKind === 'op-source' ? <InsideNote kind={node.opKind} /> : null}
         {node.opKind === 'op-source' && opTable ? (
           <SourceArrangementNotes table={opTable} arr={graph.arrangements} />
         ) : null}
@@ -1144,6 +1139,8 @@ export function DetailPanel({
         {node.opKind === 'op-sink' ? (
           <SinkView shape={graph.shapes.find((x) => x.id === (node.hop.startsWith('shape:') ? node.hop.slice('shape:'.length) : ''))} />
         ) : null}
+        {/* "inside this operator" — moved to the bottom of the panel, after all the live/headline content. */}
+        <InsideNote kind={node.opKind} />
       </>
     )
   } else if (node.kind === 'aggshape') {
@@ -1175,11 +1172,12 @@ export function DetailPanel({
         ) : null}
         <Row k="output" v="a single live scalar (streamed)" />
         {tier ? <div className="dp-note">{tier.note}</div> : null}
-        <InsideNote kind="agg" />
         {/* Fold internals exist only for fold-maintained aggregates — a circuit-served COUNT has
             no fold executor (the deep dump 404s), its value lives in the counts pipeline. */}
         {s && !s.circuit ? <AggInternalsView nodeId={stateId} /> : null}
         {s ? <SqlBlock sql={shapeSql(s)} /> : null}
+        {/* "inside this operator" — moved to the bottom of the panel. */}
+        <InsideNote kind="agg" />
       </>
     )
   } else {
@@ -1196,10 +1194,11 @@ export function DetailPanel({
         <Row k="changes-only feed" v={s?.changesOnly ? 'yes (no backfill)' : 'no (materialized)'} />
         <Row k="stream" v={<code>{s?.streamPath}</code>} />
         {live?.kind === 'shape' ? <Row k="envelopes emitted (live)" v={live.emitted.toLocaleString()} /> : null}
-        <InsideNote kind="shape" />
         {s ? <SqlBlock sql={shapeSql(s)} /> : null}
         {s ? <ShapeLiveView shape={s} /> : null}
         {tier ? <div className="dp-note">{tier.note}</div> : null}
+        {/* "inside this operator" — moved to the bottom of the panel. */}
+        <InsideNote kind="shape" />
       </>
     )
   }
