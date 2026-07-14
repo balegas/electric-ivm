@@ -22,6 +22,7 @@ use anyhow::{Context, Result};
 use crate::value::{Tup2, ZWeight};
 
 use crate::ds::{DsClient, Envelope};
+use crate::subq_circuit::{Assert, Assertions, FeedDelta};
 use crate::predicate::{
     CompiledPredicate, PredicateJson, SubqueryCollector, SubqueryEval, SubquerySig, subquery_sig,
 };
@@ -77,9 +78,6 @@ pub struct SubqueryNode {
     pub template_key: String,
     /// The lifted parameter literals, positionally aligned with the template's `param_cols`.
     pub(crate) bind: Row,
-    /// inner-row pk -> its current projected value (reverse index, for O(1) reconciliation
-    /// and exact circuit retractions).
-    pk_value: HashMap<String, Value>,
     /// Number of dependents (shapes + parent nodes) referencing this node; drop the node at 0.
     pub refcount: usize,
 }
@@ -105,34 +103,8 @@ impl SubqueryNode {
             node_id,
             template_key: String::new(),
             bind: Row(Vec::new()),
-            pk_value: HashMap::new(),
             refcount: 0,
         }
-    }
-
-    /// Number of contributing inner-row pks (the dominant per-node state term).
-    pub fn contributor_count(&self) -> usize {
-        self.pk_value.len()
-    }
-
-    /// Reconcile inner-row `pk`'s contribution so it equals `present_value` (its projected
-    /// value if the row currently matches `pred`, else `None`). Returns the **circuit tuples**
-    /// realizing the change (retract the old contribution, insert the new — at most two);
-    /// flips come back from the circuit when the tuples are applied. History-independent and
-    /// idempotent: an unchanged contribution produces no tuples.
-    pub fn reconcile_row_tuples(&mut self, pk: &str, present_value: Option<Value>) -> Vec<Tup2<Row, ZWeight>> {
-        if self.pk_value.get(pk) == present_value.as_ref() {
-            return Vec::new();
-        }
-        let mut tuples = Vec::new();
-        if let Some(old_v) = self.pk_value.remove(pk) {
-            tuples.push(Tup2(Row(vec![Value::Int(self.node_id), old_v, Value::Text(pk.to_string())]), -1));
-        }
-        if let Some(v) = present_value {
-            self.pk_value.insert(pk.to_string(), v.clone());
-            tuples.push(Tup2(Row(vec![Value::Int(self.node_id), v, Value::Text(pk.to_string())]), 1));
-        }
-        tuples
     }
 }
 
@@ -202,18 +174,11 @@ pub struct SubqueryShape {
     /// Envelopes appended to this shape's stream (backfill + live), for the visualizer's per-node
     /// state. Atomic because the append paths hold `&self`.
     pub emitted: std::sync::atomic::AtomicU64,
-    /// Pks this shape has told its stream are members (seeded from the backfill, updated by every
-    /// emission below). A delta computing "not a member" for a pk absent here is a true no-op —
-    /// this shape never claimed it, so a delete would be spurious, not idempotent — and is
-    /// dropped rather than delivered. Without this, every outer-table write wakes every
-    /// subquery shape on that table's live long-poll (durable-streams sees a real, non-empty
-    /// append), even when the row never matched: the client-side key-set filter in
-    /// `electric.rs::apply_changes` suppresses the bogus delete from the visible message, but by
-    /// then the long-poll has already resolved with an empty "up-to-date" — burning a full
-    /// round-trip per irrelevant write, per concurrently-live shape on the table. Purely local
-    /// bookkeeping (this shape's own emission history), so it carries none of the cross-table
-    /// race the absolute/idempotent emission scheme (see `emit_shape_delta`) exists to avoid.
-    known_members: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// This shape's key in the circuit's per-feed relation (`(feed_id, pk)` upsert map). The
+    /// relation replaces the old `known_members` set: a delete is delivered iff the relation
+    /// actually retracts, so a "not a member" verdict for a pk the stream never contained is
+    /// structurally a no-op — the wake-storm gate (PR #30) with no filter to keep in sync.
+    pub(crate) feed_id: i64,
 }
 
 /// A `TableSchema` lookup shared with the engine's compiled schema.
@@ -279,6 +244,10 @@ pub struct SubqueryRegistry {
     next_node_id: i64,
     /// circuit node id -> node signature (maps circuit flip deltas back to nodes).
     node_by_id: HashMap<i64, SubquerySig>,
+    /// Next feed id (per-shape circuit key; monotonic, never reused).
+    next_feed_id: i64,
+    /// circuit feed id -> shape id (maps feed deltas back to shapes).
+    feed_by_id: HashMap<i64, String>,
     /// Shared evaluation templates (see [`TemplateGroup`]), keyed by
     /// [`crate::predicate::subquery_template`]'s key.
     pub(crate) templates: HashMap<String, TemplateGroup>,
@@ -313,6 +282,8 @@ impl SubqueryRegistry {
                 .expect("membership circuit failed to start"),
             next_node_id: 1,
             node_by_id: HashMap::new(),
+            next_feed_id: 1,
+            feed_by_id: HashMap::new(),
             templates: HashMap::new(),
             pending_seed: Vec::new(),
             pending_shapes: Vec::new(),
@@ -324,68 +295,85 @@ impl SubqueryRegistry {
         }
     }
 
-    /// Apply contributor tuples to the membership circuit and map its flip deltas back to
-    /// node signatures. Callers hold the registry lock across the await — the circuit thread
-    /// never takes this lock, and awaiting the step is what gives every later membership read
-    /// (`contains`/`has_null`) read-your-writes over this batch.
-    async fn apply_tuples(&mut self, tuples: Vec<Tup2<Row, ZWeight>>) -> Vec<(SubquerySig, Flip)> {
-        if tuples.is_empty() {
-            return Vec::new();
+    /// Apply an assertion batch to the membership circuit and map its member deltas back to
+    /// node signatures (feed deltas pass through by feed id). Callers hold the registry lock
+    /// across the await — the circuit thread never takes this lock, and awaiting the step is
+    /// what gives every later membership read read-your-writes over this batch.
+    async fn apply_asserts(
+        &mut self,
+        asserts: Assertions,
+    ) -> (Vec<(SubquerySig, Flip)>, Vec<FeedDelta>) {
+        if asserts.is_empty() {
+            return (Vec::new(), Vec::new());
         }
-        self.circuit
-            .apply(tuples)
-            .await
+        let (member_deltas, feed_deltas) = self.circuit.apply(asserts).await;
+        let flips = member_deltas
             .into_iter()
             .filter_map(|d| {
                 let sig = self.node_by_id.get(&d.node_id)?.clone();
                 let dir = if d.delta > 0 { FlipDir::Enter } else { FlipDir::Leave };
                 Some((sig, Flip { value: d.value, dir }))
             })
-            .collect()
+            .collect();
+        (flips, feed_deltas)
     }
 
-    /// Reconcile one node's contribution for `pk` and keep the template's `pk_nodes` inverted
-    /// index in lockstep. ALL `pk_value` mutations must go through here.
-    fn reconcile_node_row(
+    /// Build one node's contributor assertion for `pk` and keep the template's `pk_nodes`
+    /// inverted index in lockstep. `pk_nodes` IS the record of presence per template (the
+    /// circuit's upsert map is the record of the value), so all presence transitions go
+    /// through here. Inserts always assert (idempotent; a changed value must flow); absent
+    /// stays quiet unless the node actually held the pk.
+    fn assert_node_row(
         &mut self,
         sig: &SubquerySig,
         pk: &str,
         present: Option<Value>,
-    ) -> Vec<Tup2<Row, ZWeight>> {
-        let Some(node) = self.nodes.get_mut(sig) else { return Vec::new() };
-        let had = node.pk_value.contains_key(pk);
-        let tuples = node.reconcile_row_tuples(pk, present);
-        let has = node.pk_value.contains_key(pk);
-        if had != has {
-            let tkey = node.template_key.clone();
-            if let Some(tpl) = self.templates.get_mut(&tkey) {
-                if has {
+    ) -> Option<Tup2<Row, Assert>> {
+        let (node_id, tkey) = {
+            let node = self.nodes.get(sig)?;
+            (node.node_id, node.template_key.clone())
+        };
+        let key = Row(vec![Value::Int(node_id), Value::Text(pk.to_string())]);
+        match present {
+            Some(v) => {
+                if let Some(tpl) = self.templates.get_mut(&tkey) {
                     tpl.pk_nodes.entry(pk.to_string()).or_default().insert(sig.clone());
-                } else if let Some(set) = tpl.pk_nodes.get_mut(pk) {
-                    set.remove(sig);
-                    if set.is_empty() {
-                        tpl.pk_nodes.remove(pk);
-                    }
                 }
+                Some(Tup2(key, Assert::Insert(v)))
+            }
+            None => {
+                let had = self
+                    .templates
+                    .get_mut(&tkey)
+                    .and_then(|tpl| {
+                        let set = tpl.pk_nodes.get_mut(pk)?;
+                        let had = set.remove(sig);
+                        if set.is_empty() {
+                            tpl.pk_nodes.remove(pk);
+                        }
+                        Some(had)
+                    })
+                    .unwrap_or(false);
+                had.then_some(Tup2(key, Assert::Delete))
             }
         }
-        tuples
     }
 
-    /// Reconcile a batch of per-pk evaluations against ONE node and return the resulting
-    /// flips (used by seeding replay and flip-driven parent re-derivations, where the caller
-    /// already evaluated the node's full predicate per row).
+    /// Assert a batch of per-pk evaluations against ONE node and return the resulting flips
+    /// (seeding replay and flip-driven parent re-derivations, where the caller already
+    /// evaluated the node's full predicate per row).
     async fn apply_node_evals(
         &mut self,
         sig: &SubquerySig,
         evals: Vec<(String, Option<Value>)>,
     ) -> Vec<Flip> {
-        let mut tuples = Vec::new();
+        let mut asserts = Assertions::default();
         for (pk, pv) in evals {
-            tuples.extend(self.reconcile_node_row(sig, &pk, pv));
+            asserts.contributors.extend(self.assert_node_row(sig, &pk, pv));
         }
-        // Every tuple belongs to `sig`, so the sig on each flip is redundant here.
-        self.apply_tuples(tuples).await.into_iter().map(|(_, f)| f).collect()
+        // Every assertion belongs to `sig`, so the sig on each flip is redundant here.
+        let (flips, _) = self.apply_asserts(asserts).await;
+        flips.into_iter().map(|(_, f)| f).collect()
     }
 
     /// The node's current distinct-value count, read from the circuit snapshot.
@@ -449,8 +437,9 @@ impl SubqueryRegistry {
         let mut contributors = 0;
         let mut distinct = 0;
         for n in self.nodes.values() {
-            contributors += n.contributor_count();
-            distinct += self.circuit_distinct(n.node_id);
+            let (d, vals) = self.circuit.values_for_node(n.node_id, usize::MAX);
+            contributors += vals.iter().map(|(_, c)| c).sum::<usize>();
+            distinct += d;
         }
         (self.nodes.len(), contributors, distinct, self.shapes.len(), self.edges_count())
     }
@@ -653,16 +642,16 @@ impl SubqueryRegistry {
             if let Some(n) = self.nodes.get_mut(&sig) {
                 n.gate = gate;
             }
-            let mut seed_tuples = Vec::new();
+            let mut seed = Assertions::default();
             for r in &rows {
                 let pk = ts.key_string(r).unwrap_or_default();
                 let pv = r.0.get(proj_col).cloned().unwrap_or(Value::Null);
-                seed_tuples.extend(self.reconcile_node_row(&sig, &pk, Some(pv)));
+                seed.contributors.extend(self.assert_node_row(&sig, &pk, Some(pv)));
             }
             // Initial state: the seed's flips are meaningless (every dependent's backfill
             // already reflects the seeded set), so this step's deltas are discarded — only
             // the replay below propagates.
-            let _ = self.apply_tuples(seed_tuples).await;
+            let _ = self.apply_asserts(seed).await;
             let buffered = self
                 .nodes
                 .get_mut(&sig)
@@ -686,6 +675,9 @@ impl SubqueryRegistry {
             .get(&pending.outer_table)
             .cloned()
             .context("finish_create: unknown outer table")?;
+        let feed_id = self.next_feed_id;
+        self.next_feed_id += 1;
+        self.feed_by_id.insert(feed_id, shape_id.to_string());
         self.shapes.insert(
             shape_id.to_string(),
             SubqueryShape {
@@ -696,11 +688,21 @@ impl SubqueryRegistry {
                 out_cols: pending.out_cols.clone(),
                 gate: outer_gate,
                 emitted: std::sync::atomic::AtomicU64::new(seeded),
-                known_members: std::sync::Mutex::new(seeded_pks),
+                feed_id,
             },
         );
+        // Seed the feed relation with the backfilled pks (deltas discarded: the stream
+        // already carries the snapshot) — replaces the old known_members hand-off.
+        let mut feed_seed = Assertions::default();
+        for pk in seeded_pks {
+            feed_seed
+                .feeds
+                .push(Tup2(Row(vec![Value::Int(feed_id), Value::Text(pk)]), Assert::Insert(Value::Null)));
+        }
+        let _ = self.apply_asserts(feed_seed).await;
         if !pending.buffer.is_empty() {
-            self.emit_shape_delta(shape_id, &ts, &pending.buffer, None).await?;
+            let candidates = crate::engine::membership::latest_rows_by_pk(&ts, &pending.buffer);
+            self.emit_for_shapes(&ts, vec![(shape_id.to_string(), candidates)], None).await?;
         }
         Ok(work)
     }
@@ -749,14 +751,6 @@ impl SubqueryRegistry {
         self.node_by_id.remove(&node.node_id);
         if let Some(tpl) = self.templates.get_mut(&node.template_key) {
             tpl.binds.remove(&node.bind);
-            for pk in node.pk_value.keys() {
-                if let Some(set) = tpl.pk_nodes.get_mut(pk) {
-                    set.remove(&node.sig);
-                    if set.is_empty() {
-                        tpl.pk_nodes.remove(pk);
-                    }
-                }
-            }
             if tpl.binds.is_empty() {
                 self.templates.remove(&node.template_key);
             }
@@ -787,6 +781,18 @@ impl SubqueryRegistry {
         // Sigs this shape pointed at, then drop the shape's edges.
         let sigs: Vec<SubquerySig> = collect_in_leaves(&shape.pred).into_iter().map(|l| l.sig).collect();
         self.remove_shape_edges(&shape.pred, shape_id);
+        // Retract the feed's key slice from the circuit (deltas discarded — the stream is
+        // being torn down) and drop the id mapping.
+        self.feed_by_id.remove(&shape.feed_id);
+        let feeds: Vec<Tup2<Row, Assert>> = self
+            .circuit
+            .feed_pks(shape.feed_id)
+            .into_iter()
+            .map(|pk| Tup2(Row(vec![Value::Int(shape.feed_id), Value::Text(pk)]), Assert::Delete))
+            .collect();
+        if !feeds.is_empty() {
+            let _ = self.circuit.apply(Assertions { contributors: Vec::new(), feeds }).await;
+        }
         self.decref_nodes(sigs).await;
     }
 
@@ -796,7 +802,7 @@ impl SubqueryRegistry {
     /// no dependents left to move.
     async fn decref_nodes(&mut self, sigs: Vec<SubquerySig>) {
         let mut stack = sigs;
-        let mut tuples: Vec<Tup2<Row, ZWeight>> = Vec::new();
+        let mut asserts = Assertions::default();
         while let Some(sig) = stack.pop() {
             let Some(node) = self.nodes.get_mut(&sig) else { continue };
             node.refcount = node.refcount.saturating_sub(1);
@@ -807,18 +813,28 @@ impl SubqueryRegistry {
             let child_sigs: Vec<SubquerySig> =
                 collect_in_leaves(&node.pred).into_iter().map(|l| l.sig).collect();
             let node = self.nodes.remove(&sig).expect("node fetched above");
-            for (pk, v) in &node.pk_value {
-                tuples.push(Tup2(
-                    Row(vec![Value::Int(node.node_id), v.clone(), Value::Text(pk.clone())]),
-                    -1,
-                ));
+            // The node's contributor slice comes from the circuit's own integral (prefix
+            // scan) — there is no host pk list to drain anymore.
+            for (pk, _v) in self.circuit.contributor_entries(node.node_id) {
+                if let Some(tpl) = self.templates.get_mut(&node.template_key) {
+                    if let Some(set) = tpl.pk_nodes.get_mut(&pk) {
+                        set.remove(&sig);
+                        if set.is_empty() {
+                            tpl.pk_nodes.remove(&pk);
+                        }
+                    }
+                }
+                asserts
+                    .contributors
+                    .push(Tup2(Row(vec![Value::Int(node.node_id), Value::Text(pk)]), Assert::Delete));
             }
             self.remove_node_entry(&node);
             self.remove_node_edges(&sig, &child_sigs);
             stack.extend(child_sigs);
         }
-        if !tuples.is_empty() {
-            let _ = self.circuit.apply(tuples).await;
+        // Refcount-0 removal ⇒ no dependents remain; the flips are discarded.
+        if !asserts.is_empty() {
+            let _ = self.circuit.apply(asserts).await;
         }
     }
 
@@ -865,7 +881,7 @@ impl SubqueryRegistry {
             .filter(|(_, t)| t.inner_table == table)
             .map(|(k, _)| k.clone())
             .collect();
-        let mut tuples: Vec<Tup2<Row, ZWeight>> = Vec::new();
+        let mut asserts = Assertions::default();
         let mut live_sigs: Vec<SubquerySig> = Vec::new();
         for tkey in &tkeys {
             let sigs: Vec<SubquerySig> =
@@ -884,9 +900,9 @@ impl SubqueryRegistry {
                 }
             }
             let evals = self.template_present(tkey, ts, delta);
-            tuples.extend(self.template_reconcile(tkey, evals, lsn, xid));
+            asserts.contributors.extend(self.template_assertions(tkey, evals, lsn, xid));
         }
-        let flips = self.apply_tuples(tuples).await;
+        let (flips, _) = self.apply_asserts(asserts).await;
         for sig in live_sigs {
             let flipped = flips.iter().any(|(s, _)| s == &sig);
             hop(&mut trace, format!("node:{sig}"), if flipped { "passed" } else { "dropped" });
@@ -895,18 +911,23 @@ impl SubqueryRegistry {
             work.push_back(f);
         }
 
-        // 2. Subquery shapes whose outer table is this table: evaluate the filter on the delta + append.
+        // 2. Subquery shapes whose outer table is this table: one batch of candidates across
+        // every shape — assertions feed the circuit in ONE step, its feed deltas are the
+        // deletes, matching candidates are the upserts.
         let shape_ids: Vec<String> = self
             .shapes
             .iter()
             .filter(|(_, s)| s.outer_table == table)
             .map(|(id, _)| id.clone())
             .collect();
+        let mut groups: Vec<(String, Vec<(Row, bool)>)> = Vec::new();
         for id in shape_ids {
             if self.shapes.get(&id).is_some_and(|s| s.gate.should_skip(lsn, xid)) {
                 continue;
             }
-            let emitted = self.emit_shape_delta(&id, ts, delta, txid.clone()).await?;
+            groups.push((id, crate::engine::membership::latest_rows_by_pk(ts, delta)));
+        }
+        for (id, emitted, _net) in self.emit_for_shapes(ts, groups, txid.clone()).await? {
             hop(&mut trace, format!("shape:{id}"), if emitted { "passed" } else { "dropped" });
         }
 
@@ -993,25 +1014,25 @@ impl SubqueryRegistry {
             .collect()
     }
 
-    /// Turn one template's per-pk targets into circuit tuples: retract from nodes that held
-    /// the pk but are no longer its target, insert into the new target. Per node, the delta
-    /// is skipped when the node is mid-seed (its raw buffer replays at install) or when the
-    /// node's seed gate says the snapshot already contains this change — in both cases the
-    /// node's seed is (or will be) the authority, and reconcile-by-identity absorbs any
+    /// Turn one template's per-pk targets into contributor assertions: absent for nodes that
+    /// held the pk but are no longer its target, present for the new target. Per node, the
+    /// delta is skipped when the node is mid-seed (its raw buffer replays at install) or when
+    /// the node's seed gate says the snapshot already contains this change — in both cases
+    /// the node's seed is (or will be) the authority, and absolute assertion absorbs any
     /// overlap idempotently.
-    fn template_reconcile(
+    fn template_assertions(
         &mut self,
         tkey: &str,
         evals: Vec<(String, Option<(SubquerySig, Value)>)>,
         lsn: u64,
         xid: Option<u64>,
-    ) -> Vec<Tup2<Row, ZWeight>> {
+    ) -> Vec<Tup2<Row, Assert>> {
         let node_applies = |reg: &Self, sig: &SubquerySig| {
             reg.nodes
                 .get(sig)
                 .is_some_and(|n| n.seed_buffer.is_none() && !n.gate.should_skip(lsn, xid))
         };
-        let mut tuples = Vec::new();
+        let mut asserts = Vec::new();
         for (pk, target) in evals {
             let holders: Vec<SubquerySig> = self
                 .templates
@@ -1021,19 +1042,19 @@ impl SubqueryRegistry {
                 .unwrap_or_default();
             for sig in holders {
                 if target.as_ref().is_some_and(|(tsig, _)| tsig == &sig) {
-                    continue; // still the target; the insert below reconciles the value
+                    continue; // still the target; the insert below carries the fresh value
                 }
                 if node_applies(self, &sig) {
-                    tuples.extend(self.reconcile_node_row(&sig, &pk, None));
+                    asserts.extend(self.assert_node_row(&sig, &pk, None));
                 }
             }
             if let Some((sig, v)) = target {
                 if node_applies(self, &sig) {
-                    tuples.extend(self.reconcile_node_row(&sig, &pk, Some(v)));
+                    asserts.extend(self.assert_node_row(&sig, &pk, Some(v)));
                 }
             }
         }
-        tuples
+        asserts
     }
 
     /// Deferred-propagation helper: snapshot what a query-back needs (brief lock scope at the
@@ -1042,70 +1063,86 @@ impl SubqueryRegistry {
         self.schemas.get(table).cloned().with_context(|| format!("unknown table '{table}'"))
     }
 
-    /// Evaluate a subquery shape over a delta on its own (outer) table and append the resulting
-    /// enter/leave envelopes. Emission is **absolute, not delta-based**: for each touched pk we emit the
-    /// row's *current* membership (`upsert` if its latest row matches, else `delete` by pk). This is what
-    /// makes the outer path independent of cross-table processing order — a per-table tailer may apply an
-    /// inner-set change before an earlier-committed outer change, so a delta-based "delete only if the
-    /// *old* row matched" misses move-outs once the inner set is already ahead. Emitting on the *new*
-    /// row's membership (delete is idempotent by pk) converges regardless of order; a value the inner set
-    /// hasn't caught up to yet is reconciled later by the flip-driven move query.
-    async fn emit_shape_delta(
-        &self,
-        shape_id: &str,
+    /// The ONE emission tail (spec §5): evaluate each shape's candidates against the current
+    /// membership snapshot, assert their feed presence absolutely, step the circuit once for
+    /// the whole batch, and deliver — **upserts for every matching candidate** (an update to a
+    /// continuing member must flow; upserts are always safe for readers), **deletes only from
+    /// the feed relation's retractions** (a "not a member" verdict for a pk the stream never
+    /// contained nets to nothing in the map, so the spurious delete that used to wake idle
+    /// long-polls is structurally impossible). Emission is absolute per pk, exactly as before:
+    /// deferred flip propagation converges regardless of timing.
+    ///
+    /// Callers hold the registry lock for the whole call (eval + circuit await + lane
+    /// enqueue), which is what keeps per-stream append order = evaluation order.
+    /// `candidates` are each shape's touched rows: `(latest row, still-exists)`.
+    /// Returns per shape whether anything was delivered (trace hops).
+    async fn emit_for_shapes(
+        &mut self,
         ts: &TableSchema,
-        delta: &[Tup2<Row, ZWeight>],
+        groups: Vec<(String, Vec<(Row, bool)>)>,
         txid: Option<String>,
-    ) -> Result<bool> {
-        let Some(shape) = self.shapes.get(shape_id) else { return Ok(false) };
-        let pred = shape.pred.clone();
-        // Per touched pk, take the row's latest state (shared kernel fold): `is_new`
-        // distinguishes "row still exists" from "row was deleted".
-        let out: Vec<(Row, ZWeight)> = crate::engine::membership::latest_rows_by_pk(ts, delta)
-            .into_iter()
-            .map(|(row, is_new)| {
-                let member = is_new && pred.matches_ctx(&row, self);
-                (row, if member { 1 } else { -1 })
-            })
-            .collect();
-        let out = filter_known_members(ts, out, &shape.known_members);
-        if out.is_empty() {
-            return Ok(false);
-        }
-        let envs = crate::engine::translate_output(ts, out, txid, None, shape.out_cols.as_deref().map(Vec::as_slice));
-        if envs.is_empty() {
-            return Ok(false);
-        }
-        shape.emitted.fetch_add(envs.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        let path = shape.stream_path.clone();
-        self.deliver(&path, envs).await;
-        Ok(true)
-    }
-
-}
-
-/// Drop deletes (`w <= 0`) for pks this shape's `known_members` doesn't hold — this shape never
-/// told its stream that pk was a member, so a delete for it is a true no-op, not an idempotent
-/// one, and delivering it would needlessly wake every live long-poll on this shape (durable-streams
-/// treats any non-empty append as new data). Updates `known_members` to match what's kept: an
-/// emitted insert/update adds its pk, an emitted delete removes it.
-fn filter_known_members(
-    ts: &TableSchema,
-    out: Vec<(Row, ZWeight)>,
-    known_members: &std::sync::Mutex<std::collections::HashSet<String>>,
-) -> Vec<(Row, ZWeight)> {
-    let mut known = known_members.lock().unwrap();
-    out.into_iter()
-        .filter(|(row, w)| {
-            let pk = ts.key_string(row).unwrap_or_default();
-            if *w > 0 {
-                known.insert(pk);
-                true
-            } else {
-                known.remove(&pk)
+    ) -> Result<Vec<(String, bool, i64)>> {
+        // Phase 1: evaluate + build assertions and the member upserts, per shape.
+        let mut asserts = Assertions::default();
+        // shape id -> (member rows to upsert, candidate pk -> row for delete construction)
+        let mut staged: Vec<(String, Vec<Row>)> = Vec::new();
+        for (shape_id, candidates) in groups {
+            let Some(shape) = self.shapes.get(&shape_id) else { continue };
+            let (pred, feed_id) = (shape.pred.clone(), shape.feed_id);
+            let mut members: Vec<Row> = Vec::new();
+            for (row, exists) in candidates {
+                let pk = match ts.key_string(&row) {
+                    Ok(pk) => pk,
+                    Err(_) => continue,
+                };
+                let member = exists && pred.matches_ctx(&row, self);
+                let key = Row(vec![Value::Int(feed_id), Value::Text(pk)]);
+                asserts.feeds.push(Tup2(
+                    key,
+                    if member { Assert::Insert(Value::Null) } else { Assert::Delete },
+                ));
+                if member {
+                    members.push(row);
+                }
             }
-        })
-        .collect()
+            staged.push((shape_id, members));
+        }
+        // Phase 2: one circuit step for the whole batch; retractions are the deletes.
+        let (_, feed_deltas) = self.apply_asserts(asserts).await;
+        let mut deletes: HashMap<String, Vec<String>> = HashMap::new();
+        for d in feed_deltas {
+            if d.delta < 0 {
+                if let Some(shape_id) = self.feed_by_id.get(&d.feed_id) {
+                    deletes.entry(shape_id.clone()).or_default().push(d.pk);
+                }
+            }
+        }
+        // Phase 3: build + deliver per shape (still under the caller's lock — enqueue order
+        // on each stream's FIFO lane is evaluation order).
+        let mut results = Vec::with_capacity(staged.len());
+        for (shape_id, members) in staged {
+            let Some(shape) = self.shapes.get(&shape_id) else { continue };
+            let dels = deletes.remove(&shape_id).unwrap_or_default();
+            let net = members.len() as i64 - dels.len() as i64;
+            let mut envs = crate::engine::translate_output(
+                ts,
+                members.into_iter().map(|r| (r, 1)).collect(),
+                txid.clone(),
+                None,
+                shape.out_cols.as_deref().map(Vec::as_slice),
+            );
+            envs.extend(crate::engine::delete_envelopes(ts, dels, txid.clone()));
+            if envs.is_empty() {
+                results.push((shape_id, false, 0));
+                continue;
+            }
+            shape.emitted.fetch_add(envs.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            let path = shape.stream_path.clone();
+            self.deliver(&path, envs).await;
+            results.push((shape_id, true, net));
+        }
+        Ok(results)
+    }
 }
 
 // --- deferred flip propagation ------------------------------------------------------------------
@@ -1230,32 +1267,16 @@ async fn move_shape_for_value(
     if rows.is_empty() {
         return Ok(None);
     }
-    // Evaluate membership against the *current* node sets and append, atomically under the lock
-    // (see the module comment on eval+append atomicity).
-    let reg = registry.lock().await;
-    let Some(shape) = reg.shapes.get(shape_id) else { return Ok(None) };
-    let out: Vec<(Row, ZWeight)> = rows
-        .into_iter()
-        .map(|r| {
-            let w: ZWeight = if shape.pred.matches_ctx(&r, &*reg) { 1 } else { -1 };
-            (r, w)
-        })
-        .collect();
-    let out = filter_known_members(&ts, out, &shape.known_members);
-    if out.is_empty() {
-        return Ok(None);
-    }
-    // Net membership change this move applies (enters +1, leaves −1), for the trace dot.
-    let net: i64 = out.iter().map(|(_, w)| *w as i64).sum();
-    let envs = crate::engine::translate_output(&ts, out, txid, None, shape.out_cols.as_deref().map(Vec::as_slice));
-    if envs.is_empty() {
-        return Ok(None);
-    }
-    shape.emitted.fetch_add(envs.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    // Ordered delivery: enqueued under the registry lock (lane FIFO ⇒ lands in eval order).
-    let path = shape.stream_path.clone();
-    reg.deliver(&path, envs).await;
-    Ok(Some((ts.name.clone(), net)))
+    // Evaluate + assert + deliver atomically under the lock, through the ONE emission tail
+    // (candidates from a query-back all still exist).
+    let mut reg = registry.lock().await;
+    let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
+    let results =
+        reg.emit_for_shapes(&ts, vec![(shape_id.to_string(), candidates)], txid).await?;
+    Ok(match results.first() {
+        Some((_, true, net)) => Some((ts.name.clone(), *net)),
+        _ => None,
+    })
 }
 
 /// Re-query a parent node's inner rows — `Some((col, v))` = only rows with
@@ -1313,28 +1334,10 @@ async fn rederive_dependent(
                 (reg.snapshot_for_table(&s.outer_table)?, reg.pg_url.clone())
             };
             let rows = query_all(&pg_url, &ts).await?;
-            // Eval + append atomically under the lock (see the module comment).
-            let reg = registry.lock().await;
-            let Some(s) = reg.shapes.get(id) else { return Ok(()) };
-            let out: Vec<(Row, ZWeight)> = rows
-                .into_iter()
-                .map(|r| {
-                    let w: ZWeight = if s.pred.matches_ctx(&r, &*reg) { 1 } else { -1 };
-                    (r, w)
-                })
-                .collect();
-            let out = filter_known_members(&ts, out, &s.known_members);
-            if out.is_empty() {
-                return Ok(());
-            }
-            let envs =
-                crate::engine::translate_output(&ts, out, txid, None, s.out_cols.as_deref().map(Vec::as_slice));
-            if envs.is_empty() {
-                return Ok(());
-            }
-            s.emitted.fetch_add(envs.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            let path = s.stream_path.clone();
-            reg.deliver(&path, envs).await;
+            // Full re-derive: every row is a candidate; the ONE emission tail decides.
+            let mut reg = registry.lock().await;
+            let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
+            reg.emit_for_shapes(&ts, vec![(id.clone(), candidates)], txid).await?;
         }
         Dependent::Node(parent_sig) => {
             // Full re-derive of the parent: same eval+reconcile as a value flip, fetching
@@ -1862,49 +1865,81 @@ mod tests {
         assert!(reg.pending_shapes.is_empty());
     }
 
-    /// `filter_known_members` is the fix for the live-poll wake-storm bug: a subquery shape's
-    /// `emit_shape_delta`/`move_shape_for_value`/`rederive_dependent` compute an *absolute*
-    /// membership weight (+1/-1) for every touched pk, regardless of whether that shape ever had
-    /// the pk — by design (see `emit_shape_delta`'s doc comment), since a delete is "idempotent by
-    /// pk" from a correctness standpoint. But delivering that idempotent-but-spurious delete to the
-    /// shape's durable-stream still counts as new data to a live long-poll: durable-streams wakes on
-    /// any non-empty append, and every OTHER write to the same outer table — matching this shape's
-    /// predicate or not — would resolve this shape's live poll early with an empty "up-to-date"
-    /// (electric.rs's client-side key-set filter drops the bogus delete before it reaches the
-    /// client, but by then the round-trip is already spent). Never-known pks must be dropped before
-    /// they reach `deliver()`, not just before they reach the client.
-    #[test]
-    fn filter_known_members_drops_deletes_for_never_known_pks() {
+    /// The per-feed relation is the fix for the live-poll wake-storm bug, now structural:
+    /// `emit_for_shapes` computes an *absolute* membership verdict for every touched pk, but a
+    /// delete envelope is built ONLY from the feed relation's retraction — a "not a member"
+    /// verdict for a pk the stream never contained nets to nothing in the circuit's upsert
+    /// map, so the spurious delete that used to wake every idle long-poll cannot be emitted
+    /// at all (there is no filter left to get out of sync).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn feed_relation_drops_deletes_for_never_known_pks() {
         use crate::schema::TableDef;
         let def: TableDef = serde_json::from_value(serde_json::json!({
             "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id"
         }))
         .unwrap();
         let ts = crate::schema::TableSchema::from_def("t", &def).unwrap();
-        let known: std::sync::Mutex<std::collections::HashSet<String>> = std::sync::Mutex::new(HashSet::new());
+        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+        // A shape whose predicate never matches (Not(MatchAll)): every candidate verdict is
+        // "not a member".
+        let feed_id = reg.next_feed_id;
+        reg.next_feed_id += 1;
+        reg.feed_by_id.insert(feed_id, "s1".into());
+        reg.shapes.insert(
+            "s1".into(),
+            SubqueryShape {
+                shape_id: "s1".into(),
+                outer_table: "t".into(),
+                stream_path: "shape/s1".into(),
+                pred: Arc::new(CompiledPredicate::Not(Box::new(CompiledPredicate::MatchAll))),
+                out_cols: None,
+                gate: crate::pg::SnapshotGate::passthrough(),
+                emitted: std::sync::atomic::AtomicU64::new(0),
+                feed_id,
+            },
+        );
         let row = |id: i64| Row(vec![Value::Int(id), Value::Int(0)]);
-        let pk1 = ts.key_string(&row(1)).unwrap();
 
-        // A "leave" for a pk this shape never claimed as a member is a true no-op: this shape's
-        // stream never told anyone pk 1 was there, so a delete for it is spurious, not idempotent —
-        // it must be dropped, not delivered (the bug this test guards).
-        let out = filter_known_members(&ts, vec![(row(1), -1)], &known);
-        assert!(out.is_empty(), "delete for a never-known pk must be dropped");
-        assert!(known.lock().unwrap().is_empty());
+        // A "leave" for a pk this feed never contained: nothing is emitted (no lanes are
+        // configured, so an emission would attempt a real append and fail loudly; emitted
+        // stays 0 and the result reports nothing delivered).
+        let results = reg
+            .emit_for_shapes(&ts, vec![("s1".to_string(), vec![(row(1), true)])], None)
+            .await
+            .unwrap();
+        assert_eq!(results, vec![("s1".to_string(), false, 0)], "never-member delete must be dropped");
+        assert_eq!(reg.shapes["s1"].emitted.load(std::sync::atomic::Ordering::Relaxed), 0);
 
-        // An "enter" is always kept and recorded as known.
-        let out = filter_known_members(&ts, vec![(row(1), 1)], &known);
-        assert_eq!(out.len(), 1, "insert must be kept");
-        assert!(known.lock().unwrap().contains(&pk1));
+        // Seed pk 1 as a member (backfill hand-off), then the same verdict is a GENUINE leave.
+        let mut seed = Assertions::default();
+        seed.feeds
+            .push(Tup2(Row(vec![Value::Int(feed_id), Value::Text("1".into())]), Assert::Insert(Value::Null)));
+        reg.apply_asserts(seed).await;
+        let (_, fd) = reg
+            .circuit
+            .apply(Assertions {
+                contributors: Vec::new(),
+                feeds: vec![Tup2(
+                    Row(vec![Value::Int(feed_id), Value::Text("1".into())]),
+                    Assert::Delete,
+                )],
+            })
+            .await;
+        assert_eq!(fd.len(), 1, "a known member's delete must produce the retraction");
+        assert_eq!(fd[0].delta, -1);
 
-        // Now that pk 1 is known, a genuine "leave" is kept and clears the record.
-        let out = filter_known_members(&ts, vec![(row(1), -1)], &known);
-        assert_eq!(out.len(), 1, "delete for a known pk must be kept");
-        assert!(!known.lock().unwrap().contains(&pk1));
-
-        // Deleting the same (now-unknown-again) pk a second time is dropped once more.
-        let out = filter_known_members(&ts, vec![(row(1), -1)], &known);
-        assert!(out.is_empty(), "repeat delete for an already-removed pk must be dropped");
+        // And once retracted, a repeat delete nets nothing again.
+        let (_, fd) = reg
+            .circuit
+            .apply(Assertions {
+                contributors: Vec::new(),
+                feeds: vec![Tup2(
+                    Row(vec![Value::Int(feed_id), Value::Text("1".into())]),
+                    Assert::Delete,
+                )],
+            })
+            .await;
+        assert!(fd.is_empty(), "repeat delete for an already-removed pk must net nothing");
     }
 
     #[tokio::test(flavor = "multi_thread")]

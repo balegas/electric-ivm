@@ -47,7 +47,7 @@ pub use introspection::{
     OpEdge, OpNode, ShapeRecord, StateSnapshot, TableColumnInfo, TableSchemaInfo, TableStats,
 };
 pub use planning::CircuitPlacement;
-pub(crate) use output::{apply_envelope, translate_output};
+pub(crate) use output::{apply_envelope, delete_envelopes, translate_output};
 
 /// `GET /v1/health` phases (see [`Engine::health`]).
 const HEALTH_WAITING: u8 = 0;

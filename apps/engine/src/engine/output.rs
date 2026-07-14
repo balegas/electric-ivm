@@ -100,6 +100,25 @@ pub(crate) fn translate_output(
     envs
 }
 
+/// Key-only `delete` envelopes for pks the per-feed relation retracted. The feed relation's
+/// retraction IS the delete decision (structural spurious-delete gating), so this needs no
+/// row body — only the pk. Honors the TEST-ONLY `drop_deletes` fault exactly like
+/// [`translate_output`].
+pub(crate) fn delete_envelopes(ts: &TableSchema, pks: Vec<String>, txid: Option<String>) -> Vec<Envelope> {
+    if matches!(crate::fault::active(), crate::fault::Fault::DropDeletes) {
+        return Vec::new();
+    }
+    pks.into_iter()
+        .map(|pk| Envelope {
+            type_: ts.name.clone(),
+            key: pk,
+            value: None,
+            old: None,
+            headers: EnvelopeHeaders { operation: "delete".into(), txid: txid.clone(), offset: None, lsn: None, seq: None },
+        })
+        .collect()
+}
+
 /// The aggregate wire envelope — ONE `"agg"`-keyed row `{ value, n }`, upserted when the value
 /// changes. Shared by the in-engine fold ([`super::executors::AggShape`]) and circuit-served
 /// counts ([`super::executors::CircuitAgg`]) so the two aggregate tiers cannot drift apart on
