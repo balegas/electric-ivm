@@ -824,21 +824,37 @@ fn membership_fold_refcount_flips() {
 /// sequence of inner-row changes, the circuit cohort's refcounted fold and the registry's
 /// identity-reconciled `SubqueryNode` must report the SAME flips. If these ever diverge, the
 /// same membership change would move rows on one serving tier and not the other.
-#[test]
-fn membership_flips_agree_between_refcount_and_contributor_set() {
-    use crate::subquery::{Flip, SubqueryNode};
+#[tokio::test(flavor = "multi_thread")]
+async fn membership_flips_agree_between_refcount_and_contributor_set() {
+    use crate::subquery::{Flip, FlipDir, SubqueryNode};
     // Scenario: rows (pk, projected value) — insert a→7, insert b→7, move a 7→8, delete b,
     // delete a. Expected flips: Enter 7, (none), Enter 8, Leave 7, Leave 8.
-    // Registry path: reconcile by identity.
+    // Registry path: identity-reconciled tuples applied to the membership circuit; the
+    // circuit's distinct deltas are the flips.
+    let circuit = crate::subq_circuit::MembershipCircuit::start().unwrap();
     let mut node = SubqueryNode::new(
-        "sig".into(), "inner".into(), 0, 1, Arc::new(CompiledPredicate::MatchAll),
+        "sig".into(), "inner".into(), 0, 1, Arc::new(CompiledPredicate::MatchAll), 1,
     );
     let mut reg_flips: Vec<Vec<Flip>> = Vec::new();
-    reg_flips.push(node.reconcile_row("a", Some(Value::Int(7))));
-    reg_flips.push(node.reconcile_row("b", Some(Value::Int(7))));
-    reg_flips.push(node.reconcile_row("a", Some(Value::Int(8))));
-    reg_flips.push(node.reconcile_row("b", None));
-    reg_flips.push(node.reconcile_row("a", None));
+    for (pk, pv) in [
+        ("a", Some(Value::Int(7))),
+        ("b", Some(Value::Int(7))),
+        ("a", Some(Value::Int(8))),
+        ("b", None),
+        ("a", None),
+    ] {
+        let tuples = node.reconcile_row_tuples(pk, pv);
+        let flips = circuit
+            .apply(tuples)
+            .await
+            .into_iter()
+            .map(|d| Flip {
+                value: d.value,
+                dir: if d.delta > 0 { FlipDir::Enter } else { FlipDir::Leave },
+            })
+            .collect();
+        reg_flips.push(flips);
+    }
     // Circuit path: the same changes as exactly-once weighted contributions.
     let mut groups: HashMap<Value, i64> = HashMap::new();
     let mut ref_flips: Vec<Vec<Flip>> = Vec::new();
@@ -857,6 +873,7 @@ fn membership_flips_agree_between_refcount_and_contributor_set() {
         assert_eq!(norm(r), norm(c), "flip divergence at step {i}");
     }
     assert!(groups.is_empty());
+    circuit.shutdown().await;
 }
 
 /// The latest-row-per-pk fold behind absolute membership evaluation: an update's `+1` row wins
