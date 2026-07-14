@@ -478,7 +478,7 @@ impl Engine {
         }
         drop(st);
         // Subquery shapes live in the registry (a no-op for plain shapes).
-        self.subqueries.lock().await.drop_subquery_shape(id);
+        self.subqueries.lock().await.drop_subquery_shape(id).await;
         if let Some(rec) = removed {
             if let Err(e) = self.ds.delete_stream(&rec.stream_path).await {
                 tracing::warn!("failed to delete stream {} for purged shape {id}: {e:#}", rec.stream_path);
@@ -788,7 +788,7 @@ impl Engine {
         }
         drop(st);
         if !parkable {
-            self.subqueries.lock().await.drop_subquery_shape(id);
+            self.subqueries.lock().await.drop_subquery_shape(id).await;
         }
         if let Some(rec) = removed {
             if let Err(e) = self.ds.delete_stream(&rec.stream_path).await {

@@ -46,6 +46,12 @@ pub struct Flip {
 }
 
 /// One maintained inner subquery: `SELECT proj_col FROM inner_table WHERE pred`, as a value set.
+///
+/// The set itself lives in the **membership circuit** (`crate::subq_circuit`) as the
+/// `(node_id, value)` slice of one shared relation; the node keeps only the host-side reverse
+/// index (`pk_value`) that makes maintenance reconcile-by-identity — evaluation can depend on
+/// *other* nodes' current sets (nested `IN`), so a row's tuple is not a pure function of the
+/// row and exact retraction needs the remembered old value.
 pub struct SubqueryNode {
     pub sig: SubquerySig,
     pub inner_table: String,
@@ -65,9 +71,14 @@ pub struct SubqueryNode {
     /// applied to a half-seeded set (a snapshot row landing after a fresher delta would be a
     /// stale overwrite). `None` = live.
     pub(crate) seed_buffer: Option<Vec<Tup2<Row, ZWeight>>>,
-    /// projected value -> set of contributing inner-row pks (stringified).
-    contributors: HashMap<Value, HashSet<String>>,
-    /// inner-row pk -> its current projected value (reverse index, for O(1) reconciliation).
+    /// The node's key in the membership circuit (registry-assigned, unique per live node).
+    pub node_id: i64,
+    /// The template this node is a bind of (see [`crate::predicate::subquery_template`]).
+    pub template_key: String,
+    /// The lifted parameter literals, positionally aligned with the template's `param_cols`.
+    pub(crate) bind: Row,
+    /// inner-row pk -> its current projected value (reverse index, for O(1) reconciliation
+    /// and exact circuit retractions).
     pk_value: HashMap<String, Value>,
     /// Number of dependents (shapes + parent nodes) referencing this node; drop the node at 0.
     pub refcount: usize,
@@ -80,6 +91,7 @@ impl SubqueryNode {
         proj_col: usize,
         pk_col: usize,
         pred: Arc<CompiledPredicate>,
+        node_id: i64,
     ) -> Self {
         SubqueryNode {
             sig,
@@ -90,58 +102,61 @@ impl SubqueryNode {
             where_json: None,
             gate: crate::pg::SnapshotGate::passthrough(),
             seed_buffer: None,
-            contributors: HashMap::new(),
+            node_id,
+            template_key: String::new(),
+            bind: Row(Vec::new()),
             pk_value: HashMap::new(),
             refcount: 0,
         }
     }
 
-    /// Is `value` currently a member of the inner set?
-    pub fn contains(&self, value: &Value) -> bool {
-        self.contributors.get(value).is_some_and(|s| !s.is_empty())
+    /// Number of contributing inner-row pks (the dominant per-node state term).
+    pub fn contributor_count(&self) -> usize {
+        self.pk_value.len()
     }
 
-    /// Does the inner set currently contain a NULL value? (Makes `x NOT IN set` UNKNOWN.)
-    pub fn has_null(&self) -> bool {
-        self.contains(&Value::Null)
-    }
-
-    /// Number of distinct values currently in the set (for introspection / sharing tests).
-    pub fn distinct_values(&self) -> usize {
-        self.contributors.len()
-    }
-
-    /// Reconcile inner-row `pk`'s contribution so it equals `present_value` (its projected value if the
-    /// row currently matches `pred`, else `None`). Returns the resulting value flips (at most a `Leave`
-    /// of the old value and an `Enter` of the new). History-independent and idempotent.
-    pub fn reconcile_row(&mut self, pk: &str, present_value: Option<Value>) -> Vec<Flip> {
-        // No-op if the contribution is unchanged (avoids a spurious Leave+Enter of the same value).
+    /// Reconcile inner-row `pk`'s contribution so it equals `present_value` (its projected
+    /// value if the row currently matches `pred`, else `None`). Returns the **circuit tuples**
+    /// realizing the change (retract the old contribution, insert the new — at most two);
+    /// flips come back from the circuit when the tuples are applied. History-independent and
+    /// idempotent: an unchanged contribution produces no tuples.
+    pub fn reconcile_row_tuples(&mut self, pk: &str, present_value: Option<Value>) -> Vec<Tup2<Row, ZWeight>> {
         if self.pk_value.get(pk) == present_value.as_ref() {
             return Vec::new();
         }
-        let mut flips = Vec::new();
-        // Remove the old contribution.
+        let mut tuples = Vec::new();
         if let Some(old_v) = self.pk_value.remove(pk) {
-            if let Some(set) = self.contributors.get_mut(&old_v) {
-                set.remove(pk);
-                if set.is_empty() {
-                    self.contributors.remove(&old_v);
-                    flips.push(Flip { value: old_v, dir: FlipDir::Leave });
-                }
-            }
+            tuples.push(Tup2(Row(vec![Value::Int(self.node_id), old_v, Value::Text(pk.to_string())]), -1));
         }
-        // Add the new contribution.
         if let Some(v) = present_value {
-            let set = self.contributors.entry(v.clone()).or_default();
-            let was_empty = set.is_empty();
-            set.insert(pk.to_string());
             self.pk_value.insert(pk.to_string(), v.clone());
-            if was_empty {
-                flips.push(Flip { value: v, dir: FlipDir::Enter });
-            }
+            tuples.push(Tup2(Row(vec![Value::Int(self.node_id), v, Value::Text(pk.to_string())]), 1));
         }
-        flips
+        tuples
     }
+}
+
+/// One subquery template: the shared evaluation structure for every node (bind) whose inner
+/// query differs only in the lifted equality literals — the KeyRouter factoring applied to
+/// subqueries. A delta on the inner table is evaluated ONCE per template (residual + param
+/// projection), then routed to the single affected bind by hash lookup, instead of one full
+/// predicate eval per literal-keyed node.
+pub(crate) struct TemplateGroup {
+    pub(crate) inner_table: String,
+    /// Column index (in `inner_table`) of the projected value (same for every bind).
+    proj_col: usize,
+    /// The compiled residual (lifted equalities removed, other literals baked in). May contain
+    /// nested `IN` leaves, resolved via [`SubqueryEval`] against already-collected child nodes.
+    residual: Arc<CompiledPredicate>,
+    /// Column indices of the lifted parameters, aligned with each bind `Row`.
+    param_cols: Vec<usize>,
+    /// bind literals -> the node serving that bind.
+    pub(crate) binds: HashMap<Row, SubquerySig>,
+    /// pk -> nodes of this template currently holding a contribution from that pk. An exact
+    /// inverted index over the nodes' `pk_value` maps (maintained in lockstep by
+    /// `reconcile_node_row`), so a row that stops matching finds its old bind in O(1) instead
+    /// of scanning every bind.
+    pk_nodes: HashMap<String, HashSet<SubquerySig>>,
 }
 
 /// Identifies a dependent of a node: an outer shape or a parent node, plus the connecting column on the
@@ -211,6 +226,9 @@ pub struct NodeStat {
     pub inner_table: String,
     pub distinct_values: usize,
     pub refcount: usize,
+    /// The template this node is a bind of — equal across nodes that differ only in lifted
+    /// equality literals (template-level sharing).
+    pub template: String,
 }
 
 /// A subquery shape between `begin_create` and `finish_create`: registration exists (so its
@@ -247,6 +265,17 @@ pub struct SubqueryRegistry {
     pub edges: Vec<Edge>,
     /// Registered outer subquery shapes by engine shape id.
     pub shapes: HashMap<String, SubqueryShape>,
+    /// The membership circuit: every node's value set as one dbsp relation; flip detection is
+    /// the circuit's incremental distinct (see `crate::subq_circuit`).
+    circuit: crate::subq_circuit::MembershipCircuit,
+    /// Next circuit node id (monotonic; ids of dropped nodes are never reused, so a stale
+    /// snapshot read can never alias a new node's slice).
+    next_node_id: i64,
+    /// circuit node id -> node signature (maps circuit flip deltas back to nodes).
+    node_by_id: HashMap<i64, SubquerySig>,
+    /// Shared evaluation templates (see [`TemplateGroup`]), keyed by
+    /// [`crate::predicate::subquery_template`]'s key.
+    pub(crate) templates: HashMap<String, TemplateGroup>,
     /// Nodes created but not yet seeded from Postgres (deepest-first).
     pending_seed: Vec<SubquerySig>,
     /// Shapes between `begin_create` and `finish_create` (the three-phase create): their
@@ -273,6 +302,11 @@ impl SubqueryRegistry {
             nodes: HashMap::new(),
             edges: Vec::new(),
             shapes: HashMap::new(),
+            circuit: crate::subq_circuit::MembershipCircuit::start()
+                .expect("membership circuit failed to start"),
+            next_node_id: 1,
+            node_by_id: HashMap::new(),
+            templates: HashMap::new(),
             pending_seed: Vec::new(),
             pending_shapes: Vec::new(),
             collect_log: Vec::new(),
@@ -281,6 +315,75 @@ impl SubqueryRegistry {
             schemas: Arc::new(HashMap::new()),
             lanes: None,
         }
+    }
+
+    /// Apply contributor tuples to the membership circuit and map its flip deltas back to
+    /// node signatures. Callers hold the registry lock across the await — the circuit thread
+    /// never takes this lock, and awaiting the step is what gives every later membership read
+    /// (`contains`/`has_null`) read-your-writes over this batch.
+    async fn apply_tuples(&mut self, tuples: Vec<Tup2<Row, ZWeight>>) -> Vec<(SubquerySig, Flip)> {
+        if tuples.is_empty() {
+            return Vec::new();
+        }
+        self.circuit
+            .apply(tuples)
+            .await
+            .into_iter()
+            .filter_map(|d| {
+                let sig = self.node_by_id.get(&d.node_id)?.clone();
+                let dir = if d.delta > 0 { FlipDir::Enter } else { FlipDir::Leave };
+                Some((sig, Flip { value: d.value, dir }))
+            })
+            .collect()
+    }
+
+    /// Reconcile one node's contribution for `pk` and keep the template's `pk_nodes` inverted
+    /// index in lockstep. ALL `pk_value` mutations must go through here.
+    fn reconcile_node_row(
+        &mut self,
+        sig: &SubquerySig,
+        pk: &str,
+        present: Option<Value>,
+    ) -> Vec<Tup2<Row, ZWeight>> {
+        let Some(node) = self.nodes.get_mut(sig) else { return Vec::new() };
+        let had = node.pk_value.contains_key(pk);
+        let tuples = node.reconcile_row_tuples(pk, present);
+        let has = node.pk_value.contains_key(pk);
+        if had != has {
+            let tkey = node.template_key.clone();
+            if let Some(tpl) = self.templates.get_mut(&tkey) {
+                if has {
+                    tpl.pk_nodes.entry(pk.to_string()).or_default().insert(sig.clone());
+                } else if let Some(set) = tpl.pk_nodes.get_mut(pk) {
+                    set.remove(sig);
+                    if set.is_empty() {
+                        tpl.pk_nodes.remove(pk);
+                    }
+                }
+            }
+        }
+        tuples
+    }
+
+    /// Reconcile a batch of per-pk evaluations against ONE node and return the resulting
+    /// flips (used by seeding replay and flip-driven parent re-derivations, where the caller
+    /// already evaluated the node's full predicate per row).
+    async fn apply_node_evals(
+        &mut self,
+        sig: &SubquerySig,
+        evals: Vec<(String, Option<Value>)>,
+    ) -> Vec<Flip> {
+        let mut tuples = Vec::new();
+        for (pk, pv) in evals {
+            tuples.extend(self.reconcile_node_row(sig, &pk, pv));
+        }
+        // Every tuple belongs to `sig`, so the sig on each flip is redundant here.
+        self.apply_tuples(tuples).await.into_iter().map(|(_, f)| f).collect()
+    }
+
+    /// The node's current distinct-value count, read from the circuit snapshot.
+    pub(crate) fn circuit_distinct(&self, node_id: i64) -> usize {
+        self.circuit.values_for_node(node_id, 0).0
     }
 
     pub(crate) fn set_lanes(&mut self, lanes: crate::engine::emission::EmissionLanes) {
@@ -335,16 +438,10 @@ impl SubqueryRegistry {
         cap: usize,
     ) -> Option<(usize, usize, Vec<(serde_json::Value, usize)>, bool)> {
         let n = self.nodes.get(sig)?;
-        let mut vals: Vec<(serde_json::Value, usize)> = n
-            .contributors
-            .iter()
-            .filter(|(_, pks)| !pks.is_empty())
-            .map(|(v, pks)| (v.to_json(), pks.len()))
-            .collect();
-        vals.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.to_string().cmp(&b.0.to_string())));
-        let truncated = vals.len() > cap;
-        vals.truncate(cap);
-        Some((n.distinct_values(), n.refcount, vals, truncated))
+        let (distinct, vals) = self.circuit.values_for_node(n.node_id, cap);
+        let vals: Vec<(serde_json::Value, usize)> =
+            vals.into_iter().map(|(v, c)| (v.to_json(), c)).collect();
+        Some((distinct, n.refcount, vals, distinct > cap))
     }
 
     /// Memory-relevant registry totals: maintained nodes, total contributor pks across all nodes (the
@@ -354,8 +451,8 @@ impl SubqueryRegistry {
         let mut contributors = 0;
         let mut distinct = 0;
         for n in self.nodes.values() {
-            contributors += n.contributors.values().map(|s| s.len()).sum::<usize>();
-            distinct += n.contributors.len();
+            contributors += n.contributor_count();
+            distinct += self.circuit_distinct(n.node_id);
         }
         (self.nodes.len(), contributors, distinct, self.shapes.len(), self.edges.len())
     }
@@ -370,8 +467,9 @@ impl SubqueryRegistry {
             .map(|n| NodeStat {
                 sig: n.sig.clone(),
                 inner_table: n.inner_table.clone(),
-                distinct_values: n.distinct_values(),
+                distinct_values: self.circuit_distinct(n.node_id),
                 refcount: n.refcount,
+                template: n.template_key.clone(),
             })
             .collect();
         out.sort_by(|a, b| a.sig.cmp(&b.sig));
@@ -387,7 +485,7 @@ impl SubqueryRegistry {
             out.push((
                 format!("node:{sig}"),
                 crate::engine::NodeStateSummary::SubqueryNode {
-                    distinct_values: n.distinct_values(),
+                    distinct_values: self.circuit_distinct(n.node_id),
                     refcount: n.refcount,
                 },
             ));
@@ -523,12 +621,17 @@ impl SubqueryRegistry {
             };
             if let Some(n) = self.nodes.get_mut(&sig) {
                 n.gate = gate;
-                for r in &rows {
-                    let pk = ts.key_string(r).unwrap_or_default();
-                    let pv = r.0.get(proj_col).cloned().unwrap_or(Value::Null);
-                    n.reconcile_row(&pk, Some(pv)); // initial state: flips are meaningless
-                }
             }
+            let mut seed_tuples = Vec::new();
+            for r in &rows {
+                let pk = ts.key_string(r).unwrap_or_default();
+                let pv = r.0.get(proj_col).cloned().unwrap_or(Value::Null);
+                seed_tuples.extend(self.reconcile_node_row(&sig, &pk, Some(pv)));
+            }
+            // Initial state: the seed's flips are meaningless (every dependent's backfill
+            // already reflects the seeded set), so this step's deltas are discarded — only
+            // the replay below propagates.
+            let _ = self.apply_tuples(seed_tuples).await;
             let buffered = self
                 .nodes
                 .get_mut(&sig)
@@ -540,7 +643,7 @@ impl SubqueryRegistry {
                 // node phase — here we re-evaluate membership by identity, which is idempotent
                 // against the seed for snapshot-visible rows, so replaying all is convergent.)
                 let evals = self.node_present_values(&sig, &ts, &buffered);
-                for f in self.apply_node_flips(&sig, evals) {
+                for f in self.apply_node_evals(&sig, evals).await {
                     work.push_back((sig.clone(), f));
                 }
             }
@@ -584,12 +687,34 @@ impl SubqueryRegistry {
             if let Some(n) = self.nodes.get_mut(&sig) {
                 n.refcount = n.refcount.saturating_sub(1);
                 if n.refcount == 0 {
-                    self.nodes.remove(&sig);
+                    if let Some(node) = self.nodes.remove(&sig) {
+                        self.remove_node_entry(&node);
+                    }
                     self.pending_seed.retain(|s| s != &sig);
                     self.edges.retain(|e| {
                         e.node_sig != sig && !matches!(&e.dependent, Dependent::Node(s) if s == &sig)
                     });
                 }
+            }
+        }
+    }
+
+    /// Drop a removed node's id/template bookkeeping (the circuit retraction, when the node
+    /// has state, is the caller's job — pre-seed nodes have none).
+    fn remove_node_entry(&mut self, node: &SubqueryNode) {
+        self.node_by_id.remove(&node.node_id);
+        if let Some(tpl) = self.templates.get_mut(&node.template_key) {
+            tpl.binds.remove(&node.bind);
+            for pk in node.pk_value.keys() {
+                if let Some(set) = tpl.pk_nodes.get_mut(pk) {
+                    set.remove(&node.sig);
+                    if set.is_empty() {
+                        tpl.pk_nodes.remove(pk);
+                    }
+                }
+            }
+            if tpl.binds.is_empty() {
+                self.templates.remove(&node.template_key);
             }
         }
     }
@@ -602,7 +727,9 @@ impl SubqueryRegistry {
             if let Some(n) = self.nodes.get_mut(&sig) {
                 n.refcount = n.refcount.saturating_sub(1);
                 if n.refcount == 0 {
-                    self.nodes.remove(&sig);
+                    if let Some(node) = self.nodes.remove(&sig) {
+                        self.remove_node_entry(&node);
+                    }
                     self.pending_seed.retain(|s| s != &sig);
                 }
             }
@@ -611,30 +738,44 @@ impl SubqueryRegistry {
 
     /// Remove a subquery shape: drop its edges and decref the nodes it referenced (removing nodes whose
     /// refcount hits zero, and their edges, recursively).
-    pub fn drop_subquery_shape(&mut self, shape_id: &str) {
+    pub async fn drop_subquery_shape(&mut self, shape_id: &str) {
         let Some(shape) = self.shapes.remove(shape_id) else { return };
         // Sigs this shape pointed at, then drop the shape's edges.
         let sigs: Vec<SubquerySig> = collect_in_leaves(&shape.pred).into_iter().map(|l| l.sig).collect();
         self.edges.retain(|e| !matches!(&e.dependent, Dependent::Shape(id) if id == shape_id));
-        for sig in sigs {
-            self.decref_node(&sig);
-        }
+        self.decref_nodes(sigs).await;
     }
 
-    fn decref_node(&mut self, sig: &SubquerySig) {
-        let Some(node) = self.nodes.get_mut(sig) else { return };
-        node.refcount = node.refcount.saturating_sub(1);
-        if node.refcount > 0 {
-            return;
+    /// Decrement each sig's refcount, removing (and cascading into the children of) nodes
+    /// that reach zero. Removed nodes retract their contributor tuples from the circuit in
+    /// one batch at the end; the resulting Leave flips are discarded — a refcount-0 node has
+    /// no dependents left to move.
+    async fn decref_nodes(&mut self, sigs: Vec<SubquerySig>) {
+        let mut stack = sigs;
+        let mut tuples: Vec<Tup2<Row, ZWeight>> = Vec::new();
+        while let Some(sig) = stack.pop() {
+            let Some(node) = self.nodes.get_mut(&sig) else { continue };
+            node.refcount = node.refcount.saturating_sub(1);
+            if node.refcount > 0 {
+                continue;
+            }
+            // Refcount hit zero: gather child sigs, retract state, remove node + edges, recurse.
+            let child_sigs: Vec<SubquerySig> =
+                collect_in_leaves(&node.pred).into_iter().map(|l| l.sig).collect();
+            let node = self.nodes.remove(&sig).expect("node fetched above");
+            for (pk, v) in &node.pk_value {
+                tuples.push(Tup2(
+                    Row(vec![Value::Int(node.node_id), v.clone(), Value::Text(pk.clone())]),
+                    -1,
+                ));
+            }
+            self.remove_node_entry(&node);
+            self.edges
+                .retain(|e| e.node_sig != sig && !matches!(&e.dependent, Dependent::Node(s) if s == &sig));
+            stack.extend(child_sigs);
         }
-        // Refcount hit zero: gather child sigs, remove the node + its incoming/outgoing edges, recurse.
-        let child_sigs: Vec<SubquerySig> =
-            collect_in_leaves(&node.pred).into_iter().map(|l| l.sig).collect();
-        self.nodes.remove(sig);
-        self.edges
-            .retain(|e| &e.node_sig != sig && !matches!(&e.dependent, Dependent::Node(s) if s == sig));
-        for c in child_sigs {
-            self.decref_node(&c);
+        if !tuples.is_empty() {
+            let _ = self.circuit.apply(tuples).await;
         }
     }
 
@@ -672,27 +813,43 @@ impl SubqueryRegistry {
             }
         };
 
-        // 1. Nodes whose inner table is this table: reconcile from the delta, collect flips.
-        let node_sigs: Vec<SubquerySig> =
-            self.nodes.iter().filter(|(_, n)| n.inner_table == table).map(|(s, _)| s.clone()).collect();
-        for sig in node_sigs {
-            // Mid-seed: buffer the raw delta for gated replay at install (a half-seeded set
-            // must not be reconciled — the snapshot could stale-overwrite a fresher delta).
-            if let Some(buf) = self.nodes.get_mut(&sig).and_then(|n| n.seed_buffer.as_mut()) {
-                buf.extend(delta.iter().cloned());
-                hop(&mut trace, format!("node:{sig}"), "buffered");
-                continue;
+        // 1. Templates whose inner table is this table: one residual eval + one bind lookup
+        // per touched pk (instead of one full-predicate eval per literal-keyed node), then one
+        // circuit step for the whole delta — the circuit's distinct reports the flips.
+        let tkeys: Vec<String> = self
+            .templates
+            .iter()
+            .filter(|(_, t)| t.inner_table == table)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut tuples: Vec<Tup2<Row, ZWeight>> = Vec::new();
+        let mut live_sigs: Vec<SubquerySig> = Vec::new();
+        for tkey in &tkeys {
+            let sigs: Vec<SubquerySig> =
+                self.templates.get(tkey).map(|t| t.binds.values().cloned().collect()).unwrap_or_default();
+            for sig in sigs {
+                // Mid-seed: buffer the raw delta for gated replay at install (a half-seeded
+                // set must not be reconciled — the snapshot could stale-overwrite a fresher
+                // delta).
+                if let Some(buf) = self.nodes.get_mut(&sig).and_then(|n| n.seed_buffer.as_mut()) {
+                    buf.extend(delta.iter().cloned());
+                    hop(&mut trace, format!("node:{sig}"), "buffered");
+                } else if self.nodes.get(&sig).is_some_and(|n| n.gate.should_skip(lsn, xid)) {
+                    hop(&mut trace, format!("node:{sig}"), "dropped");
+                } else {
+                    live_sigs.push(sig);
+                }
             }
-            if self.nodes.get(&sig).is_some_and(|n| n.gate.should_skip(lsn, xid)) {
-                hop(&mut trace, format!("node:{sig}"), "dropped");
-                continue;
-            }
-            let evals = self.node_present_values(&sig, ts, delta);
-            let flips = self.apply_node_flips(&sig, evals);
-            hop(&mut trace, format!("node:{sig}"), if flips.is_empty() { "dropped" } else { "passed" });
-            for f in flips {
-                work.push_back((sig.clone(), f));
-            }
+            let evals = self.template_present(tkey, ts, delta);
+            tuples.extend(self.template_reconcile(tkey, evals, lsn, xid));
+        }
+        let flips = self.apply_tuples(tuples).await;
+        for sig in live_sigs {
+            let flipped = flips.iter().any(|(s, _)| s == &sig);
+            hop(&mut trace, format!("node:{sig}"), if flipped { "passed" } else { "dropped" });
+        }
+        for f in flips {
+            work.push_back(f);
         }
 
         // 2. Subquery shapes whose outer table is this table: evaluate the filter on the delta + append.
@@ -760,14 +917,80 @@ impl SubqueryRegistry {
             .collect()
     }
 
-    /// Apply reconciliations to a node, returning the resulting flips. Mutable.
-    fn apply_node_flips(&mut self, sig: &SubquerySig, evals: Vec<(String, Option<Value>)>) -> Vec<Flip> {
-        let Some(node) = self.nodes.get_mut(sig) else { return Vec::new() };
-        let mut flips = Vec::new();
-        for (pk, pv) in evals {
-            flips.extend(node.reconcile_row(&pk, pv));
+    /// For each touched pk, the row's target contribution under one template: `Some((node
+    /// sig, projected value))` when the latest row matches the residual AND its projected
+    /// params hit a registered bind, else `None`. One residual eval + one hash lookup per pk —
+    /// the template-sharing eval win over per-node full-predicate evaluation.
+    fn template_present(
+        &self,
+        tkey: &str,
+        ts: &TableSchema,
+        delta: &[Tup2<Row, ZWeight>],
+    ) -> Vec<(String, Option<(SubquerySig, Value)>)> {
+        let Some(tpl) = self.templates.get(tkey) else { return Vec::new() };
+        crate::engine::membership::latest_rows_by_pk(ts, delta)
+            .into_iter()
+            .map(|(row, is_new)| {
+                let pk = ts.key_string(&row).unwrap_or_default();
+                let target = if is_new && tpl.residual.matches_ctx(&row, self) {
+                    let params = Row(
+                        tpl.param_cols
+                            .iter()
+                            .map(|&i| row.0.get(i).cloned().unwrap_or(Value::Null))
+                            .collect(),
+                    );
+                    tpl.binds.get(&params).map(|sig| {
+                        (sig.clone(), row.0.get(tpl.proj_col).cloned().unwrap_or(Value::Null))
+                    })
+                } else {
+                    None
+                };
+                (pk, target)
+            })
+            .collect()
+    }
+
+    /// Turn one template's per-pk targets into circuit tuples: retract from nodes that held
+    /// the pk but are no longer its target, insert into the new target. Per node, the delta
+    /// is skipped when the node is mid-seed (its raw buffer replays at install) or when the
+    /// node's seed gate says the snapshot already contains this change — in both cases the
+    /// node's seed is (or will be) the authority, and reconcile-by-identity absorbs any
+    /// overlap idempotently.
+    fn template_reconcile(
+        &mut self,
+        tkey: &str,
+        evals: Vec<(String, Option<(SubquerySig, Value)>)>,
+        lsn: u64,
+        xid: Option<u64>,
+    ) -> Vec<Tup2<Row, ZWeight>> {
+        let node_applies = |reg: &Self, sig: &SubquerySig| {
+            reg.nodes
+                .get(sig)
+                .is_some_and(|n| n.seed_buffer.is_none() && !n.gate.should_skip(lsn, xid))
+        };
+        let mut tuples = Vec::new();
+        for (pk, target) in evals {
+            let holders: Vec<SubquerySig> = self
+                .templates
+                .get(tkey)
+                .and_then(|t| t.pk_nodes.get(&pk))
+                .map(|s| s.iter().cloned().collect())
+                .unwrap_or_default();
+            for sig in holders {
+                if target.as_ref().is_some_and(|(tsig, _)| tsig == &sig) {
+                    continue; // still the target; the insert below reconciles the value
+                }
+                if node_applies(self, &sig) {
+                    tuples.extend(self.reconcile_node_row(&sig, &pk, None));
+                }
+            }
+            if let Some((sig, v)) = target {
+                if node_applies(self, &sig) {
+                    tuples.extend(self.reconcile_node_row(&sig, &pk, Some(v)));
+                }
+            }
         }
-        flips
+        tuples
     }
 
     /// Deferred-propagation helper: snapshot what a query-back needs (brief lock scope at the
@@ -1024,7 +1247,7 @@ async fn reconcile_parent_for_value(
             (pk, pv)
         })
         .collect();
-    Ok(Some((ts.name.clone(), reg.apply_node_flips(parent_sig, evals))))
+    Ok(Some((ts.name.clone(), reg.apply_node_evals(parent_sig, evals).await)))
 }
 
 /// Re-derive a dependent fully (used for NULL flips on negated edges): re-query every candidate row
@@ -1090,7 +1313,7 @@ async fn rederive_dependent(
                     (pk, pv)
                 })
                 .collect();
-            for f in reg.apply_node_flips(parent_sig, evals) {
+            for f in reg.apply_node_evals(parent_sig, evals).await {
                 work.push_back((parent_sig.clone(), f));
             }
         }
@@ -1187,11 +1410,63 @@ impl SubqueryCollector for SubqueryRegistry {
             });
         }
         let proj_col = inner_ts.column_index(project)?;
-        let mut node =
-            SubqueryNode::new(sig.clone(), table.to_string(), proj_col, inner_ts.pk_index, Arc::new(inner_pred));
+        let node_id = self.next_node_id;
+        self.next_node_id += 1;
+        // Template registration: lift the equality literals into a bind (coerced to the
+        // column types, same as leaf compilation) and share the residual across binds.
+        let (tkey, bind_literals, residual_json) =
+            crate::predicate::subquery_template(table, project, where_);
+        let mut param_cols = Vec::with_capacity(bind_literals.len());
+        let mut bind_vals = Vec::with_capacity(bind_literals.len());
+        for (col, lit) in &bind_literals {
+            let idx = inner_ts.column_index(col)?;
+            param_cols.push(idx);
+            bind_vals.push(Value::literal_from_json(lit, inner_ts.column_type(idx))?);
+        }
+        let bind = Row(bind_vals);
+        if !self.templates.contains_key(&tkey) {
+            // The residual is compiled with a sig-only collector: any nested IN inside it was
+            // already collected (and refcounted) by the full-pred compile above; collecting
+            // again would double-count.
+            struct SigOnly;
+            impl SubqueryCollector for SigOnly {
+                fn collect(&mut self, t: &str, p: &str, w: Option<&PredicateJson>) -> Result<SubquerySig> {
+                    Ok(subquery_sig(t, p, w))
+                }
+            }
+            let residual = if residual_json.is_empty() {
+                CompiledPredicate::MatchAll
+            } else {
+                CompiledPredicate::compile_with(
+                    &PredicateJson::And { and: residual_json },
+                    &inner_ts,
+                    &mut SigOnly,
+                )?
+            };
+            self.templates.insert(
+                tkey.clone(),
+                TemplateGroup {
+                    inner_table: table.to_string(),
+                    proj_col,
+                    residual: Arc::new(residual),
+                    param_cols: param_cols.clone(),
+                    binds: HashMap::new(),
+                    pk_nodes: HashMap::new(),
+                },
+            );
+        }
+        if let Some(tpl) = self.templates.get_mut(&tkey) {
+            tpl.binds.insert(bind.clone(), sig.clone());
+        }
+        let mut node = SubqueryNode::new(
+            sig.clone(), table.to_string(), proj_col, inner_ts.pk_index, Arc::new(inner_pred), node_id,
+        );
         node.where_json = where_.cloned();
+        node.template_key = tkey;
+        node.bind = bind;
         node.refcount = 1;
         self.nodes.insert(sig.clone(), node);
+        self.node_by_id.insert(node_id, sig.clone());
         self.collect_log.push(sig.clone());
         self.pending_seed.push(sig.clone());
         Ok(sig)
@@ -1200,10 +1475,10 @@ impl SubqueryCollector for SubqueryRegistry {
 
 impl SubqueryEval for SubqueryRegistry {
     fn contains(&self, sig: &SubquerySig, value: &Value) -> bool {
-        self.nodes.get(sig).is_some_and(|n| n.contains(value))
+        self.nodes.get(sig).is_some_and(|n| self.circuit.contains(n.node_id, value))
     }
     fn has_null(&self, sig: &SubquerySig) -> bool {
-        self.nodes.get(sig).is_some_and(|n| n.has_null())
+        self.nodes.get(sig).is_some_and(|n| self.circuit.contains(n.node_id, &Value::Null))
     }
 }
 
@@ -1279,8 +1554,37 @@ pub fn referenced_tables(p: &PredicateJson) -> Vec<String> {
 mod tests {
     use super::*;
 
-    fn node() -> SubqueryNode {
-        SubqueryNode::new("sig".into(), "t".into(), 0, 1, Arc::new(CompiledPredicate::MatchAll))
+    /// A registry with one MatchAll node registered the way `collect()` would: node map,
+    /// node_by_id, and a unit-bind template — so `on_table_delta`, `apply_node_evals`, and the
+    /// `SubqueryEval` reads all work.
+    fn registry_with_node(sig: &str) -> SubqueryRegistry {
+        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+        insert_test_node(&mut reg, sig);
+        reg
+    }
+
+    fn insert_test_node(reg: &mut SubqueryRegistry, sig: &str) {
+        let node_id = reg.next_node_id;
+        reg.next_node_id += 1;
+        let mut node = SubqueryNode::new(
+            sig.into(), "t".into(), 0, 1, Arc::new(CompiledPredicate::MatchAll), node_id,
+        );
+        let tkey = format!("tpl:{sig}");
+        node.template_key = tkey.clone();
+        node.refcount = 1;
+        reg.nodes.insert(sig.into(), node);
+        reg.node_by_id.insert(node_id, sig.into());
+        reg.templates.insert(
+            tkey,
+            TemplateGroup {
+                inner_table: "t".into(),
+                proj_col: 0,
+                residual: Arc::new(CompiledPredicate::MatchAll),
+                param_cols: Vec::new(),
+                binds: [(Row(Vec::new()), sig.to_string())].into_iter().collect(),
+                pk_nodes: HashMap::new(),
+            },
+        );
     }
 
     /// The trace reports an inner-table delta's effect on a subquery node: `passed` when the
@@ -1296,7 +1600,7 @@ mod tests {
             crate::schema::TableSchema::from_def("t", &def).unwrap()
         };
         let mut reg = SubqueryRegistry::new(crate::ds::DsClient::new("http://127.0.0.1:1"), None);
-        reg.nodes.insert("sig1".into(), node_with_sig("sig1"));
+        insert_test_node(&mut reg, "sig1");
 
         // A new row projects value 1 into the inner set -> Enter flip -> passed.
         let delta = vec![Tup2(Row(vec![Value::Int(1)]), 1)];
@@ -1359,8 +1663,7 @@ mod tests {
     /// path lights and the visualizer fades nothing spuriously.
     #[tokio::test]
     async fn flip_no_op_emits_no_trace() {
-        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
-        reg.nodes.insert("sig1".into(), node_with_sig("sig1"));
+        let mut reg = registry_with_node("sig1");
         reg.edges.push(Edge {
             node_sig: "sig1".into(),
             dependent: Dependent::Shape("s7".into()),
@@ -1377,30 +1680,38 @@ mod tests {
         assert!(trace_rx.try_recv().is_err(), "a NULL flip on a non-null-sensitive dependent emits nothing");
     }
 
-    fn node_with_sig(sig: &str) -> SubqueryNode {
-        SubqueryNode::new(sig.into(), "t".into(), 0, 1, Arc::new(CompiledPredicate::MatchAll))
-    }
 
-    #[test]
-    fn reconcile_enter_and_leave_on_first_and_last_contributor() {
-        let mut n = node();
-        assert_eq!(n.reconcile_row("a", Some(Value::Int(5))), vec![Flip { value: Value::Int(5), dir: FlipDir::Enter }]);
-        assert!(n.contains(&Value::Int(5)));
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconcile_enter_and_leave_on_first_and_last_contributor() {
+        let sig: SubquerySig = "sig".into();
+        let mut reg = registry_with_node(&sig);
+        let evals = |pk: &str, v: Option<Value>| vec![(pk.to_string(), v)];
+        assert_eq!(
+            reg.apply_node_evals(&sig, evals("a", Some(Value::Int(5)))).await,
+            vec![Flip { value: Value::Int(5), dir: FlipDir::Enter }]
+        );
+        assert!(reg.contains(&sig, &Value::Int(5)));
         // second contributor to the same value -> no flip
-        assert_eq!(n.reconcile_row("b", Some(Value::Int(5))), vec![]);
+        assert_eq!(reg.apply_node_evals(&sig, evals("b", Some(Value::Int(5)))).await, vec![]);
         // removing one of two -> still present, no flip
-        assert_eq!(n.reconcile_row("a", None), vec![]);
-        assert!(n.contains(&Value::Int(5)));
+        assert_eq!(reg.apply_node_evals(&sig, evals("a", None)).await, vec![]);
+        assert!(reg.contains(&sig, &Value::Int(5)));
         // removing the last -> Leave
-        assert_eq!(n.reconcile_row("b", None), vec![Flip { value: Value::Int(5), dir: FlipDir::Leave }]);
-        assert!(!n.contains(&Value::Int(5)));
+        assert_eq!(
+            reg.apply_node_evals(&sig, evals("b", None)).await,
+            vec![Flip { value: Value::Int(5), dir: FlipDir::Leave }]
+        );
+        assert!(!reg.contains(&sig, &Value::Int(5)));
     }
 
-    #[test]
-    fn reconcile_value_change_emits_leave_then_enter() {
-        let mut n = node();
-        n.reconcile_row("a", Some(Value::Int(5)));
-        let flips = n.reconcile_row("a", Some(Value::Int(7)));
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconcile_value_change_emits_leave_then_enter() {
+        let sig: SubquerySig = "sig".into();
+        let mut reg = registry_with_node(&sig);
+        reg.apply_node_evals(&sig, vec![("a".into(), Some(Value::Int(5)))]).await;
+        let mut flips = reg.apply_node_evals(&sig, vec![("a".into(), Some(Value::Int(7)))]).await;
+        flips.sort_by(|a, b| a.value.cmp(&b.value));
         assert_eq!(
             flips,
             vec![
@@ -1408,26 +1719,34 @@ mod tests {
                 Flip { value: Value::Int(7), dir: FlipDir::Enter },
             ]
         );
-        assert!(!n.contains(&Value::Int(5)));
-        assert!(n.contains(&Value::Int(7)));
+        assert!(!reg.contains(&sig, &Value::Int(5)));
+        assert!(reg.contains(&sig, &Value::Int(7)));
     }
 
-    #[test]
-    fn reconcile_same_value_is_a_noop() {
-        let mut n = node();
-        n.reconcile_row("a", Some(Value::Int(5)));
-        assert_eq!(n.reconcile_row("a", Some(Value::Int(5))), vec![]);
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconcile_same_value_is_a_noop() {
+        let sig: SubquerySig = "sig".into();
+        let mut reg = registry_with_node(&sig);
+        reg.apply_node_evals(&sig, vec![("a".into(), Some(Value::Int(5)))]).await;
+        assert_eq!(reg.apply_node_evals(&sig, vec![("a".into(), Some(Value::Int(5)))]).await, vec![]);
         // unchanged absence is also a no-op
-        assert_eq!(n.reconcile_row("z", None), vec![]);
+        assert_eq!(reg.apply_node_evals(&sig, vec![("z".into(), None)]).await, vec![]);
     }
 
-    #[test]
-    fn null_bucket_tracks_has_null() {
-        let mut n = node();
-        assert_eq!(n.reconcile_row("a", Some(Value::Null)), vec![Flip { value: Value::Null, dir: FlipDir::Enter }]);
-        assert!(n.has_null());
-        assert_eq!(n.reconcile_row("a", None), vec![Flip { value: Value::Null, dir: FlipDir::Leave }]);
-        assert!(!n.has_null());
+    #[tokio::test(flavor = "multi_thread")]
+    async fn null_bucket_tracks_has_null() {
+        let sig: SubquerySig = "sig".into();
+        let mut reg = registry_with_node(&sig);
+        assert_eq!(
+            reg.apply_node_evals(&sig, vec![("a".into(), Some(Value::Null))]).await,
+            vec![Flip { value: Value::Null, dir: FlipDir::Enter }]
+        );
+        assert!(reg.has_null(&sig));
+        assert_eq!(
+            reg.apply_node_evals(&sig, vec![("a".into(), None)]).await,
+            vec![Flip { value: Value::Null, dir: FlipDir::Leave }]
+        );
+        assert!(!reg.has_null(&sig));
     }
 
     /// `NOT (x IN S)` is exactly as NULL-sensitive as `x NOT IN S`: a NULL entering `S` turns the leaf
@@ -1558,16 +1877,15 @@ mod tests {
         assert!(out.is_empty(), "repeat delete for an already-removed pk must be dropped");
     }
 
-    #[test]
-    fn registry_eval_reads_node_sets() {
-        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
-        let mut n = node();
-        n.reconcile_row("a", Some(Value::Int(1)));
-        n.reconcile_row("b", Some(Value::Null));
-        reg.nodes.insert("sig".into(), n);
-        assert!(reg.contains(&"sig".to_string(), &Value::Int(1)));
-        assert!(!reg.contains(&"sig".to_string(), &Value::Int(2)));
-        assert!(reg.has_null(&"sig".to_string()));
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registry_eval_reads_node_sets() {
+        let sig: SubquerySig = "sig".into();
+        let mut reg = registry_with_node(&sig);
+        reg.apply_node_evals(&sig, vec![("a".into(), Some(Value::Int(1))), ("b".into(), Some(Value::Null))])
+            .await;
+        assert!(reg.contains(&sig, &Value::Int(1)));
+        assert!(!reg.contains(&sig, &Value::Int(2)));
+        assert!(reg.has_null(&sig));
         // unknown sig -> empty
         assert!(!reg.contains(&"other".to_string(), &Value::Int(1)));
     }

@@ -34,6 +34,7 @@ pub mod replication;
 pub mod retention;
 pub mod schema;
 pub mod sql;
+pub mod subq_circuit;
 pub mod subquery;
 pub mod trace;
 pub mod value;

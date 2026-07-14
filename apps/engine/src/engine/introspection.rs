@@ -701,7 +701,7 @@ impl Engine {
                 sig: n.sig.clone(),
                 inner_table: n.inner_table.clone(),
                 proj_col: col_name(&n.inner_table, n.proj_col),
-                distinct_values: n.distinct_values(),
+                distinct_values: reg.circuit_distinct(n.node_id),
                 refcount: n.refcount,
             })
             .collect();
