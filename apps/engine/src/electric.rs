@@ -354,6 +354,11 @@ fn offset_after(a: &str, b: &str) -> bool {
 /// **not** end the fold (that truncated snapshots).
 struct StreamFold {
     rows: HashMap<String, serde_json::Value>,
+    /// Keys in first-appearance (stream) order. `rows` alone would randomize the snapshot's
+    /// row order per request (HashMap iteration), which readers observably depend on — the
+    /// engine appends the backfill in a deterministic order and the adapter must not shuffle
+    /// it. Deleted keys keep their slot here and are filtered at emission by map membership.
+    order: Vec<String>,
     offset: String,
     until: Option<String>,
     done: bool,
@@ -361,11 +366,22 @@ struct StreamFold {
 
 impl StreamFold {
     fn to_tail() -> Self {
-        StreamFold { rows: HashMap::new(), offset: "-1".into(), until: None, done: false }
+        StreamFold { rows: HashMap::new(), order: Vec::new(), offset: "-1".into(), until: None, done: false }
     }
 
     fn up_to(offset: &str) -> Self {
-        StreamFold { rows: HashMap::new(), offset: "-1".into(), until: Some(offset.to_string()), done: false }
+        StreamFold {
+            rows: HashMap::new(),
+            order: Vec::new(),
+            offset: "-1".into(),
+            until: Some(offset.to_string()),
+            done: false,
+        }
+    }
+
+    /// The folded rows in stream (first-appearance) order.
+    fn ordered_rows(&self) -> impl Iterator<Item = (&String, &serde_json::Value)> {
+        self.order.iter().filter_map(|k| self.rows.get_key_value(k))
     }
 
     fn apply_page(&mut self, r: ReadResult) {
@@ -382,7 +398,9 @@ impl StreamFold {
                 }
                 _ => {
                     if let Some(v) = env.value {
-                        self.rows.insert(env.key, v);
+                        if self.rows.insert(env.key.clone(), v).is_none() {
+                            self.order.push(env.key);
+                        }
                     }
                 }
             }
@@ -412,9 +430,10 @@ async fn drive_fold(engine: &Engine, path: &str, mut fold: StreamFold) -> anyhow
 
 /// Fold a shape's whole stream (catch-up reads from `-1`) into the current key→row-value map and return
 /// it with the stream's tail offset.
-async fn materialize(engine: &Engine, path: &str) -> anyhow::Result<(HashMap<String, serde_json::Value>, String)> {
+async fn materialize(engine: &Engine, path: &str) -> anyhow::Result<(Vec<(String, serde_json::Value)>, String)> {
     let fold = drive_fold(engine, path, StreamFold::to_tail()).await?;
-    Ok((fold.rows, fold.offset))
+    let rows = fold.ordered_rows().map(|(k, v)| (k.clone(), v.clone())).collect();
+    Ok((rows, fold.offset))
 }
 
 /// The key set a client holds when positioned at `offset` (fold `-1..=offset`).
