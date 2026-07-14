@@ -929,7 +929,7 @@ pub(crate) async fn process_envelope(
         }
         if !work.is_empty() {
             subq.pending_flips.fetch_add(1, Ordering::SeqCst);
-            if subq.flip_tx.send(FlipWork { work, txid: txid.clone() }).is_err() {
+            if subq.flip_tx.send(FlipWork { work, txid: txid.clone(), lsn: lsn.clone() }).is_err() {
                 // Propagator gone (shutdown) — don't leave the barrier stuck.
                 subq.pending_flips.fetch_sub(1, Ordering::SeqCst);
             }

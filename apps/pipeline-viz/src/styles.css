@@ -168,6 +168,33 @@ body,
   align-items: center;
   justify-content: center;
 }
+.speed-ctl {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 16px 0;
+}
+.speed-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: #64748b;
+  flex: none;
+}
+.speed-slider {
+  flex: 1;
+  accent-color: #4338ca;
+}
+.speed-val {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: #334155;
+  flex: none;
+  width: 34px;
+  text-align: right;
+}
+.speed-reset {
+  flex: none;
+}
 .counts {
   padding: 10px 16px 2px;
   font-size: 12px;
@@ -1261,7 +1288,6 @@ body,
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-
 /* Add-row form — table-source detail panel (Feature 1) */
 /* Inline add-row (embedded in the data browser) */
 .dp-addrow-bar {
