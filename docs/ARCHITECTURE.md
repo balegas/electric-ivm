@@ -232,10 +232,19 @@ dropped mid-flush; discard is correct). Because shape envelopes are absolute per
 A predicate leaf `col [NOT] IN (SELECT proj FROM inner WHERE …)` routes through a registry the
 sequencer feeds every table's deltas into:
 
-- **Node** — one per distinct inner query (canonical signature), ref-counted: a map
-  `projected value → set of contributing inner-row pks`. A value is in the set iff its contributor
-  set is non-empty; tracking pks (not counts) makes maintenance reconcile-by-identity — idempotent
-  and order-independent.
+- **Node** — one per distinct inner query (canonical signature), ref-counted. The node's value
+  set lives in the **membership circuit** (§6b) as the `(node_id, value)` slice of one shared dbsp
+  relation, weighted by contributor count; a value is in the set iff its weight is positive. The
+  node keeps only a host-side `pk → projected value` reverse index, which makes maintenance
+  reconcile-by-identity — idempotent and order-independent — and yields the exact retract/insert
+  tuples the circuit needs (evaluation can read *other* nodes' sets via nested `IN`, so a row's
+  tuple is not a pure function of the row).
+- **Templates** — nodes are grouped by parameterized template (`predicate.rs::subquery_template`):
+  the inner WHERE's top-level equality literals are lifted out as a **bind**, so `user_id = 1` and
+  `user_id = 2` share one compiled residual + parameter projection. A delta on the inner table is
+  evaluated **once per template** (one residual eval + one bind hash-lookup per touched pk),
+  routed to the single affected node — instead of one full-predicate eval per literal-keyed node.
+  Flip detection is the circuit's incremental distinct: the step's output deltas ARE the flips.
 - **Edges** — `node → dependent` (an outer shape, or a *parent node* for nested subqueries), labeled
   with the connecting column. When a node **flips** a value (∅→non-empty or back), the dependent rows
   with `connecting_col = value` are queried back and re-evaluated, recursing up the DAG. Flip
@@ -263,14 +272,26 @@ sequencer feeds every table's deltas into:
 
 ---
 
-## 6b. The circuit: dbsp counts pipelines
+## 6b. The circuit tier: counts pipelines + the membership circuit
 
-The circuit (`arrangements.rs`) is one shared, in-memory dbsp circuit per engine — the
-**circuit tier** of the serving model below. **Row data lives in Postgres, never engine-side**:
-the circuit's only state is the counts pipelines' (group → count) relations, O(distinct groups)
-in memory — no storage layer, no spill, no checkpoints. The sequencer feeds each transaction
-into the circuit and steps it **before** fanning the transaction out, so circuit-served
-aggregates emit within the transaction that changed them.
+The circuit tier is two small, always-in-memory dbsp circuits per engine (O(1) — never per
+shape). **Row data lives in Postgres, never engine-side**; there is no storage layer, no spill,
+no checkpoints.
+
+- The **counts circuit** (`arrangements.rs`) maintains the configured counts pipelines
+  ((group → count) relations, O(distinct groups)). The sequencer feeds each transaction into it
+  and steps it **before** fanning the transaction out, so circuit-served aggregates emit within
+  the transaction that changed them.
+- The **membership circuit** (`subq_circuit.rs`, owned by the subquery registry, always on)
+  maintains every subquery node's inner-value set as ONE relation:
+  `contributor tuples (node_id, value, pk) → map(drop pk) → integrate_trace snapshot` (serves
+  `contains`/`has_null`/introspection) `+ distinct → output` (the step's deltas are the
+  membership **flips**, §6). The registry evaluates templates host-side per envelope, under its
+  lock, and awaits the step — so intra-transaction ordering is identical to the old in-registry
+  kernel, and membership reads are read-your-writes. Structure is fixed at construction (one
+  global tuple input); registering a new subquery template/node/bind is pure runtime data — no
+  rebuild, ever. State is O(contributing inner rows), bind-gated: only subscribed binds hold
+  state, each seeded from Postgres like any backfill.
 
 - **Counts pipelines** — `ELECTRIC_IVM_DBSP_COUNTS=table:col+col,…` compiles, per table (at
   most one spec each), a `map_index(group) → weighted_count` pipeline: a live COUNT per
@@ -307,9 +328,10 @@ state to tune.)
 - **Observability**: `/graph` carries an `arrangements` section — the counts pipelines as
   stable-id nodes (`arr:input:<table>`, `arr:counts:<table>`, with seeded flags) plus a
   `consumers` list connecting each counts node to the circuit-served aggregates it feeds.
-- **Limits**: circuit structure is fixed at boot (a dbsp circuit is fixed at construction) —
-  new counts specs need a restart (state reseeds from Postgres in O(groups), so a restart is
-  cheap); single worker; COUNT only.
+- **Limits**: a dbsp circuit's structure is fixed at construction, so new **counts specs**
+  need a restart (state reseeds from Postgres in O(groups), so a restart is cheap); single
+  worker; COUNT only. Subquery templates are NOT structure — the membership circuit's one
+  tuple input serves any number of them, registered at runtime.
 
 ### The serving model this is one tier of
 
@@ -320,9 +342,9 @@ state to tune.)
   predicates and aggregates are conjunct-indexed — a change finds its shapes by index lookup,
   never by scan.
 - **The registry serves subqueries.** All `[NOT] IN (SELECT …)` shapes: shared inner-set
-  nodes, parallel flip query-backs to Postgres, ordered emission lanes, absolute per-pk
-  emission. Correctness never depends on the circuit — it is an optimization tier for
-  decomposable COUNTs, nothing else.
+  nodes grouped as parameterized templates, membership state + flip detection in the
+  membership circuit, parallel flip query-backs to Postgres, ordered emission lanes, absolute
+  per-pk emission.
 
 ---
 
@@ -398,6 +420,7 @@ stream, and client, including live replication, batched mutations, NULLs, and co
 | flip workers | ≤ `ELECTRIC_IVM_FLIP_WORKERS` tasks (default 8) | concurrent deferred query-backs; PG round-trips never hold the registry lock |
 | emission lanes | `ELECTRIC_IVM_EMIT_LANES` tasks (default 8) | per-stream FIFO writers: append order = eval order per shape |
 | circuit (counts) | 1 OS thread | owns the `DBSPHandle`; blocking steps, fed by a bounded channel (backpressure to the sequencer) |
+| circuit (membership) | 1 OS thread | owns the membership `DBSPHandle`; stepped per envelope by the registry (subquery tables only) |
 
 Threads are flat in the number of shapes *and* in the number of equality templates.
 
@@ -472,7 +495,8 @@ predicate (which recreates the feed per click) — see AGENTS.md "gotchas".
 | path | role |
 |------|------|
 | `apps/engine/src/engine/` | the engine module: `mod.rs` (the `Engine` handle + shared state), `sequencer.rs` (the LSN-ordered sequencer, (lsn,seq) de-dup, per-txn reliable flush), `lifecycle.rs` (shape creation/sharing/retention), `circuit_serving.rs` (circuit-tier serving), `executors.rs` (routers, filters, folds), `planning.rs` (circuit placement), `catalog.rs` (durable catalog + restore), `introspection.rs` (graph/state DTOs + builders), `membership.rs` (the shared membership kernel: flip detection, pooled Postgres query-backs), `emission.rs` (per-stream ordered emission lanes), `output.rs` (envelope ⇄ delta codec) |
-| `apps/engine/src/subquery.rs` | subquery registry: shared nodes, edges, flips, absolute emission, atomic create/rollback |
+| `apps/engine/src/subquery.rs` | subquery registry: shared nodes + templates, edges, absolute emission, atomic create/rollback |
+| `apps/engine/src/subq_circuit.rs` | the membership circuit: inner-set state + flip detection (dbsp distinct) |
 | `apps/engine/src/arrangements.rs` | the circuit: in-memory dbsp counts pipelines, group-aggregated boot seeding (§6b) |
 | `apps/engine/src/replication.rs` | ingestor: streaming pgoutput (decoder: `pgoutput.rs`), per-txn buffering, (lsn, xid, seq) stamping, append-then-acknowledge |
 | `apps/engine/src/pg.rs` | connect/introspect, slot + REPLICA IDENTITY, backfill (+ `SnapshotGate`), subset query-back, value normalization |
