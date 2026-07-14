@@ -38,14 +38,18 @@ Together these are the same order as the old kernel's `contributors` + `pk_value
 the circuit swap achieved memory **parity**, while collapsing per-delta evaluation from
 O(nodes) to O(1) per template.
 
-### Host-side, per subquery shape
+### Per subquery shape — the feed relation (was `known_members`, now circuit state)
 
 | structure | cardinality | scales with |
 |---|---|---|
-| `known_members`: pks this shape's stream currently claims as members | **O(current feed size)** per shape | rows in each subscribed feed |
+| feed relation slice `(feed_id, pk)` in the membership circuit | **O(current feed size)** per shape | rows in each subscribed feed |
 
-This is the largest per-feed term and the reason "flat" is wrong as an absolute claim —
-see §3.
+Since the feed-relations change (dbsp-ds-dh6) this lives in the membership circuit as an
+upsert map — same bytes, no host structure, and its output deltas ARE the emission decisions
+(deletes only from retractions; §3's reasons-it-was-host-side are resolved by making the
+relation's transition *be* the decision). Still the largest per-feed term and the reason
+"flat" is wrong as an absolute claim; now spillable/checkpointable once the storage follow-up
+lands (§4).
 
 (The Electric `/v1/shape` adapter additionally keeps a TTL-evicted per-handle key set in
 `electric.rs` for protocol filtering — same order, handle-scoped, dropped on idle.)

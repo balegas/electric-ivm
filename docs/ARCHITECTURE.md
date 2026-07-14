@@ -233,12 +233,11 @@ A predicate leaf `col [NOT] IN (SELECT proj FROM inner WHERE …)` routes throug
 sequencer feeds every table's deltas into:
 
 - **Node** — one per distinct inner query (canonical signature), ref-counted. The node's value
-  set lives in the **membership circuit** (§6b) as the `(node_id, value)` slice of one shared dbsp
-  relation, weighted by contributor count; a value is in the set iff its weight is positive. The
-  node keeps only a host-side `pk → projected value` reverse index, which makes maintenance
-  reconcile-by-identity — idempotent and order-independent — and yields the exact retract/insert
-  tuples the circuit needs (evaluation can read *other* nodes' sets via nested `IN`, so a row's
-  tuple is not a pure function of the row).
+  set lives in the **membership circuit** (§6b): the registry asserts each inner row's current
+  contribution *absolutely* (`(node_id, pk) → value` / absent) into a dbsp **upsert map**, which
+  derives the exact retract/insert deltas internally — there is no host-side reverse index to
+  keep in sync. A value is in the set iff its contributor count is positive. (Assertions are
+  computed host-side because evaluation can read *other* nodes' sets via nested `IN`.)
 - **Templates** — nodes are grouped by parameterized template (`predicate.rs::subquery_template`):
   the inner WHERE's top-level equality literals are lifted out as a **bind**, so `user_id = 1` and
   `user_id = 2` share one compiled residual + parameter projection. A delta on the inner table is
@@ -257,13 +256,15 @@ sequencer feeds every table's deltas into:
   emission — without network under the lock. The engine exposes the in-flight count
   (`GET /replication/lsn` → `pendingFlips`) as the extra convergence-barrier term; it covers both
   undrained flips and enqueued-but-unlanded lane batches.
-- **Absolute emission** — the correctness rule that keeps deferred flips convergent: for each
-  touched pk the registry emits the row's *current* membership (`upsert` if it matches now, else
-  `delete` by pk), never a history-dependent delta. Flip propagation runs deferred (out of commit
-  order relative to the sequencer's own emissions); a delta-based "delete only if the old row
-  matched" would miss move-outs whenever the inner set runs ahead. Absolute emission converges
-  regardless of that timing — which is why the Electric-style LSN-buffering/tag protocol isn't
-  needed here.
+- **Absolute emission via the per-feed relation** — the correctness rule that keeps deferred
+  flips convergent: for each touched pk the registry asserts the row's *current* membership into
+  the shape's slice of the circuit's **feed relation** (`(feed_id, pk)` upsert map), never a
+  history-dependent delta. An `upsert` is delivered for every matching candidate (updates to
+  continuing members flow); a `delete` is delivered **only when the relation actually retracts**,
+  so a "not a member" verdict for a pk the stream never contained is structurally a no-op — the
+  never-member spurious delete (the PR #30 wake-storm) cannot be emitted at all. Flip
+  propagation runs deferred (out of commit order); absolute assertion converges regardless of
+  that timing — which is why the Electric-style LSN-buffering/tag protocol isn't needed here.
 - **NULL sensitivity** — SQL: a NULL in the inner set makes `x NOT IN S` UNKNOWN. A NULL flip
   re-derives exactly the dependents that can change: those whose `IN` leaf is negated **or sits under
   any `Not{…}`** (with no negation above the leaf, NULL only moves the leaf between FALSE and
@@ -283,15 +284,17 @@ no checkpoints.
   and steps it **before** fanning the transaction out, so circuit-served aggregates emit within
   the transaction that changed them.
 - The **membership circuit** (`subq_circuit.rs`, owned by the subquery registry, always on)
-  maintains every subquery node's inner-value set as ONE relation:
-  `contributor tuples (node_id, value, pk) → map(drop pk) → integrate_trace snapshot` (serves
-  `contains`/`has_null`/introspection) `+ distinct → output` (the step's deltas are the
-  membership **flips**, §6). The registry evaluates templates host-side per envelope, under its
-  lock, and awaits the step — so intra-transaction ordering is identical to the old in-registry
-  kernel, and membership reads are read-your-writes. Structure is fixed at construction (one
-  global tuple input); registering a new subquery template/node/bind is pure runtime data — no
-  rebuild, ever. State is O(contributing inner rows), bind-gated: only subscribed binds hold
-  state, each seeded from Postgres like any backfill.
+  holds two **upsert maps** (dbsp `add_input_map`; the operator maintains the map and derives
+  exact deltas from absolute assertions). *Contributors* `(node_id, pk) → value`: projected to
+  `(node_id, value)` weighted by contributor count → `integrate_trace` snapshot (serves
+  `contains`/`has_null`/introspection) + `distinct → output` (the step's deltas are the
+  membership **flips**, §6). *Feeds* `(feed_id, pk)`: the map's own output deltas ARE the
+  emissions — deletes come only from retractions (§6). The registry evaluates templates
+  host-side per envelope, under its lock, and awaits the step — intra-transaction ordering is
+  identical to the old in-registry kernel, and reads are read-your-writes. Structure is fixed
+  at construction (two generic inputs); registering templates/nodes/binds/shapes is pure
+  runtime data — no rebuild, ever. State is O(contributing inner rows + feed rows),
+  bind-gated: only subscribed binds hold state, each seeded from Postgres like any backfill.
 
 - **Counts pipelines** — `ELECTRIC_IVM_DBSP_COUNTS=table:col+col,…` compiles, per table (at
   most one spec each), a `map_index(group) → weighted_count` pipeline: a live COUNT per

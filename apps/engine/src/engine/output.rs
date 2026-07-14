@@ -58,6 +58,9 @@ pub(crate) fn translate_output(
 ) -> Vec<Envelope> {
     let mut pos: HashMap<String, Row> = HashMap::new();
     let mut neg: HashSet<String> = HashSet::new();
+    // First-appearance order per pk: HashMap iteration would shuffle the emission order per
+    // process (observable in snapshot appends — readers see rows in a random order per boot).
+    let mut order: Vec<String> = Vec::new();
     for (row, w) in out {
         let pk = match ts.key_string(&row) {
             Ok(pk) => pk,
@@ -66,6 +69,9 @@ pub(crate) fn translate_output(
                 continue;
             }
         };
+        if !pos.contains_key(&pk) && !neg.contains(&pk) {
+            order.push(pk.clone());
+        }
         if w > 0 {
             pos.insert(pk, row);
         } else if w < 0 {
@@ -73,7 +79,7 @@ pub(crate) fn translate_output(
         }
     }
     let mut envs = Vec::with_capacity(pos.len() + neg.len());
-    for (pk, row) in &pos {
+    for (pk, row) in order.iter().filter_map(|pk| pos.get_key_value(pk)) {
         envs.push(Envelope {
             type_: ts.name.clone(),
             key: pk.clone(),
@@ -85,7 +91,7 @@ pub(crate) fn translate_output(
     // TEST-ONLY: the `drop_deletes` fault suppresses "leave" envelopes so rows that exit a shape
     // linger in the client. No-op unless ELECTRIC_IVM_FAULT=drop_deletes (see `fault`).
     let drop_deletes = matches!(crate::fault::active(), crate::fault::Fault::DropDeletes);
-    for pk in &neg {
+    for pk in order.iter().filter(|pk| neg.contains(*pk)) {
         if pos.contains_key(pk) || drop_deletes {
             continue;
         }
@@ -98,6 +104,25 @@ pub(crate) fn translate_output(
         });
     }
     envs
+}
+
+/// Key-only `delete` envelopes for pks the per-feed relation retracted. The feed relation's
+/// retraction IS the delete decision (structural spurious-delete gating), so this needs no
+/// row body — only the pk. Honors the TEST-ONLY `drop_deletes` fault exactly like
+/// [`translate_output`].
+pub(crate) fn delete_envelopes(ts: &TableSchema, pks: Vec<String>, txid: Option<String>) -> Vec<Envelope> {
+    if matches!(crate::fault::active(), crate::fault::Fault::DropDeletes) {
+        return Vec::new();
+    }
+    pks.into_iter()
+        .map(|pk| Envelope {
+            type_: ts.name.clone(),
+            key: pk,
+            value: None,
+            old: None,
+            headers: EnvelopeHeaders { operation: "delete".into(), txid: txid.clone(), offset: None, lsn: None, seq: None },
+        })
+        .collect()
 }
 
 /// The aggregate wire envelope — ONE `"agg"`-keyed row `{ value, n }`, upserted when the value
