@@ -114,6 +114,10 @@ pub struct Engine {
 pub(crate) struct FlipWork {
     work: std::collections::VecDeque<(crate::predicate::SubquerySig, crate::subquery::Flip)>,
     txid: Option<String>,
+    /// The originating write's commit lsn, threaded through to the deferred flip's trace event so
+    /// it carries the same lsn/txid as the direct-change event that triggered the propagation —
+    /// letting the activity log group them as one write (see `subquery::emit_flip_trace`).
+    lsn: Option<String>,
 }
 
 /// Everything a tailer needs to route deltas through the subquery layer: the shared registry for
@@ -154,7 +158,7 @@ fn spawn_flip_propagator(
             let trace_tx = trace_tx.clone();
             tokio::spawn(async move {
                 if let Err(e) =
-                    crate::subquery::propagate_flips(&registry, fw.work, fw.txid, &trace_tx).await
+                    crate::subquery::propagate_flips(&registry, fw.work, fw.txid, fw.lsn, &trace_tx).await
                 {
                     tracing::error!("subquery flip propagation failed: {e:#}");
                 }

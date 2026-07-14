@@ -868,6 +868,7 @@ pub async fn propagate_flips(
     registry: &tokio::sync::Mutex<SubqueryRegistry>,
     mut work: VecDeque<(SubquerySig, Flip)>,
     txid: Option<String>,
+    lsn: Option<String>,
     trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
 ) -> Result<()> {
     while let Some((sig, flip)) = work.pop_front() {
@@ -897,7 +898,17 @@ pub async fn propagate_flips(
                     // Light the whole path only when the shape actually moved rows: source
                     // `table:<t>` → the flipped `node:<sig>` → this `shape:<id>`.
                     if let (Some((outer, net)), Some(src)) = (moved, source_table.as_deref()) {
-                        emit_flip_trace(trace_tx, &outer, src, &sig, format!("shape:{id}"), vec![id.clone()], net);
+                        emit_flip_trace(
+                            trace_tx,
+                            &outer,
+                            src,
+                            &sig,
+                            format!("shape:{id}"),
+                            vec![id.clone()],
+                            net,
+                            lsn.clone(),
+                            txid.clone(),
+                        );
                     }
                 }
                 Dependent::Node(parent_sig) => {
@@ -908,7 +919,17 @@ pub async fn propagate_flips(
                         // `node:<parent_sig>` it re-derived, so the propagation reads through. The
                         // parent's own downstream shape lights when its flips reach a shape edge.
                         if let (false, Some(src)) = (flips.is_empty(), source_table.as_deref()) {
-                            emit_flip_trace(trace_tx, src, src, &sig, format!("node:{parent_sig}"), Vec::new(), flip_net(&flips));
+                            emit_flip_trace(
+                                trace_tx,
+                                src,
+                                src,
+                                &sig,
+                                format!("node:{parent_sig}"),
+                                Vec::new(),
+                                flip_net(&flips),
+                                lsn.clone(),
+                                txid.clone(),
+                            );
                         }
                         for f in flips {
                             work.push_back((parent_sig.clone(), f));
@@ -1115,13 +1136,15 @@ fn emit_flip_trace(
     dependent: String,
     shapes: Vec<String>,
     net: i64,
+    lsn: Option<String>,
+    txid: Option<String>,
 ) {
     if trace_tx.receiver_count() == 0 {
         return;
     }
     let ev = crate::trace::TraceEvent {
-        lsn: None,
-        txid: None,
+        lsn,
+        txid,
         table: event_table.to_string(),
         // One synthetic weighted row carrying the net change: a single flip can move many outer
         // rows, so the payload is not one table row — left empty, weighted by the net.
@@ -1302,11 +1325,25 @@ mod tests {
         let (trace_tx, mut trace_rx) = tokio::sync::broadcast::channel::<Arc<String>>(8);
         // A `project_members` delete flipped inner-set value; the `issues` shape s1 lost 103 rows.
         let sig = "project_members|project_id|L(user_id,Eq,1)".to_string();
-        emit_flip_trace(&trace_tx, "issues", "project_members", &sig, "shape:s1".into(), vec!["s1".into()], -103);
+        emit_flip_trace(
+            &trace_tx,
+            "issues",
+            "project_members",
+            &sig,
+            "shape:s1".into(),
+            vec!["s1".into()],
+            -103,
+            Some("0/1A2B3C".into()),
+            Some("777".into()),
+        );
 
         let ev: serde_json::Value = serde_json::from_str(&trace_rx.try_recv().unwrap()).unwrap();
         // The event is about the dependent shape's table; the path still heads at the source.
         assert_eq!(ev["table"], "issues");
+        // Carries the originating write's lsn/txid, so the activity log can group this deferred
+        // flip event together with the direct-change event that triggered it (same commit).
+        assert_eq!(ev["lsn"], "0/1A2B3C");
+        assert_eq!(ev["txid"], "777");
         let outcome = |node: &str| {
             ev["hops"].as_array().unwrap().iter().find(|h| h["node"] == node).map(|h| h["outcome"].clone())
         };
@@ -1336,7 +1373,7 @@ mod tests {
 
         let mut work: VecDeque<(SubquerySig, Flip)> = VecDeque::new();
         work.push_back(("sig1".into(), Flip { value: Value::Null, dir: FlipDir::Enter }));
-        propagate_flips(&reg, work, None, &trace_tx).await.unwrap();
+        propagate_flips(&reg, work, None, None, &trace_tx).await.unwrap();
         assert!(trace_rx.try_recv().is_err(), "a NULL flip on a non-null-sensitive dependent emits nothing");
     }
 
