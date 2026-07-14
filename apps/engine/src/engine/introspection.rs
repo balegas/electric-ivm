@@ -709,8 +709,7 @@ impl Engine {
         // Each registry edge, resolved to (kind, id, queried table, connecting-column index):
         // the shape of a flip re-derivation, which is what the arrangement layer serves.
         let dependents: Vec<(&'static str, String, String, usize)> = reg
-            .edges
-            .iter()
+            .all_edges()
             .map(|e| {
                 let (kind, dep_id, dep_table) = match &e.dependent {
                     crate::subquery::Dependent::Shape(id) => (
@@ -728,8 +727,7 @@ impl Engine {
             })
             .collect();
         let subquery_edges: Vec<GraphEdge> = reg
-            .edges
-            .iter()
+            .all_edges()
             .zip(&dependents)
             .map(|(e, (kind, dep_id, dep_table, _))| GraphEdge {
                 node_sig: e.node_sig.clone(),

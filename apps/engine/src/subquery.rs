@@ -261,8 +261,14 @@ pub struct BeginCreate {
 pub struct SubqueryRegistry {
     /// Nodes by canonical signature (shared across identical subqueries).
     pub nodes: HashMap<SubquerySig, SubqueryNode>,
-    /// Edges from each node to its dependents.
-    pub edges: Vec<Edge>,
+    /// Edges from each node to its dependents, keyed by the node's signature — flip
+    /// propagation looks up ONE node's dependents per flip, so this must not be a scan over
+    /// every edge in the registry (the propagation-side analogue of template-grouped eval).
+    edges: HashMap<SubquerySig, Vec<Edge>>,
+    /// Edges appended by the in-flight `begin_create` compile, committed into `edges` only
+    /// when the whole registration succeeds (a failed/conflicted compile just clears this —
+    /// exact rollback without index bookkeeping).
+    staged_edges: Vec<Edge>,
     /// Registered outer subquery shapes by engine shape id.
     pub shapes: HashMap<String, SubqueryShape>,
     /// The membership circuit: every node's value set as one dbsp relation; flip detection is
@@ -300,7 +306,8 @@ impl SubqueryRegistry {
     pub fn new(ds: DsClient, pg_url: Option<String>) -> Self {
         SubqueryRegistry {
             nodes: HashMap::new(),
-            edges: Vec::new(),
+            edges: HashMap::new(),
+            staged_edges: Vec::new(),
             shapes: HashMap::new(),
             circuit: crate::subq_circuit::MembershipCircuit::start()
                 .expect("membership circuit failed to start"),
@@ -403,15 +410,6 @@ impl SubqueryRegistry {
         }
     }
 
-    /// Check out a pooled Postgres connection. All subquery PG access funnels through the shared
-    /// per-URL pool: connections are reused across shapes (connecting per shape exhausts ephemeral
-    /// TCP ports when thousands of subquery shapes are created) without serializing query-backs on
-    /// a single session.
-    async fn pg(&self) -> Result<crate::pg::PooledClient> {
-        let url = self.pg_url.as_deref().context("subquery work requires postgres")?;
-        crate::pg::pool_for(url).get().await
-    }
-
     pub fn set_schemas(&mut self, schemas: SchemaMap) {
         self.schemas = schemas;
     }
@@ -454,7 +452,7 @@ impl SubqueryRegistry {
             contributors += n.contributor_count();
             distinct += self.circuit_distinct(n.node_id);
         }
-        (self.nodes.len(), contributors, distinct, self.shapes.len(), self.edges.len())
+        (self.nodes.len(), contributors, distinct, self.shapes.len(), self.edges_count())
     }
 
     /// Per-node topology for the introspection endpoint: signature, inner table, current distinct value
@@ -501,9 +499,38 @@ impl SubqueryRegistry {
         out
     }
 
-    /// Outgoing edges for a node signature.
+    /// Outgoing edges for a node signature. O(that node's own edge list).
     fn edges_of(&self, sig: &SubquerySig) -> Vec<Edge> {
-        self.edges.iter().filter(|e| &e.node_sig == sig).cloned().collect()
+        self.edges.get(sig).cloned().unwrap_or_default()
+    }
+
+    /// Every edge in the registry (introspection only — hot paths use [`edges_of`]).
+    pub(crate) fn all_edges(&self) -> impl Iterator<Item = &Edge> {
+        self.edges.values().flatten()
+    }
+
+    /// Total edge count (memory probe + tests).
+    pub fn edges_count(&self) -> usize {
+        self.edges.values().map(Vec::len).sum()
+    }
+
+    /// Commit one edge (staged during creates; direct in tests).
+    fn add_edge(&mut self, e: Edge) {
+        self.edges.entry(e.node_sig.clone()).or_default().push(e);
+    }
+
+    /// Remove a dying node's edge entries: its outgoing list, plus the incoming edges that
+    /// point at it from its children's lists (a dependent edge lives under the CHILD's key).
+    fn remove_node_edges(&mut self, sig: &SubquerySig, child_sigs: &[SubquerySig]) {
+        self.edges.remove(sig);
+        for c in child_sigs {
+            if let Some(v) = self.edges.get_mut(c) {
+                v.retain(|e| !matches!(&e.dependent, Dependent::Node(s) if s == sig));
+                if v.is_empty() {
+                    self.edges.remove(c);
+                }
+            }
+        }
     }
 
     // --- registration -------------------------------------------------------------------------
@@ -535,13 +562,13 @@ impl SubqueryRegistry {
             self.schemas.get(outer_table).cloned().context("subquery shape: unknown outer table")?;
         // Conflict pre-check: compiling refs nodes; a referenced node mid-seed belongs to a
         // concurrent create. Compile on a scratch collector first so a conflict has no effects.
-        let edges_checkpoint = self.edges.len();
+        self.staged_edges.clear();
         self.collect_log.clear();
         let pred = match CompiledPredicate::compile_with(where_json, &outer_ts, self) {
             Ok(p) => Arc::new(p),
             Err(e) => {
                 let log = std::mem::take(&mut self.collect_log);
-                self.rollback_refs(edges_checkpoint, log);
+                self.rollback_refs(log);
                 return Err(e);
             }
         };
@@ -554,7 +581,7 @@ impl SubqueryRegistry {
         });
         if conflicted {
             // Put fresh sigs back for the rollback's decref cascade bookkeeping.
-            self.rollback_refs(edges_checkpoint, log);
+            self.rollback_refs(log);
             anyhow::bail!("subquery create conflict: shares a node another create is seeding");
         }
         // Fresh nodes start buffering their inner-table deltas.
@@ -565,15 +592,19 @@ impl SubqueryRegistry {
                 seeds.push((sig.clone(), n.inner_table.clone(), n.where_json.clone()));
             }
         }
-        // Shape-level edges.
+        // Shape-level edges (staged with the compile's child edges; committed below).
         for leaf in collect_in_leaves(&pred) {
-            self.edges.push(Edge {
+            self.staged_edges.push(Edge {
                 node_sig: leaf.sig,
                 dependent: Dependent::Shape(shape_id.to_string()),
                 connecting_col: leaf.col,
                 negated: leaf.negated,
                 null_sensitive: leaf.null_sensitive,
             });
+        }
+        // Registration is definitely happening: commit the staged edges.
+        for e in std::mem::take(&mut self.staged_edges) {
+            self.add_edge(e);
         }
         // Pending shape: outer-table deltas buffer from HERE (before the phase-B snapshot).
         self.pending_shapes.push(PendingSubqueryShape {
@@ -681,19 +712,32 @@ impl SubqueryRegistry {
             return;
         };
         let pending = self.pending_shapes.remove(idx);
-        self.edges
-            .retain(|e| !matches!(&e.dependent, Dependent::Shape(id) if id == pending.shape_id.as_str()));
+        // Shape edges live under the pred's leaf sigs — remove only there, not a global scan.
+        self.remove_shape_edges(&pending.pred, &pending.shape_id);
         for sig in pending.collect_log {
             if let Some(n) = self.nodes.get_mut(&sig) {
                 n.refcount = n.refcount.saturating_sub(1);
                 if n.refcount == 0 {
                     if let Some(node) = self.nodes.remove(&sig) {
+                        let child_sigs: Vec<SubquerySig> =
+                            collect_in_leaves(&node.pred).into_iter().map(|l| l.sig).collect();
+                        self.remove_node_edges(&sig, &child_sigs);
                         self.remove_node_entry(&node);
                     }
                     self.pending_seed.retain(|s| s != &sig);
-                    self.edges.retain(|e| {
-                        e.node_sig != sig && !matches!(&e.dependent, Dependent::Node(s) if s == &sig)
-                    });
+                }
+            }
+        }
+    }
+
+    /// Remove a shape's dependency edges: they live under the keys of the predicate's IN
+    /// leaves, so removal touches only those nodes' lists.
+    fn remove_shape_edges(&mut self, pred: &CompiledPredicate, shape_id: &str) {
+        for leaf in collect_in_leaves(pred) {
+            if let Some(v) = self.edges.get_mut(&leaf.sig) {
+                v.retain(|e| !matches!(&e.dependent, Dependent::Shape(id) if id == shape_id));
+                if v.is_empty() {
+                    self.edges.remove(&leaf.sig);
                 }
             }
         }
@@ -719,10 +763,10 @@ impl SubqueryRegistry {
         }
     }
 
-    /// Rollback helper for a failed/conflicted `begin_create` compile: undo edge appends and
-    /// node refs made by the aborted compile.
-    fn rollback_refs(&mut self, edges_checkpoint: usize, log: Vec<SubquerySig>) {
-        self.edges.truncate(edges_checkpoint);
+    /// Rollback helper for a failed/conflicted `begin_create` compile: drop the staged edges
+    /// and undo the node refs made by the aborted compile.
+    fn rollback_refs(&mut self, log: Vec<SubquerySig>) {
+        self.staged_edges.clear();
         for sig in log {
             if let Some(n) = self.nodes.get_mut(&sig) {
                 n.refcount = n.refcount.saturating_sub(1);
@@ -742,7 +786,7 @@ impl SubqueryRegistry {
         let Some(shape) = self.shapes.remove(shape_id) else { return };
         // Sigs this shape pointed at, then drop the shape's edges.
         let sigs: Vec<SubquerySig> = collect_in_leaves(&shape.pred).into_iter().map(|l| l.sig).collect();
-        self.edges.retain(|e| !matches!(&e.dependent, Dependent::Shape(id) if id == shape_id));
+        self.remove_shape_edges(&shape.pred, shape_id);
         self.decref_nodes(sigs).await;
     }
 
@@ -770,8 +814,7 @@ impl SubqueryRegistry {
                 ));
             }
             self.remove_node_entry(&node);
-            self.edges
-                .retain(|e| e.node_sig != sig && !matches!(&e.dependent, Dependent::Node(s) if s == &sig));
+            self.remove_node_edges(&sig, &child_sigs);
             stack.extend(child_sigs);
         }
         if !tuples.is_empty() {
@@ -1136,7 +1179,7 @@ pub async fn propagate_flips(
                 }
                 Dependent::Node(parent_sig) => {
                     let new_flips =
-                        reconcile_parent_for_value(registry, parent_sig, edge.connecting_col, &flip.value).await?;
+                        requery_and_reconcile_parent(registry, parent_sig, Some((edge.connecting_col, &flip.value))).await?;
                     if let Some((_inner, flips)) = new_flips {
                         // A nested `IN`: connect the flipped child `node:<sig>` to the parent
                         // `node:<parent_sig>` it re-derived, so the propagation reads through. The
@@ -1215,21 +1258,25 @@ async fn move_shape_for_value(
     Ok(Some((ts.name.clone(), net)))
 }
 
-/// A parent node's value `v` was referenced by a flipped child; re-evaluate the parent's inner rows
-/// with `connecting_col = v` and reconcile them. Returns `Some((inner_table, flips))`, or `None` if
-/// the parent vanished.
-async fn reconcile_parent_for_value(
+/// Re-query a parent node's inner rows — `Some((col, v))` = only rows with
+/// `connecting_col = v` (a value flip), `None` = every row (a NULL re-derive) — then
+/// re-evaluate the parent's full predicate and reconcile. Returns `Some((inner_table,
+/// flips))`, or `None` if the parent vanished. The shared body of both flip-driven parent
+/// paths: the fetch differs, the eval+reconcile never does.
+async fn requery_and_reconcile_parent(
     registry: &tokio::sync::Mutex<SubqueryRegistry>,
     parent_sig: &SubquerySig,
-    connecting_col: usize,
-    value: &Value,
+    filter: Option<(usize, &Value)>,
 ) -> Result<Option<(String, Vec<Flip>)>> {
     let (ts, pg_url) = {
         let reg = registry.lock().await;
         let Some(n) = reg.nodes.get(parent_sig) else { return Ok(None) };
         (reg.snapshot_for_table(&n.inner_table)?, reg.pg_url.clone())
     };
-    let rows = query_candidates(&pg_url, &ts, connecting_col, value).await?;
+    let rows = match filter {
+        Some((col, value)) => query_candidates(&pg_url, &ts, col, value).await?,
+        None => query_all(&pg_url, &ts).await?,
+    };
     let mut reg = registry.lock().await;
     let (pred, proj) = match reg.nodes.get(parent_sig) {
         Some(n) => (n.pred.clone(), n.proj_col),
@@ -1290,31 +1337,14 @@ async fn rederive_dependent(
             reg.deliver(&path, envs).await;
         }
         Dependent::Node(parent_sig) => {
-            let (ts, pg_url) = {
-                let reg = registry.lock().await;
-                let Some(n) = reg.nodes.get(parent_sig) else { return Ok(()) };
-                (reg.snapshot_for_table(&n.inner_table)?, reg.pg_url.clone())
-            };
-            let rows = query_all(&pg_url, &ts).await?;
-            let mut reg = registry.lock().await;
-            let (pred, proj) = match reg.nodes.get(parent_sig) {
-                Some(n) => (n.pred.clone(), n.proj_col),
-                None => return Ok(()),
-            };
-            let evals: Vec<(String, Option<Value>)> = rows
-                .iter()
-                .map(|r| {
-                    let pk = ts.key_string(r).unwrap_or_default();
-                    let pv = if pred.matches_ctx(r, &*reg) {
-                        Some(r.0.get(proj).cloned().unwrap_or(Value::Null))
-                    } else {
-                        None
-                    };
-                    (pk, pv)
-                })
-                .collect();
-            for f in reg.apply_node_evals(parent_sig, evals).await {
-                work.push_back((parent_sig.clone(), f));
+            // Full re-derive of the parent: same eval+reconcile as a value flip, fetching
+            // every row instead of one connecting value's candidates.
+            if let Some((_table, flips)) =
+                requery_and_reconcile_parent(registry, parent_sig, None).await?
+            {
+                for f in flips {
+                    work.push_back((parent_sig.clone(), f));
+                }
             }
         }
     }
@@ -1401,7 +1431,7 @@ impl SubqueryCollector for SubqueryRegistry {
         };
         // Record edges from each child node to THIS node (so a child flip re-derives this node's rows).
         for leaf in collect_in_leaves(&inner_pred) {
-            self.edges.push(Edge {
+            self.staged_edges.push(Edge {
                 node_sig: leaf.sig,
                 dependent: Dependent::Node(sig.clone()),
                 connecting_col: leaf.col,
@@ -1664,7 +1694,7 @@ mod tests {
     #[tokio::test]
     async fn flip_no_op_emits_no_trace() {
         let mut reg = registry_with_node("sig1");
-        reg.edges.push(Edge {
+        reg.add_edge(Edge {
             node_sig: "sig1".into(),
             dependent: Dependent::Shape("s7".into()),
             connecting_col: 0,
@@ -1826,7 +1856,7 @@ mod tests {
         assert!(reg.touches("outer_t"), "pending shape routes its outer table");
         reg.abort_create("s1");
         assert_eq!(reg.nodes.len(), 0, "aborted create left an orphaned node");
-        assert_eq!(reg.edges.len(), 0, "aborted create left orphaned edges");
+        assert_eq!(reg.edges_count(), 0, "aborted create left orphaned edges");
         assert_eq!(reg.pending_seed.len(), 0, "aborted create left a pending seed");
         assert!(reg.shapes.is_empty());
         assert!(reg.pending_shapes.is_empty());
