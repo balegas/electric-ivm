@@ -1,6 +1,6 @@
 # Subqueries in the DBSP Circuit as Parameterized Templates — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Replace the subquery registry's hand-rolled contributor-set kernel with a dbsp
 circuit that maintains membership sets and emits flips, grouped by parameterized templates.
@@ -61,7 +61,7 @@ mirror `arrangements.rs::circuit_thread` minus the highwater (host tuples are al
 reconcile-by-identity makes duplicates impossible).
 
 **Steps:**
-- [ ] 1. Write failing unit tests in `subq_circuit.rs` `#[cfg(test)]`:
+- [x] 1. Write failing unit tests in `subq_circuit.rs` `#[cfg(test)]`:
   - `flips_on_zero_crossings`: two contributors to value 5 on node 1 → one Enter; remove one
     → no flip; remove last → Leave. Assert parity with
     `engine::membership::fold_refcount_flips` on the same contribution stream.
@@ -69,11 +69,11 @@ reconcile-by-identity makes duplicates impossible).
   - `contains_and_null_bucket`: `contains(1, &Value::Null)` true after a NULL-value tuple.
   - `values_for_node_reports_contributor_counts`.
   - `retract_insert_same_step_nets`: (v_old,-1),(v_new,+1) in one apply → Leave(v_old)+Enter(v_new).
-- [ ] 2. `cargo test -p electric-ivm-engine subq_circuit` → FAIL (module missing).
-- [ ] 3. Implement. Snapshot point-read: `cursor.seek_key(key.erase())` via
+- [x] 2. `cargo test -p electric-ivm-engine subq_circuit` → FAIL (module missing).
+- [x] 3. Implement. Snapshot point-read: `cursor.seek_key(key.erase())` via
   `dbsp::dynamic::Erase` (compare `count_groups`'s downcast style). If `seek_key` fights the
   dynamic API, fallback is a linear cursor scan bounded by node prefix — but prefer seek.
-- [ ] 4. Tests pass. 5. Commit `feat: membership circuit (dbsp distinct flip detection)`.
+- [x] 4. Tests pass. 5. Commit `feat: membership circuit (dbsp distinct flip detection)`.
 
 ### Task 2: Template extraction (`apps/engine/src/predicate.rs`)
 
@@ -93,11 +93,11 @@ Lifting mirrors `equality_template`'s rules on the JSON AST: only top-level `And
 or non-eq leaf stays in the residual (do NOT reject the template — residual absorbs it).
 
 **Steps:**
-- [ ] 1. Failing tests: same-shape-different-literal → same key, different binds;
+- [x] 1. Failing tests: same-shape-different-literal → same key, different binds;
   `A(user=1,status='x')` vs `A(user=2,status='y')` → same key, binds `[status,user]` sorted;
   range/OR/nested-IN stay residual; no-where → key with empty P and empty residual;
   nested-IN inner where produces stable key (recursion via canonical_pred only).
-- [ ] 2. FAIL → 3. implement → 4. PASS → 5. Commit `feat: subquery template extraction`.
+- [x] 2. FAIL → 3. implement → 4. PASS → 5. Commit `feat: subquery template extraction`.
 
 ### Task 3: Registry on the circuit (`apps/engine/src/subquery.rs`)
 
@@ -153,41 +153,41 @@ The core swap. **Node changes:** remove `contributors`; add `node_id: i64`; keep
   `NodeStat` gains `template: String`.
 
 **Steps:**
-- [ ] 1. Port/adapt the module's unit tests FIRST (they pin semantics): reconcile
+- [x] 1. Port/adapt the module's unit tests FIRST (they pin semantics): reconcile
   enter/leave/value-change/no-op + null bucket now assert on registry+circuit
   (`apply_tuples` results and `SubqueryEval` reads); keep `filter_known_members`,
   rollback, trace, null-sensitivity tests compiling (async where needed).
-- [ ] 2. Red → 3. implement registry swap → 4. `cargo test -p electric-ivm-engine` green
+- [x] 2. Red → 3. implement registry swap → 4. `cargo test -p electric-ivm-engine` green
   (engine/tests.rs integration tests included — fix fallout in mod.rs/lifecycle.rs/
   sequencer.rs call sites: async drops, `propagate_flips` unchanged signature).
-- [ ] 5. Commit `feat: subquery registry served by the membership circuit`.
+- [x] 5. Commit `feat: subquery registry served by the membership circuit`.
 
 ### Task 4: Wiring, introspection, docs surface
 
-- [ ] `engine/mod.rs`: `mem_cardinalities` uses new `mem_totals`; drop-shape call sites await.
-- [ ] `engine/introspection.rs` + `http.rs`: `/subqueries` includes `template`; `/graph`
+- [x] `engine/mod.rs`: `mem_cardinalities` uses new `mem_totals`; drop-shape call sites await.
+- [x] `engine/introspection.rs` + `http.rs`: `/subqueries` includes `template`; `/graph`
   subquery node ids unchanged (`node:<sig>`), no breaking viz changes.
-- [ ] `docs/ARCHITECTURE.md`: §6 (registry → circuit-backed flip detection), §6b (membership
+- [x] `docs/ARCHITECTURE.md`: §6 (registry → circuit-backed flip detection), §6b (membership
   circuit alongside counts), §10 threading table (+1 row `dbsp-subq`).
-- [ ] `cargo clippy -p electric-ivm-engine` clean; commit `docs+introspection`.
+- [x] `cargo clippy -p electric-ivm-engine` clean; commit `docs+introspection`.
 
 ### Task 5: Quality gates (all must pass)
 
-- [ ] `pnpm engine:test`
-- [ ] `ELECTRIC_IVM_ENGINE_PREBUILT=1 pnpm test` (vitest incl. oracle conformance)
-- [ ] `ASDF_ELIXIR_VERSION=1.18.4-otp-28 ASDF_ERLANG_VERSION=28.1 ./electric-conformance/run.sh oracle`
+- [x] `pnpm engine:test`
+- [x] `ELECTRIC_IVM_ENGINE_PREBUILT=1 pnpm test` (vitest incl. oracle conformance)
+- [x] `ASDF_ELIXIR_VERSION=1.18.4-otp-28 ASDF_ERLANG_VERSION=28.1 ./electric-conformance/run.sh oracle`
   — **goal gate: all subquery tests pass**
-- [ ] Fix regressions until green; commit fixes individually.
+- [x] Fix regressions until green; commit fixes individually.
 
 ### Task 6: LinearLite manual verification (goal gate)
 
-- [ ] `pnpm demo:linearlite` per the run-linearlite skill; drive with Playwright MCP:
+- [x] `pnpm demo:linearlite` per the run-linearlite skill; drive with Playwright MCP:
   create/move issues across projects, membership churn (join/leave project), verify live
   updates + no console errors; check the pipeline visualizer shows subquery node state.
-- [ ] Teardown; record evidence in handoff.
+- [x] Teardown; record evidence in handoff.
 
 ### Task 7: Close-out
 
-- [ ] Update spec §11b if further deviations emerged; `bd close dbsp-ds-jq6` only after all
+- [x] Update spec §11b if further deviations emerged; `bd close dbsp-ds-jq6` only after all
   gates; `git status`; conservative handoff (branch name, commits, validation evidence,
   proposed PR command — no push).
