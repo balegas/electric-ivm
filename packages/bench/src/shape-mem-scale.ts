@@ -112,6 +112,7 @@ async function spawnEngine(dsUrl: string, pgUrl: string): Promise<{ url: string;
       ELECTRIC_IVM_PG_TABLES: 'issues,projects,users,project_members,comments',
       ELECTRIC_IVM_PG_SLOT: SLOT,
       ELECTRIC_IVM_PG_POLL_MS: '50',
+      ELECTRIC_IVM_MAX_SHAPES: String(numEnv('SCALE_MAX_SHAPES', 200000)),
     },
     stdio: ['ignore', 'pipe', 'inherit'],
   })
@@ -254,9 +255,11 @@ async function main() {
   }
   const ds = new DurableStreamTestServer({ port: 0, longPollTimeout: 25000 })
   const dsUrl = await ds.start()
-  // The test server holds its child process privately; reach in for RSS sampling.
+  // The test server holds its child process privately; reach in for RSS sampling, falling
+  // back to whoever LISTENs on the ds port (pgrep -f can match unrelated processes).
+  const dsPort = new URL(dsUrl).port
   const dsPid = ((ds as unknown as { proc?: { pid?: number } }).proc?.pid) ||
-    Number(execSync(`pgrep -f durable-streams | head -1`).toString().trim()) || undefined
+    Number(execSync(`lsof -nP -iTCP:${dsPort} -sTCP:LISTEN -t | head -1`).toString().trim()) || undefined
   const pg = bootPgSimple()
   const client = new pgpkg.Client({ connectionString: pg.pgUrl })
   await client.connect()
@@ -313,10 +316,19 @@ async function main() {
     for (let i = 0; i < LIVE_SUBS; i++) targets.push(streamUrls[i % streamUrls.length]!)
     liveProcs = (await runWorkers(LIVE_WORKER_JS, {}, chunks(targets, LIVE_PROCS), false)).procs
     console.log(`holding ${targets.length} live long-polls across ${LIVE_PROCS} client procs…`)
+    // With 20k sockets pinned, macOS runs out of kernel network buffers for NEW connections
+    // (ENOBUFS) — sample via ps (no sockets) instead of GET /memory.
+    const psSample = (label: string) => {
+      const engineRss = procRssMib(engine.proc.pid ?? undefined)
+      const dsRss = procRssMib(dsPid)
+      const last = rows[rows.length - 1]!
+      rows.push({ ...last, label, engineRssMib: engineRss, dsRssMib: dsRss })
+      console.log(`${label.padEnd(22)} engineRSS=${engineRss.toFixed(1)}MiB dsRSS=${dsRss.toFixed(1)}MiB (ps; cardinalities carried from last HTTP sample)`)
+    }
     await sleep(15000)
-    await sample('live subs held', createdUsers, requested)
+    psSample('live subs held')
     await sleep(15000)
-    await sample('live subs held +15s', createdUsers, requested)
+    psSample('live subs held +15s')
   }
 
   // Report.
