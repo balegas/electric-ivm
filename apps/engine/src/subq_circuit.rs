@@ -86,6 +86,71 @@ impl Assertions {
     }
 }
 
+/// Disk spilling for the membership circuit's relations (ON by default).
+struct SpillConfig {
+    dir: String,
+    /// Spine batches above this size go to layer files (smaller ones stay in memory).
+    min_storage_bytes: usize,
+    /// Storage buffer-cache budget (MiB); `None` = dbsp's default.
+    cache_mib: Option<usize>,
+    /// Engine-owned temp dir (removed at circuit shutdown — without checkpointing the
+    /// on-disk state is a cache, worthless across boots). `false` = user-specified dir,
+    /// never deleted.
+    auto: bool,
+}
+
+/// Spilling is ON by default: without checkpointing the layer files are a disposable cache,
+/// so the default location is a per-circuit temp dir (unique per process + circuit, removed
+/// on shutdown; stale dirs from dead processes are swept best-effort at start).
+///
+/// - `ELECTRIC_IVM_SUBQ_STORAGE=0` — disable (fully in-memory relations).
+/// - `ELECTRIC_IVM_SUBQ_STORAGE_DIR=<path>` — explicit location (kept on shutdown).
+/// - `ELECTRIC_IVM_SUBQ_MIN_STORAGE_KB` (default 128), `ELECTRIC_IVM_SUBQ_STORAGE_CACHE_MIB`.
+fn spill_config_from_env() -> Result<Option<SpillConfig>> {
+    if std::env::var("ELECTRIC_IVM_SUBQ_STORAGE").is_ok_and(|v| v == "0") {
+        return Ok(None);
+    }
+    let min_kb: usize = std::env::var("ELECTRIC_IVM_SUBQ_MIN_STORAGE_KB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128);
+    let cache_mib: Option<usize> =
+        std::env::var("ELECTRIC_IVM_SUBQ_STORAGE_CACHE_MIB").ok().and_then(|v| v.parse().ok());
+    let (dir, auto) = match std::env::var("ELECTRIC_IVM_SUBQ_STORAGE_DIR") {
+        Ok(d) if !d.is_empty() => (d, false),
+        _ => (default_spill_dir(), true),
+    };
+    Ok(Some(SpillConfig { dir, min_storage_bytes: min_kb * 1024, cache_mib, auto }))
+}
+
+/// A unique engine-owned spill dir: `<tmp>/electric-ivm-subq/<pid>-<seq>`. Sweeps sibling
+/// dirs whose owning process is gone (best-effort — a crash leaves the dir behind, and the
+/// next boot on the machine reclaims it).
+fn default_spill_dir() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let base = std::env::temp_dir().join("electric-ivm-subq");
+    if let Ok(entries) = std::fs::read_dir(&base) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(pid) = name.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+                continue;
+            };
+            if pid != std::process::id() && !process_alive(pid) {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    base.join(format!("{}-{}", std::process::id(), seq)).to_string_lossy().into_owned()
+}
+
+/// Is `pid` a live process? (`kill -0` semantics.)
+fn process_alive(pid: u32) -> bool {
+    // SAFETY: kill with signal 0 performs only the existence/permission check.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
 enum Cmd {
     Batch { asserts: Assertions, resp: oneshot::Sender<(Vec<MemberDelta>, Vec<FeedDelta>)> },
     Shutdown { resp: oneshot::Sender<()> },
@@ -103,13 +168,57 @@ pub struct MembershipCircuit {
 impl MembershipCircuit {
     /// Build the circuit and start its thread. State is in-memory only — nodes reseed from
     /// Postgres on registration, feeds from shape backfills.
+    ///
+    /// `ELECTRIC_IVM_FEED_TRACE=0` disables the published feed-relation trace — the SECOND
+    /// copy of every feed's key set, used only for drop-time retraction and introspection
+    /// (the upsert operator's internal integral, which decides the emissions, is unaffected).
+    /// Disabling roughly halves the per-feed memory term; dropped shapes then leave their
+    /// (unreachable — feed ids are never reused) entries in the operator integral instead of
+    /// retracting them, a documented trade until stream-fold drop enumeration lands
+    /// (bead dbsp-ds-4d8).
     pub fn start() -> Result<MembershipCircuit> {
+        let feed_trace = std::env::var("ELECTRIC_IVM_FEED_TRACE").map(|v| v != "0").unwrap_or(true);
+        Self::start_with(feed_trace)
+    }
+
+    /// [`start`], with the feed-trace choice explicit (tests).
+    pub fn start_with(feed_trace: bool) -> Result<MembershipCircuit> {
+        Self::start_full(feed_trace, spill_config_from_env()?)
+    }
+
+    /// [`start`], with everything explicit.
+    fn start_full(feed_trace: bool, spill: Option<SpillConfig>) -> Result<MembershipCircuit> {
         let members: Slot<MemberSnapshot> = Slot::default();
         let contributors: Slot<MapSnapshot> = Slot::default();
         let feeds: Slot<MapSnapshot> = Slot::default();
         let (m_slot, c_slot, f_slot) = (members.clone(), contributors.clone(), feeds.clone());
+        // Spill: with a storage dir configured, the circuit's spines (the upsert maps'
+        // integrals, the membership trace) page batches above `min_storage_bytes` to layer
+        // files under `dir`, keeping a bounded in-memory cache — RAM becomes O(cache)
+        // instead of O(relation). In-memory (no dir) remains the default.
+        let mut config = CircuitConfig::with_workers(1);
+        let cleanup_dir = spill.as_ref().filter(|sp| sp.auto).map(|sp| sp.dir.clone());
+        if let Some(sp) = spill {
+            use dbsp::circuit::{CircuitStorageConfig, StorageCacheConfig, StorageConfig, StorageOptions};
+            std::fs::create_dir_all(&sp.dir)
+                .map_err(|e| anyhow::anyhow!("membership circuit storage dir {}: {e}", sp.dir))?;
+            let storage = CircuitStorageConfig::for_config(
+                StorageConfig { path: sp.dir.clone(), cache: StorageCacheConfig::default() },
+                StorageOptions {
+                    min_storage_bytes: Some(sp.min_storage_bytes),
+                    cache_mib: sp.cache_mib,
+                    ..StorageOptions::default()
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("membership circuit storage config: {e}"))?;
+            config = config.with_storage(Some(storage));
+            tracing::info!(
+                "membership circuit: spilling to {} (min_storage_bytes={}, cache_mib={:?})",
+                sp.dir, sp.min_storage_bytes, sp.cache_mib
+            );
+        }
         let (dbsp, (contrib_in, feed_in, flips_out, feeds_out)) =
-            Runtime::init_circuit(CircuitConfig::with_workers(1), move |circuit| {
+            Runtime::init_circuit(config, move |circuit| {
                 // The upsert patch function is unused (we only Insert/Delete, never Update),
                 // but the API requires one; assignment is the natural no-surprise choice.
                 let (contrib_stream, contrib_in) =
@@ -129,9 +238,11 @@ impl MembershipCircuit {
                 contrib_stream.integrate_trace().apply(move |spine| {
                     *c_slot.write().expect("contributors slot") = Some(spine.ro_snapshot());
                 });
-                feed_stream.integrate_trace().apply(move |spine| {
-                    *f_slot.write().expect("feeds slot") = Some(spine.ro_snapshot());
-                });
+                if feed_trace {
+                    feed_stream.integrate_trace().apply(move |spine| {
+                        *f_slot.write().expect("feeds slot") = Some(spine.ro_snapshot());
+                    });
+                }
                 // The feed map's own deltas ARE the emissions.
                 let feeds_out = feed_stream.accumulate_output();
                 Ok((contrib_in, feed_in, flips_out, feeds_out))
@@ -141,7 +252,14 @@ impl MembershipCircuit {
         let (tx, rx) = mpsc::channel::<Cmd>(256);
         std::thread::Builder::new()
             .name("dbsp-subq".into())
-            .spawn(move || circuit_thread(dbsp, contrib_in, feed_in, flips_out, feeds_out, rx))
+            .spawn(move || {
+                circuit_thread(dbsp, contrib_in, feed_in, flips_out, feeds_out, rx);
+                // The default spill dir is a per-boot cache (no checkpointing yet): remove it
+                // once the circuit is gone. Explicit dirs are the user's to manage.
+                if let Some(dir) = cleanup_dir {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+            })
             .map_err(|e| anyhow::anyhow!("spawning dbsp-subq thread: {e}"))?;
 
         Ok(MembershipCircuit { tx, members, contributors, feeds })
@@ -496,6 +614,53 @@ mod tests {
         assert_eq!(c.feed_len(7), 0);
         assert_eq!(c.feed_len(8), 1);
         c.shutdown().await;
+    }
+
+    /// With the feed trace disabled, emissions (feed deltas) still flow — only the
+    /// enumeration copy is gone: feed_pks/feed_len return empty, halving feed memory.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn feed_trace_knob_disables_enumeration_not_emissions() {
+        let c = MembershipCircuit::start_with(false).unwrap();
+        let (_, fd) = c.apply(feed(9, "row1", true)).await;
+        assert_eq!(fd, vec![FeedDelta { feed_id: 9, pk: "row1".into(), delta: 1 }]);
+        let (_, fd) = c.apply(feed(9, "row1", false)).await;
+        assert_eq!(fd, vec![FeedDelta { feed_id: 9, pk: "row1".into(), delta: -1 }], "deletes still gate structurally");
+        let (_, fd) = c.apply(feed(9, "ghost", false)).await;
+        assert!(fd.is_empty(), "never-member gate intact without the trace");
+        c.apply(feed(9, "row2", true)).await;
+        assert_eq!(c.feed_pks(9), Vec::<String>::new(), "no enumeration copy");
+        assert_eq!(c.feed_len(9), 0);
+        c.shutdown().await;
+    }
+
+    /// Spill mode: same semantics, state pages to layer files under the storage dir.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spill_mode_preserves_semantics_and_writes_files() {
+        let dir = std::env::temp_dir().join(format!("subq-spill-test-{}", std::process::id()));
+        let c = MembershipCircuit::start_full(
+            true,
+            Some(SpillConfig {
+                dir: dir.to_string_lossy().into_owned(),
+                min_storage_bytes: 1, // spill aggressively so even tiny batches hit disk
+                cache_mib: Some(8),
+                auto: false, // the test owns and removes this dir itself
+            }),
+        )
+        .unwrap();
+        // Enough contributor entries to force at least one on-disk batch.
+        let contributors = (0..2000)
+            .map(|i| Tup2(ckey(1, &format!("pk{i}")), Assert::Insert(Value::Int(i % 50))))
+            .collect();
+        let (flips, _) = c.apply(Assertions { contributors, feeds: Vec::new() }).await;
+        assert_eq!(flips.len(), 50, "50 distinct values entered");
+        assert!(c.contains(1, &Value::Int(7)));
+        let (distinct, _) = c.values_for_node(1, 5);
+        assert_eq!(distinct, 50);
+        // Storage dir gained content (layer files / runtime metadata).
+        let entries = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+        assert!(entries > 0, "storage dir must contain spilled state, found {entries} entries");
+        c.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Same value on two nodes stays isolated per node_id (unchanged from the zset design).

@@ -1176,6 +1176,7 @@ dependencies = [
  "dbsp",
  "feldera-macros",
  "feldera-size-of",
+ "libc",
  "memory-stats",
  "opentelemetry",
  "opentelemetry-prometheus",

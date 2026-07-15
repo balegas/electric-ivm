@@ -57,6 +57,7 @@ opentelemetry-prometheus = "0.27"
 prometheus = "0.13"
 pgwire-replication = { version = "0.3.2", default-features = false, features = ["scram"] }
 url = "2"
+libc = "0.2.186"
 
 [dev-dependencies]
 # Drive the axum router in-process (Service::oneshot) for the /v1/health + endpoint tests.
