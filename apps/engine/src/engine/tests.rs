@@ -831,8 +831,9 @@ async fn membership_flips_agree_between_refcount_and_contributor_set() {
     // delete a. Expected flips: Enter 7, (none), Enter 8, Leave 7, Leave 8.
     // Registry path: identity-reconciled tuples applied to the membership circuit; the
     // circuit's distinct deltas are the flips.
+    use crate::subq_circuit::{Assert, Assertions};
     let circuit = crate::subq_circuit::MembershipCircuit::start().unwrap();
-    let mut node = SubqueryNode::new(
+    let _ = SubqueryNode::new(
         "sig".into(), "inner".into(), 0, 1, Arc::new(CompiledPredicate::MatchAll), 1,
     );
     let mut reg_flips: Vec<Vec<Flip>> = Vec::new();
@@ -843,10 +844,19 @@ async fn membership_flips_agree_between_refcount_and_contributor_set() {
         ("b", None),
         ("a", None),
     ] {
-        let tuples = node.reconcile_row_tuples(pk, pv);
-        let flips = circuit
-            .apply(tuples)
-            .await
+        // Absolute assertion: the circuit's upsert map derives the exact retract/insert.
+        let asserts = Assertions {
+            contributors: vec![crate::value::Tup2(
+                Row(vec![Value::Int(1), Value::Text(pk.into())]),
+                match pv {
+                    Some(v) => Assert::Insert(v),
+                    None => Assert::Delete,
+                },
+            )],
+            feeds: Vec::new(),
+        };
+        let (member_deltas, _) = circuit.apply(asserts).await;
+        let flips = member_deltas
             .into_iter()
             .map(|d| Flip {
                 value: d.value,
