@@ -133,28 +133,29 @@ fn handles() -> &'static std::sync::Mutex<HashMap<String, Arc<HandleEntry>>> {
 /// the registry map's own key strings + each entry's owned strings (`stream_path`, `shape_id`,
 /// `table`, `pk_name`) + its cursor state (`keys`/`offset`) + the in-flight live-poll map's key
 /// strings (the `watch::Receiver` values are shared channel handles, not uniquely owned, so
-/// only their keys are counted). Per-handle state is behind a `tokio::Mutex`, briefly awaited
-/// here — the same lock every request already takes, just for a read instead of a request.
+/// only their keys are counted).
+///
+/// Single lock, allocation-free: holds the registry's std `Mutex` for the whole walk (no cloning
+/// entries out into a `Vec` first, no second lock for the map's own bucket-overhead estimate) and
+/// reads each handle's cursor state with `try_lock` instead of awaiting the async `Mutex` — this
+/// is a best-effort byte estimate, not a request path, so a handle mid-request (lock momentarily
+/// held) is simply skipped for its `keys`/`offset` term rather than blocked on.
 pub(crate) async fn ttl_registry_heap_bytes() -> usize {
-    let entries: Vec<(String, Arc<HandleEntry>)> =
-        handles().lock().unwrap().iter().map(|(id, e)| (id.clone(), e.clone())).collect();
-    let mut total = 0usize;
-    for (id, entry) in &entries {
+    let map = handles().lock().unwrap();
+    let cap = map.capacity();
+    let mut total = (cap * (std::mem::size_of::<(String, Arc<HandleEntry>)>() + 1) * 11) / 10;
+    for (id, entry) in map.iter() {
         total += id.heap_bytes()
             + entry.stream_path.heap_bytes()
             + entry.shape_id.heap_bytes()
             + entry.table.heap_bytes()
             + entry.pk_name.heap_bytes();
-        {
-            let st = entry.state.lock().await;
+        if let Ok(st) = entry.state.try_lock() {
             total += st.keys.heap_bytes() + st.offset.heap_bytes();
         }
         total += entry.live_inflight.lock().unwrap().keys().map(HeapSize::heap_bytes).sum::<usize>();
     }
-    // The registry map's own bucket overhead (see `HeapSize for HashMap`'s formula), computed
-    // from the map's capacity outside the lock above (already dropped).
-    let cap = handles().lock().unwrap().capacity();
-    total + (cap * (std::mem::size_of::<(String, Arc<HandleEntry>)>() + 1) * 11) / 10
+    total
 }
 
 /// Overall deadline for a `live=true` long-poll, decoupled from the ds server's own long-poll timeout:

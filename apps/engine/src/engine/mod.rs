@@ -801,18 +801,26 @@ impl Engine {
     /// nodes/contributor-pks. Read directly from in-memory state (cheap; no tailer round-trip).
     ///
     /// Also reports byte-level self-accounting (Phase 0 of the memory-reduction effort): a
-    /// [`crate::heap_size::HeapSize`] lower-bound owned-heap estimate per major structure, walked
-    /// under the same locks the cardinality counts above already take. These are LOWER BOUNDS
-    /// (owned heap, not allocator slack) — the gap vs. `process.rss_bytes` is the
+    /// [`crate::heap_size::HeapSize`] lower-bound owned-heap estimate per major structure. These
+    /// are LOWER BOUNDS (owned heap, not allocator slack) — the gap vs. `process.rss_bytes` is the
     /// allocator/pinning term this phase is instrumenting to measure.
+    ///
+    /// `bytes_executors` (standalone shapes + their conjunct index, family routers, aggregate
+    /// folds + their index) is the one term this method cannot read out of already-published
+    /// state: those structures are privately owned by the sequencer task's `execs` map, never
+    /// exposed through a shared mutex (unlike `stats`/`node_states`, which are republished after
+    /// every batch specifically so other tasks can read them cheaply). Walking them for real bytes
+    /// is not cheap enough to piggyback on every batch (see `sequencer::publish_all`/`stats_of`),
+    /// so instead this method round-trips a one-off `SequencerCmd::MemBytes` — mirroring the
+    /// `DumpNode` command's pattern (see `dump_node` below) — so the byte-walk itself only ever
+    /// runs on this on-demand path (the background sampler / `GET /memory`), never per batch.
     pub async fn mem_cardinalities(&self) -> crate::mem::Cardinalities {
-        let (shapes, tailers, tables, families, family_shapes, standalone, bytes_shape_records, bytes_executors) = {
+        let (shapes, tailers, tables, families, family_shapes, standalone, bytes_shape_records, cmd_tx) = {
             let st = self.state.lock().await;
             let mut families = 0usize;
             let mut family_shapes = 0usize;
             let mut standalone = 0usize;
             let mut tables_with_execs = 0usize;
-            let mut bytes_executors = 0usize;
             if let Some(seq) = st.sequencer.as_ref()
                 && let Ok(per_table) = seq.stats.lock()
             {
@@ -821,10 +829,10 @@ impl Engine {
                     families += s.families.len();
                     family_shapes += s.families.iter().map(|f| f.shapes).sum::<usize>();
                     standalone += s.standalone;
-                    bytes_executors += s.bytes;
                 }
             }
             let bytes_shape_records = st.shapes.heap_bytes();
+            let cmd_tx = st.sequencer.as_ref().map(|seq| seq.cmd_tx.clone());
             (
                 st.shapes.len(),
                 tables_with_execs,
@@ -833,8 +841,21 @@ impl Engine {
                 family_shapes,
                 standalone,
                 bytes_shape_records,
-                bytes_executors,
+                cmd_tx,
             )
+        };
+        // Byte-walk every table's live executor state, on demand only (see the doc comment
+        // above): ask the sequencer task directly, since it privately owns `execs`.
+        let bytes_executors = match cmd_tx {
+            Some(tx) => {
+                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                if tx.send(SequencerCmd::MemBytes { resp: resp_tx }).is_ok() {
+                    resp_rx.await.unwrap_or(0)
+                } else {
+                    0
+                }
+            }
+            None => 0,
         };
         let (sq_nodes, sq_contributors, sq_distinct, sq_shapes, sq_edges, bytes_membership_circuit, bytes_subquery_registry) = {
             let reg = self.subqueries.lock().await;
