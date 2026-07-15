@@ -570,7 +570,7 @@ async fn reset_metrics() -> Json<serde_json::Value> {
 async fn get_memory(State(engine): State<Engine>) -> Json<serde_json::Value> {
     let card = engine.mem_cardinalities().await;
     crate::mem::publish(&card);
-    Json(crate::mem::snapshot_json())
+    Json(crate::mem::snapshot_json(&card))
 }
 
 /// OpenTelemetry metrics in Prometheus exposition format (what an OTel collector's prometheus receiver

@@ -46,6 +46,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::heap_size::HeapSize;
 use crate::pg::SnapshotGate;
 
 /// Retention tuning, read from the environment once at engine construction.
@@ -120,6 +121,17 @@ pub enum LifeState {
     Reactivating { done: tokio::sync::watch::Receiver<Option<bool>> },
 }
 
+impl HeapSize for LifeState {
+    /// Only `Dormant`'s `resume_offset` (a `String`) and `gate` own heap; the `watch::Receiver`
+    /// variants are channel handles (shared with the sender side), not uniquely owned data.
+    fn heap_bytes(&self) -> usize {
+        match self {
+            LifeState::Dormant { since: _, resume_offset, gate } => resume_offset.heap_bytes() + gate.heap_bytes(),
+            LifeState::Active | LifeState::Deactivating { .. } | LifeState::Reactivating { .. } => 0,
+        }
+    }
+}
+
 /// Per-shape lifecycle record.
 pub struct ShapeLife {
     /// Last engine-visible read/touch (shape create/join, `/v1/shape` request, stream read,
@@ -128,6 +140,13 @@ pub struct ShapeLife {
     /// subscription (refcount ≥ 1), which also blocks dormancy.
     pub last_read: Instant,
     pub state: LifeState,
+}
+
+impl HeapSize for ShapeLife {
+    /// `last_read` (`Instant`) is inline (no heap).
+    fn heap_bytes(&self) -> usize {
+        self.state.heap_bytes()
+    }
 }
 
 impl ShapeLife {

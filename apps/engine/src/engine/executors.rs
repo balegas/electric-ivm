@@ -2,6 +2,7 @@
 //! aggregate folds, and the circuit-served COUNT wrapper. Pure data + delta math; no engine state.
 
 use super::*;
+use crate::heap_size::HeapSize;
 
 /// A COUNT aggregate served from the counts pipeline: `value` = Σ counts of matching groups.
 pub(crate) struct CircuitAgg {
@@ -38,6 +39,14 @@ pub(crate) struct StandaloneShape {
     pub(crate) out_cols: Option<Arc<Vec<usize>>>,
 }
 
+impl HeapSize for StandaloneShape {
+    /// `pred` (`Arc<CompiledPredicate>`) and `out_cols` (`Arc<Vec<usize>>`) are shared,
+    /// not uniquely owned by this shape — skipped (lower bound, not double-counted).
+    fn heap_bytes(&self) -> usize {
+        self.stream_path.heap_bytes() + self.gate.heap_bytes()
+    }
+}
+
 /// Evaluate a stateless WHERE filter directly on a Z-set delta. A filter has no incremental state
 /// (unlike a join), so wrapping it in a dataflow circuit would only add a thread + channel round-trip
 /// + a per-shape clone of the delta. `translate_output` downstream groups by primary key, so emitting
@@ -69,6 +78,16 @@ pub(crate) struct StandaloneIndex {
     pub(crate) scan: Vec<String>,
     /// Where each shape was placed, for removal.
     pub(crate) placed: HashMap<String, Option<crate::predicate::AccessLeaf>>,
+}
+
+impl HeapSize for StandaloneIndex {
+    fn heap_bytes(&self) -> usize {
+        self.eq.heap_bytes()
+            + self.lower.heap_bytes()
+            + self.upper.heap_bytes()
+            + self.scan.heap_bytes()
+            + self.placed.heap_bytes()
+    }
 }
 
 impl StandaloneIndex {
@@ -188,6 +207,13 @@ pub(crate) struct RoutedShape {
     pub(crate) out_cols: Option<Arc<Vec<usize>>>,
 }
 
+impl HeapSize for RoutedShape {
+    /// `out_cols` (`Arc<Vec<usize>>`) is shared, not uniquely owned by this shape — skipped.
+    fn heap_bytes(&self) -> usize {
+        self.stream_path.heap_bytes() + self.gate.heap_bytes()
+    }
+}
+
 /// All equality shapes sharing one key-column set, indexed by key tuple. Holds **no table rows** —
 /// only the `key -> shapes` routing. A change is routed by its key to exactly the shapes registered on
 /// that key (O(log N), independent of shape count); each shape is backfilled directly from Postgres
@@ -200,6 +226,12 @@ pub(crate) struct KeyRouter {
 impl KeyRouter {
     pub(crate) fn member_count(&self) -> usize {
         self.index.values().map(|v| v.len()).sum()
+    }
+}
+
+impl HeapSize for KeyRouter {
+    fn heap_bytes(&self) -> usize {
+        self.key_cols.heap_bytes() + self.index.heap_bytes()
     }
 }
 
@@ -249,6 +281,13 @@ pub(crate) struct AggShape {
     pub(crate) sum: f64,
     pub(crate) multiset: std::collections::BTreeMap<Value, i64>,
     pub(crate) last: Option<serde_json::Value>,
+}
+
+impl HeapSize for AggShape {
+    /// `pred` (`Arc<CompiledPredicate>`) is shared, not uniquely owned — skipped.
+    fn heap_bytes(&self) -> usize {
+        self.stream_path.heap_bytes() + self.gate.heap_bytes() + self.multiset.heap_bytes() + self.last.heap_bytes()
+    }
 }
 
 impl AggShape {

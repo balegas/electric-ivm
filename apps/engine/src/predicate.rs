@@ -4,6 +4,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::heap_size::HeapSize;
 use crate::schema::TableSchema;
 use crate::value::{Row, Value};
 
@@ -55,6 +56,26 @@ pub enum PredicateJson {
         #[serde(default)]
         negated: bool,
     },
+}
+
+impl HeapSize for SubqueryJson {
+    fn heap_bytes(&self) -> usize {
+        self.table.heap_bytes() + self.project.heap_bytes() + self.where_.heap_bytes()
+    }
+}
+
+impl HeapSize for PredicateJson {
+    /// `op`/`is_null`/`negated` are inline (`Copy`); everything else recurses.
+    fn heap_bytes(&self) -> usize {
+        match self {
+            PredicateJson::Leaf { col, op: _, value } => col.heap_bytes() + value.heap_bytes(),
+            PredicateJson::IsNull { col, is_null: _ } => col.heap_bytes(),
+            PredicateJson::And { and } => and.heap_bytes(),
+            PredicateJson::Or { or } => or.heap_bytes(),
+            PredicateJson::Not { not } => not.heap_bytes(),
+            PredicateJson::In { col, subquery, negated: _ } => col.heap_bytes() + subquery.heap_bytes(),
+        }
+    }
 }
 
 /// Canonical signature for a subquery node: identical subqueries (same inner table, projected column,
@@ -195,6 +216,17 @@ pub enum AccessLeaf {
     Lower { col: usize, value: Value, strict: bool },
     /// `col < value` (`strict`) or `col <= value`.
     Upper { col: usize, value: Value, strict: bool },
+}
+
+impl HeapSize for AccessLeaf {
+    /// `col`/`strict` are inline; only the literal `value` owns heap.
+    fn heap_bytes(&self) -> usize {
+        match self {
+            AccessLeaf::Eq { col: _, value }
+            | AccessLeaf::Lower { col: _, value, strict: _ }
+            | AccessLeaf::Upper { col: _, value, strict: _ } => value.heap_bytes(),
+        }
+    }
 }
 
 /// Compiled predicate over positional columns. `MatchAll` is used when a shape has no `where`.

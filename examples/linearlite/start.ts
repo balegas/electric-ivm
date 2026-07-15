@@ -5,7 +5,8 @@
 // system of record. durable-streams + API use ephemeral ports; Vite proxies to them dynamically.
 //   pnpm --filter @electric-ivm/linearlite start     (or: pnpm demo:linearlite)
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
-import { appendFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { createServer as createNetServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -29,7 +30,32 @@ function repoRoot(): string {
   throw new Error('repo root not found')
 }
 
+// The next free TCP port at or after `start` (127.0.0.1 only, matching every bind in this file).
+// Used so a printed banner is never a lie: we resolve the real port BEFORE spawning anything that
+// might otherwise silently fall back to a different one (e.g. vite, with a busy DEMO_VIZ_PORT).
+function findFreePort(start: number): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = createNetServer()
+    srv.unref()
+    srv.on('error', (err: NodeJS.ErrnoException) => {
+      if (err.code === 'EADDRINUSE' && start < 65535) {
+        resolve(findFreePort(start + 1))
+      } else {
+        reject(err)
+      }
+    })
+    srv.listen(start, '127.0.0.1', () => {
+      const port = start
+      srv.close(() => resolve(port))
+    })
+  })
+}
+
 const SLOT = 'electric_ivm_linearlite'
+// PIDs of the engine + durable-streams-server children, so `scripts/linearlite.sh stop` can kill
+// exactly these two processes by PID as a backstop — never by matching on their generic binary
+// name, which would risk hitting an unrelated engine/ds instance running elsewhere on the machine.
+const CHILDREN_PIDFILE = process.env.EL_LINEARLITE_CHILDREN_PIDFILE ?? '/tmp/el-linearlite-children.pids'
 
 // Resources to tear down (in reverse order) on shutdown or partial-boot failure.
 let pgDir: string | undefined
@@ -51,6 +77,7 @@ async function shutdown(code = 0): Promise<void> {
   vizCaddyProc?.kill('SIGKILL')
   caddyProc?.kill('SIGKILL')
   engineProc?.kill('SIGKILL')
+  rmSync(CHILDREN_PIDFILE, { force: true })
   if (pg) {
     await pg.query('SELECT pg_drop_replication_slot($1)', [SLOT]).catch(() => {})
     await pg.end().catch(() => {})
@@ -296,6 +323,7 @@ try {
     engineProc!.on('exit', (c) => reject(new Error(`engine exited ${c}`)))
   })
   console.log('engine          →', engineUrl, '(postgres mode)')
+  writeFileSync(CHILDREN_PIDFILE, `${engineProc.pid}\n${ds.pid}\n`)
 
   api = await createApiServer({ dsUrl, engineUrl })
   console.log('api             →', api.url)
@@ -388,7 +416,9 @@ try {
   // renders the maintained dbsp pipeline — shapes, shared equality families, and shared subquery nodes.
   // Auto-launched pointed at the engine; set DEMO_VIZ=0 to skip, DEMO_VIZ_PORT to change the port.
   if (process.env.DEMO_VIZ !== '0') {
-    const vizPort = process.env.DEMO_VIZ_PORT ?? '5180'
+    // Resolved up front (not left to vite's own silent fallback) so the banner below is always
+    // the port the visualizer actually bound to, not just the one we asked for.
+    const vizPort = String(await findFreePort(Number(process.env.DEMO_VIZ_PORT ?? '5180')))
     const vizHttpsOn = process.env.DEMO_HTTPS !== '0' && caddyProc != null
     const vizHttpsPort = process.env.DEMO_VIZ_HTTPS_PORT ?? '5443'
     // VIZ_HOST pins the bind so the Caddy front below has a deterministic upstream (vite's default

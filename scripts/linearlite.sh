@@ -66,10 +66,15 @@ start() {
   done
   echo
   grep -E "primed" "$LOG" 2>/dev/null | tail -1
+  # Prefer the actual bound URLs start.ts reported (it resolves its own silent port fallbacks and
+  # logs the real one) — fall back to this script's own guess only if that line is missing from the
+  # log, e.g. DEMO_HTTPS=0 / DEMO_VIZ=0 skipped that server.
+  webui_line=$(grep "HTTPS (HTTP/2)" "$LOG" 2>/dev/null | grep -oE 'https://localhost:[0-9]+/' | tail -1)
+  viz_line=$(grep "Pipeline visualizer" "$LOG" 2>/dev/null | grep -oE 'https?://localhost:[0-9]+/' | tail -1)
   cat <<EOF
 
-  🖥  LinearLite web UI      →  ${WEBUI}
-  🔬 dbsp pipeline explorer  →  ${VIZ}
+  🖥  LinearLite web UI      →  ${webui_line:-$WEBUI}
+  🔬 dbsp pipeline explorer  →  ${viz_line:-$VIZ}
 
   logs: ${LOG}     stop with: $0 stop
 EOF
@@ -88,6 +93,14 @@ stop() {
   lsof -ti :"${HTTPS_PORT}" 2>/dev/null | while read -r p; do kill -9 "$p" 2>/dev/null; done
   lsof -ti :"${VIZ_PORT}" 2>/dev/null | while read -r p; do kill -9 "$p" 2>/dev/null; done
   for p in $(pgrep -f "el-linearlite-pg-.*/data" 2>/dev/null); do kill -9 "$p" 2>/dev/null; done
+  # 3. backstop: start.ts's own shutdown() usually reaps the engine + durable-streams-server
+  #    children, but not always in time for step 1's 10s wait — kill them by the EXACT pid it
+  #    recorded (never by matching on their generic binary name, which could hit an unrelated
+  #    engine/ds instance running elsewhere on this machine).
+  if [ -f /tmp/el-linearlite-children.pids ]; then
+    while read -r p; do [ -n "$p" ] && kill -9 "$p" 2>/dev/null; done </tmp/el-linearlite-children.pids
+    rm -f /tmp/el-linearlite-children.pids
+  fi
   rm -f /tmp/el-linearlite.pid
   echo "stopped."
 }
