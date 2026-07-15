@@ -22,6 +22,7 @@ pub mod ds;
 pub mod electric;
 pub mod engine;
 pub mod fault;
+pub mod heap_size;
 pub mod http;
 pub mod mem;
 pub mod metrics;

@@ -9,6 +9,7 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{Context, Result, bail};
 use tokio_postgres::{Client, NoTls};
 
+use crate::heap_size::HeapSize;
 use crate::predicate::CompiledPredicate;
 use crate::schema::{ColumnDef, ColumnType, TableDef, TableSchema};
 use crate::value::Row;
@@ -290,6 +291,13 @@ pub struct SnapshotGate {
     xmin: u64,
     xmax: u64,
     xip: std::collections::HashSet<u64>,
+}
+
+impl HeapSize for SnapshotGate {
+    /// Only `xip` (the in-progress xid set) owns heap; `lsn`/`xmin`/`xmax` are inline `u64`s.
+    fn heap_bytes(&self) -> usize {
+        self.xip.heap_bytes()
+    }
 }
 
 impl SnapshotGate {

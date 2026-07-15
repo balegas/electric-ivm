@@ -11,6 +11,11 @@
 //! (`GET /metrics/prometheus`, the format an OTel collector scrapes) and as JSON (`GET /memory`) for the
 //! benchmark harness. OTel observable-gauge callbacks are synchronous, so a background sampler refreshes
 //! a lock-free [`Gauges`] snapshot that the callbacks (and the JSON endpoint) read.
+//!
+//! A third layer, JSON-only (Phase 0 of the memory-reduction effort, no OTel gauges to avoid metric
+//! churn): byte-level self-accounting, a lower-bound owned-heap estimate (see
+//! [`crate::heap_size::HeapSize`]) per major structure. The gap between the sum of these and
+//! `process.rss_bytes` is the allocator/pinning term this instrumentation exists to isolate.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,6 +42,25 @@ pub struct Cardinalities {
     pub subquery_distinct_values: usize,
     pub subquery_shapes: usize,
     pub subquery_edges: usize,
+    /// `ShapeRecord`s in the shape registry (`Engine.state.shapes`).
+    pub bytes_shape_records: usize,
+    /// Per-table executor structures: standalone shapes + their conjunct index, family routers
+    /// (`RoutedShape`s), aggregate folds + their conjunct index.
+    pub bytes_executors: usize,
+    /// Per-shape retention lifecycle records (`Engine.lives`) — dominated by dormant shapes'
+    /// resume offsets + snapshot gates.
+    pub bytes_retention: usize,
+    /// The cross-table subquery registry's own structures: nodes, templates (incl. their
+    /// `pk_nodes` inverted index), shapes, and edges — excludes the membership circuit itself
+    /// (see `bytes_membership_circuit`).
+    pub bytes_subquery_registry: usize,
+    /// Estimated owned heap of the dbsp membership circuit (subquery inner sets + per-feed key
+    /// sets): key-count × an estimated per-entry size, since dbsp's storage-backed spines don't
+    /// expose exact byte sizes cheaply. See `SubqueryRegistry::mem_totals` for the formula.
+    pub bytes_membership_circuit: usize,
+    /// The `/v1/shape` (Electric-protocol) adapter's TTL handle registry: per-handle cursor
+    /// state (known-keys sets, in-flight live-poll map).
+    pub bytes_electric_adapter: usize,
 }
 
 /// Lock-free snapshot the OTel gauge callbacks and `/memory` read. Updated by the sampler and on demand.
@@ -97,7 +121,11 @@ pub fn publish(card: &Cardinalities) {
 }
 
 /// JSON snapshot for `GET /memory` (RSS measured fresh; cardinalities from the last publish).
-pub fn snapshot_json() -> serde_json::Value {
+///
+/// The `bytes_*` fields are read directly from `card` (the just-computed snapshot), not from
+/// [`Gauges`] — they are JSON-only (no OTel gauge), so there is nothing published to read back;
+/// every other field mirrors the last [`publish`] call, same as before.
+pub fn snapshot_json(card: &Cardinalities) -> serde_json::Value {
     let g = gauges();
     let (rss, virt) = process_memory();
     g.rss_bytes.store(rss, Ordering::Relaxed);
@@ -121,6 +149,12 @@ pub fn snapshot_json() -> serde_json::Value {
             "subquery_distinct_values": g.subquery_distinct_values.load(Ordering::Relaxed),
             "subquery_shapes": g.subquery_shapes.load(Ordering::Relaxed),
             "subquery_edges": g.subquery_edges.load(Ordering::Relaxed),
+            "bytes_shape_records": card.bytes_shape_records,
+            "bytes_executors": card.bytes_executors,
+            "bytes_retention": card.bytes_retention,
+            "bytes_subquery_registry": card.bytes_subquery_registry,
+            "bytes_membership_circuit": card.bytes_membership_circuit,
+            "bytes_electric_adapter": card.bytes_electric_adapter,
         },
         "samples": g.samples.load(Ordering::Relaxed),
     })

@@ -13,6 +13,7 @@ use ordered_float::OrderedFloat;
 use rkyv::{Archive, Deserialize, Serialize};
 use size_of::SizeOf;
 
+use crate::heap_size::HeapSize;
 use crate::schema::ColumnType;
 
 /// Signed multiplicity of a Z-set element: `+1` insert, `-1` delete.
@@ -117,6 +118,33 @@ pub struct Row(pub Vec<Value>);
 impl Row {
     pub fn get(&self, idx: usize) -> Result<&Value> {
         self.0.get(idx).with_context(|| format!("column index {idx} out of range"))
+    }
+}
+
+impl HeapSize for Value {
+    /// Only `Text` owns heap (the `String`); every other variant is inline.
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Value::Text(s) => s.heap_bytes(),
+            Value::Null | Value::Int(_) | Value::Bool(_) | Value::Float(_) => 0,
+        }
+    }
+}
+
+impl HeapSize for Row {
+    fn heap_bytes(&self) -> usize {
+        self.0.heap_bytes()
+    }
+}
+
+/// `Tup2` is dbsp's own type (foreign), but `HeapSize` is ours — allowed under the orphan
+/// rule. Only the two Z-set delta shapes the engine actually stores are covered (widening this
+/// blindly to `Tup2<A, B>` would need `B: HeapSize` too, which `ZWeight` (a bare `i64`) already
+/// satisfies via the leaf macro, but keeping the impl concrete avoids accidentally covering
+/// unrelated `Tup2` uses elsewhere with unreviewed semantics).
+impl HeapSize for Tup2<Row, ZWeight> {
+    fn heap_bytes(&self) -> usize {
+        self.0.heap_bytes()
     }
 }
 

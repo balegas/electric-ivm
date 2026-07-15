@@ -22,6 +22,7 @@ use anyhow::{Context, Result};
 use crate::value::{Tup2, ZWeight};
 
 use crate::ds::{DsClient, Envelope};
+use crate::heap_size::HeapSize;
 use crate::subq_circuit::{Assert, Assertions, FeedDelta};
 use crate::predicate::{
     CompiledPredicate, PredicateJson, SubqueryCollector, SubqueryEval, SubquerySig, subquery_sig,
@@ -82,6 +83,20 @@ pub struct SubqueryNode {
     pub refcount: usize,
 }
 
+impl HeapSize for SubqueryNode {
+    /// `pred` (`Arc<CompiledPredicate>`) is shared with the registry's compiled evaluators, not
+    /// uniquely owned by this node — skipped, like every other `Arc<...>` field in this module.
+    fn heap_bytes(&self) -> usize {
+        self.sig.heap_bytes()
+            + self.inner_table.heap_bytes()
+            + self.where_json.heap_bytes()
+            + self.gate.heap_bytes()
+            + self.seed_buffer.heap_bytes()
+            + self.template_key.heap_bytes()
+            + self.bind.heap_bytes()
+    }
+}
+
 impl SubqueryNode {
     pub fn new(
         sig: SubquerySig,
@@ -131,6 +146,14 @@ pub(crate) struct TemplateGroup {
     pk_nodes: HashMap<String, HashSet<SubquerySig>>,
 }
 
+impl HeapSize for TemplateGroup {
+    /// `residual` (`Arc<CompiledPredicate>`) is shared across every bind of this template —
+    /// skipped, like other `Arc<...>` fields in this module.
+    fn heap_bytes(&self) -> usize {
+        self.inner_table.heap_bytes() + self.param_cols.heap_bytes() + self.binds.heap_bytes() + self.pk_nodes.heap_bytes()
+    }
+}
+
 /// Identifies a dependent of a node: an outer shape or a parent node, plus the connecting column on the
 /// dependent's table whose value `= the flipped node value` selects the affected rows.
 #[derive(Debug, Clone)]
@@ -139,6 +162,15 @@ pub enum Dependent {
     Shape(String),
     /// A parent node (by signature) whose inner `pred` references this node.
     Node(SubquerySig),
+}
+
+impl HeapSize for Dependent {
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Dependent::Shape(id) => id.heap_bytes(),
+            Dependent::Node(sig) => sig.heap_bytes(),
+        }
+    }
 }
 
 /// An edge from a node to a dependent: when the node flips `value`, rows of the dependent's table with
@@ -157,6 +189,13 @@ pub struct Edge {
     /// FALSE < UNKNOWN < TRUE, so overall TRUE-ness (inclusion) cannot change. Any negation breaks the
     /// monotonicity, so those dependents must be fully re-derived on a NULL flip.
     pub null_sensitive: bool,
+}
+
+impl HeapSize for Edge {
+    /// `connecting_col`/`negated`/`null_sensitive` are inline.
+    fn heap_bytes(&self) -> usize {
+        self.node_sig.heap_bytes() + self.dependent.heap_bytes()
+    }
 }
 
 /// A registered outer subquery shape: an ordinary materialized shape whose predicate contains
@@ -179,6 +218,14 @@ pub struct SubqueryShape {
     /// actually retracts, so a "not a member" verdict for a pk the stream never contained is
     /// structurally a no-op — the wake-storm gate (PR #30) with no filter to keep in sync.
     pub(crate) feed_id: i64,
+}
+
+impl HeapSize for SubqueryShape {
+    /// `pred`/`out_cols` are `Arc`-shared, not uniquely owned; `emitted` (`AtomicU64`) and
+    /// `feed_id` (`i64`) are inline.
+    fn heap_bytes(&self) -> usize {
+        self.shape_id.heap_bytes() + self.outer_table.heap_bytes() + self.stream_path.heap_bytes() + self.gate.heap_bytes()
+    }
 }
 
 /// A `TableSchema` lookup shared with the engine's compiled schema.
@@ -210,6 +257,17 @@ pub struct PendingSubqueryShape {
     collect_log: Vec<SubquerySig>,
     /// Outer-table deltas buffered while the backfill runs; replayed through the gate at install.
     buffer: Vec<Tup2<Row, ZWeight>>,
+}
+
+impl HeapSize for PendingSubqueryShape {
+    /// `pred`/`out_cols` are `Arc`-shared, not uniquely owned; `changes_only` is inline.
+    fn heap_bytes(&self) -> usize {
+        self.shape_id.heap_bytes()
+            + self.outer_table.heap_bytes()
+            + self.stream_path.heap_bytes()
+            + self.collect_log.heap_bytes()
+            + self.buffer.heap_bytes()
+    }
 }
 
 /// What phase B (Postgres I/O, run WITHOUT the registry lock) needs from `begin_create`.
@@ -269,6 +327,28 @@ pub struct SubqueryRegistry {
     /// streams asynchronously, covered by the `pendingFlips` barrier. `None` (unit tests)
     /// falls back to a direct reliable append.
     lanes: Option<crate::engine::emission::EmissionLanes>,
+}
+
+impl HeapSize for SubqueryRegistry {
+    /// `circuit` (the dbsp membership relation) is accounted separately — see
+    /// [`SubqueryRegistry::mem_totals`]'s `bytes_membership_circuit` estimate — so it is
+    /// deliberately excluded here to avoid double-counting the same state under two `/memory`
+    /// fields. `ds` (a client handle) and `schemas` (`Arc`-shared with the engine's compiled
+    /// schema) are not uniquely owned; `lanes` holds channel senders, not owned data;
+    /// `next_node_id`/`next_feed_id` are inline counters.
+    fn heap_bytes(&self) -> usize {
+        self.nodes.heap_bytes()
+            + self.edges.heap_bytes()
+            + self.staged_edges.heap_bytes()
+            + self.shapes.heap_bytes()
+            + self.node_by_id.heap_bytes()
+            + self.feed_by_id.heap_bytes()
+            + self.templates.heap_bytes()
+            + self.pending_seed.heap_bytes()
+            + self.pending_shapes.heap_bytes()
+            + self.collect_log.heap_bytes()
+            + self.pg_url.heap_bytes()
+    }
 }
 
 impl SubqueryRegistry {
@@ -432,8 +512,27 @@ impl SubqueryRegistry {
 
     /// Memory-relevant registry totals: maintained nodes, total contributor pks across all nodes (the
     /// dominant per-node state — one entry per inner row producing a value), distinct values, shapes,
-    /// and edges. Used by the memory probe to attribute subquery state growth.
-    pub fn mem_totals(&self) -> (usize, usize, usize, usize, usize) {
+    /// edges, and an owned-heap estimate of the membership circuit itself (`bytes_membership_circuit`).
+    /// Used by the memory probe to attribute subquery state growth.
+    ///
+    /// The circuit's dbsp spines don't expose exact byte sizes cheaply (they may be disk-spilled —
+    /// see `subq_circuit`'s `SpillConfig` — so there is no single in-memory allocation to measure),
+    /// so the byte estimate is `key_count × ENTRY_BYTES_ESTIMATE`: the total contributor pks (the
+    /// CONTRIBUTORS map's keys) + distinct values (the MEMBERS relation's keys) + total feed keys
+    /// (the FEEDS map's keys, summed via `feed_len` per registered shape — the same per-shape walk
+    /// `emit_for_shapes`/`drop_subquery_shape` already do), times one entry's estimated footprint: the
+    /// key `Row`'s `Vec` allocation (an id `Value::Int` + a stringified-pk `Value::Text`) plus a
+    /// typical pk string length. A documented lower-bound estimate, not allocator-exact.
+    pub fn mem_totals(&self) -> (usize, usize, usize, usize, usize, usize) {
+        /// Assumed average length (bytes) of a stringified primary key — the dominant unknown in
+        /// the per-entry estimate below (an int pk like `"483920"` or a short uuid segment).
+        const EST_AVG_PK_BYTES: usize = 16;
+        /// One membership/contributor/feed map entry's estimated owned heap: the key `Row`'s `Vec`
+        /// allocation (2 `Value`s: an `Int` id + a `Text` pk) plus the pk string's assumed length
+        /// plus one `Value` payload (the projected/asserted value).
+        const ENTRY_BYTES_ESTIMATE: usize =
+            2 * std::mem::size_of::<Value>() + EST_AVG_PK_BYTES + std::mem::size_of::<Value>();
+
         let mut contributors = 0;
         let mut distinct = 0;
         for n in self.nodes.values() {
@@ -441,7 +540,9 @@ impl SubqueryRegistry {
             contributors += vals.iter().map(|(_, c)| c).sum::<usize>();
             distinct += d;
         }
-        (self.nodes.len(), contributors, distinct, self.shapes.len(), self.edges_count())
+        let feed_keys: usize = self.shapes.values().map(|s| self.circuit.feed_len(s.feed_id)).sum();
+        let membership_bytes = (contributors + distinct + feed_keys) * ENTRY_BYTES_ESTIMATE;
+        (self.nodes.len(), contributors, distinct, self.shapes.len(), self.edges_count(), membership_bytes)
     }
 
     /// Per-node topology for the introspection endpoint: signature, inner table, current distinct value

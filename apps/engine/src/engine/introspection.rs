@@ -2,6 +2,7 @@
 //! node-state summaries, and deep node dumps.
 
 use super::*;
+use crate::heap_size::HeapSize;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ShapeRecord {
@@ -31,6 +32,26 @@ pub struct ShapeRecord {
 pub struct AggInfo {
     pub func: AggFn,
     pub col: Option<String>,
+}
+
+impl HeapSize for AggInfo {
+    /// `func` is a bare enum tag (no heap); `col` is the only owned data.
+    fn heap_bytes(&self) -> usize {
+        self.col.heap_bytes()
+    }
+}
+
+impl HeapSize for ShapeRecord {
+    fn heap_bytes(&self) -> usize {
+        self.id.heap_bytes()
+            + self.table.heap_bytes()
+            + self.stream_path.heap_bytes()
+            + self.where_json.heap_bytes()
+            + self.columns.heap_bytes()
+            + self.family_key.heap_bytes()
+            + self.aggregate.heap_bytes()
+        // `changes_only` / `is_subquery` are bare bools (no heap).
+    }
 }
 
 // --- Pipeline-graph introspection (served at `GET /graph` for the visualizer) ---
@@ -293,6 +314,12 @@ pub struct TableStats {
     /// Circuit-served shapes + aggregates on this table.
     #[serde(default)]
     pub circuit: usize,
+    /// Owned-heap estimate of this table's executor structures (standalone shapes + their
+    /// conjunct index, family routers, aggregate folds + their index) — the memory probe's
+    /// `bytes_executors` term (see `mem_cardinalities`). Not part of the `GET
+    /// /tables/{name}/families` public payload (introspection-only).
+    #[serde(skip)]
+    pub bytes: usize,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -590,10 +617,21 @@ pub(crate) fn stats_of(exec: &TableExec) -> TableStats {
         .map(|(k, f)| FamilyStat { key_cols: k.clone(), shapes: f.member_count() })
         .collect();
     fams.sort_by(|a, b| a.key_cols.cmp(&b.key_cols));
+    // Owned-heap estimate of this table's executor structures: standalone shapes + their
+    // necessary-conjunct index, family routers (which hold the `RoutedShape`s), aggregate
+    // folds + their conjunct index. Computed here (not in `mem_cardinalities`) because this is
+    // the only place that already walks every table's live executor under its own lock, once
+    // per processed batch — the same cost class `standalone`/`families` above already pay.
+    let bytes = exec.shapes.heap_bytes()
+        + exec.shape_index.heap_bytes()
+        + exec.families.heap_bytes()
+        + exec.aggregates.heap_bytes()
+        + exec.agg_index.heap_bytes();
     TableStats {
         families: fams,
         standalone: exec.shapes.len(),
         circuit: exec.circuit_aggs.len(),
+        bytes,
     }
 }
 

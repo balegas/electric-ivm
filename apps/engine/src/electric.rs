@@ -54,6 +54,7 @@ use tokio::sync::watch;
 
 use crate::ds::{Envelope, ReadResult};
 use crate::engine::Engine;
+use crate::heap_size::HeapSize;
 use crate::schema::{ColumnType, TableSchema};
 
 #[derive(Debug, Deserialize)]
@@ -124,6 +125,36 @@ struct HandleState {
 fn handles() -> &'static std::sync::Mutex<HashMap<String, Arc<HandleEntry>>> {
     static H: OnceLock<std::sync::Mutex<HashMap<String, Arc<HandleEntry>>>> = OnceLock::new();
     H.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Owned-heap estimate of the `/v1/shape` handle registry — the memory probe's
+/// `bytes_electric_adapter` term. `HandleEntry`/`HandleState` hold sync/async primitives
+/// (`Mutex`, `watch::Receiver`), so this is a hand-rolled walk rather than a `HeapSize` impl:
+/// the registry map's own key strings + each entry's owned strings (`stream_path`, `shape_id`,
+/// `table`, `pk_name`) + its cursor state (`keys`/`offset`) + the in-flight live-poll map's key
+/// strings (the `watch::Receiver` values are shared channel handles, not uniquely owned, so
+/// only their keys are counted). Per-handle state is behind a `tokio::Mutex`, briefly awaited
+/// here — the same lock every request already takes, just for a read instead of a request.
+pub(crate) async fn ttl_registry_heap_bytes() -> usize {
+    let entries: Vec<(String, Arc<HandleEntry>)> =
+        handles().lock().unwrap().iter().map(|(id, e)| (id.clone(), e.clone())).collect();
+    let mut total = 0usize;
+    for (id, entry) in &entries {
+        total += id.heap_bytes()
+            + entry.stream_path.heap_bytes()
+            + entry.shape_id.heap_bytes()
+            + entry.table.heap_bytes()
+            + entry.pk_name.heap_bytes();
+        {
+            let st = entry.state.lock().await;
+            total += st.keys.heap_bytes() + st.offset.heap_bytes();
+        }
+        total += entry.live_inflight.lock().unwrap().keys().map(HeapSize::heap_bytes).sum::<usize>();
+    }
+    // The registry map's own bucket overhead (see `HeapSize for HashMap`'s formula), computed
+    // from the map's capacity outside the lock above (already dropped).
+    let cap = handles().lock().unwrap().capacity();
+    total + (cap * (std::mem::size_of::<(String, Arc<HandleEntry>)>() + 1) * 11) / 10
 }
 
 /// Overall deadline for a `live=true` long-poll, decoupled from the ds server's own long-poll timeout:

@@ -13,6 +13,7 @@ use tokio::sync::{Mutex, mpsc};
 use std::sync::atomic::Ordering;
 
 use crate::ds::{DsClient, Envelope, EnvelopeHeaders};
+use crate::heap_size::HeapSize;
 use crate::metrics::{Timer, metrics};
 use crate::predicate::{CompiledPredicate, PredicateJson};
 use crate::schema::{Schema, TableSchema, compile_schema};
@@ -798,13 +799,20 @@ impl Engine {
     /// registered shapes, per-table tailers, shared **family circuits** (the M× join-trace amplifier:
     /// each holds the base table once), standalone per-shape circuits, and the subquery registry's
     /// nodes/contributor-pks. Read directly from in-memory state (cheap; no tailer round-trip).
+    ///
+    /// Also reports byte-level self-accounting (Phase 0 of the memory-reduction effort): a
+    /// [`crate::heap_size::HeapSize`] lower-bound owned-heap estimate per major structure, walked
+    /// under the same locks the cardinality counts above already take. These are LOWER BOUNDS
+    /// (owned heap, not allocator slack) — the gap vs. `process.rss_bytes` is the
+    /// allocator/pinning term this phase is instrumenting to measure.
     pub async fn mem_cardinalities(&self) -> crate::mem::Cardinalities {
-        let (shapes, tailers, tables, families, family_shapes, standalone) = {
+        let (shapes, tailers, tables, families, family_shapes, standalone, bytes_shape_records, bytes_executors) = {
             let st = self.state.lock().await;
             let mut families = 0usize;
             let mut family_shapes = 0usize;
             let mut standalone = 0usize;
             let mut tables_with_execs = 0usize;
+            let mut bytes_executors = 0usize;
             if let Some(seq) = st.sequencer.as_ref()
                 && let Ok(per_table) = seq.stats.lock()
             {
@@ -813,12 +821,26 @@ impl Engine {
                     families += s.families.len();
                     family_shapes += s.families.iter().map(|f| f.shapes).sum::<usize>();
                     standalone += s.standalone;
+                    bytes_executors += s.bytes;
                 }
             }
-            (st.shapes.len(), tables_with_execs, st.tables.len(), families, family_shapes, standalone)
+            let bytes_shape_records = st.shapes.heap_bytes();
+            (
+                st.shapes.len(),
+                tables_with_execs,
+                st.tables.len(),
+                families,
+                family_shapes,
+                standalone,
+                bytes_shape_records,
+                bytes_executors,
+            )
         };
-        let (sq_nodes, sq_contributors, sq_distinct, sq_shapes, sq_edges) =
-            self.subqueries.lock().await.mem_totals();
+        let (sq_nodes, sq_contributors, sq_distinct, sq_shapes, sq_edges, bytes_membership_circuit, bytes_subquery_registry) = {
+            let reg = self.subqueries.lock().await;
+            let (nodes, contributors, distinct, shapes, edges, membership_bytes) = reg.mem_totals();
+            (nodes, contributors, distinct, shapes, edges, membership_bytes, reg.heap_bytes())
+        };
         let shapes_dormant = self
             .lives
             .lock()
@@ -826,6 +848,8 @@ impl Engine {
             .values()
             .filter(|l| matches!(l.state, LifeState::Dormant { .. }))
             .count();
+        let bytes_retention = self.lives.lock().unwrap().heap_bytes();
+        let bytes_electric_adapter = crate::electric::ttl_registry_heap_bytes().await;
         crate::mem::Cardinalities {
             shapes,
             shapes_dormant,
@@ -839,6 +863,12 @@ impl Engine {
             subquery_distinct_values: sq_distinct,
             subquery_shapes: sq_shapes,
             subquery_edges: sq_edges,
+            bytes_shape_records,
+            bytes_executors,
+            bytes_retention,
+            bytes_subquery_registry,
+            bytes_membership_circuit,
+            bytes_electric_adapter,
         }
     }
 
