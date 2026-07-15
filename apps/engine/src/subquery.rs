@@ -2043,6 +2043,187 @@ mod tests {
         assert!(fd.is_empty(), "repeat delete for an already-removed pk must net nothing");
     }
 
+    // --- Task 0.3 harness: a minimal fake durable-streams server ------------------------------
+    //
+    // `emit_for_shapes`'s `deliver()` falls back to `DsClient::append_reliable` when no lanes are
+    // configured (unit tests): a genuinely non-empty emission would otherwise retry forever
+    // against `http://unused`. `tests/live_poll_deadline.rs` and `tests/params_shape.rs` solve
+    // this the same way — spawn a real (local) axum server and point a real `DsClient` at it —
+    // reused verbatim here so appends actually land and can be inspected, instead of asserting
+    // only the `emitted` counter.
+
+    #[derive(Clone, Default)]
+    struct DsStore(Arc<std::sync::Mutex<HashMap<String, Vec<Envelope>>>>);
+
+    async fn fake_ds_handler(
+        axum::extract::State(store): axum::extract::State<DsStore>,
+        req: axum::extract::Request,
+    ) -> axum::response::Response {
+        use axum::http::{Method, StatusCode};
+        use axum::response::IntoResponse;
+        match *req.method() {
+            Method::PUT | Method::DELETE => StatusCode::OK.into_response(),
+            Method::POST => {
+                let path = req.uri().path().trim_start_matches('/').to_string();
+                let body = axum::body::to_bytes(req.into_body(), 1024 * 1024).await.unwrap_or_default();
+                if let Ok(envs) = serde_json::from_slice::<Vec<Envelope>>(&body) {
+                    store.0.lock().unwrap().entry(path).or_default().extend(envs);
+                }
+                StatusCode::OK.into_response()
+            }
+            Method::GET => {
+                ([("stream-next-offset", "tip"), ("stream-up-to-date", "1")], "[]").into_response()
+            }
+            _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+        }
+    }
+
+    /// Boots the fake server on an ephemeral port; returns its base URL and the shared store of
+    /// every envelope POSTed to it, keyed by stream path (e.g. `"shape/s1"`).
+    async fn spawn_fake_ds() -> (String, DsStore) {
+        let store = DsStore::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(fake_ds_handler).with_state(store.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), store)
+    }
+
+    /// The operations (`"upsert"`/`"delete"`) delivered to one stream path so far, in append order.
+    fn ops_for(store: &DsStore, path: &str) -> Vec<String> {
+        store.0.lock().unwrap().get(path).map(|v| v.iter().map(|e| e.headers.operation.clone()).collect()).unwrap_or_default()
+    }
+
+    /// `issues(id, project_id)`, matching the brief's example shape:
+    /// `issues WHERE project_id IN (SELECT project_id FROM project_members WHERE user_id = ...)`.
+    fn issues_ts() -> TableSchema {
+        use crate::schema::TableDef;
+        let def: TableDef = serde_json::from_value(serde_json::json!({
+            "columns": { "id": {"type":"int"}, "project_id": {"type":"int"} },
+            "primaryKey": "id"
+        }))
+        .unwrap();
+        TableSchema::from_def("issues", &def).unwrap()
+    }
+
+    fn issue(id: i64, project_id: i64) -> Row {
+        Row(vec![Value::Int(id), Value::Int(project_id)])
+    }
+
+    /// Registers a shape whose predicate is `project_id IN (node sig)` — the outer half of the
+    /// brief's example, wired to a membership node inserted with [`insert_test_node`].
+    fn insert_membership_shape(reg: &mut SubqueryRegistry, shape_id: &str, sig: &SubquerySig, project_col: usize) {
+        let feed_id = reg.next_feed_id;
+        reg.next_feed_id += 1;
+        reg.feed_by_id.insert(feed_id, shape_id.to_string());
+        reg.shapes.insert(
+            shape_id.to_string(),
+            SubqueryShape {
+                shape_id: shape_id.to_string(),
+                outer_table: "issues".into(),
+                stream_path: format!("shape/{shape_id}"),
+                pred: Arc::new(CompiledPredicate::InSubquery {
+                    col: project_col,
+                    sig: sig.clone(),
+                    negated: false,
+                }),
+                out_cols: None,
+                gate: crate::pg::SnapshotGate::passthrough(),
+                emitted: std::sync::atomic::AtomicU64::new(0),
+                feed_id,
+            },
+        );
+    }
+
+    /// G2 loop test 1/2 — the delete-gate's OPEN-failure half: a delete for a pk that was
+    /// **never** a member of the feed must be dropped (zero appends, zero wake), never a
+    /// spurious delete. `project_members` (user 1) only ever contains project 100; an issue in
+    /// project 999 is written then deleted without ever entering the `issues` shape's feed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn never_member_delete_is_dropped() {
+        let ts = issues_ts();
+        let (ds_url, store) = spawn_fake_ds().await;
+        let mut reg = SubqueryRegistry::new(DsClient::new(&ds_url), None);
+        let sig: SubquerySig = "project_members|project_id|L(user_id,Eq,1)".into();
+        insert_test_node(&mut reg, &sig);
+        // The only project user 1 is a member of.
+        reg.apply_node_evals(&sig, vec![("pm-1".into(), Some(Value::Int(100)))]).await;
+        insert_membership_shape(&mut reg, "s1", &sig, 1);
+
+        // Write an issue in a NON-matching project (999): never a member, so nothing is emitted.
+        let work = reg.on_table_delta(&ts, &[Tup2(issue(1, 999), 1)], 1, None, None, None).await.unwrap();
+        assert!(work.is_empty(), "an outer-table delta never queues node-flip propagation");
+        assert_eq!(reg.shapes["s1"].emitted.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        // Delete it: still never a member -> the delete-gate must drop it (no spurious wake).
+        reg.on_table_delta(&ts, &[Tup2(issue(1, 999), -1)], 2, None, None, None).await.unwrap();
+        assert_eq!(
+            reg.shapes["s1"].emitted.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "never-member delete must be dropped"
+        );
+        assert!(
+            ops_for(&store, "shape/s1").is_empty(),
+            "the shape's stream must receive ZERO appends for a never-member pk"
+        );
+    }
+
+    /// G2 loop test 2/2 — the delete-gate's CLOSED-failure half: a delete for a pk that WAS a
+    /// genuine member must never be dropped, on either exit path — (a) the row itself is
+    /// deleted, (b) the row survives but the membership node it depended on flips the pk out
+    /// (`project_members`'s row for user 1 is removed: "the user loses the project") — and a pk
+    /// that re-enters after leaving must re-emit (the feed relation, not a one-shot latch).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn genuine_member_delete_is_never_dropped() {
+        let ts = issues_ts();
+        let (ds_url, store) = spawn_fake_ds().await;
+        let mut reg = SubqueryRegistry::new(DsClient::new(&ds_url), None);
+        let sig: SubquerySig = "project_members|project_id|L(user_id,Eq,1)".into();
+        insert_test_node(&mut reg, &sig);
+        reg.apply_node_evals(&sig, vec![("pm-1".into(), Some(Value::Int(100)))]).await;
+        insert_membership_shape(&mut reg, "s2", &sig, 1);
+        fn emitted(reg: &SubqueryRegistry) -> u64 {
+            reg.shapes["s2"].emitted.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        // Enter: an issue in the matching project.
+        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), 1)], 1, None, None, None).await.unwrap();
+        assert_eq!(emitted(&reg), 1);
+        assert_eq!(ops_for(&store, "shape/s2"), vec!["upsert"]);
+
+        // Exit (a): the row itself is deleted -> exactly one delete emission.
+        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), -1)], 2, None, None, None).await.unwrap();
+        assert_eq!(emitted(&reg), 2, "exactly one more envelope: the row-delete emission");
+        assert_eq!(ops_for(&store, "shape/s2"), vec!["upsert", "delete"]);
+
+        // A pk that re-enters after leaving must re-emit — the feed relation gates on current
+        // membership, it is not a one-shot "already told you" latch.
+        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), 1)], 3, None, None, None).await.unwrap();
+        assert_eq!(emitted(&reg), 3, "a re-entering pk must re-emit");
+        assert_eq!(ops_for(&store, "shape/s2"), vec!["upsert", "delete", "upsert"]);
+
+        // Exit (b): the row is untouched, but the user loses the project — the membership node's
+        // only contributor is withdrawn, flipping project 100 out of the inner set. In
+        // production `propagate_flips`/`move_shape_for_value` discovers this and queries
+        // Postgres back for the outer rows with `project_id = 100` to re-evaluate; this harness
+        // has no Postgres, so the flip is driven directly and the still-present candidate row is
+        // handed to the same `emit_for_shapes` re-derivation tail that query-back would call —
+        // exactly the "membership flip" exit path, distinct from a row delete.
+        let flips = reg.apply_node_evals(&sig, vec![("pm-1".into(), None)]).await;
+        assert_eq!(flips, vec![Flip { value: Value::Int(100), dir: FlipDir::Leave }]);
+        let results =
+            reg.emit_for_shapes(&ts, vec![("s2".to_string(), vec![(issue(1, 100), true)])], None).await.unwrap();
+        assert_eq!(
+            results,
+            vec![("s2".to_string(), true, -1)],
+            "exactly one delete emission for the membership-flip exit path"
+        );
+        assert_eq!(emitted(&reg), 4);
+        assert_eq!(ops_for(&store, "shape/s2"), vec!["upsert", "delete", "upsert", "delete"]);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn registry_eval_reads_node_sets() {
         let sig: SubquerySig = "sig".into();
