@@ -103,7 +103,21 @@ pub struct MembershipCircuit {
 impl MembershipCircuit {
     /// Build the circuit and start its thread. State is in-memory only — nodes reseed from
     /// Postgres on registration, feeds from shape backfills.
+    ///
+    /// `ELECTRIC_IVM_FEED_TRACE=0` disables the published feed-relation trace — the SECOND
+    /// copy of every feed's key set, used only for drop-time retraction and introspection
+    /// (the upsert operator's internal integral, which decides the emissions, is unaffected).
+    /// Disabling roughly halves the per-feed memory term; dropped shapes then leave their
+    /// (unreachable — feed ids are never reused) entries in the operator integral instead of
+    /// retracting them, a documented trade until stream-fold drop enumeration lands
+    /// (bead dbsp-ds-4d8).
     pub fn start() -> Result<MembershipCircuit> {
+        let feed_trace = std::env::var("ELECTRIC_IVM_FEED_TRACE").map(|v| v != "0").unwrap_or(true);
+        Self::start_with(feed_trace)
+    }
+
+    /// [`start`], with the feed-trace choice explicit (tests).
+    pub fn start_with(feed_trace: bool) -> Result<MembershipCircuit> {
         let members: Slot<MemberSnapshot> = Slot::default();
         let contributors: Slot<MapSnapshot> = Slot::default();
         let feeds: Slot<MapSnapshot> = Slot::default();
@@ -129,9 +143,11 @@ impl MembershipCircuit {
                 contrib_stream.integrate_trace().apply(move |spine| {
                     *c_slot.write().expect("contributors slot") = Some(spine.ro_snapshot());
                 });
-                feed_stream.integrate_trace().apply(move |spine| {
-                    *f_slot.write().expect("feeds slot") = Some(spine.ro_snapshot());
-                });
+                if feed_trace {
+                    feed_stream.integrate_trace().apply(move |spine| {
+                        *f_slot.write().expect("feeds slot") = Some(spine.ro_snapshot());
+                    });
+                }
                 // The feed map's own deltas ARE the emissions.
                 let feeds_out = feed_stream.accumulate_output();
                 Ok((contrib_in, feed_in, flips_out, feeds_out))
@@ -495,6 +511,23 @@ mod tests {
         c.apply(Assertions { contributors: Vec::new(), feeds }).await;
         assert_eq!(c.feed_len(7), 0);
         assert_eq!(c.feed_len(8), 1);
+        c.shutdown().await;
+    }
+
+    /// With the feed trace disabled, emissions (feed deltas) still flow — only the
+    /// enumeration copy is gone: feed_pks/feed_len return empty, halving feed memory.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn feed_trace_knob_disables_enumeration_not_emissions() {
+        let c = MembershipCircuit::start_with(false).unwrap();
+        let (_, fd) = c.apply(feed(9, "row1", true)).await;
+        assert_eq!(fd, vec![FeedDelta { feed_id: 9, pk: "row1".into(), delta: 1 }]);
+        let (_, fd) = c.apply(feed(9, "row1", false)).await;
+        assert_eq!(fd, vec![FeedDelta { feed_id: 9, pk: "row1".into(), delta: -1 }], "deletes still gate structurally");
+        let (_, fd) = c.apply(feed(9, "ghost", false)).await;
+        assert!(fd.is_empty(), "never-member gate intact without the trace");
+        c.apply(feed(9, "row2", true)).await;
+        assert_eq!(c.feed_pks(9), Vec::<String>::new(), "no enumeration copy");
+        assert_eq!(c.feed_len(9), 0);
         c.shutdown().await;
     }
 
