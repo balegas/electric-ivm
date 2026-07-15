@@ -295,6 +295,10 @@ no checkpoints.
   at construction (two generic inputs); registering templates/nodes/binds/shapes is pure
   runtime data — no rebuild, ever. State is O(contributing inner rows + feed rows),
   bind-gated: only subscribed binds hold state, each seeded from Postgres like any backfill.
+  The relations **spill to disk by default** (dbsp's storage backend: spine batches page to
+  layer files under a per-boot temp dir with a bounded buffer cache; without checkpointing
+  the files are a disposable cache, auto-removed at shutdown). `ELECTRIC_IVM_SUBQ_STORAGE=0`
+  keeps them fully in-memory; `ELECTRIC_IVM_SUBQ_STORAGE_DIR` pins an explicit location.
 
 - **Counts pipelines** — `ELECTRIC_IVM_DBSP_COUNTS=table:col+col,…` compiles, per table (at
   most one spec each), a `map_index(group) → weighted_count` pipeline: a live COUNT per
@@ -323,6 +327,11 @@ no checkpoints.
 | `ELECTRIC_IVM_DBSP_COUNTS` | none | counts pipelines: `table:col+col[,…]`; at most one per table. Empty = no circuit. |
 | `ELECTRIC_IVM_FLIP_WORKERS` | `8` | concurrent flip-propagation workers (Postgres query-backs). |
 | `ELECTRIC_IVM_EMIT_LANES` | `8` | ordered emission lanes for subquery-shape appends. |
+| `ELECTRIC_IVM_SUBQ_STORAGE` | `1` | `0` disables membership-circuit disk spilling (relations stay fully in-memory). |
+| `ELECTRIC_IVM_SUBQ_STORAGE_DIR` | per-boot temp dir | explicit spill location (kept on shutdown; the default temp dir is auto-removed). |
+| `ELECTRIC_IVM_SUBQ_STORAGE_CACHE_MIB` | dbsp default | storage buffer-cache budget. |
+| `ELECTRIC_IVM_SUBQ_MIN_STORAGE_KB` | `128` | spine batches above this size page to disk. |
+| `ELECTRIC_IVM_FEED_TRACE` | `1` | `0` drops the feed-relation enumeration copy (halves per-feed memory; dropped shapes leave unreachable entries until stream-fold enumeration lands). |
 
 (The former `ELECTRIC_IVM_DBSP_DIR`/`_CACHE_MIB`/`_MIN_STORAGE_KB`/`_MAX_RSS_MB`/
 `_CHECKPOINT_SECS`/`_INDEXES` storage knobs are deprecated no-ops: there is no on-disk circuit
