@@ -86,6 +86,31 @@ impl Assertions {
     }
 }
 
+/// Opt-in disk spilling for the membership circuit's relations.
+struct SpillConfig {
+    dir: String,
+    /// Spine batches above this size go to layer files (smaller ones stay in memory).
+    min_storage_bytes: usize,
+    /// Storage buffer-cache budget (MiB); `None` = dbsp's default.
+    cache_mib: Option<usize>,
+}
+
+/// `ELECTRIC_IVM_SUBQ_STORAGE_DIR` enables spilling; `ELECTRIC_IVM_SUBQ_MIN_STORAGE_KB`
+/// (default 128) and `ELECTRIC_IVM_SUBQ_STORAGE_CACHE_MIB` tune it.
+fn spill_config_from_env() -> Result<Option<SpillConfig>> {
+    let Ok(dir) = std::env::var("ELECTRIC_IVM_SUBQ_STORAGE_DIR") else { return Ok(None) };
+    if dir.is_empty() {
+        return Ok(None);
+    }
+    let min_kb: usize = std::env::var("ELECTRIC_IVM_SUBQ_MIN_STORAGE_KB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128);
+    let cache_mib: Option<usize> =
+        std::env::var("ELECTRIC_IVM_SUBQ_STORAGE_CACHE_MIB").ok().and_then(|v| v.parse().ok());
+    Ok(Some(SpillConfig { dir, min_storage_bytes: min_kb * 1024, cache_mib }))
+}
+
 enum Cmd {
     Batch { asserts: Assertions, resp: oneshot::Sender<(Vec<MemberDelta>, Vec<FeedDelta>)> },
     Shutdown { resp: oneshot::Sender<()> },
@@ -118,12 +143,41 @@ impl MembershipCircuit {
 
     /// [`start`], with the feed-trace choice explicit (tests).
     pub fn start_with(feed_trace: bool) -> Result<MembershipCircuit> {
+        Self::start_full(feed_trace, spill_config_from_env()?)
+    }
+
+    /// [`start`], with everything explicit.
+    fn start_full(feed_trace: bool, spill: Option<SpillConfig>) -> Result<MembershipCircuit> {
         let members: Slot<MemberSnapshot> = Slot::default();
         let contributors: Slot<MapSnapshot> = Slot::default();
         let feeds: Slot<MapSnapshot> = Slot::default();
         let (m_slot, c_slot, f_slot) = (members.clone(), contributors.clone(), feeds.clone());
+        // Spill: with a storage dir configured, the circuit's spines (the upsert maps'
+        // integrals, the membership trace) page batches above `min_storage_bytes` to layer
+        // files under `dir`, keeping a bounded in-memory cache — RAM becomes O(cache)
+        // instead of O(relation). In-memory (no dir) remains the default.
+        let mut config = CircuitConfig::with_workers(1);
+        if let Some(sp) = spill {
+            use dbsp::circuit::{CircuitStorageConfig, StorageCacheConfig, StorageConfig, StorageOptions};
+            std::fs::create_dir_all(&sp.dir)
+                .map_err(|e| anyhow::anyhow!("membership circuit storage dir {}: {e}", sp.dir))?;
+            let storage = CircuitStorageConfig::for_config(
+                StorageConfig { path: sp.dir.clone(), cache: StorageCacheConfig::default() },
+                StorageOptions {
+                    min_storage_bytes: Some(sp.min_storage_bytes),
+                    cache_mib: sp.cache_mib,
+                    ..StorageOptions::default()
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("membership circuit storage config: {e}"))?;
+            config = config.with_storage(Some(storage));
+            tracing::info!(
+                "membership circuit: spilling to {} (min_storage_bytes={}, cache_mib={:?})",
+                sp.dir, sp.min_storage_bytes, sp.cache_mib
+            );
+        }
         let (dbsp, (contrib_in, feed_in, flips_out, feeds_out)) =
-            Runtime::init_circuit(CircuitConfig::with_workers(1), move |circuit| {
+            Runtime::init_circuit(config, move |circuit| {
                 // The upsert patch function is unused (we only Insert/Delete, never Update),
                 // but the API requires one; assignment is the natural no-surprise choice.
                 let (contrib_stream, contrib_in) =
@@ -529,6 +583,35 @@ mod tests {
         assert_eq!(c.feed_pks(9), Vec::<String>::new(), "no enumeration copy");
         assert_eq!(c.feed_len(9), 0);
         c.shutdown().await;
+    }
+
+    /// Spill mode: same semantics, state pages to layer files under the storage dir.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spill_mode_preserves_semantics_and_writes_files() {
+        let dir = std::env::temp_dir().join(format!("subq-spill-test-{}", std::process::id()));
+        let c = MembershipCircuit::start_full(
+            true,
+            Some(SpillConfig {
+                dir: dir.to_string_lossy().into_owned(),
+                min_storage_bytes: 1, // spill aggressively so even tiny batches hit disk
+                cache_mib: Some(8),
+            }),
+        )
+        .unwrap();
+        // Enough contributor entries to force at least one on-disk batch.
+        let contributors = (0..2000)
+            .map(|i| Tup2(ckey(1, &format!("pk{i}")), Assert::Insert(Value::Int(i % 50))))
+            .collect();
+        let (flips, _) = c.apply(Assertions { contributors, feeds: Vec::new() }).await;
+        assert_eq!(flips.len(), 50, "50 distinct values entered");
+        assert!(c.contains(1, &Value::Int(7)));
+        let (distinct, _) = c.values_for_node(1, 5);
+        assert_eq!(distinct, 50);
+        // Storage dir gained content (layer files / runtime metadata).
+        let entries = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+        assert!(entries > 0, "storage dir must contain spilled state, found {entries} entries");
+        c.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Same value on two nodes stays isolated per node_id (unchanged from the zset design).
