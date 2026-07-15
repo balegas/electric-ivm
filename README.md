@@ -213,11 +213,17 @@ your shapes live in the other:
 | **Pipeline explorer** | https://localhost:5443 |
 
 The HTTPS/HTTP-2 fronts multiplex the shape streams over one connection (past the ~6-per-origin
-HTTP/1.1 cap); the certs come from Caddy's local CA, so run `caddy trust` once or click through the
-browser warning. Plain HTTP is also served on `:5174` (app) and `:5180` (explorer). `DEMO_VIZ=0`
-skips the explorer; `scripts/linearlite.sh start large` runs the same demo at a 100k-issue workload.
-Other entry points: `pnpm demo` (headless live-shape walkthrough), `pnpm demo:web` (minimal
-end-to-end app).
+HTTP/1.1 cap); the certs come from Caddy's local CA, so run `caddy trust` **before** starting the
+demo — once the demo is up, its own Caddy instance runs with the admin API disabled, so `caddy trust`
+will fail with `connection refused`. On most dev machines the CA is already trusted from a prior
+`caddy trust` run; if not, just click through the browser's certificate warning instead. Plain HTTP
+is also served on `:5174` (app) and `:5180` (explorer). `DEMO_VIZ=0` skips the explorer;
+`scripts/linearlite.sh start large` runs the same demo at a 100k-issue workload. Other entry points:
+`pnpm demo` (headless live-shape walkthrough), `pnpm demo:web` (minimal end-to-end app).
+
+Stop the demo with `scripts/linearlite.sh stop` (or `Ctrl+C` if you ran `pnpm demo:linearlite`
+directly in the foreground) — this tears down Postgres, durable-streams, the engine, and the
+visualizer, and is safe to run even if nothing is up.
 
 ### The apps in this repo
 

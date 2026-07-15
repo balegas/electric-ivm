@@ -117,6 +117,11 @@ export class DurableStreamTestServer {
     return this.url_
   }
 
+  /** PID of the spawned `durable-streams-server` process, once started. */
+  get pid(): number | undefined {
+    return this.proc?.pid
+  }
+
   /** Spawn the server and resolve with its base URL once it reports listening. */
   async start(): Promise<string> {
     if (this.proc) throw new Error('already started')
