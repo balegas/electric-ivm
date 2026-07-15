@@ -138,6 +138,21 @@ function procRssMib(pid: number | undefined): number {
   }
 }
 
+/// macOS "phys footprint" — includes compressed pages, which `ps rss` excludes (idle
+/// processes get compressed and their RSS collapses, understating real state).
+function footprintMib(pid: number | undefined): number {
+  if (!pid) return 0
+  try {
+    const out = execSync(`/usr/bin/footprint ${pid} 2>/dev/null | head -3`).toString()
+    const m = out.match(/Footprint:\s+([\d.]+)\s+(KB|MB|GB)/)
+    if (!m) return 0
+    const v = Number(m[1])
+    return m[2] === 'KB' ? v / 1024 : m[2] === 'GB' ? v * 1024 : v
+  } catch {
+    return 0
+  }
+}
+
 async function engineMemory(engineUrl: string): Promise<{ rss: number; card: Record<string, number> }> {
   const r = await fetch(`${engineUrl}/memory`)
   const j = (await r.json()) as { process: { rss_bytes: number }; cardinalities: Record<string, number> }
@@ -270,7 +285,7 @@ async function main() {
   const engine = await spawnEngine(dsUrl, pg.pgUrl)
   await sleep(1500)
 
-  type Row = { label: string; users: number; requested: number; engineShapes: number; engineRssMib: number; dsRssMib: number; card: Record<string, number> }
+  type Row = { label: string; users: number; requested: number; engineShapes: number; engineRssMib: number; engineFpMib: number; dsRssMib: number; card: Record<string, number> }
   const rows: Row[] = []
   const sample = async (label: string, users: number, requested: number) => {
     const m = await engineMemory(engine.url)
@@ -278,11 +293,12 @@ async function main() {
       label, users, requested,
       engineShapes: m.card.shapes ?? 0,
       engineRssMib: m.rss / MIB,
+      engineFpMib: footprintMib(engine.proc.pid ?? undefined),
       dsRssMib: procRssMib(dsPid),
       card: m.card,
     }
     rows.push(row)
-    console.log(`${label.padEnd(22)} users=${String(users).padStart(5)} requested=${String(requested).padStart(6)} liveShapes=${String(row.engineShapes).padStart(6)} engineRSS=${row.engineRssMib.toFixed(1)}MiB dsRSS=${row.dsRssMib.toFixed(1)}MiB sqNodes=${m.card.subquery_nodes} contributors=${m.card.subquery_contributors}`)
+    console.log(`${label.padEnd(22)} users=${String(users).padStart(5)} requested=${String(requested).padStart(6)} liveShapes=${String(row.engineShapes).padStart(6)} engineRSS=${row.engineRssMib.toFixed(1)}MiB engineFP=${row.engineFpMib.toFixed(1)}MiB dsRSS=${row.dsRssMib.toFixed(1)}MiB sqNodes=${m.card.subquery_nodes} contributors=${m.card.subquery_contributors}`)
   }
 
   await sample('baseline', 0, 0)
@@ -328,10 +344,11 @@ async function main() {
     console.log(`holding ${held} live long-polls…`)
     const psSample = (label: string) => {
       const engineRss = procRssMib(engine.proc.pid ?? undefined)
+      const engineFp = footprintMib(engine.proc.pid ?? undefined)
       const dsRss = procRssMib(dsPid)
       const last = rows[rows.length - 1]!
-      rows.push({ ...last, label, engineRssMib: engineRss, dsRssMib: dsRss })
-      console.log(`${label.padEnd(22)} engineRSS=${engineRss.toFixed(1)}MiB dsRSS=${dsRss.toFixed(1)}MiB (ps)`)
+      rows.push({ ...last, label, engineRssMib: engineRss, engineFpMib: engineFp, dsRssMib: dsRss })
+      console.log(`${label.padEnd(22)} engineRSS=${engineRss.toFixed(1)}MiB engineFP=${engineFp.toFixed(1)}MiB dsRSS=${dsRss.toFixed(1)}MiB (ps+footprint)`)
     }
     await sleep(15000)
     psSample(`live subs ${held}`)
@@ -349,10 +366,10 @@ async function main() {
     `materialized=${MATERIALIZED}, clientProcs=${CLIENT_PROCS}, liveSubs=${LIVE_SUBS}/${LIVE_PROCS} procs, ` +
     `ELECTRIC_IVM_FEED_TRACE=${process.env.ELECTRIC_IVM_FEED_TRACE ?? '1'}`)
   md.push('')
-  md.push('| phase | users | subscriptions | live shapes | engine RSS (MiB) | ds RSS (MiB) | sq nodes | contributors |')
-  md.push('|---|---:|---:|---:|---:|---:|---:|---:|')
+  md.push('| phase | users | subscriptions | live shapes | engine RSS (MiB) | engine footprint (MiB) | ds RSS (MiB) | sq nodes | contributors |')
+  md.push('|---|---:|---:|---:|---:|---:|---:|---:|---:|')
   for (const r of rows) {
-    md.push(`| ${r.label} | ${r.users} | ${r.requested} | ${r.engineShapes} | ${r.engineRssMib.toFixed(1)} | ${r.dsRssMib.toFixed(1)} | ${r.card.subquery_nodes ?? 0} | ${r.card.subquery_contributors ?? 0} |`)
+    md.push(`| ${r.label} | ${r.users} | ${r.requested} | ${r.engineShapes} | ${r.engineRssMib.toFixed(1)} | ${r.engineFpMib.toFixed(1)} | ${r.dsRssMib.toFixed(1)} | ${r.card.subquery_nodes ?? 0} | ${r.card.subquery_contributors ?? 0} |`)
   }
   writeFileSync(OUT, md.join('\n') + '\n')
   console.log(`wrote ${OUT}`)
