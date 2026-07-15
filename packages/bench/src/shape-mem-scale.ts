@@ -309,28 +309,37 @@ async function main() {
     await sample('created', createdUsers, requested)
   }
 
-  // Hold live subscriptions.
+  // Hold live subscriptions — either one step (SCALE_LIVE_SUBS) or a ramp
+  // (SCALE_LIVE_RAMP=5000,10000,20000: sample at each level to isolate the cost of LISTENERS
+  // from the cost of shapes; unset = single-step behavior).
+  const LIVE_RAMP = process.env.SCALE_LIVE_RAMP
+    ? process.env.SCALE_LIVE_RAMP.split(',').map(Number)
+    : LIVE_SUBS > 0 ? [LIVE_SUBS] : []
   let liveProcs: ChildProcess[] = []
-  if (LIVE_SUBS > 0 && streamUrls.length) {
+  let held = 0
+  for (const level of LIVE_RAMP) {
+    if (!streamUrls.length) break
     const targets: string[] = []
-    for (let i = 0; i < LIVE_SUBS; i++) targets.push(streamUrls[i % streamUrls.length]!)
-    liveProcs = (await runWorkers(LIVE_WORKER_JS, {}, chunks(targets, LIVE_PROCS), false)).procs
-    console.log(`holding ${targets.length} live long-polls across ${LIVE_PROCS} client procs…`)
-    // With 20k sockets pinned, macOS runs out of kernel network buffers for NEW connections
-    // (ENOBUFS) — sample via ps (no sockets) instead of GET /memory.
+    for (let i = held; i < level; i++) targets.push(streamUrls[i % streamUrls.length]!)
+    if (targets.length) {
+      liveProcs.push(...(await runWorkers(LIVE_WORKER_JS, {}, chunks(targets, LIVE_PROCS), false)).procs)
+    }
+    held = level
+    console.log(`holding ${held} live long-polls…`)
     const psSample = (label: string) => {
       const engineRss = procRssMib(engine.proc.pid ?? undefined)
       const dsRss = procRssMib(dsPid)
       const last = rows[rows.length - 1]!
       rows.push({ ...last, label, engineRssMib: engineRss, dsRssMib: dsRss })
-      console.log(`${label.padEnd(22)} engineRSS=${engineRss.toFixed(1)}MiB dsRSS=${dsRss.toFixed(1)}MiB (ps; cardinalities carried from last HTTP sample)`)
+      console.log(`${label.padEnd(22)} engineRSS=${engineRss.toFixed(1)}MiB dsRSS=${dsRss.toFixed(1)}MiB (ps)`)
     }
     await sleep(15000)
-    psSample('live subs held')
-    await sleep(15000)
-    psSample('live subs held +15s')
+    psSample(`live subs ${held}`)
+    if (held === LIVE_RAMP[LIVE_RAMP.length - 1]) {
+      await sleep(15000)
+      psSample(`live subs ${held} +15s`)
+    }
   }
-
   // Report.
   mkdirSync(dirname(OUT), { recursive: true })
   const md: string[] = []
