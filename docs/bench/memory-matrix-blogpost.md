@@ -33,9 +33,12 @@ change log drains.
 | 500 (5,000) | 19.0 MiB | 20.8 MiB | 21.2 MiB |
 | 1,000 (10,000) | 26.5 MiB | 34.3 MiB | 36.2 MiB |
 
-**100× the data ⇒ 1.0–1.4× the engine state.** At 10,000 live shapes the engine's routing,
-templates, membership sets and edges fit in ~36 MiB — ~3 KiB/shape, regardless of how big the
-tables are.
+**100× the data ⇒ 1.0–1.4× the engine state.** At the top milestone there are **10,000 shape
+registrations** but only **5,005 distinct live shapes** — signature sharing collapses all
+1,000 users' five `status` boards onto the same 5 streams, so half the registrations are free
+joins. The engine's routing, templates, membership sets and edges fit in ~36 MiB: **~3 KiB per
+registration** (what a connecting user session costs) or **~7 KiB per distinct live shape**
+(what a live pipeline costs) — regardless of how big the tables are.
 
 **Feed key sets** (materialized − registration) — follow synced rows, not database size:
 
@@ -77,8 +80,9 @@ RSS ≈ 24 MiB (engine)  +  ~3 KiB × live shapes  +  ~85 B × currently-synced 
 
 1. "Engine memory is independent of database size: 100× the rows moved total RSS by ~1%
    (302→299 MiB) when users synced the same data."
-2. "10,000 live shapes across 1,000 users cost ~36 MiB of engine state — about 3 KiB per
-   shape — because identical queries share one pipeline."
+2. "10,000 shape subscriptions across 1,000 users cost ~36 MiB of engine state — about 3 KiB
+   per subscription — because identical queries share one pipeline: they resolve to just
+   5,005 distinct live shapes, and every duplicate is a free join."
 3. "The rest is ~85 bytes per row your clients currently sync — a quantity you control with
    shape predicates, with disk-spill on the roadmap." 
 
