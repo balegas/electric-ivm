@@ -69,13 +69,14 @@ milestone) — this is **creation-peak state, not steady state** (see caveats).
 **(c) dbsp circuit bytes, measured by difference.** The two runs have byte-identical
 owned-heap sums and the same live-shape/contributor counts; the only change is routing
 the membership circuit through dbsp's storage backend. Live-allocated bytes drop
-**997.9 → 543.7 MB (−454 MB)** while only 59 MB lands on disk — so at least **~454 MB
-(40% of the in-memory footprint) is membership-circuit-resident state** (spines, traces,
-per-batch structures; the 8× blow-up vs. the on-disk serialized form is dbsp in-memory
-representation overhead, consistent with §4 of `shape-memory-scale.md`). The ~443 MB
-still unattributed under spill is the remaining circuit machinery that does not spill:
-the family circuits (3 shared equality circuits each holding its base table), the
-storage cache (64 MiB), dbsp step buffers, and tokio/runtime state.
+**997.9 → 543.7 MB (−454 MB)** while only 59 MB lands on disk (read manually off the
+storage directory during the run; the directory was not captured for artifact archiving)
+— so at least **~454 MB (40% of the in-memory footprint) is membership-circuit-resident
+state** (spines, traces, per-batch structures; the 8× blow-up vs. the on-disk serialized
+form is dbsp in-memory representation overhead, consistent with §4 of `shape-memory-scale.md`).
+The ~443 MB still unattributed under spill is the remaining circuit machinery that does
+not spill: the family circuits (3 shared equality circuits each holding its base table),
+the storage cache (64 MiB), dbsp step buffers, and tokio/runtime state.
 
 ## 3. Verdict on the three Phase-1 hypotheses
 
@@ -101,10 +102,13 @@ plan** (not just the cheap fingerprint variant).
 ## Caveats, honestly
 
 - **Creation-peak, not steady state.** One 100k-subscription milestone with a snapshot
-  ~3.5 s after drain. The prior report's ramped run settled to 698 MiB steady (in-memory);
-  our in-memory 1147 MB is the storm peak (548 MB of it swapped/compressed at sample
-  time — the machine was under memory pressure). The *ratios* are the deliverable here;
-  the headline footprint of this run shape is not comparable 1:1 with the ramped runs.
+  ~3.5 s after drain. The prior report's ramped run (users added in stages with drains
+  between milestones) peaked at 789 MiB and settled to 698 MiB steady (in-memory); our
+  in-memory 1147 MB is the storm peak from creating all 100k subscriptions in a single
+  burst, which explains the ~45% higher peak (1147 vs 789 MB) on top of the peak-vs-steady
+  distinction (548 MB of the 1147 was swapped/compressed at sample time — the machine was
+  under memory pressure). The *ratios* are the deliverable here; the headline footprint of
+  this run shape is not comparable 1:1 with the ramped runs.
 - **Spill run peak (715 MB) ≈ prior spill peak (699 MB)** — the spill numbers line up
   with the ramped baseline; the in-memory storm peak is the outlier, consistent with
   allocator retention after a single giant burst.
