@@ -172,6 +172,11 @@ dbsp's 512 MiB — the measured 64 MiB-cache configuration held the same workloa
 **645 peak / 613 steady** with 27 MB on disk. The remaining ~395 MB of runtime/buffer
 churn (merger/FBuf slabs, step buffers) is the term after that.
 
+**Done:** `apps/engine/src/subq_circuit.rs` now defaults `cache_mib` to 64 MiB (TOTAL — dbsp
+uses the value verbatim, unmultiplied) when the env var is unset, instead of leaving it `None`
+and inheriting dbsp's 256 MiB × 1 worker × 2 thread-types = 512 MiB unset-default; the env var
+override still works exactly as before.
+
 ## 3. Verdict on the three Phase-1 hypotheses
 
 | hypothesis | magnitude at 100k subs | verdict |

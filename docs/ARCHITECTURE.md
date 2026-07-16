@@ -329,7 +329,7 @@ no checkpoints.
 | `ELECTRIC_IVM_EMIT_LANES` | `8` | ordered emission lanes for subquery-shape appends. |
 | `ELECTRIC_IVM_SUBQ_STORAGE` | `1` | `0` disables membership-circuit disk spilling (relations stay fully in-memory). |
 | `ELECTRIC_IVM_SUBQ_STORAGE_DIR` | per-boot temp dir | explicit spill location (kept on shutdown; the default temp dir is auto-removed). |
-| `ELECTRIC_IVM_SUBQ_STORAGE_CACHE_MIB` | dbsp default | storage buffer-cache budget. |
+| `ELECTRIC_IVM_SUBQ_STORAGE_CACHE_MIB` | `64` | storage buffer-cache budget, in MiB, TOTAL (dbsp uses the value verbatim, not multiplied by workers/thread-types). Bounds dbsp's own unset-default, which for this circuit's 1-worker layout would be 512 MiB (256 MiB × 1 worker × 2 thread-types) — see docs/bench/mem-attribution-100k.md §2c. |
 | `ELECTRIC_IVM_SUBQ_MIN_STORAGE_KB` | `128` | spine batches above this size page to disk. |
 | `ELECTRIC_IVM_FEED_TRACE` | `1` | `0` drops the feed-relation enumeration copy (halves per-feed memory; dropped shapes leave unreachable entries until stream-fold enumeration lands). |
 

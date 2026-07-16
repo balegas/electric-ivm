@@ -101,12 +101,38 @@ struct SpillConfig {
     dir: String,
     /// Spine batches above this size go to layer files (smaller ones stay in memory).
     min_storage_bytes: usize,
-    /// Storage buffer-cache budget (MiB); `None` = dbsp's default.
-    cache_mib: Option<usize>,
+    /// Storage buffer-cache budget, in MiB, passed to dbsp as `StorageOptions::cache_mib`.
+    ///
+    /// dbsp treats a `Some` value as the **grand TOTAL** cache size and uses it verbatim — no
+    /// further multiplication by worker count or thread-type (see `RuntimeInner::new` in
+    /// dbsp 0.318: `Some(cache_mib) => cache_mib * 1 MiB`, full stop). The ×nworkers×thread-types
+    /// scaling dbsp describes in its own docs only fires on ITS unset-default (`None` ⇒
+    /// `256 MiB × nworkers × ThreadType::LENGTH(=2)`); for our 1-worker circuit that default is
+    /// 512 MiB, which is why we always pass an explicit value here (see
+    /// [`spill_config_from_env`]/[`storage_cache_mib`]) instead of ever leaving this `None`.
+    cache_mib: usize,
     /// Engine-owned temp dir (removed at circuit shutdown — without checkpointing the
     /// on-disk state is a cache, worthless across boots). `false` = user-specified dir,
     /// never deleted.
     auto: bool,
+}
+
+/// The engine's own default for [`SpillConfig::cache_mib`] when
+/// `ELECTRIC_IVM_SUBQ_STORAGE_CACHE_MIB` is unset — a hard bound on dbsp's unset-default, which
+/// for this circuit's 1-worker layout resolves to 256 MiB × 1 worker × 2 thread-types = 512 MiB
+/// (see docs/bench/mem-attribution-100k.md §2c). Measured operator state across all circuits on
+/// the 100k-subscription benchmark is well under 1 MiB, so the LRU was filling toward an
+/// oversized ceiling regardless of working set; 64 MiB cut ~40% off process RSS with identical
+/// semantics on that workload.
+const DEFAULT_STORAGE_CACHE_MIB: usize = 64;
+
+/// Parses `ELECTRIC_IVM_SUBQ_STORAGE_CACHE_MIB`'s raw value (`None` if the var is unset), giving
+/// the storage buffer-cache budget in MiB — TOTAL across every worker and thread-type (see
+/// [`SpillConfig::cache_mib`]). Unset or unparseable ⇒ [`DEFAULT_STORAGE_CACHE_MIB`]; a valid
+/// value overrides it exactly (dbsp uses it verbatim as the total, so `=64` here means the same
+/// 64 MiB TOTAL as the default, not per-thread-type).
+fn storage_cache_mib(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_STORAGE_CACHE_MIB)
 }
 
 /// Spilling is ON by default: without checkpointing the layer files are a disposable cache,
@@ -115,7 +141,9 @@ struct SpillConfig {
 ///
 /// - `ELECTRIC_IVM_SUBQ_STORAGE=0` — disable (fully in-memory relations).
 /// - `ELECTRIC_IVM_SUBQ_STORAGE_DIR=<path>` — explicit location (kept on shutdown).
-/// - `ELECTRIC_IVM_SUBQ_MIN_STORAGE_KB` (default 128), `ELECTRIC_IVM_SUBQ_STORAGE_CACHE_MIB`.
+/// - `ELECTRIC_IVM_SUBQ_MIN_STORAGE_KB` (default 128).
+/// - `ELECTRIC_IVM_SUBQ_STORAGE_CACHE_MIB` (default 64, TOTAL across all workers/thread-types —
+///   see [`storage_cache_mib`]; dbsp's own unset-default would be 512 MiB for this circuit).
 fn spill_config_from_env() -> Result<Option<SpillConfig>> {
     if std::env::var("ELECTRIC_IVM_SUBQ_STORAGE").is_ok_and(|v| v == "0") {
         return Ok(None);
@@ -124,8 +152,8 @@ fn spill_config_from_env() -> Result<Option<SpillConfig>> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(128);
-    let cache_mib: Option<usize> =
-        std::env::var("ELECTRIC_IVM_SUBQ_STORAGE_CACHE_MIB").ok().and_then(|v| v.parse().ok());
+    let cache_mib =
+        storage_cache_mib(std::env::var("ELECTRIC_IVM_SUBQ_STORAGE_CACHE_MIB").ok().as_deref());
     let (dir, auto) = match std::env::var("ELECTRIC_IVM_SUBQ_STORAGE_DIR") {
         Ok(d) if !d.is_empty() => (d, false),
         _ => (default_spill_dir(), true),
@@ -246,14 +274,14 @@ impl MembershipCircuit {
                 StorageConfig { path: sp.dir.clone(), cache: StorageCacheConfig::default() },
                 StorageOptions {
                     min_storage_bytes: Some(sp.min_storage_bytes),
-                    cache_mib: sp.cache_mib,
+                    cache_mib: Some(sp.cache_mib),
                     ..StorageOptions::default()
                 },
             )
             .map_err(|e| anyhow::anyhow!("membership circuit storage config: {e}"))?;
             config = config.with_storage(Some(storage));
             tracing::info!(
-                "membership circuit: spilling to {} (min_storage_bytes={}, cache_mib={:?})",
+                "membership circuit: spilling to {} (min_storage_bytes={}, cache_mib={})",
                 sp.dir, sp.min_storage_bytes, sp.cache_mib
             );
         }
@@ -553,6 +581,28 @@ fn circuit_thread(
 mod tests {
     use super::*;
 
+    /// Pins the default: `ELECTRIC_IVM_SUBQ_STORAGE_CACHE_MIB` unset (or unparseable) bounds the
+    /// cache at [`DEFAULT_STORAGE_CACHE_MIB`] (64 MiB TOTAL) rather than falling through to
+    /// dbsp's own unset-default (512 MiB for this circuit's 1-worker layout — see
+    /// docs/bench/mem-attribution-100k.md §2c). A pure function (not `spill_config_from_env`
+    /// itself) so the test doesn't mutate process-global env vars across parallel test threads.
+    #[test]
+    fn storage_cache_mib_defaults_to_64_when_unset() {
+        assert_eq!(storage_cache_mib(None), 64);
+        assert_eq!(storage_cache_mib(Some("")), 64);
+        assert_eq!(storage_cache_mib(Some("not-a-number")), 64);
+    }
+
+    /// An explicit `ELECTRIC_IVM_SUBQ_STORAGE_CACHE_MIB` value overrides the default exactly —
+    /// dbsp uses it verbatim as the TOTAL cache size, so `"64"` here means the same 64 MiB total
+    /// as the default (not per-thread-type), and other values scale linearly from there.
+    #[test]
+    fn storage_cache_mib_respects_explicit_override() {
+        assert_eq!(storage_cache_mib(Some("64")), 64);
+        assert_eq!(storage_cache_mib(Some("256")), 256);
+        assert_eq!(storage_cache_mib(Some("8")), 8);
+    }
+
     fn ckey(id: i64, pk: u32) -> PkKey {
         PkKey { id, pk }
     }
@@ -658,7 +708,7 @@ mod tests {
         let c = MembershipCircuit::start_full(Some(SpillConfig {
             dir: dir.to_string_lossy().into_owned(),
             min_storage_bytes: 1, // spill aggressively so even tiny batches hit disk
-            cache_mib: Some(8),
+            cache_mib: 8,
             auto: false, // the test owns and removes this dir itself
         }))
         .unwrap();
