@@ -217,16 +217,14 @@ impl MembershipCircuit {
     /// `ELECTRIC_IVM_FEED_TRACE=0` disables the published feed-relation trace — the host-side
     /// `ro_snapshot` view used only for drop-time retraction and introspection.
     ///
-    /// NOTE (measured, Task 1.3): this is **not** a memory-halving knob. `feed_stream.
-    /// integrate_trace()` does not build a second copy of the feed key set — dbsp registers the
-    /// feed upsert operator's own integral under `TraceId(stream)` in the circuit cache, and
-    /// `integrate_trace` reuses it, so the published snapshot shares the operator's batches
-    /// (`Arc`-cloned). The profiler's `total_used_bytes` is within ~0.03% with the trace on vs
-    /// off (see `feed_trace_snapshot_shares_operator_integral`); disabling only drops a cheap
-    /// host-side view, saving negligible RAM. The knob's real effect is behavioral: dropped
-    /// shapes then leave their (unreachable — feed ids are never reused) entries in the operator
-    /// integral instead of retracting them, a documented trade until stream-fold drop
-    /// enumeration lands (bead dbsp-ds-4d8).
+    /// NOTE (measured, Task 1.3): `feed_stream.integrate_trace()` shares the feed upsert
+    /// operator's own integral via dbsp's per-stream `TraceId(stream)` cache, so the published
+    /// snapshot is NOT a second logical copy. However, a ~320 MiB RSS delta was measured at
+    /// 100k subscriptions with the knob off (docs/bench/shape-memory-scale.md §3) and remains
+    /// unexplained — the knob's real-world effect is unresolved, tracked in bead dbsp-ds-2hu.
+    /// Behavioral effect: dropped shapes leave their (unreachable — feed ids are never reused)
+    /// entries in the operator integral instead of retracting them, a documented trade until
+    /// stream-fold drop enumeration lands (bead dbsp-ds-4d8).
     pub fn start() -> Result<MembershipCircuit> {
         let feed_trace = std::env::var("ELECTRIC_IVM_FEED_TRACE").map(|v| v != "0").unwrap_or(true);
         Self::start_with(feed_trace)
@@ -875,8 +873,8 @@ mod tests {
         assert_eq!(c.values_for_node(7, 0).0, 1, "one live value across all {LIVE} keys");
         // Compaction bound: the spine never holds more than a small multiple of the live-key
         // count. A pin/leak would make this ~STEPS × 2 × LIVE (≈320,000). Observed peak ≈ 15×
-        // LIVE; the ×50 threshold is generous headroom for merge-cadence timing variance while
-        // still an order of magnitude below the linear-pin failure mode.
+        // LIVE; the ×50 threshold is a deliberate flakiness/power tradeoff (generous headroom
+        // for merge-cadence timing variance while still an order of magnitude below linear pin).
         let bound = (LIVE as usize) * 50;
         assert!(
             max_contrib_len <= bound,

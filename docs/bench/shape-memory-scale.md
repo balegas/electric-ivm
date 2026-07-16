@@ -44,12 +44,14 @@ listeners attached and no writes, the engine's hot working set is **~35 MiB** �
 
 ## 3. The feed-trace knob (`ELECTRIC_IVM_FEED_TRACE=0`)
 
-The published feed-relation trace is a second full copy of every feed's key set (used only
-for drop-time enumeration + introspection). At 100k subscriptions, creation-peak RSS:
-**731.8 MiB (trace on) vs 408.1 MiB (off)** — roughly the predicted duplication. Off is the
-recommended setting for feed-heavy deployments until stream-fold drop enumeration lands
-(dbsp-ds-4d8); the cost is that dropped shapes leave unreachable entries in the operator
-integral (feed ids are never reused, so correctness is unaffected).
+The measured RSS delta at 100k subscriptions, creation peak: **731.8 MiB (trace on) vs
+408.1 MiB (off)** — stands as observed. However, the "second full copy" explanation was
+disproven by the Task 1.3 audit: the trace shares the feed upsert operator's own integral
+via dbsp's TraceId cache, not a logical duplicate. The mechanism behind the measured
+~323 MiB delta is unresolved (candidates: allocator/spine-churn/OS-page effects), tracked in
+bead dbsp-ds-2hu. Off is the recommended setting for feed-heavy deployments until stream-fold
+drop enumeration lands (dbsp-ds-4d8); the cost is that dropped shapes leave unreachable
+entries in the operator integral (feed ids are never reused, so correctness is unaffected).
 
 ## 4. Disk spilling (worktree `feat/subq-circuit-spill`, bead dbsp-ds-4gc)
 
