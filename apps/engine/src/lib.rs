@@ -28,6 +28,7 @@ pub mod mem;
 pub mod metrics;
 pub mod params;
 pub mod pg;
+pub mod pk_dict;
 pub mod pgoutput;
 pub mod statsd;
 pub mod predicate;
