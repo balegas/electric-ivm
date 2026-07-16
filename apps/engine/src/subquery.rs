@@ -581,6 +581,14 @@ impl SubqueryRegistry {
         self.circuit.snapshot_bytes()
     }
 
+    /// Diagnostic only: the membership circuit's full dbsp profiler dump —
+    /// `(total_used_bytes, total_storage_size, per-operator profile JSON)`. Heavy (profiler
+    /// round-trip through the circuit thread); on-demand only (`GET /debug/dbsp-profile`),
+    /// never from the 500 ms sampler.
+    pub async fn circuit_profile_dump(&self) -> (usize, usize, String) {
+        self.circuit.profile_dump().await
+    }
+
     /// Estimated owned heap of the host-side per-feed key sets (`bytes_feed_sets` in `GET /memory`)
     /// — the delete gate's Roaring bitmaps, moved out of the membership circuit in Task 2.2
     /// (dbsp-ds-dh6). A lower-bound owned floor (serialized bitmap payloads + the outer HashMap

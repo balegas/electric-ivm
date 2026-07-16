@@ -203,7 +203,18 @@ async function writeAttributionSnapshot(engineUrl: string, pid: number | undefin
   writeFileSync(`${prefix}-vmmap-summary.txt`, await runTool('/usr/bin/vmmap', ['--summary', String(pid)]))
   writeFileSync(`${prefix}-footprint.txt`, await runTool('/usr/bin/footprint', [String(pid)]))
 
-  console.log(`  attribution snapshot (${label}) -> ${prefix}-{memory.json,vmmap-summary.txt,footprint.txt}`)
+  // Per-circuit dbsp profiler dump (membership + counts circuits, per-operator used bytes) —
+  // on-demand debug endpoint, introspection-gated; tolerate absence on older engines.
+  let profileJson = '{}'
+  try {
+    const r = await fetch(`${engineUrl}/debug/dbsp-profile`)
+    profileJson = r.ok ? JSON.stringify(await r.json(), null, 2) : JSON.stringify({ error: `HTTP ${r.status}` })
+  } catch (e) {
+    profileJson = JSON.stringify({ error: String(e) })
+  }
+  writeFileSync(`${prefix}-dbsp-profile.json`, profileJson + '\n')
+
+  console.log(`  attribution snapshot (${label}) -> ${prefix}-{memory.json,vmmap-summary.txt,footprint.txt,dbsp-profile.json}`)
 }
 
 // --- workload -----------------------------------------------------------------------------------

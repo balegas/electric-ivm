@@ -56,7 +56,10 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
             .route("/state", get(get_state))
             .route("/state/node", get(get_state_node))
             // Per-envelope pipeline trace (SSE) — best-effort, for visualization/debugging.
-            .route("/trace", get(get_trace));
+            .route("/trace", get(get_trace))
+            // On-demand dbsp profiler dump for every dbsp circuit (membership + counts).
+            // Heavy — diagnostic/attribution use only; never sampled in the background.
+            .route("/debug/dbsp-profile", get(get_dbsp_profile));
     }
     r.with_state(engine)
 }
@@ -575,6 +578,12 @@ async fn get_memory(State(engine): State<Engine>) -> Json<serde_json::Value> {
     let card = engine.mem_cardinalities().await.with_bytes(engine.mem_bytes().await);
     crate::mem::publish(&card);
     Json(crate::mem::snapshot_json(&card))
+}
+
+/// Diagnostic: dbsp profiler dump for every dbsp circuit the engine runs (see
+/// `Engine::dbsp_profile_dump`). Heavy — on-demand only, introspection-gated.
+async fn get_dbsp_profile(State(engine): State<Engine>) -> Json<serde_json::Value> {
+    Json(engine.dbsp_profile_dump().await)
 }
 
 /// OpenTelemetry metrics in Prometheus exposition format (what an OTel collector's prometheus receiver

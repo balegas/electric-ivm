@@ -883,6 +883,38 @@ impl Engine {
     /// is not cheap enough to piggyback on every batch (see `sequencer::publish_all`/`stats_of`),
     /// so instead this method round-trips the one-off `SequencerCmd::MemBytes` so the byte-walk
     /// itself only ever runs on this on-demand path, never per batch.
+    /// Diagnostic only: full dbsp profiler dumps for EVERY dbsp circuit the engine runs — the
+    /// (single, engine-wide) subquery membership circuit plus the counts/arrangements circuit
+    /// when configured. The engine's "family" and "standalone" circuits are host-side executor
+    /// structures (no dbsp runtime; sized by `bytes_executors`), so they have no profile here.
+    /// Heavy (profiler round-trip through each circuit thread, holds the subquery-registry lock
+    /// for the membership dump); serves `GET /debug/dbsp-profile` on demand ONLY — never call
+    /// this from the 500 ms sampler (see `mem::spawn_sampler`).
+    pub async fn dbsp_profile_dump(&self) -> serde_json::Value {
+        fn entry(used: usize, stored: usize, json: String) -> serde_json::Value {
+            serde_json::json!({
+                "total_used_bytes": used,
+                "total_storage_bytes": stored,
+                "profile": serde_json::from_str::<serde_json::Value>(&json)
+                    .unwrap_or(serde_json::Value::String(json)),
+            })
+        }
+        let membership = {
+            let reg = self.subqueries.lock().await;
+            let (used, stored, json) = reg.circuit_profile_dump().await;
+            entry(used, stored, json)
+        };
+        let arr = self.arrangements.lock().unwrap().clone();
+        let counts = match arr {
+            Some(a) => {
+                let (used, stored, json) = a.profile_dump().await;
+                entry(used, stored, json)
+            }
+            None => serde_json::Value::Null,
+        };
+        serde_json::json!({ "membership_circuit": membership, "counts_circuit": counts })
+    }
+
     pub async fn mem_bytes(&self) -> crate::mem::HeapBytes {
         let (bytes_shape_records, cmd_tx) = {
             let st = self.state.lock().await;

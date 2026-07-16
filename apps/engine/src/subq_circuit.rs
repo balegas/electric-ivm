@@ -166,6 +166,10 @@ enum Cmd {
     /// Diagnostic: the whole circuit's operator memory via dbsp's profiler
     /// (`(total_used_bytes, total_storage_size)`). Heavy (round-trips every worker); test-only.
     Profile { resp: oneshot::Sender<(usize, usize)> },
+    /// Diagnostic: totals plus the full per-operator profile as dbsp's own JSON
+    /// (`DbspProfile::as_json` — worker profiles with per-node `used_memory_bytes` etc., plus
+    /// the named operator graph). Heavy; on-demand only (`GET /debug/dbsp-profile`).
+    ProfileDump { resp: oneshot::Sender<(usize, usize, String)> },
     Shutdown { resp: oneshot::Sender<()> },
 }
 
@@ -376,6 +380,18 @@ impl MembershipCircuit {
         rx.await.unwrap_or((0, 0))
     }
 
+    /// Diagnostic only: `(total_used_bytes, total_storage_size, per-operator profile JSON)` —
+    /// the JSON is dbsp's own `DbspProfile::as_json` (per-node `used_memory_bytes` + the named
+    /// operator graph). Same cost caveat as [`Self::profile_bytes`]: on-demand only, never from
+    /// the 500 ms sampler.
+    pub async fn profile_dump(&self) -> (usize, usize, String) {
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(Cmd::ProfileDump { resp: tx }).await.is_err() {
+            return (0, 0, String::new());
+        }
+        rx.await.unwrap_or((0, 0, String::new()))
+    }
+
     /// Stop the circuit thread. State is in-memory only; nothing to persist.
     pub async fn shutdown(&self) {
         let (tx, rx) = oneshot::channel();
@@ -507,6 +523,21 @@ fn circuit_thread(
                 };
                 let _ = resp.send(bytes);
             }
+            Cmd::ProfileDump { resp } => {
+                let dump = match dbsp.retrieve_profile() {
+                    Ok(p) => {
+                        let used = p.total_used_bytes().map(|b| b.into_inner() as usize).unwrap_or(0);
+                        let stored =
+                            p.total_storage_size().map(|b| b.into_inner() as usize).unwrap_or(0);
+                        (used, stored, p.as_json())
+                    }
+                    Err(e) => {
+                        tracing::error!("membership circuit: retrieve_profile failed: {e}");
+                        (0, 0, format!("{{\"error\":\"retrieve_profile: {e}\"}}"))
+                    }
+                };
+                let _ = resp.send(dump);
+            }
             Cmd::Shutdown { resp } => {
                 let _ = dbsp.kill();
                 let _ = resp.send(());
@@ -598,6 +629,25 @@ mod tests {
         entries.sort();
         assert_eq!(entries, vec![(1, Value::Int(5)), (2, Value::Int(6))]);
         assert_eq!(c.contributor_entries(3), vec![]);
+        c.shutdown().await;
+    }
+
+    /// The on-demand profiler dump returns parseable dbsp JSON with per-operator metadata and
+    /// totals consistent with `profile_bytes` (non-zero once the circuit holds state).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn profile_dump_returns_parseable_per_operator_json() {
+        let c = MembershipCircuit::start().unwrap();
+        c.apply(Assertions {
+            contributors: vec![
+                Tup2(ckey(1, 1), Assert::Insert(Value::Int(5))),
+                Tup2(ckey(1, 2), Assert::Insert(Value::Int(6))),
+            ],
+        })
+        .await;
+        let (used, _stored, json) = c.profile_dump().await;
+        assert!(used > 0, "circuit with state must report used bytes");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("profiler JSON parses");
+        assert!(v.get("worker_profiles").is_some(), "dump carries per-worker/per-node metadata");
         c.shutdown().await;
     }
 
