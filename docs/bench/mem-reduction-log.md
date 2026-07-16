@@ -24,6 +24,7 @@ too — rejected iterations steer the combination decisions at phase gates.
 | 0 — instrumented baseline (Phase 0) | `mem/phase-0-attribution` @ dd7a259 | **1116 / 1059 MiB** (run 1: 1130 / 1130; reproduced) | ~11.4 KiB | ~269 B | ~9.7 KiB | PASS (engine:test green 172 tests; vitest green 27 files / 162 tests; electric-conformance `oracle` 1/1 green — no new failures; note: the "13/15" figure describes oracle+subqueries combined, not this suite alone) | PASS (`never_member_delete_is_dropped`, `genuine_member_delete_is_never_dropped` — both green in engine:test) | **REJECT** — headline B2 peak +41% / steady +52% vs baseline; B1 terms ~3× baseline; far beyond the ≤2% rule |
 | 0b — instrumented baseline, sampler fixed (66117f2) | `mem/phase-0-attribution` @ 66117f2 | **1091 / 1107 MiB** | ~11.2 KiB | ~185 B | ~9.5 KiB | PASS (engine:test 173 green incl. new `sampler_cardinalities_never_populates_bytes_fields`; vitest 27 files / 162 tests green; conformance `oracle` 1/1 green) | PASS (both delete-gate tests green, verified at 66117f2) | **ACCEPT vs same-day control** (baseline commit 3213e41, same command: 1111 / 1053 → peak −1.8%, steady +5.1%, within the observed run-to-run spread of the steady cell); the frozen 789/698 row is NOT reproducible under the Gate-G config on today's machine — see the control note |
 | 1 — circuit observability split, Task 1.3 (380a0f9) | `mem/phase-1-host-slimming` @ 380a0f9 | **1125 / 1062 MiB** | ~11.5 KiB | ~204 B | ~9.5 KiB | PASS (engine:test 157 lib + integration green incl. new `snapshots_do_not_pin_precompaction_batches` + `snapshot_bytes_measures_and_splits_relations`; vitest 27 files / 162 tests green; conformance `oracle` 1/1 green) | PASS (both delete-gate tests green at 380a0f9) | **ACCEPT vs 0b** (peak +3.1%, steady −4.1%, B1 reg unchanged — all inside the ~5–7% observed run spread; observability-only diff). FEED_TRACE A/B piggyback: on-vs-off delta ~1% → dbsp-ds-2hu resolved, see notes |
+| 2 — pk dictionary, Task 2.1 (2e94ddc) | `mem/phase-2-feed-keys` @ 2e94ddc | **1102 / 1046 MiB** | ~11.3 KiB | ~86 B (legacy ΔRSS) / **~9 B owned** (circuit+dict, primary) | ~8.5 KiB | PASS (engine:test 164 green incl. PkDict suite + `never_member_candidate_does_not_mint_pk_dict_id`; vitest 162 green; conformance `oracle` 1/1 green) | PASS (both delete-gate tests green at 2e94ddc) | **ACCEPT vs it1** — target term (owned feed/circuit bytes) collapsed (B1 materialized ΔRSS halved 675.8→329.2 MiB; synced-row 204→86 B legacy; owned ~9 B/row); B2 footprint unchanged (−2.0% / −1.5%, noise) → the 100k footprint is dbsp residency overhead, not key payload — see notes + Phase 2 gate data |
 
 ### Iteration 0 notes — the instrumentation is NOT free
 
@@ -57,6 +58,53 @@ live phase; all configured phases still completed.
 Attribution *ratios* from `mem-attribution-100k.md` (owned-heap vs slack vs circuit) were
 measured with the same tax active in both of its runs and remain directionally valid; the
 absolute footprints there carry the same inflation.
+
+### Iteration 2 notes — pk dictionary (Task 2.1); Phase 2 gate data
+
+Change under test (`mem/phase-2-feed-keys` @ 2e94ddc): global `PkDict` (append-only
+pk-string ↔ u32 interner, new `/memory` field `bytes_pk_dict`); circuit relations and
+registry maps keyed by u32 pk ids; feed relation converted from upsert-map to key-only
+upsert set. Test-scale measurement: 123 → 24 B per feed entry. Comparison point =
+iteration 1.
+
+**B1 — where the dictionary demonstrably saved.** Registration: Δ 82.9 MiB (**8.5
+KiB/shape**, −10.5% vs it1). Materialized: Δ **329.2 MiB, half of it1's 675.8** (footprint
+variant: Δ 296.3 MiB); legacy synced-row (matΔ−regΔ)/~3.0 M rows ≈ **86 B** vs 204.
+Owned-bytes variant (new 05f4777 columns; Δ(`bytes_membership_circuit`+`bytes_pk_dict`)
+main-loop milestone deltas — the materialized-probe delta reads 0 by design):
+27,267 KiB (materialized) − 948 KiB (registration) ≈ 26.3 MiB / ~3.0 M rows ≈ **9 B per
+synced row owned** — the logical feed-entry cost after u32 keying (no it1 owned reference;
+the columns are new this iteration).
+
+**B2 — where it didn't move the headline.** 1102 peak / 1046 steady vs it1's 1125 / 1062
+(−2.0% / −1.5%, inside the run spread; 20 ENOBUFS warnings, run completed). Attribution
+snapshot at the top milestone (100k subs): `bytes_membership_circuit` **1.8 MiB**
+(integral 1.1 + snapshots 0.7) + `bytes_pk_dict` **6.3 MiB**; owned-heap sum 92.2 MiB.
+Caveat: under the Gate-G `FEED_TRACE=0` config the FEEDS integral term reads **zero** by
+construction (`snapshot_bytes` doc, subq_circuit.rs), so B2's owned circuit number
+excludes the ~3.7 M feed keys even though they remain resident in the gating integral —
+B1's ~9 B/row owned (trace on) is the valid logical-feed-cost evidence.
+
+**The finding:** the dictionary collapsed the logical feed-key bytes (~40× vs the Phase-0
+88 B/key owned floor; ~5× at test scale) and halved B1-scale RSS, but the 100k footprint
+is unchanged — so the dominant 100k cost is **dbsp per-entry/spine residency overhead and
+allocator retention, not key payload width** (consistent with Phase 0's 8× in-memory vs
+serialized blow-up). Shrinking entry payloads further cannot move the headline; reducing
+the **number of resident entries/batches** (bitmap/set-per-feed representations,
+compaction, spill tuning) can.
+
+**Phase 2 gate data (controller decides):**
+- Criterion "cumulative footprint @100k ≤ ~300 MiB → stop structural work":
+  **NOT met** — 1102 peak / 1046 steady (same-day series: 0b 1091/1108 → it1 1125/1062 →
+  it2 1102/1046).
+- Criterion "feed/circuit term still >15% of footprint → Task 2.2 (roaring bitmaps) stays
+  on the table": two readings. *Owned/logical*: ~8 MiB measured at B2 (feed-blind, see
+  caveat) or ~38 MiB estimated incl. feed keys from B1's 9 B/row — **≈0.7–3.5%, well
+  under 15%**. *Resident*: the Phase-0 spill-delta method put circuit residency at
+  ~40% of footprint, and iteration 2's unchanged footprint says that overhead is still
+  there — **>15% in residency terms**. Note Task 2.2's mechanism (one bitmap per feed
+  instead of one dbsp tuple per key) attacks the per-entry overhead — the residency
+  reading is the relevant one for it.
 
 ### Iteration 1 notes — circuit observability split (Task 1.3); FEED_TRACE A/B
 
