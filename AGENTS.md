@@ -32,7 +32,7 @@ the project is growing toward).
 - `docs/ivm-engine-internals.md` — engine execution strategies + the analytical cost model,
   including the three-tier serving model (circuit/routing/fallback): see
   [`docs/ivm-engine-internals.md#serving-tiers-compiled-routed-fallback`](docs/ivm-engine-internals.md#serving-tiers-compiled-routed-fallback).
-- `docs/shapes-and-subqueries-guide.md` — user/integrator guide.
+- `docs/live-queries-guide.md` — user/integrator guide.
 - `docs/deployment-postgres.md` — Postgres-as-source-of-record setup.
 - Each package has its own `README.md` (surface, commands, env knobs).
 

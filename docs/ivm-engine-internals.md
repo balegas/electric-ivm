@@ -550,7 +550,7 @@ executors via a trait so presentation cannot drift from execution.
   adapters) and the speedup backlog.
 - `packages/bench/README.md` — the benchmark runners, including the shape-memory matrix that
   produced the memory-vs-shapes data used above.
-- `docs/shapes-and-subqueries-guide.md` — the user-facing companion to this document.
+- `docs/live-queries-guide.md` — the user-facing companion to this document.
 
 ## Serving tiers: compiled, routed, fallback
 

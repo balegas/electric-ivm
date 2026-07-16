@@ -4,7 +4,7 @@ The as-built system architecture. Companion documents:
 
 - **[ivm-engine-internals.md](ivm-engine-internals.md)** — the engine's execution strategies and the
   analytical cost model (what grows with shapes/users/rows).
-- **[shapes-and-subqueries-guide.md](shapes-and-subqueries-guide.md)** — the user/integrator guide.
+- **[live-queries-guide.md](live-queries-guide.md)** — the user/integrator guide.
 - **[deployment-postgres.md](deployment-postgres.md)** — running against your Postgres.
 
 ---
