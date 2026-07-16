@@ -84,6 +84,9 @@ enum Cmd {
         groups: Vec<(Row, i64)>,
         done: Option<oneshot::Sender<Result<(), String>>>,
     },
+    /// Diagnostic: `(total_used_bytes, total_storage_size, per-operator profile JSON)` via
+    /// dbsp's profiler (`DbspProfile::as_json`). Heavy; on-demand only (`GET /debug/dbsp-profile`).
+    ProfileDump { resp: oneshot::Sender<(usize, usize, String)> },
     Shutdown { resp: oneshot::Sender<()> },
 }
 
@@ -233,6 +236,17 @@ impl Arrangements {
         Some(out)
     }
 
+    /// Diagnostic only: `(total_used_bytes, total_storage_size, per-operator profile JSON)` via
+    /// dbsp's profiler. Heavy (round-trips the circuit thread); on-demand only
+    /// (`GET /debug/dbsp-profile`), never from the 500 ms sampler.
+    pub async fn profile_dump(&self) -> (usize, usize, String) {
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(Cmd::ProfileDump { resp: tx }).await.is_err() {
+            return (0, 0, String::new());
+        }
+        rx.await.unwrap_or((0, 0, String::new()))
+    }
+
     /// Stop the circuit thread. State is in-memory only; there is nothing to persist.
     pub async fn shutdown(&self) {
         let (tx, rx) = oneshot::channel();
@@ -334,6 +348,21 @@ fn circuit_thread(
                 if let Some(done) = done {
                     let _ = done.send(res);
                 }
+            }
+            Cmd::ProfileDump { resp } => {
+                let dump = match dbsp.retrieve_profile() {
+                    Ok(p) => {
+                        let used = p.total_used_bytes().map(|b| b.into_inner() as usize).unwrap_or(0);
+                        let stored =
+                            p.total_storage_size().map(|b| b.into_inner() as usize).unwrap_or(0);
+                        (used, stored, p.as_json())
+                    }
+                    Err(e) => {
+                        tracing::error!("arrangements: retrieve_profile failed: {e}");
+                        (0, 0, format!("{{\"error\":\"retrieve_profile: {e}\"}}"))
+                    }
+                };
+                let _ = resp.send(dump);
             }
             Cmd::Shutdown { resp } => {
                 let _ = dbsp.kill();

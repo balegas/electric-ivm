@@ -81,6 +81,12 @@ pub(crate) enum SequencerCmd {
     /// contents; an aggregate `shape:<sid>` → the fold internals incl. the MIN/MAX multiset).
     /// `None` if the node id is unknown. Serves `GET /state/node`.
     DumpNode { table: String, node_id: String, resp: tokio::sync::oneshot::Sender<Option<serde_json::Value>> },
+    /// On-demand owned-heap byte-walk of every table's live executor state (see
+    /// `introspection::exec_heap_bytes`) — the memory probe's `bytes_executors` term. Sent only
+    /// from `Engine::mem_bytes` (called only by `GET /memory` — never the 500ms background
+    /// sampler, which calls the cheap `Engine::mem_cardinalities` instead), never from the
+    /// per-batch write path, so the walk's cost never lands on ingestion or on the sampler.
+    MemBytes { resp: tokio::sync::oneshot::Sender<usize> },
 }
 
 /// What kind of shape a pending creation becomes at activation.
@@ -368,6 +374,13 @@ pub(crate) async fn sequencer_loop(
                 Some(SequencerCmd::DumpNode { table, node_id, resp }) => {
                     let val = execs.get(&table).and_then(|exec| dump_node_json(exec, &offset, &emitted, &node_id));
                     let _ = resp.send(val);
+                }
+                Some(SequencerCmd::MemBytes { resp }) => {
+                    // On-demand only (see the variant's doc comment): this sums `exec_heap_bytes`
+                    // across every live table executor, which is exactly the walk `stats_of` used
+                    // to do on every processed batch before it moved here.
+                    let total: usize = execs.values().map(exec_heap_bytes).sum();
+                    let _ = resp.send(total);
                 }
                 None => break,
             },

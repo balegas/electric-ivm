@@ -1186,6 +1186,7 @@ dependencies = [
  "prometheus",
  "reqwest",
  "rkyv",
+ "roaring",
  "serde",
  "serde_json",
  "sysinfo",

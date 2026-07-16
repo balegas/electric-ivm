@@ -1,5 +1,9 @@
 # Shape memory at scale — 100k subscriptions, 20k live listeners, in-memory vs spill
 
+> **Superseded.** This is a PR-#37-era snapshot. The feed relation now lives host-side
+> (Phase 2) and `ELECTRIC_IVM_FEED_TRACE` has been removed — §3 below is historical. For
+> current numbers see `docs/bench/mem-reduction-log.md` and `docs/memory-model.md`.
+
 Extends `memory-matrix-blogpost.md` to the scales the blog post claims should hold:
 **100,000 shape subscriptions** (10,000 users × 10 shapes, → 50,005 distinct live shapes
 after signature sharing) over a fixed **100k-issue** deployment, all shapes materialized,
@@ -44,12 +48,23 @@ listeners attached and no writes, the engine's hot working set is **~35 MiB** �
 
 ## 3. The feed-trace knob (`ELECTRIC_IVM_FEED_TRACE=0`)
 
-The published feed-relation trace is a second full copy of every feed's key set (used only
-for drop-time enumeration + introspection). At 100k subscriptions, creation-peak RSS:
-**731.8 MiB (trace on) vs 408.1 MiB (off)** — roughly the predicted duplication. Off is the
-recommended setting for feed-heavy deployments until stream-fold drop enumeration lands
-(dbsp-ds-4d8); the cost is that dropped shapes leave unreachable entries in the operator
-integral (feed ids are never reused, so correctness is unaffected).
+The historical RSS delta at 100k subscriptions, creation peak: **731.8 MiB (trace on) vs
+408.1 MiB (off)**. The "second full copy" explanation was disproven by the Task 1.3 audit:
+the trace shares the feed upsert operator's own integral via dbsp's TraceId cache, not a
+logical duplicate.
+
+**Resolved (2026-07-16, closes bead dbsp-ds-2hu):** a same-day A/B under the Gate-G B2
+config (100k subs, 100/1000/2500/5000/10000 ramp, 5000-hold live phase, spill-by-default,
+engine at `mem/phase-1-host-slimming` 380a0f9) measured phys footprint **1135 peak /
+1075 steady (trace on) vs 1125 / 1062 (off)** — a ~10–13 MiB (~1%) delta, within
+run-to-run noise. The knob has **no material real-world saving on current code**,
+consistent with the shared-integral mechanism; the historical ~323 MiB delta was an
+artifact of its measurement era (creation-peak `ps rss` on pre-audit code and different
+machine state), not a property of the trace. Consequently the "off for feed-heavy
+deployments" recommendation is withdrawn: the trace is memory-free under the shared
+integral, and leaving it on keeps drop-time enumeration + introspection. (Unreachable
+integral entries from dropped shapes exist with the trace on or off — feed ids are never
+reused, so correctness is unaffected; stream-fold drop enumeration remains dbsp-ds-4d8.)
 
 ## 4. Disk spilling (worktree `feat/subq-circuit-spill`, bead dbsp-ds-4gc)
 
@@ -85,7 +100,7 @@ not tuning the spill cache.
 
 ```bash
 cargo build --release -p electric-ivm-engine
-ELECTRIC_IVM_FEED_TRACE=0 \
+# ELECTRIC_IVM_FEED_TRACE=0 removed
 SCALE_ISSUES=100000 SCALE_PROJECTS=2000 SCALE_USERS=100,250,500,1000,2500,5000,10000 \
 SCALE_CLIENT_PROCS=4 SCALE_LIVE_RAMP=5000,10000,20000 SCALE_LIVE_PROCS=8 \
   pnpm --filter @electric-ivm/bench exec tsx src/shape-mem-scale.ts

@@ -16,6 +16,14 @@
 //! churn): byte-level self-accounting, a lower-bound owned-heap estimate (see
 //! [`crate::heap_size::HeapSize`]) per major structure. The gap between the sum of these and
 //! `process.rss_bytes` is the allocator/pinning term this instrumentation exists to isolate.
+//!
+//! The byte-level walk (`Engine::mem_bytes`) is expensive — it locks engine state, round-trips a
+//! `SequencerCmd::MemBytes` command to the sequencer task, locks the subquery registry, and walks
+//! roughly the engine's entire owned heap. It must run ONLY when `GET /memory` is actually served,
+//! never on the 500ms background sampler (`spawn_sampler` below): that sampler calls
+//! `Engine::mem_cardinalities` exclusively, which computes cheap in-memory counts and never touches
+//! `HeapSize::heap_bytes` or `SequencerCmd::MemBytes`. See `engine::Engine::mem_cardinalities` /
+//! `mem_bytes` for the split and `http::get_memory` for the one place both are combined.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,6 +33,35 @@ use opentelemetry::KeyValue;
 use opentelemetry::metrics::MeterProvider as _;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use prometheus::{Registry, TextEncoder};
+
+/// The six byte-level self-accounting terms (Phase 0 of the memory-reduction effort), computed by
+/// [`crate::engine::Engine::mem_bytes`] — the on-demand, `GET /memory`-only counterpart to
+/// [`Cardinalities`]/[`crate::engine::Engine::mem_cardinalities`]. Deliberately its own type (not
+/// folded into `Cardinalities` at the source) so the cheap-count path has no fields to leave zeroed
+/// by convention — `mem_cardinalities` simply never constructs one of these.
+#[derive(Clone, Default)]
+pub struct HeapBytes {
+    pub bytes_shape_records: usize,
+    pub bytes_executors: usize,
+    pub bytes_retention: usize,
+    pub bytes_subquery_registry: usize,
+    pub bytes_membership_circuit: usize,
+    /// Split of `bytes_membership_circuit` (Task 1.3): the raw upsert-map integrals
+    /// (CONTRIBUTORS + FEEDS `(id,pk)→value` maps — the operators' own input integrals).
+    pub bytes_circuit_integral: usize,
+    /// Split of `bytes_membership_circuit` (Task 1.3): the derived MEMBERS relation snapshot
+    /// (`(node,value)`), published for `contains`/introspection reads.
+    pub bytes_circuit_snapshots: usize,
+    /// Host-side per-feed key sets (Task 2.2, dbsp-ds-dh6): the delete gate's Roaring bitmaps,
+    /// moved OUT of the membership circuit. Replaces the feed component that used to live in
+    /// `bytes_membership_circuit`/`bytes_circuit_integral`; ~10–19× lighter than the in-circuit
+    /// relation it supplants (owned-heap floor: serialized bitmap payloads + the outer HashMap).
+    pub bytes_feed_sets: usize,
+    /// The global pk dictionary (Task 2.1): once-per-distinct-pk string storage + forward/reverse
+    /// index. Append-only (no eviction in v1); reported so the string-interning trade is visible.
+    pub bytes_pk_dict: usize,
+    pub bytes_electric_adapter: usize,
+}
 
 /// Engine-internal cardinalities, computed from in-memory state by [`crate::engine::Engine::mem_cardinalities`].
 #[derive(Clone, Default, serde::Serialize)]
@@ -42,6 +79,10 @@ pub struct Cardinalities {
     pub subquery_distinct_values: usize,
     pub subquery_shapes: usize,
     pub subquery_edges: usize,
+    /// Total pks delivered across all shapes' host-side per-feed key sets (Task 2.2, the delete
+    /// gate moved out of the membership circuit). The row-count analogue of `subquery_contributors`;
+    /// `bytes_feed_sets` measures its byte cost.
+    pub subquery_feed_entries: usize,
     /// `ShapeRecord`s in the shape registry (`Engine.state.shapes`).
     pub bytes_shape_records: usize,
     /// Per-table executor structures: standalone shapes + their conjunct index, family routers
@@ -54,13 +95,49 @@ pub struct Cardinalities {
     /// `pk_nodes` inverted index), shapes, and edges — excludes the membership circuit itself
     /// (see `bytes_membership_circuit`).
     pub bytes_subquery_registry: usize,
-    /// Estimated owned heap of the dbsp membership circuit (subquery inner sets + per-feed key
-    /// sets): key-count × an estimated per-entry size, since dbsp's storage-backed spines don't
-    /// expose exact byte sizes cheaply. See `SubqueryRegistry::mem_totals` for the formula.
+    /// Measured owned/on-disk bytes of the dbsp membership circuit's published snapshots (subquery
+    /// inner sets — the CONTRIBUTORS relation), via dbsp's `BatchReader::approximate_byte_size`
+    /// (exact in-memory columnar bytes when resident, on-disk file size when spilled). Equals
+    /// `bytes_circuit_integral + bytes_circuit_snapshots`. See `SubqueryRegistry::circuit_bytes`.
+    /// NOTE: this covers only the host-published snapshots (which share the operators' own
+    /// integrals via dbsp's trace cache); dbsp's non-published incremental state (z1 delayed
+    /// traces, `distinct` integrals) roughly doubles it and is measurable only via the profiler.
+    /// The per-feed key sets left this term in Task 2.2 — see `bytes_feed_sets`.
     pub bytes_membership_circuit: usize,
+    /// Raw contributor upsert-map integral term of `bytes_membership_circuit`.
+    pub bytes_circuit_integral: usize,
+    /// Derived MEMBERS relation snapshot term of `bytes_membership_circuit`.
+    pub bytes_circuit_snapshots: usize,
+    /// Host-side per-feed key sets (Task 2.2, dbsp-ds-dh6): the delete gate's Roaring bitmaps,
+    /// moved out of the membership circuit. Replaces the feed component formerly folded into
+    /// `bytes_membership_circuit`. See `SubqueryRegistry::feed_sets_bytes`.
+    pub bytes_feed_sets: usize,
+    /// The global pk dictionary (Task 2.1): amortized once-per-distinct-pk string storage plus its
+    /// forward/reverse index — the append-only cost of keying the circuit by `u32` pk ids instead
+    /// of heap strings. See `SubqueryRegistry::pk_dict_bytes`.
+    pub bytes_pk_dict: usize,
     /// The `/v1/shape` (Electric-protocol) adapter's TTL handle registry: per-handle cursor
     /// state (known-keys sets, in-flight live-poll map).
     pub bytes_electric_adapter: usize,
+}
+
+impl Cardinalities {
+    /// Fold in the on-demand byte-level terms computed by `Engine::mem_bytes`. The only caller is
+    /// the `/memory` HTTP handler — the counts alone (as returned by `mem_cardinalities`, all
+    /// `bytes_*` left at their `Default` zero) are what the 500ms background sampler publishes.
+    pub fn with_bytes(mut self, bytes: HeapBytes) -> Self {
+        self.bytes_shape_records = bytes.bytes_shape_records;
+        self.bytes_executors = bytes.bytes_executors;
+        self.bytes_retention = bytes.bytes_retention;
+        self.bytes_subquery_registry = bytes.bytes_subquery_registry;
+        self.bytes_membership_circuit = bytes.bytes_membership_circuit;
+        self.bytes_circuit_integral = bytes.bytes_circuit_integral;
+        self.bytes_circuit_snapshots = bytes.bytes_circuit_snapshots;
+        self.bytes_feed_sets = bytes.bytes_feed_sets;
+        self.bytes_pk_dict = bytes.bytes_pk_dict;
+        self.bytes_electric_adapter = bytes.bytes_electric_adapter;
+        self
+    }
 }
 
 /// Lock-free snapshot the OTel gauge callbacks and `/memory` read. Updated by the sampler and on demand.
@@ -80,6 +157,7 @@ struct Gauges {
     subquery_distinct_values: AtomicU64,
     subquery_shapes: AtomicU64,
     subquery_edges: AtomicU64,
+    subquery_feed_entries: AtomicU64,
     samples: AtomicU64,
 }
 
@@ -117,6 +195,7 @@ pub fn publish(card: &Cardinalities) {
     g.subquery_distinct_values.store(card.subquery_distinct_values as u64, Ordering::Relaxed);
     g.subquery_shapes.store(card.subquery_shapes as u64, Ordering::Relaxed);
     g.subquery_edges.store(card.subquery_edges as u64, Ordering::Relaxed);
+    g.subquery_feed_entries.store(card.subquery_feed_entries as u64, Ordering::Relaxed);
     g.samples.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -149,11 +228,16 @@ pub fn snapshot_json(card: &Cardinalities) -> serde_json::Value {
             "subquery_distinct_values": g.subquery_distinct_values.load(Ordering::Relaxed),
             "subquery_shapes": g.subquery_shapes.load(Ordering::Relaxed),
             "subquery_edges": g.subquery_edges.load(Ordering::Relaxed),
+            "subquery_feed_entries": g.subquery_feed_entries.load(Ordering::Relaxed),
             "bytes_shape_records": card.bytes_shape_records,
             "bytes_executors": card.bytes_executors,
             "bytes_retention": card.bytes_retention,
             "bytes_subquery_registry": card.bytes_subquery_registry,
             "bytes_membership_circuit": card.bytes_membership_circuit,
+            "bytes_circuit_integral": card.bytes_circuit_integral,
+            "bytes_circuit_snapshots": card.bytes_circuit_snapshots,
+            "bytes_feed_sets": card.bytes_feed_sets,
+            "bytes_pk_dict": card.bytes_pk_dict,
             "bytes_electric_adapter": card.bytes_electric_adapter,
         },
         "samples": g.samples.load(Ordering::Relaxed),
@@ -215,6 +299,7 @@ pub fn init_otel() -> SdkMeterProvider {
     gauge!("engine_subquery_distinct_values", "Distinct values across subquery nodes", subquery_distinct_values, "");
     gauge!("engine_subquery_shapes", "Subquery (cross-table) shapes", subquery_shapes, "");
     gauge!("engine_subquery_edges", "Subquery dependency edges", subquery_edges, "");
+    gauge!("engine_subquery_feed_entries", "Total pks delivered across subquery shapes' feed sets", subquery_feed_entries, "");
 
     // Touch a KeyValue so the import is used even if labels are added later.
     let _ = KeyValue::new("service.name", "electric-ivm-engine");
@@ -223,6 +308,11 @@ pub fn init_otel() -> SdkMeterProvider {
 
 /// Spawn the background sampler: every `interval`, recompute engine cardinalities and republish the
 /// gauges so the OTel scrape reflects current state without a `/memory` poll.
+///
+/// Deliberately calls `mem_cardinalities` only — cheap counts, no `heap_bytes` walk, no
+/// `SequencerCmd::MemBytes` round-trip. Do not change this to call `mem_bytes` (or any function
+/// that does): that byte-level walk is on-demand-only, reserved for `GET /memory` (see the module
+/// doc comment above and `Engine::mem_bytes`'s doc comment for why).
 pub fn spawn_sampler(engine: crate::engine::Engine, interval: Duration) {
     tokio::spawn(async move {
         loop {

@@ -381,6 +381,11 @@ impl Engine {
                  deprecated no-ops: the circuit is in-memory counts only (no storage layer)"
             );
         }
+        if std::env::var("ELECTRIC_IVM_FEED_TRACE").is_ok() {
+            tracing::warn!(
+                "ELECTRIC_IVM_FEED_TRACE is deprecated and ignored: the feed relation now lives host-side"
+            );
+        }
         let mut counts: Vec<crate::arrangements::CountSpec> = Vec::new();
         for (t, cols) in &cfg.counts {
             let Some(ts) = schemas.get(t) else {
@@ -798,21 +803,24 @@ impl Engine {
     /// Engine-internal cardinalities for the memory probe — the structures whose growth drives RSS:
     /// registered shapes, per-table tailers, shared **family circuits** (the M× join-trace amplifier:
     /// each holds the base table once), standalone per-shape circuits, and the subquery registry's
-    /// nodes/contributor-pks. Read directly from in-memory state (cheap; no tailer round-trip).
+    /// nodes/contributor-pks. Read directly from in-memory state (cheap; no tailer round-trip, no
+    /// byte-walk, no sequencer round-trip).
     ///
-    /// Also reports byte-level self-accounting (Phase 0 of the memory-reduction effort): a
-    /// [`crate::heap_size::HeapSize`] lower-bound owned-heap estimate per major structure, walked
-    /// under the same locks the cardinality counts above already take. These are LOWER BOUNDS
-    /// (owned heap, not allocator slack) — the gap vs. `process.rss_bytes` is the
-    /// allocator/pinning term this phase is instrumenting to measure.
+    /// This is the ONLY cardinality path the 500ms background sampler (`mem::spawn_sampler`) is
+    /// allowed to call. It deliberately never touches `HeapSize::heap_bytes` or sends
+    /// `SequencerCmd::MemBytes` — every `bytes_*` field on the returned [`crate::mem::Cardinalities`]
+    /// is left at its `Default` zero. Byte-level self-accounting (Phase 0 of the memory-reduction
+    /// effort) lives in the sibling [`Self::mem_bytes`], called only by `GET /memory`; see its doc
+    /// comment for why that split exists (a prior regression: this method used to do the walk
+    /// inline, which meant a ~100MB recursive walk + a `MemBytes` sequencer round-trip ran twice a
+    /// second at 50k+ shapes).
     pub async fn mem_cardinalities(&self) -> crate::mem::Cardinalities {
-        let (shapes, tailers, tables, families, family_shapes, standalone, bytes_shape_records, bytes_executors) = {
+        let (shapes, tailers, tables, families, family_shapes, standalone) = {
             let st = self.state.lock().await;
             let mut families = 0usize;
             let mut family_shapes = 0usize;
             let mut standalone = 0usize;
             let mut tables_with_execs = 0usize;
-            let mut bytes_executors = 0usize;
             if let Some(seq) = st.sequencer.as_ref()
                 && let Ok(per_table) = seq.stats.lock()
             {
@@ -821,25 +829,13 @@ impl Engine {
                     families += s.families.len();
                     family_shapes += s.families.iter().map(|f| f.shapes).sum::<usize>();
                     standalone += s.standalone;
-                    bytes_executors += s.bytes;
                 }
             }
-            let bytes_shape_records = st.shapes.heap_bytes();
-            (
-                st.shapes.len(),
-                tables_with_execs,
-                st.tables.len(),
-                families,
-                family_shapes,
-                standalone,
-                bytes_shape_records,
-                bytes_executors,
-            )
+            (st.shapes.len(), tables_with_execs, st.tables.len(), families, family_shapes, standalone)
         };
-        let (sq_nodes, sq_contributors, sq_distinct, sq_shapes, sq_edges, bytes_membership_circuit, bytes_subquery_registry) = {
+        let sq = {
             let reg = self.subqueries.lock().await;
-            let (nodes, contributors, distinct, shapes, edges, membership_bytes) = reg.mem_totals();
-            (nodes, contributors, distinct, shapes, edges, membership_bytes, reg.heap_bytes())
+            reg.mem_totals()
         };
         let shapes_dormant = self
             .lives
@@ -848,8 +844,6 @@ impl Engine {
             .values()
             .filter(|l| matches!(l.state, LifeState::Dormant { .. }))
             .count();
-        let bytes_retention = self.lives.lock().unwrap().heap_bytes();
-        let bytes_electric_adapter = crate::electric::ttl_registry_heap_bytes().await;
         crate::mem::Cardinalities {
             shapes,
             shapes_dormant,
@@ -858,16 +852,103 @@ impl Engine {
             families,
             family_shapes,
             standalone,
-            subquery_nodes: sq_nodes,
-            subquery_contributors: sq_contributors,
-            subquery_distinct_values: sq_distinct,
-            subquery_shapes: sq_shapes,
-            subquery_edges: sq_edges,
+            subquery_nodes: sq.nodes,
+            subquery_contributors: sq.contributors,
+            subquery_distinct_values: sq.distinct,
+            subquery_shapes: sq.shapes,
+            subquery_edges: sq.edges,
+            subquery_feed_entries: sq.feed_entries,
+            ..Default::default()
+        }
+    }
+
+    /// Diagnostic only: full dbsp profiler dumps for EVERY dbsp circuit the engine runs — the
+    /// (single, engine-wide) subquery membership circuit plus the counts/arrangements circuit
+    /// when configured. The engine's "family" and "standalone" circuits are host-side executor
+    /// structures (no dbsp runtime; sized by `bytes_executors`), so they have no profile here.
+    /// Heavy (profiler round-trip through each circuit thread, holds the subquery-registry lock
+    /// for the membership dump); serves `GET /debug/dbsp-profile` on demand ONLY — never call
+    /// this from the 500 ms sampler (see `mem::spawn_sampler`).
+    pub async fn dbsp_profile_dump(&self) -> serde_json::Value {
+        fn entry(used: usize, stored: usize, json: String) -> serde_json::Value {
+            serde_json::json!({
+                "total_used_bytes": used,
+                "total_storage_bytes": stored,
+                "profile": serde_json::from_str::<serde_json::Value>(&json)
+                    .unwrap_or(serde_json::Value::String(json)),
+            })
+        }
+        let membership = {
+            let reg = self.subqueries.lock().await;
+            let (used, stored, json) = reg.circuit_profile_dump().await;
+            entry(used, stored, json)
+        };
+        let arr = self.arrangements.lock().unwrap().clone();
+        let counts = match arr {
+            Some(a) => {
+                let (used, stored, json) = a.profile_dump().await;
+                entry(used, stored, json)
+            }
+            None => serde_json::Value::Null,
+        };
+        serde_json::json!({ "membership_circuit": membership, "counts_circuit": counts })
+    }
+
+    /// On-demand byte-level self-accounting (Phase 0 of the memory-reduction effort): a
+    /// [`crate::heap_size::HeapSize`] lower-bound owned-heap estimate per major structure. These
+    /// are LOWER BOUNDS (owned heap, not allocator slack) — the gap vs. `process.rss_bytes` is the
+    /// allocator/pinning term this phase is instrumenting to measure.
+    ///
+    /// Expensive: locks engine state, round-trips a one-off `SequencerCmd::MemBytes` to the
+    /// sequencer task (mirroring the `DumpNode` command's pattern — see `dump_node` below), locks
+    /// the subquery registry, and walks roughly the engine's entire owned heap (~100MB at 50k
+    /// shapes). Call this ONLY from the `GET /memory` HTTP handler — never from the 500ms
+    /// background sampler (`mem::spawn_sampler`), which calls `mem_cardinalities` instead. Mixing
+    /// this into the sampler's path was exactly the prior regression (+41%/+52% peak/steady RSS at
+    /// 100k subscriptions from twice-a-second byte walks); see `mem::spawn_sampler`'s doc comment.
+    ///
+    /// `bytes_executors` (standalone shapes + their conjunct index, family routers, aggregate
+    /// folds + their index) is the one term this method cannot read out of already-published
+    /// state: those structures are privately owned by the sequencer task's `execs` map, never
+    /// exposed through a shared mutex (unlike `stats`/`node_states`, which are republished after
+    /// every batch specifically so other tasks can read them cheaply). Walking them for real bytes
+    /// is not cheap enough to piggyback on every batch (see `sequencer::publish_all`/`stats_of`),
+    /// so instead this method round-trips the one-off `SequencerCmd::MemBytes` so the byte-walk
+    /// itself only ever runs on this on-demand path, never per batch.
+    pub async fn mem_bytes(&self) -> crate::mem::HeapBytes {
+        let (bytes_shape_records, cmd_tx) = {
+            let st = self.state.lock().await;
+            (st.shapes.heap_bytes(), st.sequencer.as_ref().map(|seq| seq.cmd_tx.clone()))
+        };
+        // Byte-walk every table's live executor state: ask the sequencer task directly, since it
+        // privately owns `execs`.
+        let bytes_executors = match cmd_tx {
+            Some(tx) => {
+                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                if tx.send(SequencerCmd::MemBytes { resp: resp_tx }).is_ok() {
+                    resp_rx.await.unwrap_or(0)
+                } else {
+                    0
+                }
+            }
+            None => 0,
+        };
+        let (circuit_bytes, bytes_feed_sets, bytes_subquery_registry, bytes_pk_dict) = {
+            let reg = self.subqueries.lock().await;
+            (reg.circuit_bytes(), reg.feed_sets_bytes(), reg.heap_bytes(), reg.pk_dict_bytes())
+        };
+        let bytes_retention = self.lives.lock().unwrap().heap_bytes();
+        let bytes_electric_adapter = crate::electric::ttl_registry_heap_bytes().await;
+        crate::mem::HeapBytes {
             bytes_shape_records,
             bytes_executors,
             bytes_retention,
             bytes_subquery_registry,
-            bytes_membership_circuit,
+            bytes_membership_circuit: circuit_bytes.total_bytes(),
+            bytes_circuit_integral: circuit_bytes.integral_bytes(),
+            bytes_circuit_snapshots: circuit_bytes.snapshot_bytes(),
+            bytes_feed_sets,
+            bytes_pk_dict,
             bytes_electric_adapter,
         }
     }

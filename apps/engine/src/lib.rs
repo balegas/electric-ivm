@@ -29,6 +29,7 @@ pub mod metrics;
 pub mod params;
 pub mod pg;
 pub mod pgoutput;
+pub mod pk_dict;
 pub mod statsd;
 pub mod predicate;
 pub mod replication;
@@ -36,6 +37,10 @@ pub mod retention;
 pub mod schema;
 pub mod sql;
 pub mod subq_circuit;
+// Host-side per-feed key sets (`HashMap<feed_id, RoaringBitmap>`) — the delete gate, moved out of
+// the membership circuit (Task 2.2, dbsp-ds-dh6). See subq_feed.rs and
+// docs/notes/2026-07-16-feed-set-representation-spike.md.
+mod subq_feed;
 pub mod subquery;
 pub mod trace;
 pub mod value;

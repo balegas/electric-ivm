@@ -11,19 +11,20 @@
 //     memory is sampled again with subscriptions active (engine RSS must not care — live
 //     serving is the streams server's job);
 //   - samples include the durable-streams server's RSS next to the engine's;
-//   - ELECTRIC_IVM_FEED_TRACE passes through to the engine (set 0 to drop the feed-relation
-//     enumeration copy — the "tracing" duplication — and halve the per-feed memory term).
 //
 //   pnpm --filter @electric-ivm/bench exec tsx src/shape-mem-scale.ts
 //   SCALE_ISSUES=100000 SCALE_PROJECTS=2000 SCALE_USERS=1000,2500,5000,10000 \
 //   SCALE_CLIENT_PROCS=4 SCALE_LIVE_SUBS=20000 SCALE_LIVE_PROCS=8 \
-//   ELECTRIC_IVM_FEED_TRACE=0 tsx src/shape-mem-scale.ts
+//   tsx src/shape-mem-scale.ts
 
-import { type ChildProcess, execFileSync, execSync, spawn } from 'node:child_process'
+import { type ChildProcess, execFile, execFileSync, execSync, spawn } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
+
+const execFileP = promisify(execFile)
 
 import { DurableStreamTestServer } from '@electric-ivm/ds-rust'
 import pgpkg from 'pg'
@@ -51,6 +52,17 @@ const LIVE_SUBS = numEnv('SCALE_LIVE_SUBS', 20000)
 const LIVE_PROCS = numEnv('SCALE_LIVE_PROCS', 8)
 const MATERIALIZED = process.env.SCALE_MATERIALIZED !== '0'
 const OUT = process.env.SCALE_OUT ?? join(repoRoot(), 'docs', 'bench', 'shape-memory-scale.md')
+// Phase-0 attribution hook (Task 0.2): after the final milestone drains, snapshot /memory (full
+// JSON incl. the bytes_* self-accounting fields), `vmmap --summary` (MALLOC region totals) and
+// `footprint` (phys footprint breakdown) for the engine process, and dump all three into the
+// bench output dir next to the existing raw tables. Zero behavior change when unset.
+const ATTRIBUTION = process.env.SCALE_ATTRIBUTION === '1'
+const ATTRIBUTION_LABEL =
+  process.env.SCALE_ATTRIBUTION_LABEL ?? (process.env.ELECTRIC_IVM_SUBQ_STORAGE_DIR ? 'spill' : 'inmemory')
+// Defaults to the `raw/` dir next to wherever SCALE_OUT's markdown table lands; override
+// independently so a custom SCALE_OUT (e.g. to avoid clobbering the curated results doc) doesn't
+// also relocate the attribution dump.
+const ATTRIBUTION_DIR = process.env.SCALE_ATTRIBUTION_DIR ?? join(dirname(OUT), 'raw')
 const MAX_USERS = Math.max(...USER_MILESTONES)
 const SLOT = 'electric_ivm_shapescale'
 const STATUSES = ['backlog', 'todo', 'in_progress', 'done', 'canceled']
@@ -104,7 +116,7 @@ async function createSchemaAndSeed(client: pgpkg.Client, issues: number): Promis
 async function spawnEngine(dsUrl: string, pgUrl: string): Promise<{ url: string; proc: ChildProcess }> {
   const proc = spawn(join(repoRoot(), 'target', 'release', 'electric-ivm-engine'), [], {
     env: {
-      ...process.env, // carries ELECTRIC_IVM_FEED_TRACE through
+      ...process.env,
       ELECTRIC_IVM_DS_URL: dsUrl,
       ELECTRIC_IVM_BIND: '127.0.0.1:0',
       ELECTRIC_IVM_LOG: 'warn',
@@ -157,6 +169,50 @@ async function engineMemory(engineUrl: string): Promise<{ rss: number; card: Rec
   const r = await fetch(`${engineUrl}/memory`)
   const j = (await r.json()) as { process: { rss_bytes: number }; cardinalities: Record<string, number> }
   return { rss: j.process.rss_bytes, card: j.cardinalities }
+}
+
+/// Phase-0 attribution snapshot (`SCALE_ATTRIBUTION=1`): the full `/memory` JSON (incl. the six
+/// `bytes_*` self-accounting fields from Task 0.1), `vmmap --summary` (MALLOC region totals — the
+/// allocator-owned virtual memory, as opposed to owned-heap bytes we self-account), and
+/// `footprint` (macOS phys-footprint breakdown, compression-inclusive). Written next to the
+/// existing raw tables so `docs/bench/mem-attribution-100k.md` can be built from them by hand.
+async function writeAttributionSnapshot(engineUrl: string, pid: number | undefined, outDir: string, label: string): Promise<void> {
+  mkdirSync(outDir, { recursive: true })
+  const prefix = join(outDir, `attribution-${label}`)
+
+  let memoryJson = '{}'
+  try {
+    const r = await fetch(`${engineUrl}/memory`)
+    memoryJson = JSON.stringify(await r.json(), null, 2)
+  } catch (e) {
+    memoryJson = JSON.stringify({ error: String(e) })
+  }
+  writeFileSync(`${prefix}-memory.json`, memoryJson + '\n')
+
+  const runTool = async (file: string, args: string[]): Promise<string> => {
+    if (!pid) return 'no engine pid available\n'
+    try {
+      const { stdout, stderr } = await execFileP(file, args, { maxBuffer: 64 * MIB })
+      return stdout + (stderr ? `\n--- stderr ---\n${stderr}` : '')
+    } catch (e) {
+      return `${file} ${args.join(' ')} failed: ${String(e)}\n`
+    }
+  }
+  writeFileSync(`${prefix}-vmmap-summary.txt`, await runTool('/usr/bin/vmmap', ['--summary', String(pid)]))
+  writeFileSync(`${prefix}-footprint.txt`, await runTool('/usr/bin/footprint', [String(pid)]))
+
+  // Per-circuit dbsp profiler dump (membership + counts circuits, per-operator used bytes) —
+  // on-demand debug endpoint, introspection-gated; tolerate absence on older engines.
+  let profileJson = '{}'
+  try {
+    const r = await fetch(`${engineUrl}/debug/dbsp-profile`)
+    profileJson = r.ok ? JSON.stringify(await r.json(), null, 2) : JSON.stringify({ error: `HTTP ${r.status}` })
+  } catch (e) {
+    profileJson = JSON.stringify({ error: String(e) })
+  }
+  writeFileSync(`${prefix}-dbsp-profile.json`, profileJson + '\n')
+
+  console.log(`  attribution snapshot (${label}) -> ${prefix}-{memory.json,vmmap-summary.txt,footprint.txt,dbsp-profile.json}`)
 }
 
 // --- workload -----------------------------------------------------------------------------------
@@ -325,6 +381,14 @@ async function main() {
     await sample('created', createdUsers, requested)
   }
 
+  // Phase-0 attribution hook (Task 0.2): once the final milestone has drained (creation storm
+  // settled), snapshot /memory + vmmap --summary + footprint for the engine process. Additive —
+  // no effect on the existing tables/rows when SCALE_ATTRIBUTION is unset.
+  if (ATTRIBUTION) {
+    await sleep(2000)
+    await writeAttributionSnapshot(engine.url, engine.proc.pid ?? undefined, ATTRIBUTION_DIR, ATTRIBUTION_LABEL)
+  }
+
   // Hold live subscriptions — either one step (SCALE_LIVE_SUBS) or a ramp
   // (SCALE_LIVE_RAMP=5000,10000,20000: sample at each level to isolate the cost of LISTENERS
   // from the cost of shapes; unset = single-step behavior).
@@ -363,8 +427,7 @@ async function main() {
   md.push(`# Shape-memory at scale — ${ISSUES} issues, ${MAX_USERS} users, ${requested} subscriptions`)
   md.push('')
   md.push(`Config: projects=${PROJECTS}, memberships/user=${MEMBERSHIPS_PER_USER}, shapes/user=${SHAPES_PER_USER}, ` +
-    `materialized=${MATERIALIZED}, clientProcs=${CLIENT_PROCS}, liveSubs=${LIVE_SUBS}/${LIVE_PROCS} procs, ` +
-    `ELECTRIC_IVM_FEED_TRACE=${process.env.ELECTRIC_IVM_FEED_TRACE ?? '1'}`)
+    `materialized=${MATERIALIZED}, clientProcs=${CLIENT_PROCS}, liveSubs=${LIVE_SUBS}/${LIVE_PROCS} procs`)
   md.push('')
   md.push('| phase | users | subscriptions | live shapes | engine RSS (MiB) | engine footprint (MiB) | ds RSS (MiB) | sq nodes | contributors |')
   md.push('|---|---:|---:|---:|---:|---:|---:|---:|---:|')

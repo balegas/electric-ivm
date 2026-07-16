@@ -314,12 +314,6 @@ pub struct TableStats {
     /// Circuit-served shapes + aggregates on this table.
     #[serde(default)]
     pub circuit: usize,
-    /// Owned-heap estimate of this table's executor structures (standalone shapes + their
-    /// conjunct index, family routers, aggregate folds + their index) — the memory probe's
-    /// `bytes_executors` term (see `mem_cardinalities`). Not part of the `GET
-    /// /tables/{name}/families` public payload (introspection-only).
-    #[serde(skip)]
-    pub bytes: usize,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -617,22 +611,25 @@ pub(crate) fn stats_of(exec: &TableExec) -> TableStats {
         .map(|(k, f)| FamilyStat { key_cols: k.clone(), shapes: f.member_count() })
         .collect();
     fams.sort_by(|a, b| a.key_cols.cmp(&b.key_cols));
-    // Owned-heap estimate of this table's executor structures: standalone shapes + their
-    // necessary-conjunct index, family routers (which hold the `RoutedShape`s), aggregate
-    // folds + their conjunct index. Computed here (not in `mem_cardinalities`) because this is
-    // the only place that already walks every table's live executor under its own lock, once
-    // per processed batch — the same cost class `standalone`/`families` above already pay.
-    let bytes = exec.shapes.heap_bytes()
+    TableStats { families: fams, standalone: exec.shapes.len(), circuit: exec.circuit_aggs.len() }
+}
+
+/// Owned-heap estimate of one table's executor structures: standalone shapes + their
+/// necessary-conjunct index, family routers (which hold the `RoutedShape`s), aggregate folds +
+/// their conjunct index — the memory probe's `bytes_executors` term (see `Engine::mem_bytes`).
+///
+/// **On-demand only.** This walk must never run on the per-batch write path: `stats_of` above
+/// runs inside `publish_all`, which fires after every processed sequencer batch, so anything
+/// computed there is paid on every write. It must also never run on the 500ms background sampler
+/// (`mem::spawn_sampler`), which calls the cheap `Engine::mem_cardinalities` only. This function is
+/// instead invoked exclusively via `SequencerCmd::MemBytes`, sent only from `Engine::mem_bytes`
+/// (called only by `GET /memory`) — see `sequencer.rs`'s handling of that command.
+pub(crate) fn exec_heap_bytes(exec: &TableExec) -> usize {
+    exec.shapes.heap_bytes()
         + exec.shape_index.heap_bytes()
         + exec.families.heap_bytes()
         + exec.aggregates.heap_bytes()
-        + exec.agg_index.heap_bytes();
-    TableStats {
-        families: fams,
-        standalone: exec.shapes.len(),
-        circuit: exec.circuit_aggs.len(),
-        bytes,
-    }
+        + exec.agg_index.heap_bytes()
 }
 
 /// Deep-dump one node's internal state for `GET /state/node` (see `SequencerCmd::DumpNode`).
@@ -876,5 +873,43 @@ impl Engine {
                 .ok()?;
         }
         rx.await.ok().flatten()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Struct-specific sanity check (the byte-accounting tests otherwise committed are only the
+    /// two generic ones in `heap_size.rs`): a populated `ShapeRecord` reports non-zero owned
+    /// heap, an all-empty one reports zero — proving the impl actually walks its fields instead
+    /// of e.g. returning a constant.
+    #[test]
+    fn shape_record_heap_bytes_reflects_populated_fields() {
+        let empty = ShapeRecord {
+            id: String::new(),
+            table: String::new(),
+            stream_path: String::new(),
+            changes_only: false,
+            where_json: None,
+            columns: None,
+            family_key: None,
+            is_subquery: false,
+            aggregate: None,
+        };
+        assert_eq!(empty.heap_bytes(), 0, "an all-empty ShapeRecord should own no heap");
+
+        let populated = ShapeRecord {
+            id: "s1".to_string(),
+            table: "orders".to_string(),
+            stream_path: "/streams/s1".to_string(),
+            changes_only: false,
+            where_json: None,
+            columns: Some(vec!["a".to_string(), "b".to_string()]),
+            family_key: Some(vec!["a".to_string()]),
+            is_subquery: false,
+            aggregate: Some(AggInfo { func: AggFn::Count, col: Some("qty".to_string()) }),
+        };
+        assert!(populated.heap_bytes() > 0, "a populated ShapeRecord should report non-zero owned heap");
     }
 }
