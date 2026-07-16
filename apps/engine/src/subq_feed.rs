@@ -7,8 +7,8 @@
 //! gate**: upserts are delivered for every current member unconditionally, but a delete is emitted
 //! for a pk **iff** that pk was actually in the feed. Previously this lived in the circuit as an
 //! `add_input_set` upsert-SET whose per-step retraction deltas were the deletes; measurement (the
-//! spike) showed the feed set is ~16 MiB at 100k subscriptions (10–19× lighter than the dbsp
-//! relation) and needs no spilling — so it moves here, to a `HashMap<feed_id, RoaringBitmap>`.
+//! spike) showed the feed set is much lighter than the equivalent dbsp relation and needs no
+//! spilling — so it moves here, to a `HashMap<feed_id, RoaringBitmap>`.
 //!
 //! **The gate is now a synchronous check-and-set.** On a `member == true` verdict, `insert(pk)`
 //! (the upsert is delivered regardless); on `member == false`, a delete is emitted **iff**

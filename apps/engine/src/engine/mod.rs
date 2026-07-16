@@ -901,11 +901,11 @@ impl Engine {
     ///
     /// Expensive: locks engine state, round-trips a one-off `SequencerCmd::MemBytes` to the
     /// sequencer task (mirroring the `DumpNode` command's pattern — see `dump_node` below), locks
-    /// the subquery registry, and walks roughly the engine's entire owned heap (~100MB at 50k
-    /// shapes). Call this ONLY from the `GET /memory` HTTP handler — never from the 500ms
-    /// background sampler (`mem::spawn_sampler`), which calls `mem_cardinalities` instead. Mixing
-    /// this into the sampler's path was exactly the prior regression (+41%/+52% peak/steady RSS at
-    /// 100k subscriptions from twice-a-second byte walks); see `mem::spawn_sampler`'s doc comment.
+    /// the subquery registry, and walks roughly the engine's entire owned heap. Call this ONLY
+    /// from the `GET /memory` HTTP handler — never from the 500ms background sampler
+    /// (`mem::spawn_sampler`), which calls `mem_cardinalities` instead. Mixing this into the
+    /// sampler's path was exactly the prior regression (a large peak/steady RSS increase from
+    /// twice-a-second byte walks); see `mem::spawn_sampler`'s doc comment.
     ///
     /// `bytes_executors` (standalone shapes + their conjunct index, family routers, aggregate
     /// folds + their index) is the one term this method cannot read out of already-published
