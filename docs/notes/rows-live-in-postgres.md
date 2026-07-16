@@ -46,7 +46,7 @@ not a cache of either.
   primary keys are currently in each feed. When it needs actual rows — a backfill or a
   membership flip — it queries Postgres through a bounded pool and forwards the results to
   the feed log."
-- "Memory follows what users sync (one pk per delivered row, ~85 B measured) and the
+- "Memory follows what users sync (a small, bounded cost per delivered-row pk) and the
   relationships being watched — never table sizes, because tables never enter the engine."
 
 Corollary that surprises people: engine restart loses nothing durable — feeds' history is on

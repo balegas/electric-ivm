@@ -119,11 +119,10 @@ struct SpillConfig {
 
 /// The engine's own default for [`SpillConfig::cache_mib`] when
 /// `ELECTRIC_CIRCUITS_SUBQ_STORAGE_CACHE_MIB` is unset — a hard bound on dbsp's unset-default, which
-/// for this circuit's 1-worker layout resolves to 256 MiB × 1 worker × 2 thread-types = 512 MiB
-/// (see docs/bench/mem-attribution-100k.md §2c). Measured operator state across all circuits on
-/// the 100k-subscription benchmark is well under 1 MiB, so the LRU was filling toward an
-/// oversized ceiling regardless of working set; 64 MiB cut ~40% off process RSS with identical
-/// semantics on that workload.
+/// for this circuit's 1-worker layout resolves to 256 MiB × 1 worker × 2 thread-types = 512 MiB.
+/// Operator state across all circuits is small and independent of table size, so the LRU was
+/// filling toward an oversized ceiling regardless of working set; a smaller explicit cache
+/// noticeably reduces process RSS with identical semantics.
 const DEFAULT_STORAGE_CACHE_MIB: usize = 64;
 
 /// Parses `ELECTRIC_CIRCUITS_SUBQ_STORAGE_CACHE_MIB`'s raw value (`None` if the var is unset), giving
@@ -553,9 +552,9 @@ mod tests {
 
     /// Pins the default: `ELECTRIC_CIRCUITS_SUBQ_STORAGE_CACHE_MIB` unset (or unparseable) bounds the
     /// cache at [`DEFAULT_STORAGE_CACHE_MIB`] (64 MiB TOTAL) rather than falling through to
-    /// dbsp's own unset-default (512 MiB for this circuit's 1-worker layout — see
-    /// docs/bench/mem-attribution-100k.md §2c). A pure function (not `spill_config_from_env`
-    /// itself) so the test doesn't mutate process-global env vars across parallel test threads.
+    /// dbsp's own unset-default (512 MiB for this circuit's 1-worker layout). A pure function
+    /// (not `spill_config_from_env` itself) so the test doesn't mutate process-global env vars
+    /// across parallel test threads.
     #[test]
     fn storage_cache_mib_defaults_to_64_when_unset() {
         assert_eq!(storage_cache_mib(None), 64);

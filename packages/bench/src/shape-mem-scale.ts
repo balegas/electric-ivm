@@ -175,7 +175,7 @@ async function engineMemory(engineUrl: string): Promise<{ rss: number; card: Rec
 /// `bytes_*` self-accounting fields from Task 0.1), `vmmap --summary` (MALLOC region totals — the
 /// allocator-owned virtual memory, as opposed to owned-heap bytes we self-account), and
 /// `footprint` (macOS phys-footprint breakdown, compression-inclusive). Written next to the
-/// existing raw tables so `docs/bench/mem-attribution-100k.md` can be built from them by hand.
+/// existing raw tables so a future memory-attribution write-up can be built from them by hand.
 async function writeAttributionSnapshot(engineUrl: string, pid: number | undefined, outDir: string, label: string): Promise<void> {
   mkdirSync(outDir, { recursive: true })
   const prefix = join(outDir, `attribution-${label}`)

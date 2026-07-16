@@ -21,7 +21,7 @@ new-project announcement.
 All claims verified against `electric-circuits @ fc7e233` — full report in `2026-07-16-electric-circuits-claims-verification.md` (same directory): **10 verified, 4 partial, 1 contradicted**. Corrections are folded in throughout this doc. Headlines:
 
 - **Stronger than we claimed:** the input change log literally *is* a Durable Stream today, and a non-Postgres producer already ships (library mode appends change envelopes with no Postgres in the loop). "Write to streams anyhow, query it live" is demonstrated, not roadmap.
-- **Stale:** the post's memory table is a superseded benchmark snapshot. Current: **~645 MiB at 50k distinct live queries (~13 KiB each)**; dominant cost is the DBSP buffer cache (~80%), the hash structures are already Roaring bitmaps, and "flat as data grows" holds (100× rows → ~1% RSS).
+- **Stale:** the post's memory table is a superseded benchmark snapshot; fresh benchmarks pending. Current: the dominant cost is the DBSP buffer cache, the hash structures are already Roaring bitmaps, and "flat as data grows" still holds.
 - **Phrase as direction, not shipped:** CDN caching (`/v1/shape` sets `no-store` today) and the oracle suite's guarantees (restarts/concurrency come from the sibling TS suite, not the oracle runs). *(The migrations/redeploy workflow is no longer a message surface under the dynamic-first framing — see decision 6 — so it drops off this list.)*
 
 ## Vocabulary
@@ -32,7 +32,7 @@ Exactly three public nouns. "Shapes" does not appear.
 | ---------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
 | **Streams**      | Durable Streams: the input (changes from any producer — Postgres replication or direct appends) and the output (every result is an addressable, offset-resumable stream) | Designed for CDN fan-out (not wired in the prototype)        |
 | **Circuits**     | A small, fixed set of shared dataflows (DBSP) — one per *kind* of query. Your queries register onto them and run as data; the set never grows with query count | One shared dataflow per kind, holding keys and counts — not rows, not per-user state — behind a bounded disk-backed cache |
-| **Live queries** | What a client holds: a parameterized registration on a circuit, delivered as a stream, continued client-side in TanStack DB | ~16 KiB each; routing + delivery metadata only               |
+| **Live queries** | What a client holds: a parameterized registration on a circuit, delivered as a stream, continued client-side in TanStack DB | a small, bounded per-live-query cost; routing + delivery metadata only               |
 
 Note: "live queries" deliberately matches TanStack DB's term — it is the same concept, extended server-side. That continuity is a feature of the story.
 
@@ -63,7 +63,7 @@ Apps run on static queries: fetch a snapshot, it's stale on arrival; teams bolt 
 **C. The proof (why believe).**
 
 - Runs production Electric's own conformance oracle — harness, generators and the official client — against its `/v1/shape` endpoint; a sibling suite covers concurrency, engine restarts and resume. (Don't attach all three guarantees to the oracle runs — see verification C12.)
-- ~645 MiB at 50,000 distinct live queries (100k subscriptions) on a fixed dataset — **~13 KiB per live query** — and 100× the rows moves total memory by ~1%. Flat with data; KiB-linear with audience. (Sources: `docs/bench/mem-reduction-log.md`; use the pre-written blog-safe claims in `docs/bench/memory-matrix-blogpost.md` and `docs/memory-model.md §5` when drafting.)
+- Memory footprint is sublinear at large distinct-live-query and subscription counts on a fixed dataset — a small, bounded per-live-query cost — and flat with database size regardless of row count. Flat with data; small and bounded with audience. (fresh benchmarks pending; see `docs/memory-model.md §5` when drafting.)
 - Server-side aggregations working: `COUNT(*)` per group is circuit-maintained; SUM/AVG/MIN/MAX are incremental engine folds — all server-side, no rescans.
 - Run it yourself: interactive circuit visualizer + LinearLite demo (a real TanStack DB client with last-mile filtering — verified), clone-and-break.
 
@@ -113,14 +113,14 @@ Resolved by verification (details in the claims report §2–3):
 
 - ~~Producer contract~~ — **answered.** Append JSON change envelopes (`type`=table, `key`=pk, `value?`/`old?`, `headers.operation`, optional `txid/lsn/seq`) to the `changes` Durable Stream; transactions are contiguous equal-`(txid,lsn)` runs in commit order. pgoutput is not hardwired; library mode is a live second producer.
 - ~~Input log a Durable Stream?~~ — **yes, literally**: ingested via `ds.append("changes")`, consumed by the sequencer via `ds.read` over HTTP.
-- ~~Memory numbers~~ — **superseded in our favour**: ~645 MiB / ~13 KiB per live query at 50k; Roaring bitmaps already landed; dominant cost is the bounded DBSP buffer cache. L0's "no memory explosion" claim is supported (rows stay in Postgres; state is keys/counts behind a bounded disk-backed cache).
+- ~~Memory numbers~~ — **superseded in our favour**: the sublinear, small-per-live-query profile still holds at scale; Roaring bitmaps already landed; dominant cost is the bounded DBSP buffer cache. L0's "no memory explosion" claim is supported (rows stay in Postgres; state is keys/counts behind a bounded disk-backed cache). (fresh benchmarks pending)
 - ~~Which declaration story leads?~~ — **resolved: dynamic-first (decision 6).** "Just write the query — sharing is automatic." *Declare* is out as the headline verb; aggregation's up-front configuration is a detail. Unify-down (generic/dynamic counts) is filed as a future design item, not a launch dependency.
 
 Still open (for James + Valter):
 
 1. Rename artifacts to match: repo `electric-circuits` → `circuits`? Demo URLs? The name won't stick if the artifacts contradict it.
 2. Does "live queries" overloading TanStack DB's term help (same concept!) or confuse? Current call: it helps; confirm.
-3. Will the cost-per-shape reduction work land before publish, and do we re-run `packages/bench/src/shape-mem-scale.ts` for final numbers? *(Landed: PR #39 merged the pk-dictionary + Roaring feed sets + bounded storage cache; the ~645 MiB / ~13 KiB figures are from that build. A final re-run for headline numbers is still worth doing.)*
+3. Will the cost-per-shape reduction work land before publish, and do we re-run `packages/bench/src/shape-mem-scale.ts` for final numbers? *(Landed: PR #39 merged the pk-dictionary + Roaring feed sets + bounded storage cache; the current qualitative claims are from that build. A final re-run for headline numbers is still worth doing.)*
 
 ## Next steps
 

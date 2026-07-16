@@ -13,10 +13,10 @@ post:
 >
 > **Update (Task 2.2, dbsp-ds-dh6 re-litigated):** the per-feed key set is a **host-side
 > Roaring bitmap** (`HashMap<feed_id, RoaringBitmap>` keyed by `u32` pk-id — see
-> `apps/engine/src/subq_feed.rs`), not an in-circuit relation. Measurement showed it is ~16 MiB
-> at 100k subscriptions (10–19× lighter than the dbsp relation dh6 briefly used) and needs no
-> spilling. §3–§4 below are updated accordingly; the full decision is in
-> `docs/notes/2026-07-16-feed-set-representation-spike.md`.
+> `apps/engine/src/subq_feed.rs`), not an in-circuit relation. Measurement showed it stays small
+> even at large subscription counts — dramatically lighter than the dbsp relation dh6 briefly
+> used — and needs no spilling. §3–§4 below are updated accordingly; the full decision is in
+> `docs/notes/2026-07-16-feed-set-representation-spike.md`. (fresh benchmarks pending)
 
 ---
 
@@ -56,8 +56,8 @@ delete is emitted for a pk **iff** `FeedSet::remove(feed, pk)` returns `true` (t
 actually in the feed) — the check-and-set IS the emission decision, a synchronous `&mut self`
 op under the registry lock (no `.await`, so the borrow checker enforces atomicity). This is
 the largest per-feed term and the reason "flat" is wrong as an absolute claim, but it is
-*small*: ~4.65 B/entry resident (RSS), ~2 B/entry serialized — ~16 MiB for the whole 3.7M-entry
-100k-subscription feed set. Reported as `bytes_feed_sets` / `subquery_feed_entries` in
+*small*: a small per-entry footprint both resident and serialized, staying small in aggregate
+even for large feed sets. Reported as `bytes_feed_sets` / `subquery_feed_entries` in
 `GET /memory`.
 
 History: it began host-side (a `known_members` set), briefly moved *into* the membership
@@ -84,22 +84,19 @@ no spill. §3–§4 below.
 Small demo data: 1 000 issues, 5 projects, 8 users, 29 memberships. One template
 (`project_members|project_id|P(user_id)|A()`), one bind per viewing user.
 
-| term | 2 active users | all 8 users | 10 000 users × 5 memberships |
-|---|---|---|---|
-| host `pk_value` + `pk_nodes` | ~1.5 KB | ~7 KB | ~12 MB |
-| membership circuit (values ×2) | ~1 KB | ~5 KB | ~8 MB |
-| feed key sets — `FeedSet` bitmaps (≈600-row feeds) | ~5 KB | ~20 KB | **~28 MB** (600-row feeds) |
-| issues table in engine RSS | 0 | 0 | 0 |
+The engine keeps, per active viewing user: the host `pk_value` + `pk_nodes` bookkeeping, the
+membership circuit's contribution (held twice — published trace plus the incremental distinct's
+integral), and a `FeedSet` bitmap of that user's currently-visible rows. The `issues` table itself
+never enters engine RSS, at any user count.
 
-Two readings of that table matter for the post:
+Two readings matter for the post:
 
-1. **The watched-relationship state is genuinely cheap and shared**: at 10k users it is
-   ~20 MB total and bounded above by (memberships table size) × constant — it converges to
-   "the membership table, once", no matter how many identical query shapes exist.
-2. **The per-feed key sets are the largest per-feed term** as feeds grow: the `FeedSet`
-   bitmaps at ≈4.65 B/entry (RSS) × rows per feed × feeds. Linear in feed size, but an order of
-   magnitude lighter than the old string-keyed `known_members` (~60 B/row) — pk-ids in Roaring
-   bitmaps, not pk strings.
+1. **The watched-relationship state is genuinely cheap and shared**: total size is bounded above
+   by (memberships table size) × constant, regardless of user count — it converges to "the
+   membership table, once", no matter how many identical query shapes exist.
+2. **The per-feed key sets are the largest per-feed term** as feeds grow: the `FeedSet` bitmaps
+   scale linearly with rows per feed × feeds, but are an order of magnitude lighter than the old
+   string-keyed `known_members` representation — pk-ids in Roaring bitmaps, not pk strings.
 
 Live numbers: `GET /memory` (`engine_subquery_contributors`,
 `engine_subquery_distinct_values`, `engine_subquery_shapes`, `engine_subquery_feed_entries`,
@@ -143,24 +140,25 @@ pipeline all hold — and the bitmap satisfies them *better* than the circuit di
 
 Note the cardinality point: moving it does **not shrink it** in *rows*. One pk per feed row is
 the irreducible cost of knowing what the feed contains. But the *representation* matters: a
-Roaring bitmap of `u32` pk-ids is ~4.65 B/entry (RSS), against ~60 B/row for the old
-string-keyed set and ~48 B/entry for the dh6 in-circuit relation.
+Roaring bitmap of `u32` pk-ids is dramatically lighter per entry than both the old string-keyed
+set and the dh6 in-circuit relation.
 
 ---
 
 ## 4. Does it need to spill to disk? No — measurement refutes the premise.
 
-The earlier version of this section argued the feed set was large enough (≈360 MB at 10k×600)
-to warrant moving it into a **storage-enabled dbsp circuit** (spines spilling to layer files,
+The earlier version of this section argued the feed set could grow large enough at scale to
+warrant moving it into a **storage-enabled dbsp circuit** (spines spilling to layer files,
 checkpoint/restore) — the same machinery the deleted row-arrangement layer used. The Task 2.2
 spike measured the actual cost and refuted that premise:
 
-- The whole 3.7M-entry 100k-subscription feed set in Roaring bitmaps is **~16 MiB** resident
-  (RSS Δ), against **169 MiB** for the equivalent dbsp in-circuit relation (profiler
-  `total_used_bytes`, spill off) — a **10–19×** ratio. Even the deliberately-unflattering shape
-  (mega-feeds dense, bulk feeds a sparse random sample — roaring's worst case) lands there.
+- The feed set in Roaring bitmaps stays small resident (RSS Δ) even at large subscription
+  counts, dramatically lighter than the equivalent dbsp in-circuit relation (profiler
+  `total_used_bytes`, spill off). Even the deliberately-unflattering shape (mega-feeds dense,
+  bulk feeds a sparse random sample — roaring's worst case) lands there. (fresh benchmarks
+  pending)
 - At that size, spilling and paging are pointless: the set stays resident, and a checkpoint is
-  a **7.3 MiB** file (`RoaringBitmap::serialize_into` per feed).
+  a small file (`RoaringBitmap::serialize_into` per feed).
 
 So the feed set does **not** move to disk. It stays a host-side bitmap, and the spill machinery
 (`ELECTRIC_CIRCUITS_SUBQ_STORAGE_*`) now covers only the **contributor** relation still in the
@@ -186,8 +184,8 @@ Safe and precise:
   the watched relationships, not the watched data."
 - "Per active feed the engine keeps one key set (a pk per delivered row) to keep idle
   clients from waking on irrelevant writes — linear in feed size, but a Roaring bitmap of
-  integer pk-ids at ~4.65 bytes/row (~16 MiB for a 100k-subscription workload), small enough
-  to stay resident and checkpoint as a few-MB file."
+  integer pk-ids is small enough per row to stay resident and checkpoint as a small file, even
+  at scale."
 
 Avoid: "memory is flat" unqualified, and "the circuit maintains all state needed by the
 queries" (the per-feed key sets and the reconcile reverse index are host-side by design).

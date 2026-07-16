@@ -293,7 +293,7 @@ bullet). Neither circuit checkpoints: both reseed on boot.
   `contains`/`has_null`/introspection) + `distinct → output` (the step's deltas are the
   membership **flips**, §6). The per-feed key sets — the delete gate — live **host-side**
   (`subq_feed.rs`, one Roaring bitmap per feed over `u32` pk-dictionary ids): a synchronous
-  check-and-set under the registry lock, ~10–19× lighter than the former in-circuit feed
+  check-and-set under the registry lock, dramatically lighter than the former in-circuit feed
   relation (§6). The registry evaluates templates host-side per envelope, under its lock, and
   awaits the step — intra-transaction ordering is identical to the old in-registry kernel, and
   reads are read-your-writes. Structure is fixed at construction (one generic input);
@@ -334,7 +334,7 @@ bullet). Neither circuit checkpoints: both reseed on boot.
 | `ELECTRIC_CIRCUITS_EMIT_LANES` | `8` | ordered emission lanes for subquery-shape appends. |
 | `ELECTRIC_CIRCUITS_SUBQ_STORAGE` | `1` | `0` disables membership-circuit disk spilling (relations stay fully in-memory). |
 | `ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR` | per-boot temp dir | explicit spill location (kept on shutdown; the default temp dir is auto-removed). |
-| `ELECTRIC_CIRCUITS_SUBQ_STORAGE_CACHE_MIB` | `64` | storage buffer-cache budget, in MiB, TOTAL (dbsp uses the value verbatim, not multiplied by workers/thread-types). Bounds dbsp's own unset-default, which for this circuit's 1-worker layout would be 512 MiB (256 MiB × 1 worker × 2 thread-types) — see docs/bench/mem-attribution-100k.md §2c. |
+| `ELECTRIC_CIRCUITS_SUBQ_STORAGE_CACHE_MIB` | `64` | storage buffer-cache budget, in MiB, TOTAL (dbsp uses the value verbatim, not multiplied by workers/thread-types). Bounds dbsp's own unset-default, which for this circuit's 1-worker layout would be 512 MiB (256 MiB × 1 worker × 2 thread-types). |
 | `ELECTRIC_CIRCUITS_SUBQ_MIN_STORAGE_KB` | `128` | spine batches above this size page to disk. |
 
 (The former `ELECTRIC_CIRCUITS_DBSP_DIR`/`_CACHE_MIB`/`_MIN_STORAGE_KB`/`_MAX_RSS_MB`/
@@ -463,8 +463,9 @@ Threads are flat in the number of shapes *and* in the number of equality templat
 
 ## 12. Potential speedups
 
-The engine's internal per-change cost is <1 ms p99 at 100k shapes; the end-to-end ceiling under load
-is **storage throughput** (the single-process durable-streams test server), not engine compute.
+The engine's internal per-change cost stays small even at a large shape count; the end-to-end
+ceiling under load is **storage throughput** (the single-process durable-streams test server), not
+engine compute.
 
 **Storage / append path (current ceiling)**
 1. Multi-stream append (one request, many streams) — fan-out to M streams is M HTTP requests today.

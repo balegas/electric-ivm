@@ -38,8 +38,8 @@ Three layers, one idea — *maintain query results incrementally as the database
 reasoning about cost. State that scales with row count lives in Postgres, full stop; the
 engine keeps only per-shape metadata, the counts pipelines' (group → count) relations, and,
 for subqueries, a shared set of *inner-query result values*.
-Baseline engine RSS is ~19 MiB whether the database has 1,000 or 100,000 rows
-(measured by the shape-memory matrix benchmark in `packages/bench`).
+Baseline engine RSS is flat with database size, whether the database has 1,000 or 100,000 rows
+(measured by the shape-memory matrix benchmark in `packages/bench`; fresh benchmarks pending).
 
 ### What dbsp is here
 
@@ -317,13 +317,13 @@ and disk?**
 
 The headline, measured (shape-memory matrix benchmark, `packages/bench`): a steady fleet of *many* shapes
 over a *large* table is cheap; the only deployment-size-sensitive cost is the **transient
-backfill working set** of a *materialized* shape.
+backfill working set** of a *materialized* shape. (fresh benchmarks pending)
 
 ### 4.1 What is shared vs per-shape vs per-user
 
 | construct | granularity | cost driver |
 |---|---|---|
-| Engine baseline (no shapes) | global | constant ~19 MiB, **independent of table size** (no table copy) |
+| Engine baseline (no shapes) | global | a small constant, **independent of table size** (no table copy) |
 | `KeyRouter` (family) | per **template** (key-column set) | a handful; *not* per shape and *not* per user |
 | Routing entry | per **shape** | one `(key_tuple, stream_path, seed_lsn)` |
 | `StandaloneShape` | per **shape** | one predicate + metadata; per-change eval cost |
@@ -333,34 +333,31 @@ backfill working set** of a *materialized* shape.
 | Per-shape stream | per **shape** | one `shape/<id>` durable stream (storage, not engine RAM) |
 
 "Per user" is not a first-class concept in the engine — it shows up as *the shapes a user
-opens*. The LinearLite model opens ~10 shapes/user. In the matrix run, **1,000 users → 10,000
-shapes → 1,000 subquery nodes, 6,000 contributors, 1,000 edges, but still only 3 family
-circuits.** The router count is flat in users; node/contributor/edge counts grow linearly in
-users but with a tiny constant (a node holds the user's ~6 membership rows, not any issues).
+opens*. In the matrix run, growing the user count grew shapes, subquery nodes, contributors, and
+edges proportionally, but family circuit count stayed flat at a small constant. The router count
+is flat in users; node/contributor/edge counts grow linearly in users but with a tiny constant
+(a node holds only the user's own membership rows, not any issues).
 
 ### 4.2 Memory: the numbers
 
-From the shape-memory matrix run (Postgres mode, OTel RSS probe):
+From the shape-memory matrix run (Postgres mode, OTel RSS probe): (fresh benchmarks pending)
 
-- **Baseline RSS is independent of deployment size:** ~18.7 MiB at 1k issues, ~19.0 at 10k,
-  ~18.7 at 100k. The engine keeps no table copy.
-- **Per-shape registration is ~0.7–0.9 KiB/shape and constant across deployment sizes.** Even
-  10,000 changes-only shapes grow RSS by **< 10 MiB**.
-- **Family circuits stay at a small constant** (3 here) no matter how many equality shapes
-  share them.
+- **Baseline RSS is independent of deployment size** across 1k, 10k, and 100k issues. The engine
+  keeps no table copy.
+- **Per-shape registration is a small, bounded per-shape cost and constant across deployment
+  sizes.** Even a large fleet of changes-only shapes grows RSS by only a small amount.
+- **Family circuits stay at a small constant** no matter how many equality shapes share them.
 - **Backfill is the deployment-size-sensitive cost:** a *materialized* shape's one-off backfill
-  working set scales ~linearly with the number of *visible* rows, ≈ **2 KiB/visible-row** peak
-  (e.g. a 12,000-visible-issue visibility shape over a 100k-issue DB peaks ~22 MiB above
-  baseline, then settles). This is transient read-batch + JSON serialization memory, **not
-  retained state**.
+  working set scales ~linearly with the number of *visible* rows (transient read-batch + JSON
+  serialization memory, **not retained state**, released once the backfill settles).
 
 So engine memory is, to first order:
 
 ```
-RSS ≈ baseline(~19 MiB)
-    + ~0.8 KiB × (#shapes)
+RSS ≈ baseline (flat with database size)
+    + a small, bounded per-shape cost × (#shapes)
     + Σ over nodes (inner-set size × pk size)        // shared, tiny for visibility-style subqueries
-    + peak concurrent backfill working set (~2 KiB × visible-rows-per-shape, transient)
+    + peak concurrent backfill working set (bounded per visible row, transient)
 ```
 
 ### 4.3 Sizing rule
@@ -369,8 +366,8 @@ RSS ≈ baseline(~19 MiB)
 of many shapes over a large table is cheap; a *burst of large materialized backfills* is the
 spike to provision for. Two levers reduce the spike:
 
-- **`changes-only` / subset feeds skip the backfill entirely** — they pay only registration
-  (~0.8 KiB) and live deltas.
+- **`changes-only` / subset feeds skip the backfill entirely** — they pay only a small,
+  bounded registration cost and live deltas.
 - The **`columns` projection** narrows each backfilled/synced row to the columns a view needs
   (the pk is always kept), cutting both the backfill working set and the synced payload.
 
@@ -397,9 +394,9 @@ For one table change:
   flip) — the inherent cost any correct incremental subquery maintenance pays.
 
 The append/storage path — not engine compute — is the throughput ceiling under max load
-(telemetry shows < 1 ms p99 internal per-change cost at 100k shapes). The flush coalesces per
-stream and parallelizes across streams (CAP=32) precisely because HTTP round-trips to storage
-dominate.
+(telemetry shows internal per-change compute cost stays small even at a large shape count). The
+flush coalesces per stream and parallelizes across streams (CAP=32) precisely because HTTP
+round-trips to storage dominate.
 
 ### 4.5 Disk
 
@@ -450,8 +447,8 @@ subquery shape:
   `project_id` values. **~6 pks, not any issues.**
 - One edge `(this shape, project_id, node, negated=false)`.
 - One routing/shape entry + one `shape/<id>` stream.
-- If materialized: a backfill of the *visible* issues (~2 KiB/visible-row, transient). If
-  `changes-only`, no backfill.
+- If materialized: a backfill of the *visible* issues (a small, bounded per-row cost, transient).
+  If `changes-only`, no backfill.
 
 **Live cost (membership changes — user added to a project):**
 
@@ -466,11 +463,12 @@ subquery shape:
 `new.project_id ∈ node` and `old.project_id ∈ node` → emits `upsert`/`delete` accordingly.
 `O(1)` node lookups, no inner-table query.
 
-**Scaling tally (the matrix's 1,000-user run):** 1,000 such shapes → 1,000 nodes, 6,000
-contributors, 1,000 edges, ~8 MiB total RSS growth, **3** family circuits for the *other*
-(equality) shapes those users open. The visibility subquery is per-user by nature (each user's
-membership set differs, so each gets its own node), but each node is tiny and the per-change
-cost is bounded by the fan-out of the specific project that changed.
+**Scaling tally (a matrix run with many such users):** nodes, contributors, and edges all grow
+linearly with the number of such shapes, with a small total RSS growth and family circuit count
+staying at a small constant for the *other* (equality) shapes those users open. The visibility
+subquery is per-user by nature (each user's membership set differs, so each gets its own node),
+but each node is tiny and the per-change cost is bounded by the fan-out of the specific project
+that changed. (fresh benchmarks pending)
 
 ---
 

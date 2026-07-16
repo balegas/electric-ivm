@@ -73,13 +73,11 @@ how the engine routes deltas to it, is an implementation detail documented for e
 `docs/ivm-engine-internals.md`.)
 
 The engine keeps **no copy of any table**: its memory scales with the *kinds* of query your app
-runs and the relationships they watch, not with table size or query count. Measured at ~50,000
-distinct live queries (100,000 subscriptions): **~645 MiB total engine RSS, about 13 KiB per live
-query**; and memory is flat with database size — 100× the rows moves total RSS by about 1%. See
-`docs/bench/mem-reduction-log.md` (the 645 MiB / 6.6 KiB-per-subscription footprint),
-`docs/bench/mem-attribution-100k.md` (the 50,005-distinct-query breakdown behind ~13 KiB per live
-query), and `docs/memory-model.md` §5 for the full figures, and `docs/ARCHITECTURE.md` §6b for the
-circuit's in-memory state model.
+runs and the relationships they watch, not with table size or query count. Memory footprint is
+sublinear in the number of distinct live queries and subscriptions — a small, bounded per-live-query
+cost — and flat with database size: growing the underlying tables does not grow engine RSS in
+proportion. See `docs/memory-model.md` §5 for the full methodology, and `docs/ARCHITECTURE.md` §6b
+for the circuit's in-memory state model. (fresh benchmarks pending)
 
 ## A live query as a DBSP pipeline
 

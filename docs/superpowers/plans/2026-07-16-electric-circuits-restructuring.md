@@ -202,7 +202,7 @@ Delete the static-compile / "compiled at deploy time / access cohort" framing an
 
 - [ ] **Step 4: Fix the memory paragraph with current figures**
 
-Replace the stale "engine RSS is ~19 MiB … +~0.8 KiB per shape" claim (in the DBSP-tiers paragraph) with the current model: a fixed set of shared dataflows sized by query *kind* not instances; ~13 KiB per live query at 50k distinct live queries; flat with database size (100× rows → ~1% RSS). Source: `docs/bench/mem-reduction-log.md`, `docs/memory-model.md §5`.
+Replace the stale baseline-RSS-plus-per-shape-cost claim (in the DBSP-tiers paragraph) with the current model: a fixed set of shared dataflows sized by query *kind* not instances; a small, bounded per-live-query cost; flat with database size. (fresh benchmarks pending) Source: `docs/memory-model.md §5`.
 
 - [ ] **Step 5: Keep and vocab-align the rest**
 

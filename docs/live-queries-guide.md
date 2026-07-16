@@ -226,20 +226,21 @@ The full analysis is in `docs/ivm-engine-internals.md` §4; the practical summar
 
 **Cheap (do freely):**
 
-- **Many live queries.** Per-live-query registration is ~0.8 KiB and constant regardless of table
-  size (the engine keeps no table copy; baseline RSS ~19 MiB at 1k or 100k rows).
+- **Many live queries.** Per-live-query registration is a small, bounded per-live-query cost and
+  constant regardless of table size (the engine keeps no table copy; baseline RSS is flat with
+  database size).
 - **Equality/tenant live queries.** They collapse onto a few shared routers — flat in live-query
   count.
-- **Per-user visibility subqueries.** Each user's node holds only that user's membership rows
-  (e.g. ~6), not any issues; identical subqueries are shared. 1,000 users ≈ +8 MiB.
+- **Per-user visibility subqueries.** Each user's node holds only that user's membership rows, not
+  any issues; identical subqueries are shared. Memory scales with your audience, not your database.
 - **`changes-only` and subset feeds.** They skip backfill entirely — registration + live deltas
   only.
 
 **The thing to budget for:**
 
 - **Concurrent large materialized backfills.** A materialized live query's *initial* backfill
-  working set is ~2 KiB per visible row (transient, released after sync). Budget memory by the
-  **peak concurrent backfill working set** (visible-rows-per-live-query × 2 KiB, summed over live
+  working set is a small, bounded per-row cost (transient, released after sync). Budget memory by
+  the **peak concurrent backfill working set** (visible-rows-per-live-query, summed over live
   queries backfilling at once) — *not* by total live-query count or total rows. Narrow it with the
   `columns` projection, or avoid it with `changes-only`/subset.
 
