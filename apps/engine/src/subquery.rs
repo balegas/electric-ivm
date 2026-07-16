@@ -215,10 +215,11 @@ pub struct SubqueryShape {
     /// Envelopes appended to this shape's stream (backfill + live), for the visualizer's per-node
     /// state. Atomic because the append paths hold `&self`.
     pub emitted: std::sync::atomic::AtomicU64,
-    /// This shape's key in the circuit's per-feed relation (`(feed_id, pk)` upsert map). The
-    /// relation replaces the old `known_members` set: a delete is delivered iff the relation
-    /// actually retracts, so a "not a member" verdict for a pk the stream never contained is
-    /// structurally a no-op — the wake-storm gate (PR #30) with no filter to keep in sync.
+    /// This shape's key into the host-side per-feed key set ([`crate::subq_feed::FeedSet`],
+    /// `feed_sets`). The set replaces the old `known_members` set: a delete is delivered iff
+    /// the set actually retracts, so a "not a member" verdict for a pk the stream never
+    /// contained is structurally a no-op — the wake-storm gate (PR #30) with no filter to keep
+    /// in sync.
     pub(crate) feed_id: i64,
 }
 
@@ -359,7 +360,9 @@ impl HeapSize for SubqueryRegistry {
     /// [`SubqueryRegistry::circuit_bytes`]'s `bytes_membership_circuit` measurement — so it is
     /// deliberately excluded here to avoid double-counting the same state under two `/memory`
     /// fields. The `pk_dict` is likewise accounted separately (`bytes_pk_dict`, see
-    /// [`SubqueryRegistry::pk_dict_bytes`]) — `Arc`-shared and reported once. `ds` (a client
+    /// [`SubqueryRegistry::pk_dict_bytes`]) — `Arc`-shared and reported once. `feed_sets` is
+    /// likewise excluded, accounted separately as `bytes_feed_sets` (see
+    /// [`SubqueryRegistry::feed_sets_bytes`]). `ds` (a client
     /// handle) and `schemas` (`Arc`-shared with the engine's compiled
     /// schema) are not uniquely owned; `lanes` holds channel senders, not owned data;
     /// `next_node_id`/`next_feed_id` are inline counters.

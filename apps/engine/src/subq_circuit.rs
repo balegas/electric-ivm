@@ -191,9 +191,6 @@ fn process_alive(pid: u32) -> bool {
 
 enum Cmd {
     Batch { asserts: Assertions, resp: oneshot::Sender<Vec<MemberDelta>> },
-    /// Diagnostic: the whole circuit's operator memory via dbsp's profiler
-    /// (`(total_used_bytes, total_storage_size)`). Heavy (round-trips every worker); test-only.
-    Profile { resp: oneshot::Sender<(usize, usize)> },
     /// Diagnostic: totals plus the full per-operator profile as dbsp's own JSON
     /// (`DbspProfile::as_json` — worker profiles with per-node `used_memory_bytes` etc., plus
     /// the named operator graph). Heavy; on-demand only (`GET /debug/dbsp-profile`).
@@ -396,22 +393,10 @@ impl MembershipCircuit {
         CircuitBytes { members_bytes, members_len, contributors_bytes, contributors_len }
     }
 
-    /// Diagnostic only: the whole circuit's operator memory via dbsp's profiler —
-    /// `(total_used_bytes, total_storage_size)` summed over every stateful operator (all
-    /// integrals, `distinct` state, `z1` traces, upsert feedback). Heavy — round-trips every
-    /// worker through the circuit thread — so this is for tests/attribution, NOT `GET /memory`.
-    pub async fn profile_bytes(&self) -> (usize, usize) {
-        let (tx, rx) = oneshot::channel();
-        if self.tx.send(Cmd::Profile { resp: tx }).await.is_err() {
-            return (0, 0);
-        }
-        rx.await.unwrap_or((0, 0))
-    }
-
     /// Diagnostic only: `(total_used_bytes, total_storage_size, per-operator profile JSON)` —
     /// the JSON is dbsp's own `DbspProfile::as_json` (per-node `used_memory_bytes` + the named
-    /// operator graph). Same cost caveat as [`Self::profile_bytes`]: on-demand only, never from
-    /// the 500 ms sampler.
+    /// operator graph). Heavy — round-trips every worker through the circuit thread — so this
+    /// is on-demand only, never from the 500 ms sampler.
     pub async fn profile_dump(&self) -> (usize, usize, String) {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(Cmd::ProfileDump { resp: tx }).await.is_err() {
@@ -535,21 +520,6 @@ fn circuit_thread(
                     Err(e) => tracing::error!("membership circuit: transaction failed: {e}"),
                 }
                 let _ = resp.send(flips);
-            }
-            Cmd::Profile { resp } => {
-                let bytes = match dbsp.retrieve_profile() {
-                    Ok(p) => {
-                        let used = p.total_used_bytes().map(|b| b.into_inner() as usize).unwrap_or(0);
-                        let stored =
-                            p.total_storage_size().map(|b| b.into_inner() as usize).unwrap_or(0);
-                        (used, stored)
-                    }
-                    Err(e) => {
-                        tracing::error!("membership circuit: retrieve_profile failed: {e}");
-                        (0, 0)
-                    }
-                };
-                let _ = resp.send(bytes);
             }
             Cmd::ProfileDump { resp } => {
                 let dump = match dbsp.retrieve_profile() {
@@ -683,7 +653,7 @@ mod tests {
     }
 
     /// The on-demand profiler dump returns parseable dbsp JSON with per-operator metadata and
-    /// totals consistent with `profile_bytes` (non-zero once the circuit holds state).
+    /// non-zero totals (once the circuit holds state).
     #[tokio::test(flavor = "multi_thread")]
     async fn profile_dump_returns_parseable_per_operator_json() {
         let c = MembershipCircuit::start().unwrap();

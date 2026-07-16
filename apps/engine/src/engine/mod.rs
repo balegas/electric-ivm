@@ -862,27 +862,6 @@ impl Engine {
         }
     }
 
-    /// On-demand byte-level self-accounting (Phase 0 of the memory-reduction effort): a
-    /// [`crate::heap_size::HeapSize`] lower-bound owned-heap estimate per major structure. These
-    /// are LOWER BOUNDS (owned heap, not allocator slack) — the gap vs. `process.rss_bytes` is the
-    /// allocator/pinning term this phase is instrumenting to measure.
-    ///
-    /// Expensive: locks engine state, round-trips a one-off `SequencerCmd::MemBytes` to the
-    /// sequencer task (mirroring the `DumpNode` command's pattern — see `dump_node` below), locks
-    /// the subquery registry, and walks roughly the engine's entire owned heap (~100MB at 50k
-    /// shapes). Call this ONLY from the `GET /memory` HTTP handler — never from the 500ms
-    /// background sampler (`mem::spawn_sampler`), which calls `mem_cardinalities` instead. Mixing
-    /// this into the sampler's path was exactly the prior regression (+41%/+52% peak/steady RSS at
-    /// 100k subscriptions from twice-a-second byte walks); see `mem::spawn_sampler`'s doc comment.
-    ///
-    /// `bytes_executors` (standalone shapes + their conjunct index, family routers, aggregate
-    /// folds + their index) is the one term this method cannot read out of already-published
-    /// state: those structures are privately owned by the sequencer task's `execs` map, never
-    /// exposed through a shared mutex (unlike `stats`/`node_states`, which are republished after
-    /// every batch specifically so other tasks can read them cheaply). Walking them for real bytes
-    /// is not cheap enough to piggyback on every batch (see `sequencer::publish_all`/`stats_of`),
-    /// so instead this method round-trips the one-off `SequencerCmd::MemBytes` so the byte-walk
-    /// itself only ever runs on this on-demand path, never per batch.
     /// Diagnostic only: full dbsp profiler dumps for EVERY dbsp circuit the engine runs — the
     /// (single, engine-wide) subquery membership circuit plus the counts/arrangements circuit
     /// when configured. The engine's "family" and "standalone" circuits are host-side executor
@@ -915,6 +894,27 @@ impl Engine {
         serde_json::json!({ "membership_circuit": membership, "counts_circuit": counts })
     }
 
+    /// On-demand byte-level self-accounting (Phase 0 of the memory-reduction effort): a
+    /// [`crate::heap_size::HeapSize`] lower-bound owned-heap estimate per major structure. These
+    /// are LOWER BOUNDS (owned heap, not allocator slack) — the gap vs. `process.rss_bytes` is the
+    /// allocator/pinning term this phase is instrumenting to measure.
+    ///
+    /// Expensive: locks engine state, round-trips a one-off `SequencerCmd::MemBytes` to the
+    /// sequencer task (mirroring the `DumpNode` command's pattern — see `dump_node` below), locks
+    /// the subquery registry, and walks roughly the engine's entire owned heap (~100MB at 50k
+    /// shapes). Call this ONLY from the `GET /memory` HTTP handler — never from the 500ms
+    /// background sampler (`mem::spawn_sampler`), which calls `mem_cardinalities` instead. Mixing
+    /// this into the sampler's path was exactly the prior regression (+41%/+52% peak/steady RSS at
+    /// 100k subscriptions from twice-a-second byte walks); see `mem::spawn_sampler`'s doc comment.
+    ///
+    /// `bytes_executors` (standalone shapes + their conjunct index, family routers, aggregate
+    /// folds + their index) is the one term this method cannot read out of already-published
+    /// state: those structures are privately owned by the sequencer task's `execs` map, never
+    /// exposed through a shared mutex (unlike `stats`/`node_states`, which are republished after
+    /// every batch specifically so other tasks can read them cheaply). Walking them for real bytes
+    /// is not cheap enough to piggyback on every batch (see `sequencer::publish_all`/`stats_of`),
+    /// so instead this method round-trips the one-off `SequencerCmd::MemBytes` so the byte-walk
+    /// itself only ever runs on this on-demand path, never per batch.
     pub async fn mem_bytes(&self) -> crate::mem::HeapBytes {
         let (bytes_shape_records, cmd_tx) = {
             let st = self.state.lock().await;
