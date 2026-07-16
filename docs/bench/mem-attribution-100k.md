@@ -78,6 +78,40 @@ The ~443 MB still unattributed under spill is the remaining circuit machinery th
 not spill: the family circuits (3 shared equality circuits each holding its base table),
 the storage cache (64 MiB), dbsp step buffers, and tokio/runtime state.
 
+## 2b. Post-dictionary attribution (HEAD 2e94ddc, 2026-07-16)
+
+Same A/B method re-run after Task 2.1 (global pk dictionary: u32-keyed relations,
+key-only feed upsert set — logical feed entries shrank ~5× at test scale). Workload:
+the standard Gate-G **ramped** creation (100→10,000 users, 100k subscriptions,
+FEED_TRACE=0), snapshot ~3.5 s after the final 50k-subscription burst drained
+(creation-peak state); spill run: explicit storage dir, cache 64 MiB.
+
+| | in-memory (it2) | spill (cache 64 MiB) |
+|---|---:|---:|
+| phys footprint (peak) | **1102 MB** | **645 MB** |
+| footprint, live-5000 steady | 1046 MB | 613 MB |
+| MALLOC regions, dirty+swapped (incl. empty + metadata) | ~1094 MB | ~639 MB |
+| — zone live-allocated (vmmap "bytes allocated") | 1001.9 MB | 543.1 MB |
+| —— self-accounted owned heap (`bytes_*` sum, incl. `bytes_pk_dict` 6.3 MiB) | 96.8 MB (8.8%) | 96.8 MB (15.0%) |
+| — allocator slack (regions − live; zone frag 70.9 / 67.4 MB) | ~92 MB (8.4%) | ~96 MB (14.9%) |
+| non-MALLOC | ~8 MB | ~6 MB |
+| spilled to disk (du during run) | — | **27 MB** |
+
+**(a) circuit-resident (spillable): 1001.9 − 543.1 ≈ 459 MB** — statistically identical
+to the pre-dictionary 454 MB, even though each feed entry's payload shrank ~5× and the
+serialized on-disk form halved (59 → 27 MB). The resident-to-serialized blow-up is now
+~17× (was ~8×): the circuit's resident cost is **per-entry/spine machinery, not payload
+bytes**. **(b) allocator slack: ~92–96 MB (8–15% of footprint)** — still below the 25%
+jemalloc gate. **(c) neither: ~551 MB** of the in-memory footprint = 96.8 MB owned host
+metadata + ~8 MB non-malloc + **~446 MB live-but-unattributed even under spill** (family
+circuits' base tables, dbsp step buffers, storage cache, runtime) — unchanged from
+Phase 0's ~443 MB residual.
+
+**Conclusion:** payload narrowing is exhausted; the two remaining levers are the ~459 MB
+spillable term and the ~446 MB non-spillable circuit machinery, both driven by **entry
+and batch counts** — i.e. Task 2.2 (bitmap/set-per-feed representations) / Phase-3-class
+work, not further key compression and not the allocator.
+
 ## 3. Verdict on the three Phase-1 hypotheses
 
 | hypothesis | magnitude at 100k subs | verdict |

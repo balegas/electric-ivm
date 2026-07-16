@@ -93,6 +93,13 @@ serialized blow-up). Shrinking entry payloads further cannot move the headline; 
 the **number of resident entries/batches** (bitmap/set-per-feed representations,
 compaction, spill tuning) can.
 
+**Post-dict spill attribution (one extra B2, spill cache 64 MiB, HEAD 2e94ddc — full
+numbers in `mem-attribution-100k.md` §2b):** spillable circuit-resident term **~459 MB**
+(pre-dict: 454 — unchanged by the 5× payload shrink; on-disk serialized form halved to
+27 MB → ~17× resident/serialized blow-up), allocator slack ~92–96 MB (8–15%), remainder
+~551 MB (96.8 owned + ~8 non-malloc + ~446 non-spillable circuit machinery) — the
+footprint is entry/batch-count-driven, not payload-driven.
+
 **Phase 2 gate data (controller decides):**
 - Criterion "cumulative footprint @100k ≤ ~300 MiB → stop structural work":
   **NOT met** — 1102 peak / 1046 steady (same-day series: 0b 1091/1108 → it1 1125/1062 →
