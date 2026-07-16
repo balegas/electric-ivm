@@ -573,11 +573,21 @@ impl SubqueryRegistry {
     ///
     /// Replaces the former `key_count × 88 B` estimate with dbsp's exact per-batch
     /// `approximate_byte_size` (columnar bytes when resident; on-disk file size when spilled —
-    /// see `subq_circuit`'s `SpillConfig`). Cheap: reads the three snapshot slots the circuit
+    /// see `subq_circuit`'s `SpillConfig`). Cheap: reads the two snapshot slots the circuit
     /// already publishes, no circuit round-trip. See [`crate::subq_circuit::CircuitBytes`] for
-    /// what each term covers and the (profiler-only) non-published state it does not.
+    /// what each term covers and the (profiler-only) non-published state it does not. Covers only
+    /// the contributor relation now — the per-feed key sets left the circuit (see
+    /// [`Self::feed_sets_bytes`]).
     pub fn circuit_bytes(&self) -> crate::subq_circuit::CircuitBytes {
         self.circuit.snapshot_bytes()
+    }
+
+    /// Estimated owned heap of the host-side per-feed key sets (`bytes_feed_sets` in `GET /memory`)
+    /// — the delete gate's Roaring bitmaps, moved out of the membership circuit in Task 2.2
+    /// (dbsp-ds-dh6). A lower-bound owned floor (serialized bitmap payloads + the outer HashMap
+    /// backing store). On-demand only (a per-bitmap payload walk); never on the 500ms sampler path.
+    pub fn feed_sets_bytes(&self) -> usize {
+        self.feed_sets.heap_bytes()
     }
 
     /// Estimated owned heap of the global pk dictionary (`bytes_pk_dict` in `GET /memory`) — the

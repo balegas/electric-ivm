@@ -52,6 +52,11 @@ pub struct HeapBytes {
     /// Split of `bytes_membership_circuit` (Task 1.3): the derived MEMBERS relation snapshot
     /// (`(node,value)`), published for `contains`/introspection reads.
     pub bytes_circuit_snapshots: usize,
+    /// Host-side per-feed key sets (Task 2.2, dbsp-ds-dh6): the delete gate's Roaring bitmaps,
+    /// moved OUT of the membership circuit. Replaces the feed component that used to live in
+    /// `bytes_membership_circuit`/`bytes_circuit_integral`; ~10–19× lighter than the in-circuit
+    /// relation it supplants (owned-heap floor: serialized bitmap payloads + the outer HashMap).
+    pub bytes_feed_sets: usize,
     /// The global pk dictionary (Task 2.1): once-per-distinct-pk string storage + forward/reverse
     /// index. Append-only (no eviction in v1); reported so the string-interning trade is visible.
     pub bytes_pk_dict: usize,
@@ -90,18 +95,23 @@ pub struct Cardinalities {
     /// `pk_nodes` inverted index), shapes, and edges — excludes the membership circuit itself
     /// (see `bytes_membership_circuit`).
     pub bytes_subquery_registry: usize,
-    /// Measured owned/on-disk bytes of the dbsp membership circuit's published snapshots
-    /// (subquery inner sets + per-feed key sets), via dbsp's `BatchReader::approximate_byte_size`
+    /// Measured owned/on-disk bytes of the dbsp membership circuit's published snapshots (subquery
+    /// inner sets — the CONTRIBUTORS relation), via dbsp's `BatchReader::approximate_byte_size`
     /// (exact in-memory columnar bytes when resident, on-disk file size when spilled). Equals
     /// `bytes_circuit_integral + bytes_circuit_snapshots`. See `SubqueryRegistry::circuit_bytes`.
     /// NOTE: this covers only the host-published snapshots (which share the operators' own
     /// integrals via dbsp's trace cache); dbsp's non-published incremental state (z1 delayed
     /// traces, `distinct` integrals) roughly doubles it and is measurable only via the profiler.
+    /// The per-feed key sets left this term in Task 2.2 — see `bytes_feed_sets`.
     pub bytes_membership_circuit: usize,
-    /// Raw upsert-map integrals term of `bytes_membership_circuit` (CONTRIBUTORS + FEEDS maps).
+    /// Raw contributor upsert-map integral term of `bytes_membership_circuit`.
     pub bytes_circuit_integral: usize,
     /// Derived MEMBERS relation snapshot term of `bytes_membership_circuit`.
     pub bytes_circuit_snapshots: usize,
+    /// Host-side per-feed key sets (Task 2.2, dbsp-ds-dh6): the delete gate's Roaring bitmaps,
+    /// moved out of the membership circuit. Replaces the feed component formerly folded into
+    /// `bytes_membership_circuit`. See `SubqueryRegistry::feed_sets_bytes`.
+    pub bytes_feed_sets: usize,
     /// The global pk dictionary (Task 2.1): amortized once-per-distinct-pk string storage plus its
     /// forward/reverse index — the append-only cost of keying the circuit by `u32` pk ids instead
     /// of heap strings. See `SubqueryRegistry::pk_dict_bytes`.
@@ -123,6 +133,7 @@ impl Cardinalities {
         self.bytes_membership_circuit = bytes.bytes_membership_circuit;
         self.bytes_circuit_integral = bytes.bytes_circuit_integral;
         self.bytes_circuit_snapshots = bytes.bytes_circuit_snapshots;
+        self.bytes_feed_sets = bytes.bytes_feed_sets;
         self.bytes_pk_dict = bytes.bytes_pk_dict;
         self.bytes_electric_adapter = bytes.bytes_electric_adapter;
         self
@@ -225,6 +236,7 @@ pub fn snapshot_json(card: &Cardinalities) -> serde_json::Value {
             "bytes_membership_circuit": card.bytes_membership_circuit,
             "bytes_circuit_integral": card.bytes_circuit_integral,
             "bytes_circuit_snapshots": card.bytes_circuit_snapshots,
+            "bytes_feed_sets": card.bytes_feed_sets,
             "bytes_pk_dict": card.bytes_pk_dict,
             "bytes_electric_adapter": card.bytes_electric_adapter,
         },

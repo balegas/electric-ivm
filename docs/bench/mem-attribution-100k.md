@@ -112,6 +112,17 @@ spillable term and the ~446 MB non-spillable circuit machinery, both driven by *
 and batch counts** — i.e. Task 2.2 (bitmap/set-per-feed representations) / Phase-3-class
 work, not further key compression and not the allocator.
 
+> **Addendum (Task 2.2 landed, dbsp-ds-dh6 re-litigated).** The feed relation — the dominant
+> chunk of the ~459 MB spillable membership-circuit-resident term above — has been moved OUT
+> of the circuit to host-side Roaring bitmaps (`apps/engine/src/subq_feed.rs`). The spike
+> (`docs/notes/2026-07-16-feed-set-representation-spike.md`) measured the two representations
+> over this same ~3.7M-entry feed shape: **169 MiB** in-circuit (profiler `total_used_bytes`,
+> spill off) vs **~16 MiB** as bitmaps (RSS Δ) — a 10–19× reduction. This attacks *both* levers
+> the conclusion names: it removes the feed set's share of the spillable term **and** its share
+> of the batch/spine machinery the circuit could never page out. The residual circuit term is
+> now dominated by the **contributor** relation (~60k entries at 100k subs). This doc's
+> measured numbers predate the change; re-measure to quantify the landed RSS reduction.
+
 ## 3. Verdict on the three Phase-1 hypotheses
 
 | hypothesis | magnitude at 100k subs | verdict |
