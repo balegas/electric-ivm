@@ -325,12 +325,11 @@ pub struct SubqueryRegistry {
     next_feed_id: i64,
     /// circuit feed id -> shape id (maps feed deltas back to shapes).
     feed_by_id: HashMap<i64, String>,
-    /// Host-side per-feed key sets (Task 2.2, dbsp-ds-dh6): the delete gate, moved out of the
-    /// membership circuit. Mutated only under this registry's lock, synchronously (no `.await`),
-    /// at the same emission points as the circuit feed asserts — so the emission decision and the
-    /// bitmap transition are one indivisible step. During increment 2 both this and the circuit
-    /// feed relation are live; a debug-only parity assert in `emit_for_shapes` proves they agree
-    /// before increment 3 cuts the circuit feed input out.
+    /// Host-side per-feed key sets (Task 2.2, dbsp-ds-dh6): per-feed Roaring bitmaps over pk_ids,
+    /// implementing the delete gate. A delete is emitted iff `remove(feed_id, pk_id)` returns true.
+    /// Mutated only under this registry's lock, synchronously (no `.await`), in the same critical
+    /// section as the emission decision — so the emission decision and the bitmap transition are
+    /// one indivisible step.
     feed_sets: crate::subq_feed::FeedSet,
     /// Shared evaluation templates (see [`TemplateGroup`]), keyed by
     /// [`crate::predicate::subquery_template`]'s key.

@@ -381,6 +381,11 @@ impl Engine {
                  deprecated no-ops: the circuit is in-memory counts only (no storage layer)"
             );
         }
+        if std::env::var("ELECTRIC_IVM_FEED_TRACE").is_ok() {
+            tracing::warn!(
+                "ELECTRIC_IVM_FEED_TRACE is deprecated and ignored: the feed relation now lives host-side"
+            );
+        }
         let mut counts: Vec<crate::arrangements::CountSpec> = Vec::new();
         for (t, cols) in &cfg.counts {
             let Some(ts) = schemas.get(t) else {
