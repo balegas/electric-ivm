@@ -24,6 +24,7 @@ too — rejected iterations steer the combination decisions at phase gates.
 | 0 — instrumented baseline (Phase 0) | `mem/phase-0-attribution` @ dd7a259 | **1116 / 1059 MiB** (run 1: 1130 / 1130; reproduced) | ~11.4 KiB | ~269 B | ~9.7 KiB | PASS (engine:test green 172 tests; vitest green 27 files / 162 tests; electric-conformance `oracle` 1/1 green — no new failures; note: the "13/15" figure describes oracle+subqueries combined, not this suite alone) | PASS (`never_member_delete_is_dropped`, `genuine_member_delete_is_never_dropped` — both green in engine:test) | **REJECT** — headline B2 peak +41% / steady +52% vs baseline; B1 terms ~3× baseline; far beyond the ≤2% rule |
 | 0b — instrumented baseline, sampler fixed (66117f2) | `mem/phase-0-attribution` @ 66117f2 | **1091 / 1107 MiB** | ~11.2 KiB | ~185 B | ~9.5 KiB | PASS (engine:test 173 green incl. new `sampler_cardinalities_never_populates_bytes_fields`; vitest 27 files / 162 tests green; conformance `oracle` 1/1 green) | PASS (both delete-gate tests green, verified at 66117f2) | **ACCEPT vs same-day control** (baseline commit 3213e41, same command: 1111 / 1053 → peak −1.8%, steady +5.1%, within the observed run-to-run spread of the steady cell); the frozen 789/698 row is NOT reproducible under the Gate-G config on today's machine — see the control note |
 | 1 — circuit observability split, Task 1.3 (380a0f9) | `mem/phase-1-host-slimming` @ 380a0f9 | **1125 / 1062 MiB** | ~11.5 KiB | ~204 B | ~9.5 KiB | PASS (engine:test 157 lib + integration green incl. new `snapshots_do_not_pin_precompaction_batches` + `snapshot_bytes_measures_and_splits_relations`; vitest 27 files / 162 tests green; conformance `oracle` 1/1 green) | PASS (both delete-gate tests green at 380a0f9) | **ACCEPT vs 0b** (peak +3.1%, steady −4.1%, B1 reg unchanged — all inside the ~5–7% observed run spread; observability-only diff). FEED_TRACE A/B piggyback: on-vs-off delta ~1% → dbsp-ds-2hu resolved, see notes |
+| 3 — FeedSet: feed relation out of the circuit, Task 2.2 (3cd9956) | `mem/phase-2-feed-keys` @ 3cd9956 | **1104 / 1053 MiB** | ~11.3 KiB | ~16 B (legacy ΔRSS) / **2.2 B/entry owned** (`bytes_feed_sets`) | ~8.6 KiB | PASS (engine:test 164 green; vitest 162 green; conformance `oracle` 1/1 green) | PASS (both delete-gate tests green at 3cd9956 — the gate is now the host-side FeedSet check-and-set) | **ACCEPT vs it2** — target term collapsed everywhere it is visible (B1 materialized Δ 329.2→131.6 MiB, −60%; B1 footprint Δ 296→96 MiB; owned feed cost 6.4 MiB for 3.0 M entries); B2 headline unchanged (+0.2% / +0.7%) → **the 100k footprint was not feed-entry-driven** — see notes |
 | 2 — pk dictionary, Task 2.1 (2e94ddc) | `mem/phase-2-feed-keys` @ 2e94ddc | **1102 / 1046 MiB** | ~11.3 KiB | ~86 B (legacy ΔRSS) / **~9 B owned** (circuit+dict, primary) | ~8.5 KiB | PASS (engine:test 164 green incl. PkDict suite + `never_member_candidate_does_not_mint_pk_dict_id`; vitest 162 green; conformance `oracle` 1/1 green) | PASS (both delete-gate tests green at 2e94ddc) | **ACCEPT vs it1** — target term (owned feed/circuit bytes) collapsed (B1 materialized ΔRSS halved 675.8→329.2 MiB; synced-row 204→86 B legacy; owned ~9 B/row); B2 footprint unchanged (−2.0% / −1.5%, noise) → the 100k footprint is dbsp residency overhead, not key payload — see notes + Phase 2 gate data |
 
 ### Iteration 0 notes — the instrumentation is NOT free
@@ -58,6 +59,43 @@ live phase; all configured phases still completed.
 Attribution *ratios* from `mem-attribution-100k.md` (owned-heap vs slack vs circuit) were
 measured with the same tax active in both of its runs and remain directionally valid; the
 absolute footprints there carry the same inflation.
+
+### Iteration 3 notes — FeedSet (Task 2.2); Phase 2 gate data refresh
+
+Change under test (`mem/phase-2-feed-keys` @ 3cd9956): feed relation moved OUT of the dbsp
+circuit into host-side per-feed Roaring bitmaps (`FeedSet`, ~2.2 B/entry); the delete gate
+is an explicit check-and-set under the registry lock; circuit keeps contributor relations
+only; `ELECTRIC_IVM_FEED_TRACE` removed (warn-and-ignore — the standard B2 command was
+kept verbatim and the engine logged the deprecation warning); new `/memory` field
+`bytes_feed_sets`. Comparison point = iteration 2.
+
+**Where the move is visible.** B1 materialized: Δ **131.6 MiB vs it2's 329.2 (−60%)**;
+footprint variant Δ 96 MiB vs 296 (−68%); legacy synced-row ≈ 16 B vs 86. B1 owned
+circuit+dict milestone delta collapsed to ~0.36 MiB (the bench's owned column predates
+`bytes_feed_sets` and now sees almost nothing — correct, the feed left its scope). B2
+attribution snapshot @100k: `bytes_feed_sets` **6.4 MiB for exactly 3,000,000 feed
+entries (2.2 B/entry, as designed)**; `bytes_membership_circuit` 1.8 MiB; owned sum
+98.7 MiB. B2 milestones up to 1000 users are ~30–50% below it2 (49/86 MiB vs 96/120).
+
+**Where it is not.** B2 headline: 1104 peak / 1053 steady vs it2's 1102 / 1046 (+0.2% /
++0.7% — noise). vmmap @ top milestone: zone live-allocated ~1000.6 MB (it2: 1001.9),
+frag 68.2 MB. **Removing a 3 M-entry relation from the circuit did not move live
+allocations at 100k subs** — so the ~460 MB "spillable" term measured in §2b of
+`mem-attribution-100k.md` and the ~446 MB non-spillable residual are NOT feed-entry
+storage. The entry-count hypothesis survives only in its general form: the remaining
+~0.9 GB of live-but-unattributed dbsp state must sit in the contributor-side machinery —
+per-node/per-shape arrangements, join/candidate traces, step buffers — whose scaling
+driver is subscription/node count (10k nodes, 60k contributors, 50k live shapes), not
+feed rows. Decomposing that (dbsp-level sizing per operator/trace, or a fresh spill A/B
+on this build) is the next measurement, not more feed-side work.
+
+**Phase 2 gate data (controller decides):**
+- Criterion "footprint @100k ≤ ~300 MiB": **NOT met** — 1104 peak / 1053 steady
+  (series: 0b 1091/1108 → it1 1125/1062 → it2 1102/1046 → it3 1104/1053).
+- Largest remaining attributable term: **live-allocated, unattributed dbsp/circuit
+  machinery ≈ 0.90 GB ≈ 82% of footprint** (owned self-accounted 98.7 MiB ≈ 9%,
+  allocator slack ~68–100 MB ≈ 7–9%, non-malloc ~8 MB). The feed/circuit *logical* term
+  is now 6.4 + 1.8 MiB < 1%.
 
 ### Iteration 2 notes — pk dictionary (Task 2.1); Phase 2 gate data
 
