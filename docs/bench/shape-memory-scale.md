@@ -44,14 +44,23 @@ listeners attached and no writes, the engine's hot working set is **~35 MiB** �
 
 ## 3. The feed-trace knob (`ELECTRIC_IVM_FEED_TRACE=0`)
 
-The measured RSS delta at 100k subscriptions, creation peak: **731.8 MiB (trace on) vs
-408.1 MiB (off)** — stands as observed. However, the "second full copy" explanation was
-disproven by the Task 1.3 audit: the trace shares the feed upsert operator's own integral
-via dbsp's TraceId cache, not a logical duplicate. The mechanism behind the measured
-~323 MiB delta is unresolved (candidates: allocator/spine-churn/OS-page effects), tracked in
-bead dbsp-ds-2hu. Off is the recommended setting for feed-heavy deployments until stream-fold
-drop enumeration lands (dbsp-ds-4d8); the cost is that dropped shapes leave unreachable
-entries in the operator integral (feed ids are never reused, so correctness is unaffected).
+The historical RSS delta at 100k subscriptions, creation peak: **731.8 MiB (trace on) vs
+408.1 MiB (off)**. The "second full copy" explanation was disproven by the Task 1.3 audit:
+the trace shares the feed upsert operator's own integral via dbsp's TraceId cache, not a
+logical duplicate.
+
+**Resolved (2026-07-16, closes bead dbsp-ds-2hu):** a same-day A/B under the Gate-G B2
+config (100k subs, 100/1000/2500/5000/10000 ramp, 5000-hold live phase, spill-by-default,
+engine at `mem/phase-1-host-slimming` 380a0f9) measured phys footprint **1135 peak /
+1075 steady (trace on) vs 1125 / 1062 (off)** — a ~10–13 MiB (~1%) delta, within
+run-to-run noise. The knob has **no material real-world saving on current code**,
+consistent with the shared-integral mechanism; the historical ~323 MiB delta was an
+artifact of its measurement era (creation-peak `ps rss` on pre-audit code and different
+machine state), not a property of the trace. Consequently the "off for feed-heavy
+deployments" recommendation is withdrawn: the trace is memory-free under the shared
+integral, and leaving it on keeps drop-time enumeration + introspection. (Unreachable
+integral entries from dropped shapes exist with the trace on or off — feed ids are never
+reused, so correctness is unaffected; stream-fold drop enumeration remains dbsp-ds-4d8.)
 
 ## 4. Disk spilling (worktree `feat/subq-circuit-spill`, bead dbsp-ds-4gc)
 

@@ -23,6 +23,7 @@ too — rejected iterations steer the combination decisions at phase gates.
 |---|---|---|---|---|---|---|---|---|
 | 0 — instrumented baseline (Phase 0) | `mem/phase-0-attribution` @ dd7a259 | **1116 / 1059 MiB** (run 1: 1130 / 1130; reproduced) | ~11.4 KiB | ~269 B | ~9.7 KiB | PASS (engine:test green 172 tests; vitest green 27 files / 162 tests; electric-conformance `oracle` 1/1 green — no new failures; note: the "13/15" figure describes oracle+subqueries combined, not this suite alone) | PASS (`never_member_delete_is_dropped`, `genuine_member_delete_is_never_dropped` — both green in engine:test) | **REJECT** — headline B2 peak +41% / steady +52% vs baseline; B1 terms ~3× baseline; far beyond the ≤2% rule |
 | 0b — instrumented baseline, sampler fixed (66117f2) | `mem/phase-0-attribution` @ 66117f2 | **1091 / 1107 MiB** | ~11.2 KiB | ~185 B | ~9.5 KiB | PASS (engine:test 173 green incl. new `sampler_cardinalities_never_populates_bytes_fields`; vitest 27 files / 162 tests green; conformance `oracle` 1/1 green) | PASS (both delete-gate tests green, verified at 66117f2) | **ACCEPT vs same-day control** (baseline commit 3213e41, same command: 1111 / 1053 → peak −1.8%, steady +5.1%, within the observed run-to-run spread of the steady cell); the frozen 789/698 row is NOT reproducible under the Gate-G config on today's machine — see the control note |
+| 1 — circuit observability split, Task 1.3 (380a0f9) | `mem/phase-1-host-slimming` @ 380a0f9 | **1125 / 1062 MiB** | ~11.5 KiB | ~204 B | ~9.5 KiB | PASS (engine:test 157 lib + integration green incl. new `snapshots_do_not_pin_precompaction_batches` + `snapshot_bytes_measures_and_splits_relations`; vitest 27 files / 162 tests green; conformance `oracle` 1/1 green) | PASS (both delete-gate tests green at 380a0f9) | **ACCEPT vs 0b** (peak +3.1%, steady −4.1%, B1 reg unchanged — all inside the ~5–7% observed run spread; observability-only diff). FEED_TRACE A/B piggyback: on-vs-off delta ~1% → dbsp-ds-2hu resolved, see notes |
 
 ### Iteration 0 notes — the instrumentation is NOT free
 
@@ -56,6 +57,38 @@ live phase; all configured phases still completed.
 Attribution *ratios* from `mem-attribution-100k.md` (owned-heap vs slack vs circuit) were
 measured with the same tax active in both of its runs and remain directionally valid; the
 absolute footprints there carry the same inflation.
+
+### Iteration 1 notes — circuit observability split (Task 1.3); FEED_TRACE A/B
+
+Change under test (`mem/phase-1-host-slimming` @ 380a0f9): observability-only —
+`bytes_membership_circuit` split into `bytes_circuit_integral` / `bytes_circuit_snapshots`
+via real dbsp sizing, a snapshot-pinning regression test
+(`snapshots_do_not_pin_precompaction_batches`), and doc corrections. Expected no benchmark
+movement vs 0b; measured (comparison point = iteration 0b, NOT the stale frozen row):
+
+- **B2 (FEED_TRACE=0, spill-by-default)**: peak 1125 / steady 1062 MiB vs 0b's 1091 / 1108
+  → +3.1% / −4.1%, both inside the ~5–7% run-to-run spread this cell has shown on
+  identical configs. No ENOBUFS.
+- **B1**: registration Δ 93.1 MiB (**9.5 KiB/shape**, = 0b); materialized Δ 675.8 MiB →
+  (mat − reg) ≈ 583 MiB / ~3.0 M rows ≈ **204 B/row** vs 0b's 185 (+10% — an RSS-based
+  cell whose iteration-0→0b swing was −28% on identical structural state; treated as
+  noise, flagged for watching).
+- **Verdict: ACCEPT** — no regression signal attributable to an observability-only diff.
+
+**FEED_TRACE A/B (resolves bead dbsp-ds-2hu).** One extra B2, identical config except
+`ELECTRIC_IVM_FEED_TRACE=1`, same day, back-to-back, both spill-by-default:
+
+| run | peak @100k | live-5000 | +15 s (steady) |
+|---|---:|---:|---:|
+| FEED_TRACE=0 | 1125 MiB | 1125 | 1062 |
+| FEED_TRACE=1 | 1135 MiB | 1135 | 1075 |
+
+Delta ~10–13 MiB (~1%) — the historical ~323 MiB saving did **not** reappear. This
+matches the Task-1.3 audit mechanism (the published feed trace shares the upsert
+operator's integral via dbsp's TraceId cache — no second copy): the old 731.8-vs-408.1
+RSS measurement was an artifact of its era (creation-peak `ps rss` on different code and
+machine state, likely allocator/paging effects), not a real steady saving of the knob
+today. `docs/bench/shape-memory-scale.md` §3 updated; **bead dbsp-ds-2hu can be closed**.
 
 ### Iteration 0b notes — sampler fixed; the frozen baselines are not reproducible under the Gate-G configs
 
