@@ -12,8 +12,8 @@ Collected with the `SCALE_ATTRIBUTION=1` hook in `packages/bench/src/shape-mem-s
 after the final milestone drains, the harness snapshots the full `/memory` JSON,
 `vmmap --summary <pid>` and `footprint <pid>` into `docs/bench/raw/attribution-<label>-*`.
 Two runs, one milestone each (`SCALE_USERS=10000`, no live phase): **in-memory** and
-**spill** (`ELECTRIC_IVM_SUBQ_STORAGE_DIR`, cache 64 MiB). Engine at
-`mem/phase-0-attribution` (Task 0.1 instrumentation included), `ELECTRIC_IVM_FEED_TRACE=0`.
+**spill** (`ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR`, cache 64 MiB). Engine at
+`mem/phase-0-attribution` (Task 0.1 instrumentation included), `ELECTRIC_CIRCUITS_FEED_TRACE=0`.
 
 **What each source measures.** `footprint` = phys footprint (dirty + compressed/swapped,
 the honest state metric). `vmmap`'s MALLOC ZONE table splits the malloc heap into
@@ -43,7 +43,7 @@ its relations) — values from the in-memory run:
 
 **Caveat — `bytes_membership_circuit` badly undercounts here.** 10,560,000 =
 (60,000 contributors + 60,000 distinct values + **0 feed keys**) × 88 B. With
-`ELECTRIC_IVM_FEED_TRACE=0` the published feed trace is disabled, so `feed_len` reads an
+`ELECTRIC_CIRCUITS_FEED_TRACE=0` the published feed trace is disabled, so `feed_len` reads an
 empty snapshot and the ~3.7 M feed keys (prior-report count for this workload) contribute
 nothing to the estimate — even though the gating integral inside the dbsp circuit still
 holds them. The circuit's real resident cost is measured below by the spill delta, not by
@@ -167,7 +167,7 @@ O(groups)) was not even running. The §2 speculation that "family circuits each 
 base table" is refuted — family circuits are host-side (22.2 MiB owned, no dbsp).
 
 **Actionable next step (one line, ~40% of footprint):** default
-`ELECTRIC_IVM_SUBQ_STORAGE_CACHE_MIB` to a bounded value (e.g. 64) instead of inheriting
+`ELECTRIC_CIRCUITS_SUBQ_STORAGE_CACHE_MIB` to a bounded value (e.g. 64) instead of inheriting
 dbsp's 512 MiB — the measured 64 MiB-cache configuration held the same workload at
 **645 peak / 613 steady** with 27 MB on disk. The remaining ~395 MB of runtime/buffer
 churn (merger/FBuf slabs, step buffers) is the term after that.
@@ -223,17 +223,17 @@ plan** (not just the cheap fingerprint variant).
 ## Reproduce
 
 ```bash
-cargo build --release -p electric-ivm-engine
+cargo build --release -p electric-circuits-engine
 
 # in-memory
-ELECTRIC_IVM_FEED_TRACE=0 \
+ELECTRIC_CIRCUITS_FEED_TRACE=0 \
 SCALE_ISSUES=100000 SCALE_PROJECTS=2000 SCALE_USERS=10000 \
 SCALE_CLIENT_PROCS=4 SCALE_LIVE_SUBS=0 \
 SCALE_ATTRIBUTION=1 SCALE_ATTRIBUTION_LABEL=inmemory \
-  pnpm --filter @electric-ivm/bench exec tsx src/shape-mem-scale.ts
+  pnpm --filter @electric-circuits/bench exec tsx src/shape-mem-scale.ts
 
 # spill: add
-#   ELECTRIC_IVM_SUBQ_STORAGE_DIR=$(mktemp -d) ELECTRIC_IVM_SUBQ_STORAGE_CACHE_MIB=64 \
+#   ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR=$(mktemp -d) ELECTRIC_CIRCUITS_SUBQ_STORAGE_CACHE_MIB=64 \
 #   SCALE_ATTRIBUTION_LABEL=spill
 
 # artifacts land in docs/bench/raw/attribution-<label>-{memory.json,vmmap-summary.txt,footprint.txt}

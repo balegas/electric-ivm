@@ -13,7 +13,7 @@
 // A separate probe creates a *materialized* visibility shape (with backfill) to measure the backfill
 // working set as a function of deployment size.
 //
-//   pnpm --filter @electric-ivm/bench exec tsx src/shape-mem-matrix.ts
+//   pnpm --filter @electric-circuits/bench exec tsx src/shape-mem-matrix.ts
 //   MATRIX_SIZES=1000,10000,100000  MATRIX_USERS=10,25,50,100  MATRIX_PROJECTS=20 tsx src/shape-mem-matrix.ts
 
 import { type ChildProcess, execFileSync, execSync, spawn } from 'node:child_process'
@@ -22,7 +22,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { DurableStreamTestServer } from '@electric-ivm/ds-rust'
+import { DurableStreamTestServer } from '@electric-circuits/ds-rust'
 import pgpkg from 'pg'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -47,7 +47,7 @@ const COMMENTS_PER_ISSUE = process.env.MATRIX_COMMENTS ? Number(process.env.MATR
 const CONC = numEnv('MATRIX_CONC', 24) // concurrent shape-creation requests
 const OUT = process.env.MATRIX_OUT ?? join(repoRoot(), 'docs', 'bench', 'shape-memory-matrix.md')
 
-const SLOT = 'electric_ivm_shapemem'
+const SLOT = 'electric_circuits_shapemem'
 const STATUSES = ['backlog', 'todo', 'in_progress', 'done', 'canceled']
 const PRIORITIES = ['none', 'low', 'medium', 'high', 'urgent']
 const MAX_USERS = Math.max(...USER_MILESTONES)
@@ -62,8 +62,8 @@ interface Sample {
 }
 
 function mustHaveBin() {
-  if (!existsSync(join(repoRoot(), 'target', 'release', 'electric-ivm-engine'))) {
-    console.error('build first: cargo build --release -p electric-ivm-engine')
+  if (!existsSync(join(repoRoot(), 'target', 'release', 'electric-circuits-engine'))) {
+    console.error('build first: cargo build --release -p electric-circuits-engine')
     process.exit(1)
   }
 }
@@ -153,16 +153,16 @@ async function createSchemaAndSeed(client: pgpkg.Client, issues: number): Promis
 }
 
 async function spawnEngine(dsUrl: string, pgUrl: string): Promise<{ url: string; proc: ChildProcess }> {
-  const proc = spawn(join(repoRoot(), 'target', 'release', 'electric-ivm-engine'), [], {
+  const proc = spawn(join(repoRoot(), 'target', 'release', 'electric-circuits-engine'), [], {
     env: {
       ...process.env,
-      ELECTRIC_IVM_DS_URL: dsUrl,
-      ELECTRIC_IVM_BIND: '127.0.0.1:0',
-      ELECTRIC_IVM_LOG: 'warn',
-      ELECTRIC_IVM_PG_URL: pgUrl,
-      ELECTRIC_IVM_PG_TABLES: 'issues,projects,users,project_members,comments',
-      ELECTRIC_IVM_PG_SLOT: SLOT,
-      ELECTRIC_IVM_PG_POLL_MS: '50',
+      ELECTRIC_CIRCUITS_DS_URL: dsUrl,
+      ELECTRIC_CIRCUITS_BIND: '127.0.0.1:0',
+      ELECTRIC_CIRCUITS_LOG: 'warn',
+      ELECTRIC_CIRCUITS_PG_URL: pgUrl,
+      ELECTRIC_CIRCUITS_PG_TABLES: 'issues,projects,users,project_members,comments',
+      ELECTRIC_CIRCUITS_PG_SLOT: SLOT,
+      ELECTRIC_CIRCUITS_PG_POLL_MS: '50',
     },
     stdio: ['ignore', 'pipe', 'inherit'],
   })
@@ -366,8 +366,8 @@ async function main() {
   log(`\`bytes_circuit_snapshots\`, \`bytes_pk_dict\`, \`bytes_subquery_registry\`, ...) — exact-ish and immune`)
   log(`to allocator/compression noise, unlike ΔRSS.`)
   log('')
-  log(`**Reproduce.** \`cargo build --release -p electric-ivm-engine\` then`)
-  log('`MATRIX_SIZES=1000,10000,100000 MATRIX_USERS=100,250,500,1000 pnpm --filter @electric-ivm/bench shape-mem`.')
+  log(`**Reproduce.** \`cargo build --release -p electric-circuits-engine\` then`)
+  log('`MATRIX_SIZES=1000,10000,100000 MATRIX_USERS=100,250,500,1000 pnpm --filter @electric-circuits/bench shape-mem`.')
   log('')
   log(`Config this run: projects=${PROJECTS}, users=${MAX_USERS}, memberships/user=${MEMBERSHIPS_PER_USER}, comments/issue=${COMMENTS_PER_ISSUE}, shapes/user=${SHAPES_PER_USER}, user milestones=${USER_MILESTONES.join(',')}.`)
   log('')

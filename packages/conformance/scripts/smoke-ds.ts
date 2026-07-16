@@ -2,9 +2,9 @@
 //  1. the DurableStreamTestServer stream-path layout (prefix? slashes?),
 //  2. that our State-Protocol envelope round-trips through createStreamDB into a
 //     materialized TanStack collection.
-// Run: pnpm --filter @electric-ivm/conformance exec tsx src/smoke-ds.ts
+// Run: pnpm --filter @electric-circuits/conformance exec tsx src/smoke-ds.ts
 
-import { DurableStreamTestServer } from '@electric-ivm/ds-rust'
+import { DurableStreamTestServer } from '@electric-circuits/ds-rust'
 import { createStreamDB, createStateSchema } from '@durable-streams/state/db'
 import { z } from 'zod'
 

@@ -1,4 +1,4 @@
-import type { ShapeMaterialization } from '@electric-ivm/client'
+import type { ShapeMaterialization } from '@electric-circuits/client'
 import { client, LIVE_SHAPE } from './electric'
 
 export interface Shapes {

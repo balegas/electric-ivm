@@ -3,7 +3,7 @@
 // row shapes, subquery shapes, and aggregations. Complements conformance-subquery-sharing.test.ts,
 // which asserts inner-node sharing. Asserted via the engine's GET /graph introspection.
 
-import type { AggregateDef, Predicate, Schema, ShapeDef } from '@electric-ivm/protocol'
+import type { AggregateDef, Predicate, Schema, ShapeDef } from '@electric-circuits/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { bootHarness, drainEngine, type Harness } from './harness.js'
 

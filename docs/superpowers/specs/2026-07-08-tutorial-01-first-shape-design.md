@@ -7,7 +7,7 @@ the series, a reader understands how DBSP-style incremental view maintenance wor
 
 ## Goals
 
-1. A tutorial series that teaches electric-ivm hands-on: shell + bare HTTP for shapes, `psql` for
+1. A tutorial series that teaches electric-circuits hands-on: shell + bare HTTP for shapes, `psql` for
    writes, the pipeline visualizer as the window into the engine.
 2. Each episode doubles as an **end-to-end accuracy test of the visualizer**: every visual claim in
    the text is verified against the engine's own `/graph`, `/state`, and `/trace` output while the
@@ -200,7 +200,7 @@ topic.)
 
 ## Out of scope for episode 1 (tracked as beads)
 
-- `ELECTRIC_IVM_TRACE=0` hard kill switch for the trace/graph/state endpoints (today tracing is
+- `ELECTRIC_CIRCUITS_TRACE=0` hard kill switch for the trace/graph/state endpoints (today tracing is
   near-zero-cost when unobserved, but there is no way to force it off; endpoints are also
   unauthenticated — production note belongs in a later episode or deployment docs).
 - Auth story for the engine control plane.

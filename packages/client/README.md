@@ -1,16 +1,16 @@
-# @electric-ivm/client
+# @electric-circuits/client
 
-The browser/Node client for the extended electric-ivm API: a typed tRPC client over
-[`@electric-ivm/api`](../../apps/api/README.md) plus `@durable-streams/state` for materializing
+The browser/Node client for the extended electric-circuits API: a typed tRPC client over
+[`@electric-circuits/api`](../../apps/api/README.md) plus `@durable-streams/state` for materializing
 shape streams into live TanStack DB collections. (ElectricSQL clients don't use this package —
 they sync straight from the engine's `/v1/shape`.)
 
 ```ts
-import { createClient } from '@electric-ivm/client'
+import { createClient } from '@electric-circuits/client'
 
 const client = createClient({
   apiUrl,            // the tRPC API server
-  schema,            // Schema from @electric-ivm/protocol
+  schema,            // Schema from @electric-circuits/protocol
   dsBaseUrl,         // optional: durable-streams base override (e.g. '/ds' behind a dev proxy)
   liveMode,          // true (SSE, default) | 'sse' | 'long-poll'
 })

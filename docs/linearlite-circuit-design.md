@@ -34,24 +34,24 @@ Two observations do all the work:
 ## 2. The circuit the demo launches
 
 The circuit is always on; `examples/linearlite/start.ts` boots the engine with the counts
-configuration by default (pre-set `ELECTRIC_IVM_DBSP_*` vars win over it):
+configuration by default (pre-set `ELECTRIC_CIRCUITS_DBSP_*` vars win over it):
 
 ```sh
-ELECTRIC_IVM_DBSP_COUNTS=issues:project_id+status+priority+username
+ELECTRIC_CIRCUITS_DBSP_COUNTS=issues:project_id+status+priority+username
 ```
 
 That compiles one counts pipeline — a live COUNT of `issues` per
 `(project_id, status, priority, username)` group that actually occurs (sparse) — fed per
 transaction by the sequencer. Its state is O(distinct groups), in memory, reseeded on every
 boot from one group-aggregated Postgres snapshot; row data lives in Postgres.
-(`ELECTRIC_IVM_DBSP_INDEXES` is deprecated and ignored: there are no engine-side row
+(`ELECTRIC_CIRCUITS_DBSP_INDEXES` is deprecated and ignored: there are no engine-side row
 arrangements.) No per-user, per-shape, or per-subscription structure anywhere.
 
 ## 3. Which query goes to which tier
 
 | Queries | Tier | How |
 |---|---|---|
-| #4 board columns, #6 search list | **registry** | the visibility subquery (`project_id IN (SELECT project_id FROM project_members WHERE user_id = $me)`) is served by the subquery registry, like every membership subquery: two-phase creation with a Postgres backfill fenced by a `SnapshotGate`, and one shared inner-set node per distinct subquery — a user's board-column shapes (#4 × status) and search shape (#6) all share their `visibleIssues($me)` node. Status/priority/project/mine filters ride as the residual. Adding/removing the user from a project flips a value in the inner set; the flip queries that project's issues back from Postgres on the parallel flip-worker pool (`ELECTRIC_IVM_FLIP_WORKERS`) and emits them absolutely, per pk, through ordered per-stream emission lanes. |
+| #4 board columns, #6 search list | **registry** | the visibility subquery (`project_id IN (SELECT project_id FROM project_members WHERE user_id = $me)`) is served by the subquery registry, like every membership subquery: two-phase creation with a Postgres backfill fenced by a `SnapshotGate`, and one shared inner-set node per distinct subquery — a user's board-column shapes (#4 × status) and search shape (#6) all share their `visibleIssues($me)` node. Status/priority/project/mine filters ride as the residual. Adding/removing the user from a project flips a value in the inner set; the flip queries that project's issues back from Postgres on the parallel flip-worker pool (`ELECTRIC_CIRCUITS_FLIP_WORKERS`) and emits them absolutely, per pk, through ordered per-stream emission lanes. |
 | #9 header count | **circuit (counts)** | the predicate — member-project IN-list × selected statuses × priorities [× me] — decomposes over the counts pipeline's group columns, so the aggregate is seeded by summing matching groups and updated from each step's group deltas. The visibility-over-aggregates problem disappears because visibility is, again, a set of project cohorts. |
 | #3 memberships, #5 comments | **routing** | single-column equality templates on `KeyRouter` families (`user_id`, `issue_id`); one router per template, shared by every instance. Deliberately not circuit-served — the router finds a change's shapes by index instead of scanning deltas. |
 | #1 users, #2 projects | **routing** | whole-table (match-all) fan-out; nothing to compute. |

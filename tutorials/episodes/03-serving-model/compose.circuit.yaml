@@ -23,6 +23,6 @@
 services:
   engine:
     environment:
-      ELECTRIC_IVM_DBSP_DIR: /tmp/dbsp
-      ELECTRIC_IVM_DBSP_INDEXES: "todos.list_id,list_members.user_id,list_members.list_id"
-      ELECTRIC_IVM_DBSP_COUNTS: "todos:list_id+done"
+      ELECTRIC_CIRCUITS_DBSP_DIR: /tmp/dbsp
+      ELECTRIC_CIRCUITS_DBSP_INDEXES: "todos.list_id,list_members.user_id,list_members.list_id"
+      ELECTRIC_CIRCUITS_DBSP_COUNTS: "todos:list_id+done"

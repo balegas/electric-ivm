@@ -3,7 +3,7 @@
 // pk space (so inserts/updates/deletes naturally overlap and exercise enter/leave/update).
 
 import { en, Faker, generateMersenne53Randomizer } from '@faker-js/faker'
-import type { ChangeEvent, Row, Schema, TableDef, Value } from '@electric-ivm/protocol'
+import type { ChangeEvent, Row, Schema, TableDef, Value } from '@electric-circuits/protocol'
 
 export interface SimOp {
   table: string
@@ -92,7 +92,7 @@ export function randomSeed(): number {
   return f.seed()
 }
 
-import type { LeafOp, Predicate, ShapeDef } from '@electric-ivm/protocol'
+import type { LeafOp, Predicate, ShapeDef } from '@electric-circuits/protocol'
 
 const ALL_OPS: LeafOp[] = ['eq', 'neq', 'lt', 'lte', 'gt', 'gte']
 

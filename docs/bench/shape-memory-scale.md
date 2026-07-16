@@ -1,7 +1,7 @@
 # Shape memory at scale — 100k subscriptions, 20k live listeners, in-memory vs spill
 
 > **Superseded.** This is a PR-#37-era snapshot. The feed relation now lives host-side
-> (Phase 2) and `ELECTRIC_IVM_FEED_TRACE` has been removed — §3 below is historical. For
+> (Phase 2) and `ELECTRIC_CIRCUITS_FEED_TRACE` has been removed — §3 below is historical. For
 > current numbers see `docs/bench/mem-reduction-log.md` and `docs/memory-model.md`.
 
 Extends `memory-matrix-blogpost.md` to the scales the blog post claims should hold:
@@ -9,7 +9,7 @@ Extends `memory-matrix-blogpost.md` to the scales the blog post claims should ho
 after signature sharing) over a fixed **100k-issue** deployment, all shapes materialized,
 driven by 4 client processes, with up to **20,000 live long-polls held** by 8 more.
 Raw run tables: `raw/scale-*.md`. Engine at the feed-relations merge + the
-`ELECTRIC_IVM_FEED_TRACE` / `ELECTRIC_IVM_SUBQ_STORAGE_*` knobs.
+`ELECTRIC_CIRCUITS_FEED_TRACE` / `ELECTRIC_CIRCUITS_SUBQ_STORAGE_*` knobs.
 
 **Metric note.** At these scales macOS compresses idle pages, so `ps rss` collapses on
 quiescent processes (to ~35 MiB!) and overstates during allocation storms. The honest
@@ -46,7 +46,7 @@ server's job; the engine only decides what changed for whom. Striking corollary:
 listeners attached and no writes, the engine's hot working set is **~35 MiB** — the other
 ~660 MiB is cold, compressed state.
 
-## 3. The feed-trace knob (`ELECTRIC_IVM_FEED_TRACE=0`)
+## 3. The feed-trace knob (`ELECTRIC_CIRCUITS_FEED_TRACE=0`)
 
 The historical RSS delta at 100k subscriptions, creation peak: **731.8 MiB (trace on) vs
 408.1 MiB (off)**. The "second full copy" explanation was disproven by the Task 1.3 audit:
@@ -68,7 +68,7 @@ reused, so correctness is unaffected; stream-fold drop enumeration remains dbsp-
 
 ## 4. Disk spilling (worktree `feat/subq-circuit-spill`, bead dbsp-ds-4gc)
 
-`ELECTRIC_IVM_SUBQ_STORAGE_DIR` routes the membership circuit through dbsp's storage
+`ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR` routes the membership circuit through dbsp's storage
 backend. Same workload, footprint at 100k subscriptions:
 
 | configuration | engine footprint (peak / steady) | spilled to disk |
@@ -99,12 +99,12 @@ not tuning the spill cache.
 ## Reproduce
 
 ```bash
-cargo build --release -p electric-ivm-engine
-# ELECTRIC_IVM_FEED_TRACE=0 removed
+cargo build --release -p electric-circuits-engine
+# ELECTRIC_CIRCUITS_FEED_TRACE=0 removed
 SCALE_ISSUES=100000 SCALE_PROJECTS=2000 SCALE_USERS=100,250,500,1000,2500,5000,10000 \
 SCALE_CLIENT_PROCS=4 SCALE_LIVE_RAMP=5000,10000,20000 SCALE_LIVE_PROCS=8 \
-  pnpm --filter @electric-ivm/bench exec tsx src/shape-mem-scale.ts
-# spill variant: add ELECTRIC_IVM_SUBQ_STORAGE_DIR=… [ELECTRIC_IVM_SUBQ_STORAGE_CACHE_MIB=64]
+  pnpm --filter @electric-circuits/bench exec tsx src/shape-mem-scale.ts
+# spill variant: add ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR=… [ELECTRIC_CIRCUITS_SUBQ_STORAGE_CACHE_MIB=64]
 ```
 (macOS: clean 0-attach shm segments between runs; expect ENOBUFS for NEW sockets while 20k
 long-polls are held — the bench samples via ps/footprint during that phase.)

@@ -65,7 +65,7 @@ absolute footprints there carry the same inflation.
 
 Change under test (`ac000ff`): the engine's default dbsp storage cache is now **64 MiB
 total** (dbsp's implicit default was 512 MiB = 256 × workers × 2 thread-types); the
-`ELECTRIC_IVM_SUBQ_STORAGE_CACHE_MIB` override is unchanged. This is the one-line fix the
+`ELECTRIC_CIRCUITS_SUBQ_STORAGE_CACHE_MIB` override is unchanged. This is the one-line fix the
 §2c decomposition predicted at ~645/613 MB; measured **645 peak / 632 steady** —
 prediction confirmed. B2 attribution @100k: owned 98.7 MiB, circuit operator state
 0.94 MB (+5.3 MB on disk), zone live 546.3 MB, frag 76.5 MB. This iteration also fixed
@@ -98,7 +98,7 @@ backfill churn) — the next real term; ~100 MiB owned host metadata (subquery r
 the bounded 64 MiB cache (tunable); ~76–90 MB allocator slack (below the jemalloc gate).
 Known process debts: the plan's frozen-baseline table is stale/not reproducible (Phase-0
 finding — this summary uses the same-day 0b control instead); the Gate-G B2 command still
-names the removed `ELECTRIC_IVM_FEED_TRACE` knob; intermittent live-phase ENOBUFS
+names the removed `ELECTRIC_CIRCUITS_FEED_TRACE` knob; intermittent live-phase ENOBUFS
 (pre-existing, seen on the baseline engine too).
 
 ### Iteration 3 notes — FeedSet (Task 2.2); Phase 2 gate data refresh
@@ -106,7 +106,7 @@ names the removed `ELECTRIC_IVM_FEED_TRACE` knob; intermittent live-phase ENOBUF
 Change under test (`mem/phase-2-feed-keys` @ 3cd9956): feed relation moved OUT of the dbsp
 circuit into host-side per-feed Roaring bitmaps (`FeedSet`, ~2.2 B/entry); the delete gate
 is an explicit check-and-set under the registry lock; circuit keeps contributor relations
-only; `ELECTRIC_IVM_FEED_TRACE` removed (warn-and-ignore — the standard B2 command was
+only; `ELECTRIC_CIRCUITS_FEED_TRACE` removed (warn-and-ignore — the standard B2 command was
 kept verbatim and the engine logged the deprecation warning); new `/memory` field
 `bytes_feed_sets`. Comparison point = iteration 2.
 
@@ -210,7 +210,7 @@ movement vs 0b; measured (comparison point = iteration 0b, NOT the stale frozen 
 - **Verdict: ACCEPT** — no regression signal attributable to an observability-only diff.
 
 **FEED_TRACE A/B (resolves bead dbsp-ds-2hu).** One extra B2, identical config except
-`ELECTRIC_IVM_FEED_TRACE=1`, same day, back-to-back, both spill-by-default:
+`ELECTRIC_CIRCUITS_FEED_TRACE=1`, same day, back-to-back, both spill-by-default:
 
 | run | peak @100k | live-5000 | +15 s (steady) |
 |---|---:|---:|---:|

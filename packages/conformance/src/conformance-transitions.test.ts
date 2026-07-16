@@ -2,7 +2,7 @@
 // machinery — enter/leave churn, pk-changing "updates", re-insert of a deleted pk, idempotent and
 // redundant ops, high-churn over a tiny pk space, and multiple shapes across multiple tables.
 
-import type { Schema, ShapeDef } from '@electric-ivm/protocol'
+import type { Schema, ShapeDef } from '@electric-circuits/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { formatCompare } from './compare.js'
 import { applyOp, bootHarness, drainEngine, type Harness, waitForConvergence } from './harness.js'
@@ -23,7 +23,7 @@ const usersSchema: Schema = {
   },
 }
 const COLUMNS = ['id', 'name', 'age', 'active', 'score']
-const mk = (id: number, active: boolean, age = 20): import('@electric-ivm/protocol').Row => ({
+const mk = (id: number, active: boolean, age = 20): import('@electric-circuits/protocol').Row => ({
   id,
   name: 'alpha',
   age,

@@ -15,10 +15,10 @@ use axum::extract::Request;
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
-use electric_ivm_engine::ds::DsClient;
-use electric_ivm_engine::engine::Engine;
-use electric_ivm_engine::http::router;
-use electric_ivm_engine::schema::Schema;
+use electric_circuits_engine::ds::DsClient;
+use electric_circuits_engine::engine::Engine;
+use electric_circuits_engine::http::router;
+use electric_circuits_engine::schema::Schema;
 use tower::ServiceExt; // oneshot
 
 /// Fake ds server live-read behavior: 0 = idle (park 10s then 204), 1 = data available immediately.

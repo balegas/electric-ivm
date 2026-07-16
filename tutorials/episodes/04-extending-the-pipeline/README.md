@@ -81,9 +81,9 @@ force-recreate the engine. The overlay
 
 ```sh
 # the episode-3 config, verbatim, plus todos.assignee — one new lookup arrangement
-ELECTRIC_IVM_DBSP_INDEXES=todos.list_id,list_members.user_id,list_members.list_id,todos.assignee
-ELECTRIC_IVM_DBSP_COUNTS=todos:list_id+done
-ELECTRIC_IVM_DBSP_DIR=/tmp/dbsp
+ELECTRIC_CIRCUITS_DBSP_INDEXES=todos.list_id,list_members.user_id,list_members.list_id,todos.assignee
+ELECTRIC_CIRCUITS_DBSP_COUNTS=todos:list_id+done
+ELECTRIC_CIRCUITS_DBSP_DIR=/tmp/dbsp
 ```
 
 It is a strict superset of episode 3's overlay: the same three indexes and the same count, with
@@ -149,14 +149,14 @@ pipeline without disturbing what it already served.
 
 Not every engine restart throws its state away. The fork is the layout fingerprint:
 
-- **Unchanged config + a persistent `ELECTRIC_IVM_DBSP_DIR`** → the fingerprint matches, and the
+- **Unchanged config + a persistent `ELECTRIC_CIRCUITS_DBSP_DIR`** → the fingerprint matches, and the
   restart is a fast **checkpoint restore**: arrangements come back from disk and replay resumes from
   the checkpointed change-log offset. No snapshot scan.
 - **Changed config (fingerprint mismatch) — or an ephemeral state dir** → the restart **reseeds**
   from Postgres.
 
 This rebuild takes the reseed path *twice over*. The config changed (`7 → 8` indexes), which alone
-forces a reseed; and the tutorial stack's `ELECTRIC_IVM_DBSP_DIR` is `/tmp/dbsp` — a container-local
+forces a reseed; and the tutorial stack's `ELECTRIC_CIRCUITS_DBSP_DIR` is `/tmp/dbsp` — a container-local
 path with no volume behind it — so a `--force-recreate` starts every arrangement from an empty
 directory regardless. The tutorial stack **always reseeds**; that is deliberate, so this episode's
 lesson is never masked by a lucky checkpoint hit. A reseed costs one snapshot scan per table, not an

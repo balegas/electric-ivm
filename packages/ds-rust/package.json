@@ -1,5 +1,5 @@
 {
-  "name": "@electric-ivm/ds-rust",
+  "name": "@electric-circuits/ds-rust",
   "version": "0.0.0",
   "private": true,
   "type": "module",

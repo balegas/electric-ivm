@@ -2,7 +2,7 @@
 // infra), then prints a comparison table of peak memory / CPU / disk vs. workload size. Each run writes
 // results/metrics-u<N>.csv (time series) + results/summary-u<N>.json (peaks/finals).
 //
-//   SWEEP_USERS=5,25,100 SEED_ISSUES=5000 DURATION_S=30 pnpm --filter @electric-ivm/loadgen sweep
+//   SWEEP_USERS=5,25,100 SEED_ISSUES=5000 DURATION_S=30 pnpm --filter @electric-circuits/loadgen sweep
 
 import { spawnSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'

@@ -140,7 +140,7 @@ fn map_pg_type(data_type: &str) -> ColumnType {
 }
 
 /// List all base tables in the `public` schema that have a primary key (skipping the engine's own
-/// `__el_sync` bookkeeping table). Used by "introspect all" mode (`ELECTRIC_IVM_PG_TABLES=*`), where the
+/// `__el_sync` bookkeeping table). Used by "introspect all" mode (`ELECTRIC_CIRCUITS_PG_TABLES=*`), where the
 /// set of tables isn't known up front (e.g. driving Electric's integration tests over varied schemas).
 pub async fn list_tables(client: &Client) -> Result<Vec<String>> {
     let rows = client

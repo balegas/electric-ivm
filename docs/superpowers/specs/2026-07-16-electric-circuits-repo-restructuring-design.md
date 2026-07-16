@@ -1,6 +1,6 @@
 # Electric Circuits — repo restructuring design
 
-Status: design for implementation, 2026-07-16. Turns the `electric-ivm` repo into the public
+Status: design for implementation, 2026-07-16. Turns the `electric-circuits` repo into the public
 **Electric Circuits** project: a full mechanical rename, deletion of tutorials and
 pipeline-authoring docs, and a dynamic-first rewrite of the public documentation. Engine logic
 does not change; the rename is mechanical.
@@ -18,8 +18,8 @@ code-accurate.
 ## Locked decisions
 
 1. **Delete for real** (git preserves history): `tutorials/` (whole tree), `docs/building-app-pipelines.md`, `docs/linearlite-circuit-design.md`, and the tutorial process artifacts under `docs/superpowers/{plans,specs}/*tutorial*`.
-2. **Full rename `electric-ivm` → `electric-circuits`**, extended to code: npm packages, the Rust crate/binary, Docker image paths, env vars, and all imports/string references. No legacy aliases.
-3. **Blog post out of scope** — `../electric/website/blog/posts/2026-07-14-electric-ivm.md` is a separate track (blog-planner flow, sibling repo).
+2. **Full rename `electric-circuits` → `electric-circuits`**, extended to code: npm packages, the Rust crate/binary, Docker image paths, env vars, and all imports/string references. No legacy aliases.
+3. **Blog post out of scope** — `../electric/website/blog/posts/2026-07-14-electric-circuits.md` is a separate track (blog-planner flow, sibling repo).
 4. **Dynamic-first message** — the verb is *write / run*, not *declare*; the circuit is generic always-on infrastructure queries register onto; aggregation's up-front `COUNT` configuration is a one-line detail, never a headline; persistence and CDN caching are not launch doc topics.
 
 ## Vocabulary mapping
@@ -39,16 +39,16 @@ getting-started, live-queries-guide, how-queries-become-live), use only the thre
 
 ## The rename (mechanical)
 
-Blast radius measured at `d65daee`: **149 files, 468 `electric-ivm` occurrences, 381 `ELECTRIC_IVM_`
+Blast radius measured at `d65daee`: **149 files, 468 `electric-circuits` occurrences, 381 `ELECTRIC_CIRCUITS_`
 occurrences across 38 distinct env vars, 13 npm packages, the crate in 3 spots.**
 
 Concrete substitutions:
 
-- `@electric-ivm/<pkg>` → `@electric-circuits/<pkg>` (all 13: api, bench, client, conformance, docker, ds-rust, examples, linearlite, loadgen, oracle, pipeline-viz, protocol, web) — in every `package.json` `name`/`dependencies`/`devDependencies` and every import specifier.
-- `electric-ivm-engine` → `electric-circuits-engine` (crate name, binary name); `electric_ivm_engine` → `electric_circuits_engine` (Rust lib name / underscore form); `ELECTRIC_IVM_ENGINE_PREBUILT` and friends follow the env-var rule below.
-- `ELECTRIC_IVM_<X>` → `ELECTRIC_CIRCUITS_<X>` (all 38 vars, in engine `config.rs`, scripts, demos, docker, docs, CI).
-- `ghcr.io/balegas/electric-ivm/{engine,node}` → `ghcr.io/balegas/electric-circuits/{engine,node}`.
-- Prose/product name → "Electric Circuits"; the `electric-ivm` project token → `electric-circuits`.
+- `@electric-circuits/<pkg>` → `@electric-circuits/<pkg>` (all 13: api, bench, client, conformance, docker, ds-rust, examples, linearlite, loadgen, oracle, pipeline-viz, protocol, web) — in every `package.json` `name`/`dependencies`/`devDependencies` and every import specifier.
+- `electric-circuits-engine` → `electric-circuits-engine` (crate name, binary name); `electric_circuits_engine` → `electric_circuits_engine` (Rust lib name / underscore form); `ELECTRIC_CIRCUITS_ENGINE_PREBUILT` and friends follow the env-var rule below.
+- `ELECTRIC_CIRCUITS_<X>` → `ELECTRIC_CIRCUITS_<X>` (all 38 vars, in engine `config.rs`, scripts, demos, docker, docs, CI).
+- `ghcr.io/balegas/electric-circuits/{engine,node}` → `ghcr.io/balegas/electric-circuits/{engine,node}`.
+- Prose/product name → "Electric Circuits"; the `electric-circuits` project token → `electric-circuits`.
 
 **Guardrails (must NOT be renamed — these refer to upstream ElectricSQL, not to us):**
 
@@ -56,11 +56,11 @@ Concrete substitutions:
 - The `electric-conformance/` directory and its contents (it means "conformance against Electric").
 - The word "Electric" as the brand/umbrella.
 
-The rename target is specifically the `electric-ivm` compound, which is unambiguous — none of the
-guarded tokens contain it. Post-rename, `git grep electric-ivm` returns **0**.
+The rename target is specifically the `electric-circuits` compound, which is unambiguous — none of the
+guarded tokens contain it. Post-rename, `git grep electric-circuits` returns **0**.
 
 **Not automatable by the agent (manual, note in handoff):** renaming the GitHub remote repository
-(`balegas/electric-ivm` → `balegas/electric-circuits`) and publishing images under the new ghcr path.
+(`balegas/electric-circuits` → `balegas/electric-circuits`) and publishing images under the new ghcr path.
 The local checkout directory (`dbsp-ds`) is irrelevant and unchanged.
 
 ## Documentation dispositions
@@ -113,7 +113,7 @@ Dynamic-first, honest to the code.
 
 Rename first, so the doc rewrites land on final names.
 
-1. **Mechanical rename** — all 149 files. Verify: `cargo build` + `pnpm engine:test` green; TS typecheck/build green; `git grep electric-ivm` returns 0; guarded upstream tokens (`electric-sql`, `electric-conformance/`) untouched (spot-check counts unchanged).
+1. **Mechanical rename** — all 149 files. Verify: `cargo build` + `pnpm engine:test` green; TS typecheck/build green; `git grep electric-circuits` returns 0; guarded upstream tokens (`electric-sql`, `electric-conformance/`) untouched (spot-check counts unchanged).
 2. **Deletions + cross-ref repair** — remove the tutorial/pipeline docs; fix every dangling link. Verify: the deleted paths are gone; `git grep -F` for each removed filename returns 0 in remaining tracked files; `scripts/linearlite.sh` and demo entry points don't reference deleted composes; the LinearLite demo still boots.
 3. **Public-doc rewrite** — README, getting-started, live-queries-guide (renamed), and the new how-queries-become-live.md. Verify: these four/five files use only the three nouns; `git grep -iwn shape <those files>` yields only code-bridge contexts (`client.shape()`, `/v1/shape`); the memory figures match `docs/bench/mem-reduction-log.md` / `docs/memory-model.md §5`.
 4. **Internal-doc vocab alignment + final sweep** — bridge sentences in code-reference READMEs; consistency pass. Verify: no broken intra-repo links (a link-extraction grep over `docs/**` + `README.md` resolves every relative target); the demo boots; product name is "Electric Circuits" everywhere in prose.
@@ -127,7 +127,7 @@ Rename first, so the doc rewrites land on final names.
 
 ## Risks
 
-1. **Rename over-reach.** A careless global replace could hit guarded upstream tokens. Mitigation: target the exact `electric-ivm` compound (and its `electric_ivm` / `ELECTRIC_IVM_` variants) only; verify guarded-token counts are unchanged after the pass.
+1. **Rename over-reach.** A careless global replace could hit guarded upstream tokens. Mitigation: target the exact `electric-circuits` compound (and its `electric_circuits` / `ELECTRIC_CIRCUITS_` variants) only; verify guarded-token counts are unchanged after the pass.
 2. **Env-var churn breaking demos/CI.** 381 references across scripts, docker, CI. Mitigation: the rename is a single coordinated pass; Phase 1 verification includes booting the demo and running the test suites, which exercise the env vars end-to-end.
 3. **Public/code vocabulary gap confusing readers.** The API still says `shape()`. Mitigation: the bridge rule — one explicit mapping sentence in code-reference docs, three-nouns-only in public docs.
 4. **Message drift into overclaim.** Mitigation: the story doc's honesty guardrails (aggregation configured-not-dynamic; persistence/CDN as direction) are carried into the new/rewritten docs verbatim in intent.

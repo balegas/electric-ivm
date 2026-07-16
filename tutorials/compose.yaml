@@ -15,7 +15,7 @@
 # editing this file. The engine introspects the table set at startup — an episode script that
 # ADDS tables is always followed by `docker compose restart engine` in the episode text.
 
-name: electric-ivm-tutorials
+name: electric-circuits-tutorials
 
 services:
   postgres:
@@ -57,10 +57,10 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.engine
     environment:
-      ELECTRIC_IVM_DS_URL: http://ds:8791
-      ELECTRIC_IVM_PG_URL: postgres://postgres:password@postgres:5432/electric
-      ELECTRIC_IVM_PG_TABLES: "*"
-      ELECTRIC_IVM_BIND: 0.0.0.0:7010
+      ELECTRIC_CIRCUITS_DS_URL: http://ds:8791
+      ELECTRIC_CIRCUITS_PG_URL: postgres://postgres:password@postgres:5432/electric
+      ELECTRIC_CIRCUITS_PG_TABLES: "*"
+      ELECTRIC_CIRCUITS_BIND: 0.0.0.0:7010
     ports:
       - "${ENGINE_PORT:-7010}:7010"
     depends_on:

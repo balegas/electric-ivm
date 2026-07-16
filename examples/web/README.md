@@ -1,6 +1,6 @@
 # examples/web — live todos
 
-The smallest end-to-end electric-ivm demo: a React todos app where **writes go to Postgres and the
+The smallest end-to-end electric-circuits demo: a React todos app where **writes go to Postgres and the
 UI updates through the sync engine**, never by local mutation.
 
 - Left pane: every todo (a match-all shape), editable — each edit `POST`s to a tiny `/pg/write`
@@ -41,7 +41,7 @@ DEMO_SEED_COUNT=10000 DEMO_CHURN_MS=50 pnpm demo:web
 | File | Role |
 |---|---|
 | `start.ts` | dev entrypoint: Postgres + engine + streams + API + Vite (+ `/pg/write`, seeding, churn) |
-| `src/schema.ts` | the one-table `todos` schema (`@electric-ivm/protocol` Schema) |
+| `src/schema.ts` | the one-table `todos` schema (`@electric-circuits/protocol` Schema) |
 | `src/electric.ts` | `createClient` wiring (proxy-friendly `long-poll` live mode) + the live-shape definition |
 | `src/shapes.ts` | shape registration, cached so HMR/re-renders don't register duplicates |
 | `src/App.tsx` | the two panes; writes via `/pg/write` |

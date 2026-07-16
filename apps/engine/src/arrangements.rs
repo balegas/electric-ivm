@@ -2,7 +2,7 @@
 //!
 //! One shared circuit per engine (never per-shape circuits: structure must not scale with
 //! subscriptions — see `docs/ARCHITECTURE.md` §6b). The circuit maintains a live COUNT per
-//! group projection for each configured table (`ELECTRIC_IVM_DBSP_COUNTS`); circuit-served
+//! group projection for each configured table (`ELECTRIC_CIRCUITS_DBSP_COUNTS`); circuit-served
 //! COUNT aggregates are seeded by summing groups and updated from each step's group deltas.
 //!
 //! **Row data lives in Postgres, not here.** The circuit's state is O(distinct groups) — in

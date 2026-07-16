@@ -1,9 +1,9 @@
-// Dev entrypoint for LinearLite on electric-ivm, wired to the Postgres backend. Boots an ephemeral
+// Dev entrypoint for LinearLite on electric-circuits, wired to the Postgres backend. Boots an ephemeral
 // Postgres with logical replication, the engine in Postgres mode (it ingests changes via the
 // replication slot and reads rows back for backfill), durable-streams + the API for the read/shape
 // path, and Vite. Browser writes go to Postgres through a /pg/write middleware — Postgres is the
 // system of record. durable-streams + API use ephemeral ports; Vite proxies to them dynamically.
-//   pnpm --filter @electric-ivm/linearlite start     (or: pnpm demo:linearlite)
+//   pnpm --filter @electric-circuits/linearlite start     (or: pnpm demo:linearlite)
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
 import { appendFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer as createNetServer } from 'node:net'
@@ -11,9 +11,9 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { type ApiServer, createApiServer } from '@electric-ivm/api'
-import { DurableStreamTestServer } from '@electric-ivm/ds-rust'
-import { changeEventToDML } from '@electric-ivm/protocol'
+import { type ApiServer, createApiServer } from '@electric-circuits/api'
+import { DurableStreamTestServer } from '@electric-circuits/ds-rust'
+import { changeEventToDML } from '@electric-circuits/protocol'
 import { faker } from '@faker-js/faker'
 import pgpkg from 'pg'
 import { createServer as createViteServer, type Plugin, type ViteDevServer } from 'vite'
@@ -51,7 +51,7 @@ function findFreePort(start: number): Promise<number> {
   })
 }
 
-const SLOT = 'electric_ivm_linearlite'
+const SLOT = 'electric_circuits_linearlite'
 // PIDs of the engine + durable-streams-server children, so `scripts/linearlite.sh stop` can kill
 // exactly these two processes by PID as a backstop — never by matching on their generic binary
 // name, which would risk hitting an unrelated engine/ds instance running elsewhere on the machine.
@@ -289,23 +289,23 @@ try {
   const dsUrl = await ds.start()
   console.log('durable-streams →', dsUrl)
 
-  execFileSync('cargo', ['build', '-p', 'electric-ivm-engine'], { cwd: repoRoot(), stdio: 'inherit' })
+  execFileSync('cargo', ['build', '-p', 'electric-circuits-engine'], { cwd: repoRoot(), stdio: 'inherit' })
   // dbsp pipeline: the demo runs the engine with the circuit serving the app's query graph —
   // cohort indexes for every lookup/membership column LinearLite uses, and a counts pipeline
   // for the browse header's live COUNT. Counts state is in-memory (reseeded each boot from a
   // group-aggregated Postgres snapshot); row data lives in Postgres — membership shapes are
-  // registry-served with pooled query-backs. Pre-set ELECTRIC_IVM_DBSP* env vars win.
-  engineProc = spawn(join(repoRoot(), 'target', 'debug', 'electric-ivm-engine'), [], {
+  // registry-served with pooled query-backs. Pre-set ELECTRIC_CIRCUITS_DBSP* env vars win.
+  engineProc = spawn(join(repoRoot(), 'target', 'debug', 'electric-circuits-engine'), [], {
     env: {
-      ELECTRIC_IVM_DBSP_COUNTS: 'issues:project_id+status+priority+username',
+      ELECTRIC_CIRCUITS_DBSP_COUNTS: 'issues:project_id+status+priority+username',
       ...process.env,
-      ELECTRIC_IVM_DS_URL: dsUrl,
-      ELECTRIC_IVM_BIND: '127.0.0.1:0',
-      ELECTRIC_IVM_LOG: 'warn',
-      ELECTRIC_IVM_PG_URL: pgUrl,
-      ELECTRIC_IVM_PG_TABLES: Object.keys(schema.tables).join(','),
-      ELECTRIC_IVM_PG_SLOT: SLOT,
-      ELECTRIC_IVM_PG_POLL_MS: '25',
+      ELECTRIC_CIRCUITS_DS_URL: dsUrl,
+      ELECTRIC_CIRCUITS_BIND: '127.0.0.1:0',
+      ELECTRIC_CIRCUITS_LOG: 'warn',
+      ELECTRIC_CIRCUITS_PG_URL: pgUrl,
+      ELECTRIC_CIRCUITS_PG_TABLES: Object.keys(schema.tables).join(','),
+      ELECTRIC_CIRCUITS_PG_SLOT: SLOT,
+      ELECTRIC_CIRCUITS_PG_POLL_MS: '25',
     },
     stdio: ['ignore', 'pipe', 'inherit'],
   })
@@ -330,7 +330,7 @@ try {
 
   // --- 3. Vite + the /pg/write middleware (writes go to Postgres) --------------------------------
   const pgWritePlugin: Plugin = {
-    name: 'electric-ivm-pg-write',
+    name: 'electric-circuits-pg-write',
     configureServer(server) {
       server.middlewares.use('/pg/write', (req, res) => {
         if (req.method !== 'POST') {
@@ -425,11 +425,11 @@ try {
     // binding varies by platform — see the webui proxy above, which must dial the exact bound address).
     // VIZ_HMR_CLIENT_PORT makes vite's HMR websocket dial the caddy front (wss) instead of the
     // hardcoded plain-HTTP vite port, which a browser on the https URL cannot reach.
-    vizProc = spawn('pnpm', ['--filter', '@electric-ivm/pipeline-viz', 'dev'], {
+    vizProc = spawn('pnpm', ['--filter', '@electric-circuits/pipeline-viz', 'dev'], {
       cwd: repoRoot(),
       env: {
         ...process.env,
-        ELECTRIC_IVM_ENGINE_URL: engineUrl,
+        ELECTRIC_CIRCUITS_ENGINE_URL: engineUrl,
         VIZ_PORT: vizPort,
         VIZ_HOST: '127.0.0.1',
         ...(vizHttpsOn ? { VIZ_HMR_CLIENT_PORT: vizHttpsPort } : {}),
@@ -460,7 +460,7 @@ try {
   }
 
   console.log(`\n👉 Open a URL above. LinearLite (${PRIORITIES.length} priorities, ${STATUSES.length} statuses)`)
-  console.log('   on electric-ivm: writes go to Postgres, replicate into the engine, and the')
+  console.log('   on electric-circuits: writes go to Postgres, replicate into the engine, and the')
   console.log('   board/list shapes update live.\n')
 } catch (e) {
   console.error('linearlite: startup failed:', e)

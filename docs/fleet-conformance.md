@@ -1,6 +1,6 @@
 # Benchmarking-Fleet Conformance Spec
 
-Contract for the single `electric-ivm` Docker image that is a drop-in replacement for
+Contract for the single `electric-circuits` Docker image that is a drop-in replacement for
 `electricsql/electric` in the [benchmarking-fleet](https://github.com/electric-sql/benchmarking-fleet).
 Ground truths: the fleet's executor (`apps/executor/lib/executor/{presets,docker,gcloud_provisioner,statsd_server}.ex`),
 Electric's telemetry package (`electric/packages/electric-telemetry`), Electric's `config/runtime.exs`,
@@ -32,9 +32,9 @@ and electrustic's proven parity implementation (`electrustic/src/telemetry/`).
 The image accepts the union of what the fleet sets and Electric's documented vars. Mapping to
 engine internals happens in the engine itself (preferred) or the entrypoint.
 
-| Env var | Behavior in electric-ivm image |
+| Env var | Behavior in electric-circuits image |
 |---|---|
-| `DATABASE_URL` | → engine Postgres URL (`ELECTRIC_IVM_PG_URL`). Must tolerate `?sslmode=disable`. Required. |
+| `DATABASE_URL` | → engine Postgres URL (`ELECTRIC_CIRCUITS_PG_URL`). Must tolerate `?sslmode=disable`. Required. |
 | `ELECTRIC_PORT` | HTTP port for `/v1/shape` + `/v1/health` (default **3000**, bind `0.0.0.0`). |
 | `ELECTRIC_INSTANCE_ID` | Tag every StatsD metric `instance_id:<value>`. Default: generated UUID. |
 | `ELECTRIC_STATSD_HOST` | StatsD destination, `host[:port]`, default port 8125. Absent → StatsD off. |
@@ -89,7 +89,7 @@ Wire format = `TelemetryMetricsStatsd` datadog formatter:
 Application-level (from `ApplicationTelemetry.metrics/1`), with our honest Rust equivalents.
 **Emit only genuinely measured values — omit any metric we cannot measure; never fake.**
 
-| Electric StatsD name | Type | electric-ivm source (must be real) |
+| Electric StatsD name | Type | electric-circuits source (must be real) |
 |---|---|---|
 | `system.cpu.core_count` | g | logical cores (respect cgroup quota if detectable) |
 | `system.cpu.utilization.total` | g | mean CPU busy % across cores (0–100), sysinfo |
@@ -159,7 +159,7 @@ port for our own tooling.
 - Must be healthy < 10 s after start (engine boot incl. introspection + slot creation is
   sub-second; ds boot ~1 s).
 - Runs as non-root where possible; must run fine as PID≠1 under docker `--init`.
-- Publish `ghcr.io/<owner>/electric-ivm/electric:<tag>` via existing docker workflow.
+- Publish `ghcr.io/<owner>/electric-circuits/electric:<tag>` via existing docker workflow.
 
 ## 7. Verification gates (all must pass before calling it done)
 

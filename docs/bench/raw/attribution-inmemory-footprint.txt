@@ -1,5 +1,5 @@
 ======================================================================
-electric-ivm-engine [47825]: 64-bit    Footprint: 1147 MB (16384 bytes per page)
+electric-circuits-engine [47825]: 64-bit    Footprint: 1147 MB (16384 bytes per page)
 ======================================================================
 
   Dirty      Clean  Reclaimable    Regions    Category

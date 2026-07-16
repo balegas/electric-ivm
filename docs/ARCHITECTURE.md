@@ -1,4 +1,4 @@
-# electric-ivm — architecture
+# electric-circuits — architecture
 
 The as-built system architecture. Companion documents:
 
@@ -31,7 +31,7 @@ The as-built system architecture. Companion documents:
                                   │ read / long-poll
                                   ▼
                                CLIENTS
-                                  ├─ @electric-ivm/client  (shapes, subset queries, aggregations)
+                                  ├─ @electric-circuits/client  (shapes, subset queries, aggregations)
                                   └─ ElectricSQL client     (GET /v1/shape on the engine)
 ```
 
@@ -60,7 +60,7 @@ Three ideas carry the whole design:
 - **engine** (`apps/engine`, Rust) — the core: replication ingest, per-change Z-set deltas, fan-out to
   shapes/subqueries/aggregations, the control-plane HTTP API, and the Electric-compatible
   `GET /v1/shape` endpoint.
-- **API** (`apps/api`, tRPC) — the extended surface used by `@electric-ivm/client`: `schema.define`,
+- **API** (`apps/api`, tRPC) — the extended surface used by `@electric-circuits/client`: `schema.define`,
   `ingest.write` (library mode), `shapes.create/get/delete`, `subset.query/live`, `aggregate`.
 - **client** (`packages/client`) — `shape()` (a live TanStack DB collection), `subset()` (an ordered,
   windowed page + a shared live tail), `aggregate()` (a live scalar), typed writes, `awaitTxId`.
@@ -182,7 +182,7 @@ The shape of the predicate picks the strategy (full detail + cost model: interna
   subquery form — the registry is the one membership implementation (row data lives in
   Postgres; see §6b).
 
-**Aggregations** (electric-ivm extension, not part of the Electric-compatible API): a scalar
+**Aggregations** (electric-circuits extension, not part of the Electric-compatible API): a scalar
 COUNT/SUM/AVG/MIN/MAX over a non-subquery predicate, maintained incrementally as a fold over the
 delta — COUNT/SUM/AVG hold running scalars, MIN/MAX a `value → net-weight` multiset so retractions
 restore the previous extreme. A COUNT whose predicate decomposes over a counts pipeline's group
@@ -249,11 +249,11 @@ sequencer feeds every table's deltas into:
 - **Edges** — `node → dependent` (an outer shape, or a *parent node* for nested subqueries), labeled
   with the connecting column. When a node **flips** a value (∅→non-empty or back), the dependent rows
   with `connecting_col = value` are queried back and re-evaluated, recursing up the DAG. Flip
-  propagation runs on a **semaphore-bounded worker pool** (`ELECTRIC_IVM_FLIP_WORKERS`, default 8),
+  propagation runs on a **semaphore-bounded worker pool** (`ELECTRIC_CIRCUITS_FLIP_WORKERS`, default 8),
   off the sequencer hot path: the Postgres query-backs run concurrently (bounded by the shared
   `ELECTRIC_DB_POOL_SIZE` pool) and never hold the registry lock. Membership evaluation and the
   **enqueue** of the resulting envelopes happen atomically under the lock, and each shape stream
-  drains through one ordered **emission lane** (`engine/emission.rs`, `ELECTRIC_IVM_EMIT_LANES`),
+  drains through one ordered **emission lane** (`engine/emission.rs`, `ELECTRIC_CIRCUITS_EMIT_LANES`),
   so per-shape append order equals evaluation order — a stale move can never land after a fresher
   emission — without network under the lock. The engine exposes the in-flight count
   (`GET /replication/lsn` → `pendingFlips`) as the extra convergence-barrier term; it covers both
@@ -302,10 +302,10 @@ bullet). Neither circuit checkpoints: both reseed on boot.
   Postgres like any backfill. The contributor relation **spills to disk by default** (dbsp's
   storage backend: spine batches page to layer files under a per-boot temp dir with a bounded
   buffer cache; without checkpointing the files are a disposable cache, auto-removed at
-  shutdown). `ELECTRIC_IVM_SUBQ_STORAGE=0` keeps it fully in-memory;
-  `ELECTRIC_IVM_SUBQ_STORAGE_DIR` pins an explicit location.
+  shutdown). `ELECTRIC_CIRCUITS_SUBQ_STORAGE=0` keeps it fully in-memory;
+  `ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR` pins an explicit location.
 
-- **Counts pipelines** — `ELECTRIC_IVM_DBSP_COUNTS=table:col+col,…` compiles, per table (at
+- **Counts pipelines** — `ELECTRIC_CIRCUITS_DBSP_COUNTS=table:col+col,…` compiles, per table (at
   most one spec each), a `map_index(group) → weighted_count` pipeline: a live COUNT per
   distinct projection of the group columns.
 - **Serving**: COUNT aggregates whose predicate decomposes over a counts pipeline's group
@@ -318,7 +318,7 @@ bullet). Neither circuit checkpoints: both reseed on boot.
   replay exactly like a shape backfill.
 - **Row lookups** (subquery flip re-derivations, full re-derives, membership move-ins) are
   pooled Postgres queries (`engine/membership.rs`) — parallel across the flip-worker pool,
-  bounded by `ELECTRIC_DB_POOL_SIZE`. `ELECTRIC_IVM_DBSP_INDEXES` is **deprecated** and ignored
+  bounded by `ELECTRIC_DB_POOL_SIZE`. `ELECTRIC_CIRCUITS_DBSP_INDEXES` is **deprecated** and ignored
   (it configured the removed row arrangements).
 - **Membership shapes** — including single-level non-negated `col IN (SELECT …)` — are served
   by the subquery registry (§6): two-phase creation (Postgres backfill + gate), shared inner-set
@@ -329,17 +329,17 @@ bullet). Neither circuit checkpoints: both reseed on boot.
 
 | variable | default | meaning |
 |---|---|---|
-| `ELECTRIC_IVM_DBSP_COUNTS` | none | counts pipelines: `table:col+col[,…]`; at most one per table. Empty = no circuit. |
-| `ELECTRIC_IVM_FLIP_WORKERS` | `8` | concurrent flip-propagation workers (Postgres query-backs). |
-| `ELECTRIC_IVM_EMIT_LANES` | `8` | ordered emission lanes for subquery-shape appends. |
-| `ELECTRIC_IVM_SUBQ_STORAGE` | `1` | `0` disables membership-circuit disk spilling (relations stay fully in-memory). |
-| `ELECTRIC_IVM_SUBQ_STORAGE_DIR` | per-boot temp dir | explicit spill location (kept on shutdown; the default temp dir is auto-removed). |
-| `ELECTRIC_IVM_SUBQ_STORAGE_CACHE_MIB` | `64` | storage buffer-cache budget, in MiB, TOTAL (dbsp uses the value verbatim, not multiplied by workers/thread-types). Bounds dbsp's own unset-default, which for this circuit's 1-worker layout would be 512 MiB (256 MiB × 1 worker × 2 thread-types) — see docs/bench/mem-attribution-100k.md §2c. |
-| `ELECTRIC_IVM_SUBQ_MIN_STORAGE_KB` | `128` | spine batches above this size page to disk. |
+| `ELECTRIC_CIRCUITS_DBSP_COUNTS` | none | counts pipelines: `table:col+col[,…]`; at most one per table. Empty = no circuit. |
+| `ELECTRIC_CIRCUITS_FLIP_WORKERS` | `8` | concurrent flip-propagation workers (Postgres query-backs). |
+| `ELECTRIC_CIRCUITS_EMIT_LANES` | `8` | ordered emission lanes for subquery-shape appends. |
+| `ELECTRIC_CIRCUITS_SUBQ_STORAGE` | `1` | `0` disables membership-circuit disk spilling (relations stay fully in-memory). |
+| `ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR` | per-boot temp dir | explicit spill location (kept on shutdown; the default temp dir is auto-removed). |
+| `ELECTRIC_CIRCUITS_SUBQ_STORAGE_CACHE_MIB` | `64` | storage buffer-cache budget, in MiB, TOTAL (dbsp uses the value verbatim, not multiplied by workers/thread-types). Bounds dbsp's own unset-default, which for this circuit's 1-worker layout would be 512 MiB (256 MiB × 1 worker × 2 thread-types) — see docs/bench/mem-attribution-100k.md §2c. |
+| `ELECTRIC_CIRCUITS_SUBQ_MIN_STORAGE_KB` | `128` | spine batches above this size page to disk. |
 
-(The former `ELECTRIC_IVM_DBSP_DIR`/`_CACHE_MIB`/`_MIN_STORAGE_KB`/`_MAX_RSS_MB`/
+(The former `ELECTRIC_CIRCUITS_DBSP_DIR`/`_CACHE_MIB`/`_MIN_STORAGE_KB`/`_MAX_RSS_MB`/
 `_CHECKPOINT_SECS`/`_INDEXES` storage knobs are deprecated no-ops: there is no on-disk circuit
-state to tune. `ELECTRIC_IVM_FEED_TRACE` is likewise removed — the feed relation now lives
+state to tune. `ELECTRIC_CIRCUITS_FEED_TRACE` is likewise removed — the feed relation now lives
 host-side (Phase 2), so there is no enumeration copy left to toggle.)
 
 - **Observability**: `/graph` carries an `arrangements` section — the counts pipelines as
@@ -434,8 +434,8 @@ stream, and client, including live replication, batched mutations, NULLs, and co
 | shapes (any kind) | **0** | no per-shape thread or circuit |
 | replication ingestor | 1 task | stream pgoutput/decode/append/acknowledge |
 | subquery registry | 0 (a mutex) | eval + emission-lane enqueue under it (in-memory only; no network under the lock) |
-| flip workers | ≤ `ELECTRIC_IVM_FLIP_WORKERS` tasks (default 8) | concurrent deferred query-backs; PG round-trips never hold the registry lock |
-| emission lanes | `ELECTRIC_IVM_EMIT_LANES` tasks (default 8) | per-stream FIFO writers: append order = eval order per shape |
+| flip workers | ≤ `ELECTRIC_CIRCUITS_FLIP_WORKERS` tasks (default 8) | concurrent deferred query-backs; PG round-trips never hold the registry lock |
+| emission lanes | `ELECTRIC_CIRCUITS_EMIT_LANES` tasks (default 8) | per-stream FIFO writers: append order = eval order per shape |
 | circuit (counts) | 1 OS thread | owns the `DBSPHandle`; blocking steps, fed by a bounded channel (backpressure to the sequencer) |
 | circuit (membership) | 1 OS thread | owns the membership `DBSPHandle`; stepped per envelope by the registry (subquery tables only) |
 
@@ -523,7 +523,7 @@ predicate (which recreates the feed per click) — see AGENTS.md "gotchas".
 | `apps/engine/src/ds.rs` | durable-streams client: `append`, `append_reliable`, `delete_stream`, reads |
 | `apps/engine/src/http.rs` | control-plane HTTP |
 | `apps/engine/src/retention.rs` | shape retention: the active / dormant / evicted lifecycle + layered dormant-only eviction |
-| `apps/engine/src/config.rs` | boot config: `ELECTRIC_IVM_*` env + Electric fleet-surface mapping |
+| `apps/engine/src/config.rs` | boot config: `ELECTRIC_CIRCUITS_*` env + Electric fleet-surface mapping |
 | `apps/engine/src/params.rs` | Electric `params[N]` / `$N` substitution for `/v1/shape` |
 | `apps/engine/src/statsd.rs` | StatsD (datadog wire) telemetry for the benchmarking fleet |
 | `apps/engine/src/trace.rs` | per-envelope pipeline trace broadcast (`GET /trace` SSE, feeds the explorer) |

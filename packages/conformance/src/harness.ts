@@ -5,18 +5,18 @@
 // Topology:
 //   Vitest worker:  per-test Postgres database (in the shared ephemeral PG) + DurableStreamTestServer
 //                   + tRPC API + streamdb client + pg-backed oracle
-//   child process:  electric-ivm-engine (Rust) in Postgres mode (ingestor + query-back backfill)
+//   child process:  electric-circuits-engine (Rust) in Postgres mode (ingestor + query-back backfill)
 
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { DurableStreamTestServer } from '@electric-ivm/ds-rust'
-import { type ApiServer, createApiServer } from '@electric-ivm/api'
-import { createClient, type ElectricIvmClient, type ShapeMaterialization } from '@electric-ivm/client'
-import { createPgOracle, createPgTables, type Oracle } from '@electric-ivm/oracle'
-import type { ChangeEvent, Row, Schema, ShapeDef } from '@electric-ivm/protocol'
+import { DurableStreamTestServer } from '@electric-circuits/ds-rust'
+import { type ApiServer, createApiServer } from '@electric-circuits/api'
+import { createClient, type ElectricIvmClient, type ShapeMaterialization } from '@electric-circuits/client'
+import { createPgOracle, createPgTables, type Oracle } from '@electric-circuits/oracle'
+import type { ChangeEvent, Row, Schema, ShapeDef } from '@electric-circuits/protocol'
 import pgpkg from 'pg'
 
 import { compareShapeSets, type CompareResult } from './compare.js'
@@ -35,13 +35,13 @@ function repoRoot(): string {
 let engineBuilt = false
 /** Build the engine binary once per process. Skipped when the vitest globalSetup already built it. */
 export function buildEngine(): void {
-  if (engineBuilt || process.env.ELECTRIC_IVM_ENGINE_PREBUILT === '1') return
-  execFileSync('cargo', ['build', '-p', 'electric-ivm-engine'], { cwd: repoRoot(), stdio: 'inherit' })
+  if (engineBuilt || process.env.ELECTRIC_CIRCUITS_ENGINE_PREBUILT === '1') return
+  execFileSync('cargo', ['build', '-p', 'electric-circuits-engine'], { cwd: repoRoot(), stdio: 'inherit' })
   engineBuilt = true
 }
 
 function engineBin(): string {
-  return join(repoRoot(), 'target', 'debug', 'electric-ivm-engine')
+  return join(repoRoot(), 'target', 'debug', 'electric-circuits-engine')
 }
 
 async function spawnEngine(
@@ -55,14 +55,14 @@ async function spawnEngine(
   const proc = spawn(engineBin(), [], {
     env: {
       ...process.env,
-      ELECTRIC_IVM_DS_URL: dsUrl,
-      ELECTRIC_IVM_BIND: '127.0.0.1:0',
-      ELECTRIC_IVM_LOG: process.env.ELECTRIC_IVM_LOG ?? 'warn',
-      ELECTRIC_IVM_PG_URL: pgUrl,
-      ELECTRIC_IVM_PG_TABLES: tables.join(','),
-      ELECTRIC_IVM_PG_SLOT: slot,
-      ELECTRIC_IVM_PG_POLL_MS: '25',
-      ...(fault ? { ELECTRIC_IVM_FAULT: fault } : {}),
+      ELECTRIC_CIRCUITS_DS_URL: dsUrl,
+      ELECTRIC_CIRCUITS_BIND: '127.0.0.1:0',
+      ELECTRIC_CIRCUITS_LOG: process.env.ELECTRIC_CIRCUITS_LOG ?? 'warn',
+      ELECTRIC_CIRCUITS_PG_URL: pgUrl,
+      ELECTRIC_CIRCUITS_PG_TABLES: tables.join(','),
+      ELECTRIC_CIRCUITS_PG_SLOT: slot,
+      ELECTRIC_CIRCUITS_PG_POLL_MS: '25',
+      ...(fault ? { ELECTRIC_CIRCUITS_FAULT: fault } : {}),
       ...(extraEnv ?? {}),
     },
     // Pipe stderr so tests can assert on engine logs (e.g. no silent `process_envelope failed`); teed
@@ -129,13 +129,13 @@ export interface BootOptions {
    * Postgres column types the coarse protocol Schema can't express (e.g. `uuid`). Must create every
    * table in `schema` with `REPLICA IDENTITY FULL`. */
   ddl?: string
-  /** Extra env vars for the engine process (e.g. retention tuning: `ELECTRIC_IVM_SHAPE_IDLE_SECS`). */
+  /** Extra env vars for the engine process (e.g. retention tuning: `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`). */
   engineEnv?: Record<string, string>
 }
 
 function adminUrl(): string {
-  const url = process.env.ELECTRIC_IVM_TEST_PG_URL
-  if (!url) throw new Error('ELECTRIC_IVM_TEST_PG_URL not set (vitest globalSetup should boot Postgres)')
+  const url = process.env.ELECTRIC_CIRCUITS_TEST_PG_URL
+  if (!url) throw new Error('ELECTRIC_CIRCUITS_TEST_PG_URL not set (vitest globalSetup should boot Postgres)')
   return url
 }
 

@@ -15,7 +15,7 @@ pub fn router(engine: Engine) -> Router {
     router_with_introspection(engine, true)
 }
 
-/// `introspection = false` (`ELECTRIC_IVM_TRACE=0`) leaves the visualizer/introspection surface
+/// `introspection = false` (`ELECTRIC_CIRCUITS_TRACE=0`) leaves the visualizer/introspection surface
 /// unregistered — `/trace` (SSE), `/graph`(`/node`), `/state`(`/node`) all 404. With no route there
 /// can be no `/trace` subscriber, so the per-envelope trace instrumentation stays on its
 /// zero-subscriber fast path (one atomic load). The surface is unauthenticated when enabled.
@@ -213,7 +213,7 @@ struct AggregateReq {
     col: Option<String>,
 }
 
-/// Create a scalar aggregation shape (electric-ivm extension; not in the Electric protocol).
+/// Create a scalar aggregation shape (electric-circuits extension; not in the Electric protocol).
 async fn create_aggregate(
     State(engine): State<Engine>,
     Json(req): Json<AggregateReq>,

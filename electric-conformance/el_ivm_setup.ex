@@ -1,9 +1,9 @@
 defmodule Support.ElIvmSetup do
   @moduledoc """
-  Boots the `electric-ivm` stack (durable-streams + engine + Electric `/v1/shape` adapter) on an
+  Boots the `electric-circuits` stack (durable-streams + engine + Electric `/v1/shape` adapter) on an
   ephemeral Postgres and points `Electric.Client` at it — a drop-in replacement for
   `with_unique_db` + `with_complete_stack` + `with_electric_client` so Electric's integration tests run
-  against electric-ivm instead of Electric's own sync-service.
+  against electric-circuits instead of Electric's own sync-service.
 
   Two-phase: `el_ivm_pg/1` boots the launcher, captures the ephemeral PG URL, and exposes `db_conn` so
   Electric's schema setups (`with_parent_child_tables`, `with_sql_execute`, …) populate it. `el_ivm_client/1`
@@ -12,10 +12,10 @@ defmodule Support.ElIvmSetup do
   """
   import ExUnit.Callbacks
 
-  @lite_dir System.get_env("ELECTRIC_IVM_DIR") || Path.expand("../../../../../dbsp-ds", __DIR__)
+  @lite_dir System.get_env("ELECTRIC_CIRCUITS_DIR") || Path.expand("../../../../../dbsp-ds", __DIR__)
 
   def el_ivm_pg(_ctx) do
-    cmd = "cd #{@lite_dir} && exec pnpm --filter @electric-ivm/bench exec tsx src/electric-adapter.ts"
+    cmd = "cd #{@lite_dir} && exec pnpm --filter @electric-circuits/bench exec tsx src/electric-adapter.ts"
 
     port =
       Port.open({:spawn_executable, "/bin/bash"}, [
@@ -67,12 +67,12 @@ defmodule Support.ElIvmSetup do
         end
 
       {^port, {:exit_status, status}} ->
-        raise "electric-ivm launcher exited (#{status}) while waiting for #{prefix}"
+        raise "electric-circuits launcher exited (#{status}) while waiting for #{prefix}"
 
       {:DOWN, _ref, :port, ^port, reason} ->
-        raise "electric-ivm launcher down (#{inspect(reason)}) while waiting for #{prefix}"
+        raise "electric-circuits launcher down (#{inspect(reason)}) while waiting for #{prefix}"
     after
-      timeout -> raise "timed out waiting for '#{prefix}' from electric-ivm launcher"
+      timeout -> raise "timed out waiting for '#{prefix}' from electric-circuits launcher"
     end
   end
 

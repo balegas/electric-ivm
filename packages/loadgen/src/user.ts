@@ -1,11 +1,11 @@
 // A simulated LinearLite user as a state machine — no rendering, no DOM. It uses the real
-// @electric-ivm/client for reads (browse subset feeds + a live COUNT aggregation + board status
+// @electric-circuits/client for reads (browse subset feeds + a live COUNT aggregation + board status
 // shapes that exercise the visibility subquery) and writes mutations straight to Postgres (the system
 // of record). Each user holds a bounded set of live subscriptions (≈ its open connections) and, on a
 // think-timed loop, either mutates or navigates.
 
-import type { AggregateSubscription, ElectricIvmClient, ShapeMaterialization, SubsetSubscription } from '@electric-ivm/client'
-import type { Predicate, ShapeDef, SubsetDef } from '@electric-ivm/protocol'
+import type { AggregateSubscription, ElectricIvmClient, ShapeMaterialization, SubsetSubscription } from '@electric-circuits/client'
+import type { Predicate, ShapeDef, SubsetDef } from '@electric-circuits/protocol'
 
 import type { Config } from './config'
 import { MEMBERSHIP, PRIORITIES, STATUSES, USERS } from './infra'

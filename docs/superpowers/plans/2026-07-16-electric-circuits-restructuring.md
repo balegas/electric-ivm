@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Turn the `electric-ivm` repo into the public **Electric Circuits** project — a full mechanical `electric-ivm → electric-circuits` rename, deletion of tutorials and pipeline-authoring docs, and a dynamic-first rewrite of the public documentation — without changing engine logic.
+**Goal:** Turn the `electric-circuits` repo into the public **Electric Circuits** project — a full mechanical `electric-circuits → electric-circuits` rename, deletion of tutorials and pipeline-authoring docs, and a dynamic-first rewrite of the public documentation — without changing engine logic.
 
 **Architecture:** Four phases, rename first so doc rewrites land on final names: (1) atomic mechanical rename via three literal substitutions; (2) delete tutorial/pipeline docs and repair cross-refs; (3) rewrite the public docs dynamic-first + create one new conceptual doc; (4) align code-reference docs with a bridge note and run a final consistency sweep. Spec: `docs/superpowers/specs/2026-07-16-electric-circuits-repo-restructuring-design.md`.
 
@@ -10,13 +10,13 @@
 
 ## Global Constraints
 
-- **Rename target is exactly three literal tokens:** `electric-ivm` → `electric-circuits`, `electric_ivm` → `electric_circuits`, `ELECTRIC_IVM_` → `ELECTRIC_CIRCUITS_`. No legacy aliases.
+- **Rename target is exactly three literal tokens:** `electric-circuits` → `electric-circuits`, `electric_circuits` → `electric_circuits`, `ELECTRIC_CIRCUITS_` → `ELECTRIC_CIRCUITS_`. No legacy aliases.
 - **Never touch guarded upstream tokens** (none contain the rename target, so they are safe by construction, but verify): `electric-sql`, `electricsql`, `electric-sql.com`, `electricsql/electric`, `@electric-sql/*`, the `electric-conformance/` directory. "Electric" as the brand stays.
 - **Public vocabulary = three nouns:** Streams, Circuits, Live queries. "Shapes" appears ONLY in code-reference contexts (the API method `client.shape()`, the endpoint `/v1/shape`), each with a one-line bridge sentence.
 - **Dynamic-first message:** verb is *write / run*, not *declare*; the circuit is generic always-on infrastructure queries register onto; aggregation's up-front `COUNT` config is a one-line detail, never a headline; persistence and CDN caching are direction, not launch topics.
 - **Canonical prose sources** (reuse verbatim where possible): `docs/notes/2026-07-16-electric-circuits-story-dynamic-first.md` (L0, unlock, vocabulary) and `docs/notes/2026-07-16-electric-circuits-messaging-hierarchy.md` (v2).
 - **Engine logic does not change.** No `.rs` edits beyond the mechanical token substitution.
-- **Post-rename invariant:** `git grep -nE 'electric-ivm|electric_ivm|ELECTRIC_IVM_'` returns nothing (0 matches) for the rest of the project's life.
+- **Post-rename invariant:** `git grep -nE 'electric-circuits|electric_circuits|ELECTRIC_CIRCUITS_'` returns nothing (0 matches) for the rest of the project's life.
 - **Commit trailer** on every commit:
   ```
   Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
@@ -40,7 +40,7 @@
 
 ---
 
-### Task 1: Atomic mechanical rename `electric-ivm → electric-circuits`
+### Task 1: Atomic mechanical rename `electric-circuits → electric-circuits`
 
 **Files:** every tracked file containing the token (≈149), including `package.json` (root + all packages), `apps/engine/Cargo.toml`, `apps/engine/src/**/*.rs`, `scripts/*.sh`, `docker/*`, `.github/**` (CI), and all `docs/**` / `*.md`. Excludes `.git/`, `node_modules/`, `target/`.
 
@@ -60,7 +60,7 @@ Record the number.
 ```bash
 cd /Users/vbalegas/workspace/dbsp-ds
 git ls-files -z -- ':!:*.png' ':!:*.jpg' ':!:*.ico' ':!:pnpm-lock.yaml' \
-  | xargs -0 perl -pi -e 's/electric-ivm/electric-circuits/g; s/electric_ivm/electric_circuits/g; s/ELECTRIC_IVM_/ELECTRIC_CIRCUITS_/g;'
+  | xargs -0 perl -pi -e 's/electric-circuits/electric-circuits/g; s/electric_circuits/electric_circuits/g; s/ELECTRIC_CIRCUITS_/ELECTRIC_CIRCUITS_/g;'
 ```
 (perl `-pi` edits in place; the three subs are independent and order-free — the guarded tokens contain none of the three, so they are untouched.)
 
@@ -74,7 +74,7 @@ Expected: resolves the `@electric-circuits/*` workspace links, rewrites `pnpm-lo
 - [ ] **Step 4: Verify the rename is complete (the invariant)**
 
 ```bash
-git grep -nE 'electric-ivm|electric_ivm|ELECTRIC_IVM_'
+git grep -nE 'electric-circuits|electric_circuits|ELECTRIC_CIRCUITS_'
 ```
 Expected: **no output** (exit 1 = no matches).
 
@@ -114,7 +114,7 @@ Expected: demo boots, LinearLite returns 200. (If boot fails on a missing `ELECT
 
 ```bash
 git add -A
-git commit -m "rename: electric-ivm -> electric-circuits (packages, crate, env vars, Docker, refs)"
+git commit -m "rename: electric-circuits -> electric-circuits (packages, crate, env vars, Docker, refs)"
 ```
 
 ---
@@ -337,7 +337,7 @@ Both predate the Task 2.2 FeedSet move. Update any claim that the per-feed key s
 ```bash
 cd /Users/vbalegas/workspace/dbsp-ds
 # 3a. The rename invariant still holds:
-git grep -nE 'electric-ivm|electric_ivm|ELECTRIC_IVM_'                       # expect no output
+git grep -nE 'electric-circuits|electric_circuits|ELECTRIC_CIRCUITS_'                       # expect no output
 # 3b. No dangling links anywhere in docs + README:
 for f in README.md $(git ls-files 'docs/**/*.md'); do
   grep -oE '\]\(([^)]+\.md[^)]*)\)' "$f" | sed -E 's/.*\(([^)#]+).*/\1/' | while read l; do
@@ -370,7 +370,7 @@ git commit -m "docs: code-reference bridge notes, FeedSet memory update, final c
 ## Out of scope (handoff notes, not tasks)
 
 - **Blog post** (`../electric/website/…`) — separate track.
-- **GitHub remote repo rename** (`balegas/electric-ivm` → `balegas/electric-circuits`) and **publishing images** under `ghcr.io/balegas/electric-circuits/*` — manual, the maintainer does these; all in-repo references already point at the new names after Task 1.
+- **GitHub remote repo rename** (`balegas/electric-circuits` → `balegas/electric-circuits`) and **publishing images** under `ghcr.io/balegas/electric-circuits/*` — manual, the maintainer does these; all in-repo references already point at the new names after Task 1.
 - **Making the counts pipeline generic/dynamic** ("unify-down") — future design item, not part of this restructuring.
 
 ## Self-Review

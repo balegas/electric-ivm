@@ -241,7 +241,7 @@ subqueries).
 2. **For each flipped value `v` of node `N`:** for every edge on `N`, the affected dependent
    rows are exactly those with `col = v`. Query them (`SELECT … WHERE col = v`) and either
    reconcile a parent node (recurse) or re-evaluate the outer shape predicate. This propagation
-   runs **deferred, on a semaphore-bounded worker pool** (`ELECTRIC_IVM_FLIP_WORKERS`) — the
+   runs **deferred, on a semaphore-bounded worker pool** (`ELECTRIC_CIRCUITS_FLIP_WORKERS`) — the
    sequencer only collects the flips; the query-backs run concurrently against pooled Postgres
    and never hold the registry lock. Evaluation and the **enqueue** of the resulting envelopes
    happen atomically under the lock, and per-stream FIFO emission lanes make append order equal
@@ -538,7 +538,7 @@ executors via a trait so presentation cannot drift from execution.
 | `apps/engine/src/electric.rs` / `http.rs` | `/v1/shape` Electric adapter + control-plane HTTP |
 | `apps/engine/src/metrics.rs` / `mem.rs` | counters, latency histograms, OTel memory/cardinality gauges |
 | `apps/engine/src/retention.rs` | shape retention: the active / dormant / evicted lifecycle + layered dormant-only eviction |
-| `apps/engine/src/config.rs` | boot config: `ELECTRIC_IVM_*` env + Electric fleet-surface mapping |
+| `apps/engine/src/config.rs` | boot config: `ELECTRIC_CIRCUITS_*` env + Electric fleet-surface mapping |
 | `apps/engine/src/params.rs` | Electric `params[N]` / `$N` substitution for `/v1/shape` |
 | `apps/engine/src/statsd.rs` | StatsD (datadog wire) telemetry for the benchmarking fleet |
 | `apps/engine/src/trace.rs` | per-envelope pipeline trace broadcast (`GET /trace` SSE, feeds the explorer) |

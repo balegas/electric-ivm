@@ -22,7 +22,7 @@ oracle conformance, electric-conformance oracle, LinearLite demo).
 
 - Direct replacement: no feature flag; conformance suites gate the branch.
 - Bind-gated: memory proportional to subscriptions; each new node still seeds from PG.
-- No new env vars. `ELECTRIC_IVM_FLIP_WORKERS` / `ELECTRIC_IVM_EMIT_LANES` unchanged.
+- No new env vars. `ELECTRIC_CIRCUITS_FLIP_WORKERS` / `ELECTRIC_CIRCUITS_EMIT_LANES` unchanged.
 - Node identity = existing literal-level `SubquerySig` (edges/sharing unchanged); template
   layer sits above it for eval grouping.
 - Counts circuit (`arrangements.rs`) untouched.
@@ -69,7 +69,7 @@ reconcile-by-identity makes duplicates impossible).
   - `contains_and_null_bucket`: `contains(1, &Value::Null)` true after a NULL-value tuple.
   - `values_for_node_reports_contributor_counts`.
   - `retract_insert_same_step_nets`: (v_old,-1),(v_new,+1) in one apply → Leave(v_old)+Enter(v_new).
-- [x] 2. `cargo test -p electric-ivm-engine subq_circuit` → FAIL (module missing).
+- [x] 2. `cargo test -p electric-circuits-engine subq_circuit` → FAIL (module missing).
 - [x] 3. Implement. Snapshot point-read: `cursor.seek_key(key.erase())` via
   `dbsp::dynamic::Erase` (compare `count_groups`'s downcast style). If `seek_key` fights the
   dynamic API, fallback is a linear cursor scan bounded by node prefix — but prefer seek.
@@ -157,7 +157,7 @@ The core swap. **Node changes:** remove `contributors`; add `node_id: i64`; keep
   enter/leave/value-change/no-op + null bucket now assert on registry+circuit
   (`apply_tuples` results and `SubqueryEval` reads); keep `filter_known_members`,
   rollback, trace, null-sensitivity tests compiling (async where needed).
-- [x] 2. Red → 3. implement registry swap → 4. `cargo test -p electric-ivm-engine` green
+- [x] 2. Red → 3. implement registry swap → 4. `cargo test -p electric-circuits-engine` green
   (engine/tests.rs integration tests included — fix fallout in mod.rs/lifecycle.rs/
   sequencer.rs call sites: async drops, `propagate_flips` unchanged signature).
 - [x] 5. Commit `feat: subquery registry served by the membership circuit`.
@@ -169,12 +169,12 @@ The core swap. **Node changes:** remove `contributors`; add `node_id: i64`; keep
   subquery node ids unchanged (`node:<sig>`), no breaking viz changes.
 - [x] `docs/ARCHITECTURE.md`: §6 (registry → circuit-backed flip detection), §6b (membership
   circuit alongside counts), §10 threading table (+1 row `dbsp-subq`).
-- [x] `cargo clippy -p electric-ivm-engine` clean; commit `docs+introspection`.
+- [x] `cargo clippy -p electric-circuits-engine` clean; commit `docs+introspection`.
 
 ### Task 5: Quality gates (all must pass)
 
 - [x] `pnpm engine:test`
-- [x] `ELECTRIC_IVM_ENGINE_PREBUILT=1 pnpm test` (vitest incl. oracle conformance)
+- [x] `ELECTRIC_CIRCUITS_ENGINE_PREBUILT=1 pnpm test` (vitest incl. oracle conformance)
 - [x] `ASDF_ELIXIR_VERSION=1.18.4-otp-28 ASDF_ERLANG_VERSION=28.1 ./electric-conformance/run.sh oracle`
   — **goal gate: all subquery tests pass**
 - [x] Fix regressions until green; commit fixes individually.

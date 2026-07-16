@@ -1,15 +1,15 @@
-# electric-ivm VIZ image: the pipeline visualizer as static assets behind Caddy, which also
+# electric-circuits VIZ image: the pipeline visualizer as static assets behind Caddy, which also
 # reverse-proxies /engine/* to the engine control plane (same contract as the Vite dev proxy).
 #
 # Build context is the repo root:
-#   docker build -f docker/Dockerfile.viz -t electric-ivm-viz .
+#   docker build -f docker/Dockerfile.viz -t electric-circuits-viz .
 
 FROM node:22-slim AS build
 RUN corepack enable
 WORKDIR /repo
 COPY . .
-RUN pnpm install --filter @electric-ivm/pipeline-viz...
-RUN pnpm --filter @electric-ivm/pipeline-viz build
+RUN pnpm install --filter @electric-circuits/pipeline-viz...
+RUN pnpm --filter @electric-circuits/pipeline-viz build
 
 FROM caddy:2-alpine
 COPY docker/viz.Caddyfile /etc/caddy/Caddyfile

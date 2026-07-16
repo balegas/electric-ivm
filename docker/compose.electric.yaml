@@ -7,7 +7,7 @@
 # Postgres here plays the role the fleet's toxiproxy-fronted Postgres plays (wal_level=logical,
 # user postgres / password password / db postgres).
 
-name: electric-ivm-fleet
+name: electric-circuits-fleet
 
 services:
   postgres:

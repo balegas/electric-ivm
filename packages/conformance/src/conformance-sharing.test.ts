@@ -3,7 +3,7 @@
 // Sharing is verified via the engine's `GET /tables/:name/families` introspection endpoint.
 // See docs/ivm-engine-internals.md §3 (shared execution strategies).
 
-import type { Schema, ShapeDef } from '@electric-ivm/protocol'
+import type { Schema, ShapeDef } from '@electric-circuits/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { formatCompare } from './compare.js'
 import { applyOp, bootHarness, drainEngine, type Harness, waitForConvergence } from './harness.js'

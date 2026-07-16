@@ -4,7 +4,7 @@ Status: v2 draft for discussion (James + Valter), 2026-07-16. **v2 folds in the 
 message change:** the static pre-declared pipeline is de-emphasized, `COUNT`/aggregation is demoted
 to a detail, the verb shifts from *declare* to *write / run*, and the core idea is now **one shared
 circuit per *kind* of query, sized by kinds not instances**. Persistence is out of the post.
-Scope: reframing of the electric-ivm post (`website/blog/posts/2026-07-14-electric-ivm.md`) as a
+Scope: reframing of the electric-circuits post (`website/blog/posts/2026-07-14-electric-circuits.md`) as a
 new-project announcement.
 
 ## Decisions so far
@@ -18,7 +18,7 @@ new-project announcement.
 
 ## Verification vs code (2026-07-16)
 
-All claims verified against `electric-ivm @ fc7e233` — full report in `2026-07-16-electric-circuits-claims-verification.md` (same directory): **10 verified, 4 partial, 1 contradicted**. Corrections are folded in throughout this doc. Headlines:
+All claims verified against `electric-circuits @ fc7e233` — full report in `2026-07-16-electric-circuits-claims-verification.md` (same directory): **10 verified, 4 partial, 1 contradicted**. Corrections are folded in throughout this doc. Headlines:
 
 - **Stronger than we claimed:** the input change log literally *is* a Durable Stream today, and a non-Postgres producer already ships (library mode appends change envelopes with no Postgres in the loop). "Write to streams anyhow, query it live" is demonstrated, not roadmap.
 - **Stale:** the post's memory table is a superseded benchmark snapshot. Current: **~645 MiB at 50k distinct live queries (~13 KiB each)**; dominant cost is the DBSP buffer cache (~80%), the hash structures are already Roaring bitmaps, and "flat as data grows" holds (100× rows → ~1% RSS).
@@ -118,7 +118,7 @@ Resolved by verification (details in the claims report §2–3):
 
 Still open (for James + Valter):
 
-1. Rename artifacts to match: repo `electric-ivm` → `circuits`? Demo URLs? The name won't stick if the artifacts contradict it.
+1. Rename artifacts to match: repo `electric-circuits` → `circuits`? Demo URLs? The name won't stick if the artifacts contradict it.
 2. Does "live queries" overloading TanStack DB's term help (same concept!) or confuse? Current call: it helps; confirm.
 3. Will the cost-per-shape reduction work land before publish, and do we re-run `packages/bench/src/shape-mem-scale.ts` for final numbers? *(Landed: PR #39 merged the pk-dictionary + Roaring feed sets + bounded storage cache; the ~645 MiB / ~13 KiB figures are from that build. A final re-run for headline numbers is still worth doing.)*
 

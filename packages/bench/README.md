@@ -1,6 +1,6 @@
-# @electric-ivm/bench
+# @electric-circuits/bench
 
-Benchmark and measurement tooling for [electric-ivm](../../README.md). Every runner boots the full
+Benchmark and measurement tooling for [electric-circuits](../../README.md). Every runner boots the full
 stack itself (durable-streams + engine, plus Postgres/API where relevant); results are written to
 files under `docs/bench/` or the package directory.
 
@@ -26,7 +26,7 @@ pnpm bench:fleet          # from the repo root — auto-clones the fleet repo on
 | `EXTERNAL_ELECTRIC_URL` | *(unset)* | run against an external Electric-compatible server instead of booting our stack (requires `EXTERNAL_DATABASE_URL`) |
 | `EXTERNAL_DATABASE_URL` | *(unset)* | the external target's Postgres; benchmark tables are dropped/recreated there |
 
-**macOS latency note:** the stack boots the real `durable-streams-server` binary (`@electric-ivm/ds-rust`)
+**macOS latency note:** the stack boots the real `durable-streams-server` binary (`@electric-circuits/ds-rust`)
 instead of an in-process store. That binary's `--durability memory` mode is Linux-only (a zero-copy
 socket→file path); on macOS every append falls back to disk-durable `wal` mode, which inflates
 latency on shape-creation-heavy benchmarks (e.g. `concurrent_shape_creation_with_subqueries` p50
@@ -43,9 +43,9 @@ status-equality shapes in batches, and samples the engine's `GET /memory` probes
 cardinalities) at each milestone. Results are written to `docs/bench/shape-memory-matrix.md`.
 
 ```bash
-pnpm --filter @electric-ivm/bench shape-mem
+pnpm --filter @electric-circuits/bench shape-mem
 MATRIX_SIZES=1000,10000,100000 MATRIX_USERS=10,25,50,100 MATRIX_PROJECTS=20 \
-  pnpm --filter @electric-ivm/bench shape-mem
+  pnpm --filter @electric-circuits/bench shape-mem
 ```
 
 ## Other runners

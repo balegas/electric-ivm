@@ -9,7 +9,7 @@ const host = process.env.BIND_HOST ?? '0.0.0.0'
 const dataDir = process.env.DS_DATA_DIR ?? '/data'
 const inMemory = process.env.DS_MEMORY === '1'
 
-const { DurableStreamTestServer } = await import('@electric-ivm/ds-rust')
+const { DurableStreamTestServer } = await import('@electric-circuits/ds-rust')
 
 if (!inMemory) mkdirSync(dataDir, { recursive: true })
 const server = new DurableStreamTestServer(inMemory ? { port, host } : { port, host, dataDir })

@@ -1,5 +1,5 @@
 {
-  "name": "@electric-ivm/client",
+  "name": "@electric-circuits/client",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -10,8 +10,8 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@electric-ivm/protocol": "workspace:*",
-    "@electric-ivm/api": "workspace:*",
+    "@electric-circuits/protocol": "workspace:*",
+    "@electric-circuits/api": "workspace:*",
     "@trpc/client": "^11.18.0",
     "@durable-streams/client": "0.2.6",
     "@durable-streams/state": "^0.3.1",

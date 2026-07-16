@@ -1,7 +1,7 @@
-Process:         electric-ivm-engine [48471]
-Path:            /Users/USER/*/electric-ivm-engine
+Process:         electric-circuits-engine [48471]
+Path:            /Users/USER/*/electric-circuits-engine
 Load Address:    0x1047d4000
-Identifier:      electric-ivm-engine
+Identifier:      electric-circuits-engine
 Version:         0
 Code Type:       ARM64
 Platform:        macOS

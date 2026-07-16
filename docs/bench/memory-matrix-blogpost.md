@@ -1,6 +1,6 @@
 # Engine memory across deployment size × audience size
 
-Benchmark backing the electric-ivm blog post's memory claims. Run on a MacBook (M-series,
+Benchmark backing the electric-circuits blog post's memory claims. Run on a MacBook (M-series,
 macOS), engine `release` build at the feed-relations merge (PR #34/#35), via
 `packages/bench/src/shape-mem-matrix.ts`.
 
@@ -92,9 +92,9 @@ and linear in feeds × feed size; the honest (and stronger) claim is *what it sc
 ## Reproduce
 
 ```bash
-cargo build --release -p electric-ivm-engine
+cargo build --release -p electric-circuits-engine
 MATRIX_SIZES=100000 MATRIX_USERS=50,100,250,500,1000 MATRIX_PROJECTS=200 \
-  [MATRIX_MATERIALIZED=1] pnpm --filter @electric-ivm/bench exec tsx src/shape-mem-matrix.ts
+  [MATRIX_MATERIALIZED=1] pnpm --filter @electric-circuits/bench exec tsx src/shape-mem-matrix.ts
 ```
 
 (macOS: clean leaked PG shared-memory segments between runs — `ipcs -ma` / `ipcrm -m` for

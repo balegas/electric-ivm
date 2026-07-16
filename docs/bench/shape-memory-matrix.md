@@ -20,8 +20,8 @@ backfill, so the per-shape numbers isolate *registration* memory; a separate pro
 `engine_standalone_circuits`, `engine_subquery_nodes`, `engine_subquery_contributors`,
 `engine_subquery_distinct_values`, `engine_subquery_edges`.
 
-**Reproduce.** `cargo build --release -p electric-ivm-engine` then
-`MATRIX_SIZES=1000,10000,100000 MATRIX_USERS=100,250,500,1000 pnpm --filter @electric-ivm/bench shape-mem`.
+**Reproduce.** `cargo build --release -p electric-circuits-engine` then
+`MATRIX_SIZES=1000,10000,100000 MATRIX_USERS=100,250,500,1000 pnpm --filter @electric-circuits/bench shape-mem`.
 
 Config this run: projects=20, users=1000, memberships/user=6, comments/issue=0.5, shapes/user=10, user milestones=100,500,1000.
 

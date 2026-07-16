@@ -1,7 +1,7 @@
-// electric-ivm demo: a live "active high-priority todos" shape that reacts to writes.
+// electric-circuits demo: a live "active high-priority todos" shape that reacts to writes.
 //
 // Run:  pnpm demo            (from the repo root)
-//   or:  pnpm --filter @electric-ivm/examples demo
+//   or:  pnpm --filter @electric-circuits/examples demo
 //
 // It boots the whole stack in one process for convenience:
 //   - a durable-streams server (here the in-process test server; in production you'd run the
@@ -15,10 +15,10 @@ import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { DurableStreamTestServer } from '@electric-ivm/ds-rust'
-import { createApiServer } from '@electric-ivm/api'
-import { createClient } from '@electric-ivm/client'
-import type { Row, Schema } from '@electric-ivm/protocol'
+import { DurableStreamTestServer } from '@electric-circuits/ds-rust'
+import { createApiServer } from '@electric-circuits/api'
+import { createClient } from '@electric-circuits/client'
+import type { Row, Schema } from '@electric-circuits/protocol'
 
 // --- the schema the user defines ---------------------------------------------------------
 const schema: Schema = {
@@ -46,9 +46,9 @@ function repoRoot(): string {
 }
 
 async function spawnEngine(dsUrl: string) {
-  execFileSync('cargo', ['build', '-p', 'electric-ivm-engine'], { cwd: repoRoot(), stdio: 'inherit' })
-  const proc = spawn(join(repoRoot(), 'target', 'debug', 'electric-ivm-engine'), [], {
-    env: { ...process.env, ELECTRIC_IVM_DS_URL: dsUrl, ELECTRIC_IVM_BIND: '127.0.0.1:0', ELECTRIC_IVM_LOG: 'warn' },
+  execFileSync('cargo', ['build', '-p', 'electric-circuits-engine'], { cwd: repoRoot(), stdio: 'inherit' })
+  const proc = spawn(join(repoRoot(), 'target', 'debug', 'electric-circuits-engine'), [], {
+    env: { ...process.env, ELECTRIC_CIRCUITS_DS_URL: dsUrl, ELECTRIC_CIRCUITS_BIND: '127.0.0.1:0', ELECTRIC_CIRCUITS_LOG: 'warn' },
     stdio: ['ignore', 'pipe', 'inherit'],
   })
   const url = await new Promise<string>((resolve, reject) => {
@@ -75,7 +75,7 @@ const summarize = (rows: Row[]) =>
     .sort((a, b) => Number(a.id) - Number(b.id))
 
 async function main() {
-  console.log('Booting electric-ivm (durable-streams + engine + API + client)...\n')
+  console.log('Booting electric-circuits (durable-streams + engine + API + client)...\n')
   const ds = new DurableStreamTestServer({ port: 0 })
   const dsUrl = await ds.start()
   const engine = await spawnEngine(dsUrl)
@@ -104,14 +104,14 @@ async function main() {
   }
 
   // Write through the schema-derived ingestion API; watch the shape react live.
-  await step('insert #1 "Ship electric-ivm" (priority 5)            — MATCHES',
-    client.tables.todos.insert({ id: 1, title: 'Ship electric-ivm', priority: 5, done: false }), true)
+  await step('insert #1 "Ship electric-circuits" (priority 5)            — MATCHES',
+    client.tables.todos.insert({ id: 1, title: 'Ship electric-circuits', priority: 5, done: false }), true)
   await step('insert #2 "Water the plants" (priority 1)              — no match',
     client.tables.todos.insert({ id: 2, title: 'Water the plants', priority: 1, done: false }), false)
   await step('insert #3 "Write the docs" (priority 4)                — MATCHES',
     client.tables.todos.insert({ id: 3, title: 'Write the docs', priority: 4, done: false }), true)
   await step('complete #1 (done = true)                             — LEAVES the shape',
-    client.tables.todos.update({ id: 1, title: 'Ship electric-ivm', priority: 5, done: true }), true)
+    client.tables.todos.update({ id: 1, title: 'Ship electric-circuits', priority: 5, done: true }), true)
   await step('bump #2 to priority 5                                 — ENTERS the shape',
     client.tables.todos.update({ id: 2, title: 'Water the plants', priority: 5, done: false }), true)
   await step('delete #3                                             — LEAVES the shape',

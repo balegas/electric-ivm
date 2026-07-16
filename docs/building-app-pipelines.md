@@ -74,7 +74,7 @@ The load-bearing separation is between what is *compiled* and what is *routed*:
    *both* inputs) reintroduces a table copy — derived visibility belongs in the registry's
    subqueries, with row lookups going to Postgres.
 5. **Ship structure with deploys.** A new counts template = a config change
-   (`ELECTRIC_IVM_DBSP_COUNTS`) + a restart; counts state is in-memory and reseeds on every
+   (`ELECTRIC_CIRCUITS_DBSP_COUNTS`) + a restart; counts state is in-memory and reseeds on every
    boot from one group-aggregated Postgres snapshot per table (O(groups), not O(rows)). Leave
    ordering/pagination to the database (keyset pages + a changes-only live tail) — don't
    force topk into the circuit to reproduce what SQL already does well.
@@ -128,10 +128,10 @@ subscriptions and a thousand small inner sets.
 
 All three tiers ship in the engine and are always on. The circuit
 (`src/arrangements.rs`) compiles one template kind from env configuration: **counts
-pipelines** (`ELECTRIC_IVM_DBSP_COUNTS=table:col+col`) that maintain a live COUNT per group —
+pipelines** (`ELECTRIC_CIRCUITS_DBSP_COUNTS=table:col+col`) that maintain a live COUNT per group —
 O(distinct groups), in memory. The sequencer serves decomposable COUNT aggregates from that
 state end to end (`engine/circuit_serving.rs`; `ARCHITECTURE.md` §6b); membership shapes are
-served by the subquery registry against Postgres. `ELECTRIC_IVM_DBSP_INDEXES` is deprecated
+served by the subquery registry against Postgres. `ELECTRIC_CIRCUITS_DBSP_INDEXES` is deprecated
 and ignored (warn-and-ignore): row data lives in Postgres, and row lookups are pooled queries
 (`engine/membership.rs`). New template kinds extend the same skeleton; the feed and stepping
 plumbing in `arrangements.rs` is reused unchanged.
@@ -184,7 +184,7 @@ the last microstep's delta.
 
 The todo circuit above maps onto the engine's compiled template kinds directly:
 
-- **(E) open_counts is a counts pipeline** — `ELECTRIC_IVM_DBSP_COUNTS=todos:list_id+done`
+- **(E) open_counts is a counts pipeline** — `ELECTRIC_CIRCUITS_DBSP_COUNTS=todos:list_id+done`
   compiles exactly `map_index((list_id, done)).weighted_count()` (`arrangements.rs`). Its
   per-step group deltas are drained after each transaction (`apply_count_deltas`,
   `engine/circuit_serving.rs`) and any COUNT aggregate whose predicate decomposes over the group columns is
@@ -196,7 +196,7 @@ The todo circuit above maps onto the engine's compiled template kinds directly:
   `REPEATABLE READ` snapshot, `SnapshotGate`-fenced against the live log), with one shared
   inner-set node per distinct subquery (`subquery.rs`). `list_members` deltas reconcile the
   node's contributor sets; a flip (the user joins/leaves a list) queries that list's todos
-  back from Postgres on the parallel flip-worker pool (`ELECTRIC_IVM_FLIP_WORKERS`,
+  back from Postgres on the parallel flip-worker pool (`ELECTRIC_CIRCUITS_FLIP_WORKERS`,
   `engine/mod.rs`) and emits them absolutely, per pk, through ordered per-stream emission
   lanes (`engine/emission.rs`).
 - **(A) and (D)** are equality/match-all templates: the routing tier serves them by index,
@@ -208,14 +208,14 @@ Two operations wear the word "extend"; keep them apart.
 
 - **Extend the config — a deploy, not a code change.** Adding a *count group the circuit already
   knows how to compile* is a configuration change: append the table/columns to
-  `ELECTRIC_IVM_DBSP_COUNTS` and restart the engine. Counts state is in-memory and reseeds on
+  `ELECTRIC_CIRCUITS_DBSP_COUNTS` and restart the engine. Counts state is in-memory and reseeds on
   **every** boot from one `SELECT <group_cols>, count(*) … GROUP BY` per table under a
   `REPEATABLE READ` snapshot — O(groups), not O(rows) — with a `SnapshotGate` fencing change-log
   replay (`maybe_start_arrangements`, `engine/mod.rs`). There is no layout fingerprint, no
   checkpoint, and nothing to migrate. Shapes are not lost: they replay from the durable shape
   catalog (`meta/catalog` in `engine/catalog.rs`), and any COUNT aggregate whose predicate
   decomposes over the freshly-added group columns is circuit-served the moment the config ships.
-  (`ELECTRIC_IVM_DBSP_INDEXES` is deprecated and ignored — row data lives in Postgres, and
+  (`ELECTRIC_CIRCUITS_DBSP_INDEXES` is deprecated and ignored — row data lives in Postgres, and
   membership shapes are registry-served regardless of config.) This is the `COUNTS` half of
   "ship structure with deploys" (recipe step 5).
 - **Add a new template *kind* — a code change.** A pipeline the circuit cannot express from config
@@ -278,7 +278,7 @@ the pipeline.
 4. Drain the new handle in the step loop; route by group at the delivery edge.
 5. State is in-memory: every boot reseeds, so a new template needs a group-aggregated
    seeding query (like `backfill_group_counts`) and a `SnapshotGate`.
-   `cargo test -p electric-ivm-engine` and the conformance suite
+   `cargo test -p electric-circuits-engine` and the conformance suite
    (`pnpm test:conformance` — always exercises the circuit) are the safety net.
 
 `linearlite-circuit-design.md` maps the full flagship application onto these tiers.

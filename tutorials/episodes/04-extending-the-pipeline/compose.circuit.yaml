@@ -17,13 +17,13 @@
 # survives the recreate, so every open shape replays from it; any membership shape that now
 # decomposes over `todos.assignee` is PROMOTED from the fallback tier to circuit-served.
 #
-# `ELECTRIC_IVM_DBSP_DIR` stays `/tmp/dbsp` — an ephemeral container path — so a force-recreate
+# `ELECTRIC_CIRCUITS_DBSP_DIR` stays `/tmp/dbsp` — an ephemeral container path — so a force-recreate
 # reseeds even without the fingerprint change. (With a persistent DIR and unchanged config, the
 # same restart would be a fast checkpoint restore instead.)
 
 services:
   engine:
     environment:
-      ELECTRIC_IVM_DBSP_DIR: /tmp/dbsp
-      ELECTRIC_IVM_DBSP_INDEXES: "todos.list_id,list_members.user_id,list_members.list_id,todos.assignee"
-      ELECTRIC_IVM_DBSP_COUNTS: "todos:list_id+done"
+      ELECTRIC_CIRCUITS_DBSP_DIR: /tmp/dbsp
+      ELECTRIC_CIRCUITS_DBSP_INDEXES: "todos.list_id,list_members.user_id,list_members.list_id,todos.assignee"
+      ELECTRIC_CIRCUITS_DBSP_COUNTS: "todos:list_id+done"

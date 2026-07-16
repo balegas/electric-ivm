@@ -68,8 +68,8 @@ serving config from the recipe:
 
 ```sh
 # the circuit is always on; these declare which shapes it serves end to end
-ELECTRIC_IVM_DBSP_INDEXES=todos.list_id,list_members.user_id,list_members.list_id
-ELECTRIC_IVM_DBSP_COUNTS=todos:list_id+done
+ELECTRIC_CIRCUITS_DBSP_INDEXES=todos.list_id,list_members.user_id,list_members.list_id
+ELECTRIC_CIRCUITS_DBSP_COUNTS=todos:list_id+done
 ```
 
 (This is the same shape of config the flagship demo runs — see `examples/linearlite/start.ts`,

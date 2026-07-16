@@ -4,7 +4,7 @@
 // shape streams keep receiving changes. Subquery shapes are deliberately NOT restored (their
 // inner-node state is not persisted) — their streams are deleted loudly so clients recreate.
 
-import type { Schema } from '@electric-ivm/protocol'
+import type { Schema } from '@electric-circuits/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { applyOp, bootHarness, drainEngine, type Harness } from './harness.js'
 

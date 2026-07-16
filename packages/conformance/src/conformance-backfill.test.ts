@@ -3,7 +3,7 @@
 //   A) the FIRST shape on a table created after writes  -> tailer reads the backlog,
 //   B) a shape added to a table whose tailer already ran -> backfill from current table state.
 
-import type { Schema, ShapeDef } from '@electric-ivm/protocol'
+import type { Schema, ShapeDef } from '@electric-circuits/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { formatCompare } from './compare.js'
 import { applyOp, bootHarness, drainEngine, type Harness, waitForConvergence } from './harness.js'

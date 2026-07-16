@@ -20,7 +20,7 @@ importers:
 
   apps/api:
     dependencies:
-      '@electric-ivm/protocol':
+      '@electric-circuits/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol
       '@trpc/server':
@@ -63,10 +63,10 @@ importers:
 
   docker:
     dependencies:
-      '@electric-ivm/api':
+      '@electric-circuits/api':
         specifier: workspace:*
         version: link:../apps/api
-      '@electric-ivm/ds-rust':
+      '@electric-circuits/ds-rust':
         specifier: workspace:*
         version: link:../packages/ds-rust
     devDependencies:
@@ -76,16 +76,16 @@ importers:
 
   examples:
     dependencies:
-      '@electric-ivm/api':
+      '@electric-circuits/api':
         specifier: workspace:*
         version: link:../apps/api
-      '@electric-ivm/client':
+      '@electric-circuits/client':
         specifier: workspace:*
         version: link:../packages/client
-      '@electric-ivm/ds-rust':
+      '@electric-circuits/ds-rust':
         specifier: workspace:*
         version: link:../packages/ds-rust
-      '@electric-ivm/protocol':
+      '@electric-circuits/protocol':
         specifier: workspace:*
         version: link:../packages/protocol
       tsx:
@@ -97,16 +97,16 @@ importers:
       '@durable-streams/state':
         specifier: ^0.3.1
         version: 0.3.1(@tanstack/db@0.6.12(typescript@5.9.3))
-      '@electric-ivm/api':
+      '@electric-circuits/api':
         specifier: workspace:*
         version: link:../../apps/api
-      '@electric-ivm/client':
+      '@electric-circuits/client':
         specifier: workspace:*
         version: link:../../packages/client
-      '@electric-ivm/ds-rust':
+      '@electric-circuits/ds-rust':
         specifier: workspace:*
         version: link:../../packages/ds-rust
-      '@electric-ivm/protocol':
+      '@electric-circuits/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol
       '@faker-js/faker':
@@ -161,16 +161,16 @@ importers:
       '@durable-streams/state':
         specifier: ^0.3.1
         version: 0.3.1(@tanstack/db@0.6.12(typescript@5.9.3))
-      '@electric-ivm/api':
+      '@electric-circuits/api':
         specifier: workspace:*
         version: link:../../apps/api
-      '@electric-ivm/client':
+      '@electric-circuits/client':
         specifier: workspace:*
         version: link:../../packages/client
-      '@electric-ivm/ds-rust':
+      '@electric-circuits/ds-rust':
         specifier: workspace:*
         version: link:../../packages/ds-rust
-      '@electric-ivm/protocol':
+      '@electric-circuits/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol
       '@tanstack/db':
@@ -216,16 +216,16 @@ importers:
 
   packages/bench:
     dependencies:
-      '@electric-ivm/api':
+      '@electric-circuits/api':
         specifier: workspace:*
         version: link:../../apps/api
-      '@electric-ivm/client':
+      '@electric-circuits/client':
         specifier: workspace:*
         version: link:../client
-      '@electric-ivm/ds-rust':
+      '@electric-circuits/ds-rust':
         specifier: workspace:*
         version: link:../ds-rust
-      '@electric-ivm/protocol':
+      '@electric-circuits/protocol':
         specifier: workspace:*
         version: link:../protocol
       pg:
@@ -243,10 +243,10 @@ importers:
       '@durable-streams/state':
         specifier: ^0.3.1
         version: 0.3.1(@tanstack/db@0.6.12(typescript@5.9.3))
-      '@electric-ivm/api':
+      '@electric-circuits/api':
         specifier: workspace:*
         version: link:../../apps/api
-      '@electric-ivm/protocol':
+      '@electric-circuits/protocol':
         specifier: workspace:*
         version: link:../protocol
       '@tanstack/db':
@@ -267,19 +267,19 @@ importers:
       '@durable-streams/state':
         specifier: ^0.3.1
         version: 0.3.1(@tanstack/db@0.6.12(typescript@5.9.3))
-      '@electric-ivm/api':
+      '@electric-circuits/api':
         specifier: workspace:*
         version: link:../../apps/api
-      '@electric-ivm/client':
+      '@electric-circuits/client':
         specifier: workspace:*
         version: link:../client
-      '@electric-ivm/ds-rust':
+      '@electric-circuits/ds-rust':
         specifier: workspace:*
         version: link:../ds-rust
-      '@electric-ivm/oracle':
+      '@electric-circuits/oracle':
         specifier: workspace:*
         version: link:../oracle
-      '@electric-ivm/protocol':
+      '@electric-circuits/protocol':
         specifier: workspace:*
         version: link:../protocol
       '@electric-sql/pglite':
@@ -309,16 +309,16 @@ importers:
 
   packages/loadgen:
     dependencies:
-      '@electric-ivm/api':
+      '@electric-circuits/api':
         specifier: workspace:*
         version: link:../../apps/api
-      '@electric-ivm/client':
+      '@electric-circuits/client':
         specifier: workspace:*
         version: link:../client
-      '@electric-ivm/ds-rust':
+      '@electric-circuits/ds-rust':
         specifier: workspace:*
         version: link:../ds-rust
-      '@electric-ivm/protocol':
+      '@electric-circuits/protocol':
         specifier: workspace:*
         version: link:../protocol
       '@faker-js/faker':
@@ -343,7 +343,7 @@ importers:
 
   packages/oracle:
     dependencies:
-      '@electric-ivm/protocol':
+      '@electric-circuits/protocol':
         specifier: workspace:*
         version: link:../protocol
       '@electric-sql/pglite':

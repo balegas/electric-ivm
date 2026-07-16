@@ -1,6 +1,6 @@
 # Guide: shapes and subqueries
 
-Audience: people integrating against electric-ivm — defining shapes and subqueries, wiring the
+Audience: people integrating against electric-circuits — defining shapes and subqueries, wiring the
 engine to Postgres, and sizing a deployment. For how the engine works internally and the full
 analytical cost model, see the companion `docs/ivm-engine-internals.md`.
 
@@ -56,10 +56,10 @@ identical either way.)
 
 | env var | meaning |
 |---|---|
-| `ELECTRIC_IVM_PG_URL` | Postgres connection string. Its presence selects Postgres mode. |
-| `ELECTRIC_IVM_PG_TABLES` | comma-separated table list, or `*`/empty to **introspect every public table that has a primary key** (skipping the engine's `__el_sync` bookkeeping table). |
-| `ELECTRIC_IVM_PG_SLOT` | replication slot name (default `electric_ivm`; the slot uses the `pgoutput` plugin). |
-| `ELECTRIC_IVM_PG_POLL_MS` | slot poll interval. |
+| `ELECTRIC_CIRCUITS_PG_URL` | Postgres connection string. Its presence selects Postgres mode. |
+| `ELECTRIC_CIRCUITS_PG_TABLES` | comma-separated table list, or `*`/empty to **introspect every public table that has a primary key** (skipping the engine's `__el_sync` bookkeeping table). |
+| `ELECTRIC_CIRCUITS_PG_SLOT` | replication slot name (default `electric_circuits`; the slot uses the `pgoutput` plugin). |
+| `ELECTRIC_CIRCUITS_PG_POLL_MS` | slot poll interval. |
 
 On boot the engine introspects the configured tables (columns, types, primary key — composite
 keys ordered by index position), sets `REPLICA IDENTITY FULL`, creates the replication slot,
@@ -92,7 +92,7 @@ Postgres oracle always agree).
 ### Via the client (tRPC + stream-db)
 
 ```ts
-import { createClient } from '@electric-ivm/client'
+import { createClient } from '@electric-circuits/client'
 
 const client = createClient({ apiUrl, schema })
 

@@ -191,7 +191,7 @@ registration commands, adjust input, membership snapshot publication, flip drain
   `GET /subqueries` reports template → binds → dependents; `/state` exposes per-template
   arrangement cardinalities from the snapshot.
 - No new env vars. Subquery pipelines are always-on per table (empty until a template
-  registers). `ELECTRIC_IVM_FLIP_WORKERS` / `ELECTRIC_IVM_EMIT_LANES` unchanged.
+  registers). `ELECTRIC_CIRCUITS_FLIP_WORKERS` / `ELECTRIC_CIRCUITS_EMIT_LANES` unchanged.
 - ARCHITECTURE.md §6b's "circuit structure is fixed at boot" limitation is rewritten to apply
   only to counts specs; subquery templates are runtime data. The blog-review claim that
   prompted this bead ("the circuit maintains the shared indexes… needed by the queries")
@@ -205,7 +205,7 @@ Per AGENTS.md's engine-task checklist, all of:
    canonicalization, sig stability), bind-gated flat_map eval, adjust-input
    seed/replay/retract round-trips, flip-delta equivalence vs. the old kernel's semantics
    (port the `reconcile_row` and known_members regression tests, incl. PR #30's).
-2. `ELECTRIC_IVM_ENGINE_PREBUILT=1 pnpm test` — the oracle conformance suite is the real
+2. `ELECTRIC_CIRCUITS_ENGINE_PREBUILT=1 pnpm test` — the oracle conformance suite is the real
    referee: NULLs, nested subqueries, concurrent writers, batched mutations (the historical
    symptom of emission-order bugs: op-by-op converges, batches diverge).
 3. `./electric-conformance/run.sh oracle` — Electric's own oracle vs `/v1/shape`.
@@ -254,7 +254,7 @@ table-of-decisions choices in §2 are unchanged; these amend *how* §4–§5 rea
    same memory) and emits precise retract/insert tuple pairs. What the circuit replaces is the
    `contributors` map (the larger structure) and all flip-detection logic.
 3. **A dedicated always-on membership circuit.** The counts circuit is built only when
-   `ELECTRIC_IVM_DBSP_COUNTS` is configured, and only at Postgres boot — but subqueries must
+   `ELECTRIC_CIRCUITS_DBSP_COUNTS` is configured, and only at Postgres boot — but subqueries must
    work in library mode too. The membership pipeline is its own small `dbsp` circuit (one
    global tuple input, structure fixed at construction, one worker thread), owned by the
    `SubqueryRegistry` and started with it. Circuits per engine stay O(1): counts + membership.

@@ -4,7 +4,7 @@
 
 A **shape** is a live query result: "the rows matching this predicate", kept up to date forever. You ask for it once; from then on, every change that affects it is pushed to you as a delta — no polling, no re-running the query.
 
-Your data doesn't move anywhere to make this work. It lives in **Postgres**, the system of record, and your apps keep writing to it with ordinary SQL. The **electric-ivm engine** tails Postgres logical replication and maintains every shape incrementally: each committed change flows once through a small pipeline of operators, and only the shapes it affects hear about it. In this episode you'll create one shape, watch its pipeline get built, and watch one write flow through it — live, on screen.
+Your data doesn't move anywhere to make this work. It lives in **Postgres**, the system of record, and your apps keep writing to it with ordinary SQL. The **electric-circuits engine** tails Postgres logical replication and maintains every shape incrementally: each committed change flows once through a small pipeline of operators, and only the shapes it affects hear about it. In this episode you'll create one shape, watch its pipeline get built, and watch one write flow through it — live, on screen.
 
 ## 2. Start the stack
 

@@ -1,10 +1,10 @@
-# electric-ivm — a hands-on tutorial series
+# electric-circuits — a hands-on tutorial series
 
 Modern applications need to continuously synchronize backend changes to the client in real time. The usual ways to do this are to poll the database repeatedly, or to assemble caches and queues and hope they stay consistent. A **sync engine** replaces all of that: it keeps subsets of your database (Postgres in our case) continuously up to date wherever they're needed, streaming every change out in real time over plain HTTP. Postgres stays the single source of truth; the sync engine is the pipe that keeps everything downstream in step with it.
 
 The unit of sync is a **shape**. A shape is a subset of your Postgres data — the rows of a table that match a `where` clause (and, if you like, only some of their columns). You declare the shape once and the engine hands you its rows, then keeps them live: every insert, update, or delete that affects the shape is pushed to you as it happens. You sync only the data you actually need, and it never goes stale. (Shapes come from [ElectricSQL](https://electric.ax), whose shape protocol this engine speaks.)
 
-**electric-ivm** is an experiment: a reimagining of Electric in Rust that swaps its hand-rolled shape-matching for a **general-purpose incremental view maintenance (IVM) engine**. This allows more expressive shapes, so a shape on the backend stays close to what the client actually queries. It's built on **DBSP** ([paper](https://arxiv.org/abs/2203.16684), VLDB 2023), which compiles a query into a circuit of operators over streams of changes and maintains even rich queries incrementally. That's what this series is about.
+**electric-circuits** is an experiment: a reimagining of Electric in Rust that swaps its hand-rolled shape-matching for a **general-purpose incremental view maintenance (IVM) engine**. This allows more expressive shapes, so a shape on the backend stays close to what the client actually queries. It's built on **DBSP** ([paper](https://arxiv.org/abs/2203.16684), VLDB 2023), which compiles a query into a circuit of operators over streams of changes and maintains even rich queries incrementally. That's what this series is about.
 
 This series teaches that engine the way you'd actually poke at it — from a terminal, one small step at a time — and gives you a window into what it's doing while you do it.
 

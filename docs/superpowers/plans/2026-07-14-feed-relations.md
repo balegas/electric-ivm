@@ -39,7 +39,7 @@ Branch: feat/feed-relations (off chore/subquery-registry-cleanups / PR #33).
       engine/tests.rs regression test to assertion path. cargo suites green -> commit.
 
 ### Task 3: gates + demo
-- [ ] pnpm engine:test; ELECTRIC_IVM_ENGINE_PREBUILT=1 pnpm test (PR30 regression must pass
+- [ ] pnpm engine:test; ELECTRIC_CIRCUITS_ENGINE_PREBUILT=1 pnpm test (PR30 regression must pass
       with known_members gone); electric-conformance oracle + subqueries (13/15 baseline);
       LinearLite via Playwright (join/leave churn, new issue, visualizer). create-storm bench
       before/after noted for the serialization risk.

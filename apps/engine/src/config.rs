@@ -1,8 +1,8 @@
 //! Boot configuration resolved from the environment.
 //!
-//! The engine grew up on `ELECTRIC_IVM_*` vars (see `README.md`); the benchmarking-fleet drives the
+//! The engine grew up on `ELECTRIC_CIRCUITS_*` vars (see `README.md`); the benchmarking-fleet drives the
 //! image with Electric's own `ELECTRIC_*` / `DATABASE_URL` surface (see `docs/fleet-conformance.md`).
-//! This module maps the fleet surface onto the engine, keeping the `ELECTRIC_IVM_*` vars as the
+//! This module maps the fleet surface onto the engine, keeping the `ELECTRIC_CIRCUITS_*` vars as the
 //! higher-precedence override so the existing dev/test workflow is unchanged. Resolution is a pure
 //! function of an env getter ([`Config::resolve`]) so precedence is unit-testable without touching the
 //! process environment.
@@ -28,9 +28,9 @@ impl StatsdTarget {
 /// Fully-resolved boot configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Postgres connection string (enables Postgres mode). `ELECTRIC_IVM_PG_URL` wins over `DATABASE_URL`.
+    /// Postgres connection string (enables Postgres mode). `ELECTRIC_CIRCUITS_PG_URL` wins over `DATABASE_URL`.
     pub pg_url: Option<String>,
-    /// Durable-streams base URL (`ELECTRIC_IVM_DS_URL`; required for a real run, set by the entrypoint).
+    /// Durable-streams base URL (`ELECTRIC_CIRCUITS_DS_URL`; required for a real run, set by the entrypoint).
     pub ds_url: Option<String>,
     /// HTTP bind address for the control plane + `/v1/shape` + `/v1/health`.
     pub bind: String,
@@ -38,10 +38,10 @@ pub struct Config {
     pub log_filter: String,
     /// Logical-replication slot name.
     pub slot: String,
-    /// Tables to replicate (`ELECTRIC_IVM_PG_TABLES`); empty / `["*"]` = introspect all.
+    /// Tables to replicate (`ELECTRIC_CIRCUITS_PG_TABLES`); empty / `["*"]` = introspect all.
     pub tables: Vec<String>,
     /// Legacy replication poll interval (ms). Unused since the ingestor streams pgoutput (push
-    /// delivery); still parsed so existing `ELECTRIC_IVM_PG_POLL_MS` settings are accepted.
+    /// delivery); still parsed so existing `ELECTRIC_CIRCUITS_PG_POLL_MS` settings are accepted.
     pub poll_ms: u64,
     /// This instance's id — tags every StatsD metric.
     pub instance_id: String,
@@ -60,7 +60,7 @@ pub struct Config {
     /// Max pooled Postgres connections for backfills/query-backs (`ELECTRIC_DB_POOL_SIZE`, default 20).
     pub db_pool_size: usize,
     /// Register the introspection surface (`/trace` SSE + `/graph`(`/node`) + `/state`(`/node`) —
-    /// the pipeline-visualizer backend). `ELECTRIC_IVM_TRACE=0|false|off` disables it: the routes
+    /// the pipeline-visualizer backend). `ELECTRIC_CIRCUITS_TRACE=0|false|off` disables it: the routes
     /// are never registered, so nothing can subscribe and the hot-path trace gating stays on its
     /// zero-subscriber fast path. Default on. Note: the surface is unauthenticated either way.
     pub trace: bool,
@@ -71,34 +71,34 @@ pub struct Config {
     pub noop_vars: Vec<String>,
 }
 
-/// Settings for the dbsp arrangement layer (all under `ELECTRIC_IVM_DBSP*`).
+/// Settings for the dbsp arrangement layer (all under `ELECTRIC_CIRCUITS_DBSP*`).
 #[derive(Clone, Debug)]
 pub struct DbspConfig {
-    /// State directory (`ELECTRIC_IVM_DBSP_DIR`; default
+    /// State directory (`ELECTRIC_CIRCUITS_DBSP_DIR`; default
     /// `<ELECTRIC_STORAGE_DIR|./data>/dbsp/<slot>` — slot-keyed so parallel engines and
     /// different source databases never share dbsp state).
     pub dir: std::path::PathBuf,
-    /// Storage-cache budget in MiB (`ELECTRIC_IVM_DBSP_CACHE_MIB`).
+    /// Storage-cache budget in MiB (`ELECTRIC_CIRCUITS_DBSP_CACHE_MIB`).
     pub cache_mib: Option<usize>,
-    /// Spill threshold in KiB (`ELECTRIC_IVM_DBSP_MIN_STORAGE_KB`; default 1024 = 1 MiB;
+    /// Spill threshold in KiB (`ELECTRIC_CIRCUITS_DBSP_MIN_STORAGE_KB`; default 1024 = 1 MiB;
     /// 0 spills everything eligible).
     pub min_storage_bytes: Option<usize>,
-    /// Memory ceiling in MiB driving dbsp's pressure-based spilling (`ELECTRIC_IVM_DBSP_MAX_RSS_MB`).
+    /// Memory ceiling in MiB driving dbsp's pressure-based spilling (`ELECTRIC_CIRCUITS_DBSP_MAX_RSS_MB`).
     pub max_rss_bytes: Option<u64>,
-    /// Checkpoint cadence in seconds (`ELECTRIC_IVM_DBSP_CHECKPOINT_SECS`; default 60; 0 = only
+    /// Checkpoint cadence in seconds (`ELECTRIC_CIRCUITS_DBSP_CHECKPOINT_SECS`; default 60; 0 = only
     /// at shutdown).
     pub checkpoint_every: Option<Duration>,
     /// Extra lookup indexes beyond the per-table primary key: `table.column[,table.column…]`
-    /// (`ELECTRIC_IVM_DBSP_INDEXES`). Lookups against undeclared indexes fall back to Postgres.
+    /// (`ELECTRIC_CIRCUITS_DBSP_INDEXES`). Lookups against undeclared indexes fall back to Postgres.
     pub indexes: Vec<(String, String)>,
-    /// Counts pipelines: `table:col+col[,table:col…]` (`ELECTRIC_IVM_DBSP_COUNTS`). The circuit
+    /// Counts pipelines: `table:col+col[,table:col…]` (`ELECTRIC_CIRCUITS_DBSP_COUNTS`). The circuit
     /// maintains a live COUNT per distinct group projection; COUNT aggregates whose predicate
     /// decomposes over these columns are served from the groups.
     pub counts: Vec<(String, Vec<String>)>,
 }
 
 /// `ELECTRIC_*` vars the engine actually reads and acts on. Anything else matching `^ELECTRIC_`
-/// (and not the internal `ELECTRIC_IVM_*` namespace) is an accepted no-op.
+/// (and not the internal `ELECTRIC_CIRCUITS_*` namespace) is an accepted no-op.
 const HANDLED: &[&str] = &[
     "ELECTRIC_PORT",
     "ELECTRIC_INSTANCE_ID",
@@ -157,12 +157,12 @@ impl Config {
         let g = |k: &str| nonempty(get(k));
 
         // Postgres URL: our internal var wins, then the fleet's DATABASE_URL.
-        let pg_url = g("ELECTRIC_IVM_PG_URL").or_else(|| g("DATABASE_URL"));
-        let ds_url = g("ELECTRIC_IVM_DS_URL");
+        let pg_url = g("ELECTRIC_CIRCUITS_PG_URL").or_else(|| g("DATABASE_URL"));
+        let ds_url = g("ELECTRIC_CIRCUITS_DS_URL");
 
-        // Bind address. ELECTRIC_IVM_BIND always wins (preserves 127.0.0.1:0 dev behavior). Otherwise,
+        // Bind address. ELECTRIC_CIRCUITS_BIND always wins (preserves 127.0.0.1:0 dev behavior). Otherwise,
         // if the fleet surface is present (ELECTRIC_PORT or DATABASE_URL) bind 0.0.0.0:<port|3000>.
-        let bind = if let Some(b) = g("ELECTRIC_IVM_BIND") {
+        let bind = if let Some(b) = g("ELECTRIC_CIRCUITS_BIND") {
             b
         } else if let Some(port) = g("ELECTRIC_PORT") {
             format!("0.0.0.0:{}", port.trim())
@@ -172,8 +172,8 @@ impl Config {
             "127.0.0.1:0".to_string()
         };
 
-        // Log filter: ELECTRIC_IVM_LOG (a raw EnvFilter) wins; else map ELECTRIC_LOG_LEVEL; else info.
-        let log_filter = g("ELECTRIC_IVM_LOG").unwrap_or_else(|| match g("ELECTRIC_LOG_LEVEL").as_deref() {
+        // Log filter: ELECTRIC_CIRCUITS_LOG (a raw EnvFilter) wins; else map ELECTRIC_LOG_LEVEL; else info.
+        let log_filter = g("ELECTRIC_CIRCUITS_LOG").unwrap_or_else(|| match g("ELECTRIC_LOG_LEVEL").as_deref() {
             Some("error") => "error".into(),
             Some("warning") | Some("warn") => "warn".into(),
             Some("debug") => "debug".into(),
@@ -181,21 +181,21 @@ impl Config {
             _ => "info".into(),
         });
 
-        // Slot name: ELECTRIC_IVM_PG_SLOT wins; else electric_slot_<stream id>; else the legacy default.
+        // Slot name: ELECTRIC_CIRCUITS_PG_SLOT wins; else electric_slot_<stream id>; else the legacy default.
         let stream_id = g("ELECTRIC_REPLICATION_STREAM_ID");
-        let slot = g("ELECTRIC_IVM_PG_SLOT").unwrap_or_else(|| match &stream_id {
+        let slot = g("ELECTRIC_CIRCUITS_PG_SLOT").unwrap_or_else(|| match &stream_id {
             Some(id) => format!("electric_slot_{id}"),
-            None => "electric_ivm".to_string(),
+            None => "electric_circuits".to_string(),
         });
 
-        let tables: Vec<String> = g("ELECTRIC_IVM_PG_TABLES")
+        let tables: Vec<String> = g("ELECTRIC_CIRCUITS_PG_TABLES")
             .unwrap_or_default()
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
 
-        let poll_ms = g("ELECTRIC_IVM_PG_POLL_MS").and_then(|s| s.trim().parse().ok()).unwrap_or(50);
+        let poll_ms = g("ELECTRIC_CIRCUITS_PG_POLL_MS").and_then(|s| s.trim().parse().ok()).unwrap_or(50);
 
         let instance_id = g("ELECTRIC_INSTANCE_ID").unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let stack_id = stream_id.clone().unwrap_or_else(|| "single_stack".to_string());
@@ -228,7 +228,7 @@ impl Config {
             .filter(|n| *n >= 1)
             .unwrap_or(20);
 
-        let trace = g("ELECTRIC_IVM_TRACE")
+        let trace = g("ELECTRIC_CIRCUITS_TRACE")
             .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
             .unwrap_or(true);
 
@@ -240,26 +240,26 @@ impl Config {
             // Default dir is keyed by the replication slot: dbsp state is only valid for the
             // database identity it was built from, and parallel engines (conformance harnesses)
             // get disjoint state dirs for free.
-            dir: g("ELECTRIC_IVM_DBSP_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| {
+            dir: g("ELECTRIC_CIRCUITS_DBSP_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| {
                 std::path::Path::new(storage_dir.as_deref().unwrap_or("./data")).join("dbsp").join(&slot)
             }),
-            cache_mib: g("ELECTRIC_IVM_DBSP_CACHE_MIB").and_then(|s| s.trim().parse().ok()),
+            cache_mib: g("ELECTRIC_CIRCUITS_DBSP_CACHE_MIB").and_then(|s| s.trim().parse().ok()),
             min_storage_bytes: Some(
-                g("ELECTRIC_IVM_DBSP_MIN_STORAGE_KB")
+                g("ELECTRIC_CIRCUITS_DBSP_MIN_STORAGE_KB")
                     .and_then(|s| s.trim().parse::<usize>().ok())
                     .unwrap_or(1024)
                     * 1024,
             ),
-            max_rss_bytes: g("ELECTRIC_IVM_DBSP_MAX_RSS_MB")
+            max_rss_bytes: g("ELECTRIC_CIRCUITS_DBSP_MAX_RSS_MB")
                 .and_then(|s| s.trim().parse::<u64>().ok())
                 .map(|mb| mb * 1024 * 1024),
-            checkpoint_every: match g("ELECTRIC_IVM_DBSP_CHECKPOINT_SECS").and_then(|s| s.trim().parse::<u64>().ok())
+            checkpoint_every: match g("ELECTRIC_CIRCUITS_DBSP_CHECKPOINT_SECS").and_then(|s| s.trim().parse::<u64>().ok())
             {
                 Some(0) => None,
                 Some(s) => Some(Duration::from_secs(s)),
                 None => Some(Duration::from_secs(60)),
             },
-            indexes: g("ELECTRIC_IVM_DBSP_INDEXES")
+            indexes: g("ELECTRIC_CIRCUITS_DBSP_INDEXES")
                 .unwrap_or_default()
                 .split(',')
                 .filter_map(|s| {
@@ -267,7 +267,7 @@ impl Config {
                     Some((t.trim().to_string(), c.trim().to_string()))
                 })
                 .collect(),
-            counts: g("ELECTRIC_IVM_DBSP_COUNTS")
+            counts: g("ELECTRIC_CIRCUITS_DBSP_COUNTS")
                 .unwrap_or_default()
                 .split(',')
                 .filter_map(|s| {
@@ -338,9 +338,9 @@ impl Config {
 }
 
 /// Is `k` an `ELECTRIC_*` var the engine does not act on (so it should be accepted as a no-op)?
-/// Internal `ELECTRIC_IVM_*` vars are ours (handled) and never counted here.
+/// Internal `ELECTRIC_CIRCUITS_*` vars are ours (handled) and never counted here.
 pub fn is_noop_var(k: &str) -> bool {
-    k.starts_with("ELECTRIC_") && !k.starts_with("ELECTRIC_IVM_") && !HANDLED.contains(&k)
+    k.starts_with("ELECTRIC_") && !k.starts_with("ELECTRIC_CIRCUITS_") && !HANDLED.contains(&k)
 }
 
 /// Redact `user:pass@` credentials from a Postgres/URL connection string for logging.
@@ -404,7 +404,7 @@ mod tests {
 
     #[test]
     fn pg_url_precedence_ivm_wins_over_database_url() {
-        let c = cfg(&[("ELECTRIC_IVM_PG_URL", "postgres://ivm"), ("DATABASE_URL", "postgres://fleet")]);
+        let c = cfg(&[("ELECTRIC_CIRCUITS_PG_URL", "postgres://ivm"), ("DATABASE_URL", "postgres://fleet")]);
         assert_eq!(c.pg_url.as_deref(), Some("postgres://ivm"));
         let c = cfg(&[("DATABASE_URL", "postgres://fleet")]);
         assert_eq!(c.pg_url.as_deref(), Some("postgres://fleet"));
@@ -429,9 +429,9 @@ mod tests {
         assert_eq!(cfg(&[("ELECTRIC_PORT", "3000")]).bind, "0.0.0.0:3000");
         // DATABASE_URL present, no port -> 0.0.0.0:3000
         assert_eq!(cfg(&[("DATABASE_URL", "postgres://x")]).bind, "0.0.0.0:3000");
-        // ELECTRIC_IVM_BIND always wins
+        // ELECTRIC_CIRCUITS_BIND always wins
         assert_eq!(
-            cfg(&[("ELECTRIC_IVM_BIND", "127.0.0.1:9"), ("ELECTRIC_PORT", "3000")]).bind,
+            cfg(&[("ELECTRIC_CIRCUITS_BIND", "127.0.0.1:9"), ("ELECTRIC_PORT", "3000")]).bind,
             "127.0.0.1:9"
         );
     }
@@ -442,19 +442,19 @@ mod tests {
         assert_eq!(cfg(&[("ELECTRIC_LOG_LEVEL", "warning")]).log_filter, "warn");
         assert_eq!(cfg(&[("ELECTRIC_LOG_LEVEL", "error")]).log_filter, "error");
         assert_eq!(cfg(&[("ELECTRIC_LOG_LEVEL", "debug")]).log_filter, "debug");
-        // ELECTRIC_IVM_LOG wins and passes through verbatim
+        // ELECTRIC_CIRCUITS_LOG wins and passes through verbatim
         assert_eq!(
-            cfg(&[("ELECTRIC_IVM_LOG", "electric_ivm_engine=debug"), ("ELECTRIC_LOG_LEVEL", "error")]).log_filter,
-            "electric_ivm_engine=debug"
+            cfg(&[("ELECTRIC_CIRCUITS_LOG", "electric_circuits_engine=debug"), ("ELECTRIC_LOG_LEVEL", "error")]).log_filter,
+            "electric_circuits_engine=debug"
         );
     }
 
     #[test]
     fn slot_name_from_stream_id() {
-        assert_eq!(cfg(&[]).slot, "electric_ivm");
+        assert_eq!(cfg(&[]).slot, "electric_circuits");
         assert_eq!(cfg(&[("ELECTRIC_REPLICATION_STREAM_ID", "bench")]).slot, "electric_slot_bench");
         assert_eq!(
-            cfg(&[("ELECTRIC_IVM_PG_SLOT", "custom"), ("ELECTRIC_REPLICATION_STREAM_ID", "bench")]).slot,
+            cfg(&[("ELECTRIC_CIRCUITS_PG_SLOT", "custom"), ("ELECTRIC_REPLICATION_STREAM_ID", "bench")]).slot,
             "custom"
         );
     }
@@ -519,11 +519,11 @@ mod tests {
     #[test]
     fn trace_flag() {
         assert!(cfg(&[]).trace, "introspection defaults on");
-        assert!(!cfg(&[("ELECTRIC_IVM_TRACE", "0")]).trace);
-        assert!(!cfg(&[("ELECTRIC_IVM_TRACE", "false")]).trace);
-        assert!(!cfg(&[("ELECTRIC_IVM_TRACE", "off")]).trace);
-        assert!(cfg(&[("ELECTRIC_IVM_TRACE", "1")]).trace);
-        assert!(cfg(&[("ELECTRIC_IVM_TRACE", "true")]).trace);
+        assert!(!cfg(&[("ELECTRIC_CIRCUITS_TRACE", "0")]).trace);
+        assert!(!cfg(&[("ELECTRIC_CIRCUITS_TRACE", "false")]).trace);
+        assert!(!cfg(&[("ELECTRIC_CIRCUITS_TRACE", "off")]).trace);
+        assert!(cfg(&[("ELECTRIC_CIRCUITS_TRACE", "1")]).trace);
+        assert!(cfg(&[("ELECTRIC_CIRCUITS_TRACE", "true")]).trace);
     }
 
     #[test]
@@ -533,7 +533,7 @@ mod tests {
         let c = cfg(&[]);
         assert!(c.dbsp.indexes.is_empty(), "empty _INDEXES is valid");
         assert!(c.dbsp.counts.is_empty(), "empty _COUNTS is valid");
-        assert!(c.dbsp.dir.ends_with("dbsp/electric_ivm"), "default dir is slot-keyed: {:?}", c.dbsp.dir);
+        assert!(c.dbsp.dir.ends_with("dbsp/electric_circuits"), "default dir is slot-keyed: {:?}", c.dbsp.dir);
         assert_eq!(c.dbsp.checkpoint_every, Some(Duration::from_secs(60)));
         assert_eq!(c.dbsp.min_storage_bytes, Some(1024 * 1024));
     }
@@ -541,11 +541,11 @@ mod tests {
     #[test]
     fn dbsp_tunables_parse() {
         let c = cfg(&[
-            ("ELECTRIC_IVM_DBSP_DIR", "/tmp/dbsp"),
-            ("ELECTRIC_IVM_DBSP_INDEXES", "todos.list_id, list_members.user_id"),
-            ("ELECTRIC_IVM_DBSP_COUNTS", "todos:list_id+done"),
-            ("ELECTRIC_IVM_DBSP_CHECKPOINT_SECS", "0"),
-            ("ELECTRIC_IVM_DBSP_MIN_STORAGE_KB", "2048"),
+            ("ELECTRIC_CIRCUITS_DBSP_DIR", "/tmp/dbsp"),
+            ("ELECTRIC_CIRCUITS_DBSP_INDEXES", "todos.list_id, list_members.user_id"),
+            ("ELECTRIC_CIRCUITS_DBSP_COUNTS", "todos:list_id+done"),
+            ("ELECTRIC_CIRCUITS_DBSP_CHECKPOINT_SECS", "0"),
+            ("ELECTRIC_CIRCUITS_DBSP_MIN_STORAGE_KB", "2048"),
         ]);
         assert_eq!(c.dbsp.dir, std::path::PathBuf::from("/tmp/dbsp"));
         assert_eq!(
@@ -563,7 +563,7 @@ mod tests {
         assert!(is_noop_var("ELECTRIC_OTLP_ENDPOINT"));
         assert!(!is_noop_var("ELECTRIC_DB_POOL_SIZE")); // handled: sizes the backfill pool
         assert!(!is_noop_var("ELECTRIC_PORT")); // handled
-        assert!(!is_noop_var("ELECTRIC_IVM_PG_URL")); // internal
+        assert!(!is_noop_var("ELECTRIC_CIRCUITS_PG_URL")); // internal
         assert!(!is_noop_var("DATABASE_URL")); // not an ELECTRIC_ var
     }
 }

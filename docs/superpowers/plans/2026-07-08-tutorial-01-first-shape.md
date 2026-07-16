@@ -55,18 +55,18 @@
 - [ ] **Step 2: Write `docker/Dockerfile.viz`**
 
 ```dockerfile
-# electric-ivm VIZ image: the pipeline visualizer as static assets behind Caddy, which also
+# electric-circuits VIZ image: the pipeline visualizer as static assets behind Caddy, which also
 # reverse-proxies /engine/* to the engine control plane (same contract as the Vite dev proxy).
 #
 # Build context is the repo root:
-#   docker build -f docker/Dockerfile.viz -t electric-ivm-viz .
+#   docker build -f docker/Dockerfile.viz -t electric-circuits-viz .
 
 FROM node:22-slim AS build
 RUN corepack enable
 WORKDIR /repo
 COPY . .
-RUN pnpm install --filter @electric-ivm/pipeline-viz...
-RUN pnpm --filter @electric-ivm/pipeline-viz build
+RUN pnpm install --filter @electric-circuits/pipeline-viz...
+RUN pnpm --filter @electric-circuits/pipeline-viz build
 
 FROM caddy:2-alpine
 COPY docker/viz.Caddyfile /etc/caddy/Caddyfile
@@ -76,15 +76,15 @@ EXPOSE 5180
 
 - [ ] **Step 3: Build the image**
 
-Run: `docker build -f docker/Dockerfile.viz -t electric-ivm-viz /Users/vbalegas/workspace/dbsp-ds`
+Run: `docker build -f docker/Dockerfile.viz -t electric-circuits-viz /Users/vbalegas/workspace/dbsp-ds`
 Expected: builds to completion; the `vite build` step prints `✓ built in …` and emits `dist/index.html`.
-(If `pnpm install --filter @electric-ivm/pipeline-viz...` fails on workspace resolution, fall back to plain `RUN pnpm install` — same as `Dockerfile.node`.)
+(If `pnpm install --filter @electric-circuits/pipeline-viz...` fails on workspace resolution, fall back to plain `RUN pnpm install` — same as `Dockerfile.node`.)
 
 - [ ] **Step 4: Smoke-test the image standalone**
 
 Run:
 ```bash
-docker run -d --name viz-smoke -p 5181:5180 -e ENGINE_UPSTREAM=127.0.0.1:9 electric-ivm-viz
+docker run -d --name viz-smoke -p 5181:5180 -e ENGINE_UPSTREAM=127.0.0.1:9 electric-circuits-viz
 sleep 1
 curl -s -o /dev/null -w '%{http_code}\n' http://localhost:5181/          # expect 200
 curl -s -o /dev/null -w '%{http_code}\n' http://localhost:5181/engine/health  # expect 502 (no engine — proves the proxy route exists)
@@ -154,7 +154,7 @@ INSERT INTO issues VALUES
 # editing this file. The engine introspects the table set at startup — an episode script that
 # ADDS tables is always followed by `docker compose restart engine` in the episode text.
 
-name: electric-ivm-tutorials
+name: electric-circuits-tutorials
 
 services:
   postgres:
@@ -197,10 +197,10 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.engine
     environment:
-      ELECTRIC_IVM_DS_URL: http://ds:8791
-      ELECTRIC_IVM_PG_URL: postgres://postgres:password@postgres:5432/electric
-      ELECTRIC_IVM_PG_TABLES: "*"
-      ELECTRIC_IVM_BIND: 0.0.0.0:7010
+      ELECTRIC_CIRCUITS_DS_URL: http://ds:8791
+      ELECTRIC_CIRCUITS_PG_URL: postgres://postgres:password@postgres:5432/electric
+      ELECTRIC_CIRCUITS_PG_TABLES: "*"
+      ELECTRIC_CIRCUITS_BIND: 0.0.0.0:7010
     ports:
       - "${ENGINE_PORT:-7010}:7010"
     depends_on:
@@ -294,7 +294,7 @@ forever. You ask for it once; from then on, every change that affects it is push
 delta — no polling, no re-running the query.
 
 Your data doesn't move anywhere to make this work. It lives in **Postgres**, the system of
-record, and your apps keep writing to it with ordinary SQL. The **electric-ivm engine** tails
+record, and your apps keep writing to it with ordinary SQL. The **electric-circuits engine** tails
 Postgres logical replication and maintains every shape incrementally: each committed change
 flows once through a small pipeline of operators, and only the shapes it affects hear about it.
 In this episode you'll create one shape, watch its pipeline get built, and watch one write flow

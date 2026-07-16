@@ -1,4 +1,4 @@
-# electric-ivm
+# electric-circuits
 
 A reactive sync engine in the style of [Electric](https://electric-sql.com/), built on **incremental
 view maintenance**. Your app writes to Postgres with ordinary SQL; clients subscribe to **shapes** —
@@ -50,7 +50,7 @@ The consequence: to keep a query result up to date you never re-run the query �
 change's delta through the pipeline and apply the (usually tiny) output delta to the result. Cost
 scales with the size of the *change*, not the size of the *data*.
 
-electric-ivm is built on this model. Every replicated change becomes a Z-set delta (Postgres's
+electric-circuits is built on this model. Every replicated change becomes a Z-set delta (Postgres's
 `REPLICA IDENTITY FULL` supplies the old row, so updates retract precisely), and every shape,
 subquery, and aggregation is an incremental operator over those deltas. The engine serves them
 from **three tiers**. One shared dbsp **circuit** — always-on infrastructure — maintains
@@ -171,7 +171,7 @@ routing entries over the same pipeline; a thousand such combinations cost the ci
                       DURABLE STREAMS   shape/<id>         (one feed per DISTINCT shape)
                          │  read / long-poll
                          ▼
-                      CLIENTS   Electric client (/v1/shape)  or  @electric-ivm/client
+                      CLIENTS   Electric client (/v1/shape)  or  @electric-circuits/client
 ```
 
 Postgres owns durability and transactions; [durable streams](https://durablestreams.com) is the log
@@ -186,7 +186,7 @@ Full design: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**; execution strateg
 - **The Electric protocol** — `GET /v1/shape` on the engine, compatible with the ElectricSQL TS
   client and validated against Electric's own oracle/property/integration tests
   ([`electric-conformance/`](electric-conformance/README.md)).
-- **The extended API** (`@electric-ivm/client`) — shapes plus the pieces the Electric API doesn't
+- **The extended API** (`@electric-circuits/client`) — shapes plus the pieces the Electric API doesn't
   cover today; this surface is where the API is headed:
   - **Subset queries** — one-shot `SELECT … ORDER BY … LIMIT` pages + a shared live tail, merged
     client-side; the basis for infinite scroll / keyset pagination.
@@ -236,9 +236,9 @@ the Electric wire protocol (`/v1/shape`), and the `/trace` SSE feed. You rarely 
 the demos and Docker do — but standalone:
 
 ```bash
-cargo build -p electric-ivm-engine
-ELECTRIC_IVM_DS_URL=<durable-streams url> ELECTRIC_IVM_PG_URL=<postgres url> \
-ELECTRIC_IVM_PG_TABLES='*' target/debug/electric-ivm-engine   # prints ENGINE_LISTENING <url>
+cargo build -p electric-circuits-engine
+ELECTRIC_CIRCUITS_DS_URL=<durable-streams url> ELECTRIC_CIRCUITS_PG_URL=<postgres url> \
+ELECTRIC_CIRCUITS_PG_TABLES='*' target/debug/electric-circuits-engine   # prints ENGINE_LISTENING <url>
 ```
 
 **`apps/api` — the extended API (TS).** The tRPC façade for the extended client surface (schema,
@@ -255,8 +255,8 @@ Includes shape management (drop one / sweep all). Auto-launched by `pnpm demo:li
 or standalone:
 
 ```bash
-ELECTRIC_IVM_ENGINE_URL=http://127.0.0.1:<engine-port> VIZ_PORT=5180 \
-  pnpm --filter @electric-ivm/pipeline-viz dev
+ELECTRIC_CIRCUITS_ENGINE_URL=http://127.0.0.1:<engine-port> VIZ_PORT=5180 \
+  pnpm --filter @electric-circuits/pipeline-viz dev
 ```
 
 **`examples/linearlite` — the flagship demo app (TS).** A Linear-style issue tracker synced
@@ -274,13 +274,13 @@ client: `pnpm demo:web`. (`pnpm demo` runs the even smaller headless todos walkt
 pnpm docker:up    # Postgres + durable-streams + engine (+ extended API) — see docker/README.md
 ```
 
-Point an ElectricSQL client at `http://localhost:7010/v1/shape`, or `@electric-ivm/client` at
-`http://localhost:8790`. Prebuilt images: `ghcr.io/balegas/electric-ivm/{engine,node}`.
+Point an ElectricSQL client at `http://localhost:7010/v1/shape`, or `@electric-circuits/client` at
+`http://localhost:8790`. Prebuilt images: `ghcr.io/balegas/electric-circuits/{engine,node}`.
 
 ### Using the extended client
 
 ```ts
-import { createClient } from '@electric-ivm/client'
+import { createClient } from '@electric-circuits/client'
 const client = createClient({ apiUrl, schema })
 
 // a live shape (materialized TanStack DB collection)

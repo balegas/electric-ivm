@@ -1,4 +1,4 @@
-# Electric benchmarking-fleet — results vs electric-ivm
+# Electric benchmarking-fleet — results vs electric-circuits
 
 Generated 2026-07-13T16:03:01.778Z on darwin/arm64. Scale 1.
 Each row runs the unmodified ElectricSQL `byo_electric` benchmark `.exs` against our `/v1/shape`

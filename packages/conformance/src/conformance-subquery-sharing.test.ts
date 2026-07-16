@@ -3,7 +3,7 @@
 // of the outer column or surrounding predicate. Asserted via the engine's GET /subqueries introspection
 // (refcount == number of dependents), analogous to conformance-sharing.test.ts for equality families.
 
-import type { Predicate, Schema, ShapeDef } from '@electric-ivm/protocol'
+import type { Predicate, Schema, ShapeDef } from '@electric-circuits/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { bootHarness, drainEngine, type Harness } from './harness.js'
 

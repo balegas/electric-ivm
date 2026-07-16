@@ -30,8 +30,8 @@ This is the loop the user asked for. It is identical for all phases; each task b
 pnpm engine:test
 
 # 2. Full vitest suite incl. oracle conformance (boots its own Postgres)
-cargo build --release -p electric-ivm-engine
-ELECTRIC_IVM_ENGINE_PREBUILT=1 pnpm test
+cargo build --release -p electric-circuits-engine
+ELECTRIC_CIRCUITS_ENGINE_PREBUILT=1 pnpm test
 
 # 3. Electric's own oracle vs /v1/shape (needs elixir + ../electric)
 ASDF_ELIXIR_VERSION=1.18.4-otp-28 ASDF_ERLANG_VERSION=28.1 \
@@ -58,15 +58,15 @@ Phase 0, Task 0.3):
 
 ```bash
 # B1 — matrix (medium scale, materialized): the ~85 B/row and ~3 KiB/shape terms
-cargo build --release -p electric-ivm-engine
+cargo build --release -p electric-circuits-engine
 MATRIX_SIZES=10000 MATRIX_USERS=100,500,1000 MATRIX_PROJECTS=20 MATRIX_MATERIALIZED=1 \
-  pnpm --filter @electric-ivm/bench exec tsx src/shape-mem-matrix.ts
+  pnpm --filter @electric-circuits/bench exec tsx src/shape-mem-matrix.ts
 
 # B2 — scale (100k subscriptions, the blog-post scenario): footprint is the headline
 # (FEED_TRACE removed in Phase 2)
 SCALE_ISSUES=100000 SCALE_PROJECTS=2000 SCALE_USERS=100,1000,2500,5000,10000 \
 SCALE_CLIENT_PROCS=4 SCALE_LIVE_RAMP=5000 SCALE_LIVE_PROCS=8 \
-  pnpm --filter @electric-ivm/bench exec tsx src/shape-mem-scale.ts
+  pnpm --filter @electric-circuits/bench exec tsx src/shape-mem-scale.ts
 ```
 
 Record per iteration in `docs/bench/mem-reduction-log.md`:
@@ -150,7 +150,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails** — `cargo test -p electric-ivm-engine heap_size` → FAIL (module missing).
+- [ ] **Step 2: Run to verify it fails** — `cargo test -p electric-circuits-engine heap_size` → FAIL (module missing).
 
 - [ ] **Step 3: Implement `heap_size.rs`**
 
@@ -202,7 +202,7 @@ not guess).
 
 - [ ] **Step 4: Wire into `mem_cardinalities` + `Cardinalities` + the `/memory` JSON.** Keep gauges out of OTel for now (JSON only) to avoid metric churn.
 
-- [ ] **Step 5: Run the tests** — `cargo test -p electric-ivm-engine heap_size` and `pnpm engine:test` → PASS.
+- [ ] **Step 5: Run the tests** — `cargo test -p electric-circuits-engine heap_size` and `pnpm engine:test` → PASS.
 
 - [ ] **Step 6: Commit** — `git commit -m "mem: byte-level self-accounting in /memory (heap_size trait)"`
 
@@ -215,7 +215,7 @@ not guess).
 **Steps:**
 
 - [ ] **Step 1:** Add the `SCALE_ATTRIBUTION` hook to the bench script (spawn `vmmap`/`footprint` via `child_process.execFile`, write alongside the existing raw tables).
-- [ ] **Step 2:** Run B2 at `SCALE_USERS=10000` with `SCALE_ATTRIBUTION=1`, in-memory and with spill (`ELECTRIC_IVM_SUBQ_STORAGE_DIR`), one run each.
+- [ ] **Step 2:** Run B2 at `SCALE_USERS=10000` with `SCALE_ATTRIBUTION=1`, in-memory and with spill (`ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR`), one run each.
 - [ ] **Step 3:** Write `docs/bench/mem-attribution-100k.md`: a table attributing footprint into — (a) self-accounted owned heap per subsystem (Task 0.1 numbers), (b) MALLOC region total minus (a) = allocator slack/retention, (c) dbsp trace/batch bytes, (d) unattributed. State explicitly which of Phase 1's three hypotheses (metadata, allocator, snapshot pinning) the numbers support, with magnitudes.
 - [ ] **Step 4:** Commit — `git commit -m "bench: 100k-subscription memory attribution runbook + results"`
 
@@ -325,7 +325,7 @@ fn intern_dedupes_storage() {
 }
 ```
 
-- [ ] **Step 2:** `cargo test -p electric-ivm-engine intern` → FAIL → implement (`RwLock<HashSet<Arc<str>>>` behind `OnceLock`) → PASS.
+- [ ] **Step 2:** `cargo test -p electric-circuits-engine intern` → FAIL → implement (`RwLock<HashSet<Arc<str>>>` behind `OnceLock`) → PASS.
 - [ ] **Step 3:** Convert the attribution's top-3 string fields to `Istr`, one struct per commit, `pnpm engine:test` between each. Do NOT convert pk strings here (that is Phase 2's job — pks are high-cardinality and don't intern).
 - [ ] **Step 4:** Run Gate G; the target metric is B2 KiB/subscription and `bytes_shape_records`+`bytes_executors` from the self-accounting (which makes the win directly attributable).
 - [ ] **Step 5:** Commit per struct; final commit `"mem: intern shape-metadata strings (Istr)"`.
@@ -423,7 +423,7 @@ enumeration. Success bar: B1 bytes/synced-row becomes sublinear in feed overlap
 **Write as** `docs/superpowers/plans/YYYY-MM-DD-feed-key-eviction.md` when triggered.
 
 **Design brief:** the feed key set is a cache of a fold over the feed's own stream
-(the dbsp-ds-4d8 observation). Add a global LRU budget (`ELECTRIC_IVM_FEED_KEYS_CACHE_MIB`);
+(the dbsp-ds-4d8 observation). Add a global LRU budget (`ELECTRIC_CIRCUITS_FEED_KEYS_CACHE_MIB`);
 evicted feeds either (a) re-seed by folding the stream tail on first touch, or
 (b) temporarily emit ungated (spurious deletes are idempotent; only cold feeds pay).
 The child plan must cover: reseed atomicity vs. in-flight emissions (same critical
