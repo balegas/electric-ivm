@@ -53,11 +53,19 @@ Concrete substitutions:
 **Guardrails (must NOT be renamed — these refer to upstream ElectricSQL, not to us):**
 
 - `electric-sql`, `electricsql`, `electric-sql.com`, `electricsql/electric`, `@electric-sql/*`.
-- The `electric-conformance/` directory and its contents (it means "conformance against Electric").
+- The `electric-conformance/` **directory name** stays (it means "conformance against Electric"), as do
+  genuine upstream references inside it (`ElectricSQL`, `Electric.Client`, `ELECTRIC_DIR`). But that
+  directory's contents also reference **our own** product/symbols — the renamed npm packages
+  (`@electric-circuits/bench`), the renamed crate (`cargo build -p electric-circuits-engine`), our own
+  env var (`ELECTRIC_CIRCUITS_DIR`), and our oracle test filenames — and those MUST be renamed like
+  everywhere else, or the harness (`pnpm --filter`, `cargo -p`, `run.sh`'s `cp`) breaks. Renaming a
+  content string that names a test file (`run.sh`) also requires renaming that file on disk to match —
+  `perl -pi` edits contents, not filenames. (Correction applied post-Task-1: the two oracle `.exs`
+  files were `git mv`'d to their new names after the content pass.)
 - The word "Electric" as the brand/umbrella.
 
-The rename target is specifically the `electric-circuits` compound, which is unambiguous — none of the
-guarded tokens contain it. Post-rename, `git grep electric-circuits` returns **0**.
+The rename target is specifically the old product compound, which is unambiguous — none of the
+guarded upstream tokens contain it. Post-rename, `git grep` for the old compound returns **0**.
 
 **Not automatable by the agent (manual, note in handoff):** renaming the GitHub remote repository
 (`balegas/electric-circuits` → `balegas/electric-circuits`) and publishing images under the new ghcr path.
