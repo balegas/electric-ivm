@@ -33,6 +33,11 @@ const ARC_CONTROL_BYTES: usize = 2 * std::mem::size_of::<usize>();
 
 /// A global, append-only `pk string ↔ u32` interner shared by the circuit, its registry, and the
 /// emission seam. See the module docs for the append-only / locking rationale.
+///
+/// **Lock order: `forward` before `reverse`, always.** Any code path that holds both locks at
+/// once (currently only `get_or_insert`'s slow path) MUST acquire `forward` first, then `reverse`
+/// — acquiring them in the opposite order anywhere risks a lock-order-inversion deadlock against
+/// a concurrent `get_or_insert`.
 pub struct PkDict {
     /// pk string → id. The `Arc<str>` key shares its allocation with the reverse table's entry.
     forward: RwLock<HashMap<Arc<str>, u32>>,
@@ -81,11 +86,13 @@ impl PkDict {
         self.forward.read().expect("pk_dict forward").get(pk).copied()
     }
 
-    /// The pk string for a previously-minted `id`. Panics on an id this dictionary never minted —
-    /// callers only ever resolve ids that came out of the same dictionary (append-only ⇒ any id it
-    /// once returned stays resolvable forever).
-    pub fn resolve(&self, id: u32) -> Arc<str> {
-        self.reverse.read().expect("pk_dict reverse")[id as usize].clone()
+    /// The pk string for a previously-minted `id`, or `None` if this dictionary never minted it.
+    /// Callers only ever resolve ids that came out of the same dictionary (append-only ⇒ any id
+    /// it once returned stays resolvable forever), so `None` should be unreachable in practice —
+    /// returning `Option` instead of panicking keeps the emission hot path defensive rather than
+    /// crash-on-invariant-violation.
+    pub fn resolve(&self, id: u32) -> Option<Arc<str>> {
+        self.reverse.read().expect("pk_dict reverse").get(id as usize).cloned()
     }
 
     /// Number of distinct pks interned (also the next id to be minted).
@@ -97,12 +104,16 @@ impl PkDict {
         self.len() == 0
     }
 
-    /// Estimated owned heap bytes — the amortized string storage plus the forward/reverse index
-    /// buffers. Reported as `bytes_pk_dict` in `GET /memory` so the append-only trade is visible.
-    /// On-demand only (walks every interned string); never call it from the 500 ms sampler.
+    /// Estimated owned heap bytes (estimate — hashbrown bucket approximation) — the amortized
+    /// string storage plus the forward/reverse index buffers. Reported as `bytes_pk_dict` in
+    /// `GET /memory` so the append-only trade is visible. On-demand only (walks every interned
+    /// string); never call it from the 500 ms sampler.
+    ///
+    /// Locks `forward` then `reverse` — same order as `get_or_insert` (see the struct doc's lock
+    /// order note) — to avoid a lock-order inversion against a concurrent mint.
     pub fn heap_bytes(&self) -> usize {
-        let rev = self.reverse.read().expect("pk_dict reverse");
         let fwd = self.forward.read().expect("pk_dict forward");
+        let rev = self.reverse.read().expect("pk_dict reverse");
         // Each distinct pk's `Arc<str>` allocation (control block + inline bytes) is counted ONCE
         // here even though it is pointed at by both the forward key and the reverse entry.
         let strings: usize = rev.iter().map(|s| ARC_CONTROL_BYTES + s.len()).sum();
@@ -139,12 +150,21 @@ mod tests {
         let pks = ["", "1", "a-long-uuid-like-primary-key-0000", "unicode-π-θ", "42"];
         let ids: Vec<u32> = pks.iter().map(|p| d.get_or_insert(p)).collect();
         for (pk, id) in pks.iter().zip(&ids) {
-            assert_eq!(&*d.resolve(*id), *pk, "resolve(get_or_insert(pk)) must be pk");
+            assert_eq!(d.resolve(*id).as_deref(), Some(*pk), "resolve(get_or_insert(pk)) must be pk");
         }
         // And re-resolving via a re-insert is stable.
         for (pk, id) in pks.iter().zip(&ids) {
             assert_eq!(d.get_or_insert(pk), *id);
         }
+    }
+
+    /// `resolve` returns `None` (never panics) for an id this dictionary never minted.
+    #[test]
+    fn resolve_none_for_unminted_id() {
+        let d = PkDict::new();
+        assert_eq!(d.resolve(0), None, "empty dictionary has no id 0");
+        d.get_or_insert("alpha");
+        assert_eq!(d.resolve(1), None, "id 1 was never minted");
     }
 
     /// Concurrent stress: 8 threads each interning the SAME 10k-pk keyspace must agree on one id
@@ -188,7 +208,7 @@ mod tests {
         assert_eq!(ids.len(), KEYS, "no two distinct pks share an id");
         assert_eq!(*ids.last().unwrap(), (KEYS - 1) as u32, "id space is dense 0..KEYS");
         for (k, id) in canonical {
-            assert_eq!(&*dict.resolve(*id), &format!("pk-{k}"), "id resolves to its pk");
+            assert_eq!(dict.resolve(*id).as_deref(), Some(format!("pk-{k}").as_str()), "id resolves to its pk");
         }
     }
 

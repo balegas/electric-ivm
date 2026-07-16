@@ -1216,8 +1216,17 @@ impl SubqueryRegistry {
                     Err(_) => continue,
                 };
                 let member = exists && pred.matches_ctx(&row, self);
-                let pk_id = self.pk_dict.get_or_insert(&pk);
-                asserts.feeds.push(Tup2(PkKey { id: feed_id, pk: pk_id }, member));
+                // Mint only for a genuine member — a never-interned pk can hold no feed-relation
+                // contribution, so asserting `false` for it is a guaranteed no-op (mirrors the
+                // same probe-without-minting rationale in `template_assertions`).
+                let pk_id = if member {
+                    Some(self.pk_dict.get_or_insert(&pk))
+                } else {
+                    self.pk_dict.get(&pk)
+                };
+                if let Some(pk_id) = pk_id {
+                    asserts.feeds.push(Tup2(PkKey { id: feed_id, pk: pk_id }, member));
+                }
                 if member {
                     members.push(row);
                 }
@@ -1233,8 +1242,18 @@ impl SubqueryRegistry {
         for d in feed_deltas {
             if d.delta < 0 {
                 if let Some(shape_id) = self.feed_by_id.get(&d.feed_id) {
-                    let pk = self.pk_dict.resolve(d.pk_id).to_string();
-                    deletes.entry(shape_id.clone()).or_default().push(pk);
+                    // A feed retraction's pk id was minted when the pk was first asserted a
+                    // member (see `emit_for_shapes`'s mint-only-for-members change above), so
+                    // this is unreachable in practice; log-and-skip defensively rather than
+                    // panic on the emission hot path.
+                    match self.pk_dict.resolve(d.pk_id) {
+                        Some(pk) => deletes.entry(shape_id.clone()).or_default().push(pk.to_string()),
+                        None => tracing::warn!(
+                            pk_id = d.pk_id,
+                            feed_id = d.feed_id,
+                            "feed retraction resolved to an unminted pk id; dropping delete"
+                        ),
+                    }
                 }
             }
         }
@@ -2057,6 +2076,66 @@ mod tests {
             })
             .await;
         assert!(fd.is_empty(), "repeat delete for an already-removed pk must net nothing");
+    }
+
+    /// Focused regression: `emit_for_shapes` must mint a `pk_dict` id ONLY for a genuine member
+    /// (mirrors the existing probe-without-minting rationale for `template_assertions`'s
+    /// `pk_dict.get` lookups). A delete or non-matching candidate for a pk never seen before must
+    /// leave the dictionary's `len()` unchanged — no forward/reverse slot for a pk that can never
+    /// be present in the feed relation — while a genuinely matching candidate DOES mint.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn never_member_candidate_does_not_mint_pk_dict_id() {
+        use crate::schema::TableDef;
+        let def: TableDef = serde_json::from_value(serde_json::json!({
+            "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id"
+        }))
+        .unwrap();
+        let ts = crate::schema::TableSchema::from_def("t", &def).unwrap();
+        // A real (fake) DS server: the final phase genuinely emits an upsert, which would retry
+        // forever against an unreachable URL.
+        let (ds_url, _store) = spawn_fake_ds().await;
+        let mut reg = SubqueryRegistry::new(DsClient::new(&ds_url), None);
+        let feed_id = reg.next_feed_id;
+        reg.next_feed_id += 1;
+        reg.feed_by_id.insert(feed_id, "s1".into());
+        reg.shapes.insert(
+            "s1".into(),
+            SubqueryShape {
+                shape_id: "s1".into(),
+                outer_table: "t".into(),
+                stream_path: "shape/s1".into(),
+                pred: Arc::new(CompiledPredicate::MatchAll),
+                out_cols: None,
+                gate: crate::pg::SnapshotGate::passthrough(),
+                emitted: std::sync::atomic::AtomicU64::new(0),
+                feed_id,
+            },
+        );
+        let row = |id: i64| Row(vec![Value::Int(id), Value::Int(0)]);
+        assert_eq!(reg.pk_dict.len(), 0);
+
+        // A delete for a brand-new pk (42), never interned before: `exists = false` forces
+        // `member = false` regardless of the (always-true) predicate. The fix must skip minting.
+        reg.emit_for_shapes(&ts, vec![("s1".to_string(), vec![(row(42), false)])], None)
+            .await
+            .unwrap();
+        assert_eq!(reg.pk_dict.len(), 0, "a never-member delete candidate must not mint a pk_dict id");
+
+        // A non-matching (but existing) candidate for another brand-new pk (43) must likewise
+        // skip minting: swap in a never-matching predicate for this check.
+        reg.shapes.get_mut("s1").unwrap().pred =
+            Arc::new(CompiledPredicate::Not(Box::new(CompiledPredicate::MatchAll)));
+        reg.emit_for_shapes(&ts, vec![("s1".to_string(), vec![(row(43), true)])], None)
+            .await
+            .unwrap();
+        assert_eq!(reg.pk_dict.len(), 0, "a non-matching candidate must not mint a pk_dict id");
+
+        // A genuinely matching insert (pk 44) DOES mint exactly one id.
+        reg.shapes.get_mut("s1").unwrap().pred = Arc::new(CompiledPredicate::MatchAll);
+        reg.emit_for_shapes(&ts, vec![("s1".to_string(), vec![(row(44), true)])], None)
+            .await
+            .unwrap();
+        assert_eq!(reg.pk_dict.len(), 1, "a matching candidate must mint exactly one pk_dict id");
     }
 
     // --- Task 0.3 harness: a minimal fake durable-streams server ------------------------------
