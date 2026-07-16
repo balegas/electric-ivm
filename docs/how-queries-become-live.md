@@ -80,9 +80,9 @@ only for what just changed — never held speculatively, never duplicated per su
 
 This inner-side-only design is why engine memory is **flat with database size**: growing the
 tables underneath your app doesn't grow what the circuit holds, because the circuit was never
-holding your data in the first place. What it holds — keys and counts — scales with the shape of
-your app's membership and grouping structure (how many users, how many groups), not with how many
-rows sit behind them.
+holding your data in the first place. What it holds — keys and counts — scales with your app's
+membership and grouping structure (how many users, how many groups), not with how many rows sit
+behind them.
 
 ## 5. What you get back
 
