@@ -122,6 +122,6 @@ retraction plus an insertion; and a predicate like yours needs no state at all. 
 "how does the engine know a row *left* a query result without re-running it?", you now know the
 answer: the `−1` told it.
 
-**Next — Episode 3, Cross-table live queries: subqueries are dynamic:** a live query that spans two
-tables, served immediately with zero configuration — and what changes (and doesn't) when a whole
-circuit has to remember something shared across queries.
+**Next — Episode 3, Cross-table live queries with subqueries:** a live query that spans two
+tables — and what changes (and doesn't) when a whole circuit has to remember something shared across
+queries.

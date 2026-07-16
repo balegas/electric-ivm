@@ -123,9 +123,9 @@ Reopen `https://localhost:5543` and the warning is gone.
 2. **[Inside the circuit: deltas and weights](episodes/02-inside-the-circuit/README.md)** — the same
    live query, exploded into the DBSP operators the engine actually runs: deltas, weights, and why an
    update is a retraction plus an insertion.
-3. **[Cross-table live queries: subqueries are dynamic](episodes/03-subqueries-are-dynamic/README.md)**
-   — a membership live query across two tables, served immediately with zero configuration by a shared
-   inner-set node; equality live queries sharing a router automatically.
+3. **[Cross-table live queries with subqueries](episodes/03-subqueries-are-dynamic/README.md)**
+   — a membership live query across two tables, maintained by a shared inner-set node; equality live
+   queries sharing a router automatically.
 4. **[Aggregations: a live COUNT](episodes/04-aggregations/README.md)** — a live per-list open-todo
    count, maintained incrementally — the one place today's engine still has a piece you configure
    ahead of time.

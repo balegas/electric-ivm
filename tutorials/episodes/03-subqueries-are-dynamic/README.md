@@ -1,10 +1,10 @@
-# Episode 3 — Cross-table live queries: subqueries are dynamic
+# Episode 3 — Cross-table live queries with subqueries
 
 Episodes 1 and 2 lived inside one table. A real app's live queries usually don't stop at one table —
-"todos of the lists I belong to" needs to know about `list_members` too. This episode shows how that
-works today: a cross-table membership live query is served **immediately**, with **zero
-configuration** — no index to declare, no pipeline to deploy ahead of time. You write the query; a
-shared, maintained inner set — the **circuit** — appears to serve it, live, on the canvas.
+"todos of the lists I belong to" needs to know about `list_members` too. Electric Circuits has one
+cross-table form for exactly this — a **subquery** — and you write it just like any other live query.
+The interesting part is what the engine does behind it: it maintains a small **shared set**, part of
+the **circuit**, that you can watch appear and update live on the canvas.
 
 ## 1. The app: a tiny todo model
 
@@ -32,7 +32,7 @@ alice is a member of lists 1 (Groceries) and 2 (Launch plan); bob is a member of
 (Reading). Seven todos are split across the three lists. Small enough that you can predict every
 result by reading [`setup.sql`](setup.sql).
 
-## 2. A membership live query — no deploy required
+## 2. A membership live query
 
 Ask for *all the todos of alice's lists*. The `where` carries a subquery — a column `IN` the result
 of another `SELECT`:
@@ -48,10 +48,9 @@ HANDLE=$(printf '%s' "$RES" | awk 'tolower($1)=="electric-handle:"{print $2}' | 
 OFFSET=$(printf '%s' "$RES" | awk 'tolower($1)=="electric-offset:"{print $2}' | tr -d '\r')
 ```
 
-alice is in lists 1 and 2, so you get back **five inserts** — todos 1–5 — then `up-to-date`. Nothing
-was configured for this query ahead of time: no env var names `list_id` or `list_members`, no
-pipeline was deployed, no restart happened between episode 1 and this request. You just wrote the
-query and it works.
+alice is in lists 1 and 2, so you get back **five inserts** — todos 1–5 — then `up-to-date`. You
+wrote a query that reaches across two tables and got its live result — from where you sit, no
+different than episode 1's single-table query.
 
 Look at the pipeline explorer. Alongside your live query's output node, a new node appears — a
 **shared inner set** — holding the *distinct `list_id` values alice belongs to*, not the todos
@@ -155,13 +154,7 @@ No second route-join node appears — this live query shares the same one, keyed
 (`list_id`), just a different value. Every equality live query on `list_id`, however many, routes
 through this one shared structure.
 
-## 6. One thing still configured ahead of time
-
-Everything in this episode — the membership subquery, the equality live queries — was served with
-**zero configuration**: you wrote the query, and the engine registered it onto circuits that were
-already running. There is exactly one place today's engine still asks you to configure something
-*ahead of time*: live **COUNT** groupings, via the `ELECTRIC_CIRCUITS_DBSP_COUNTS` environment
-variable. That's a config change plus a restart — episode 4 is entirely about it.
+## 6. Under the hood, if you're curious
 
 (If you want the engine-internals view of how live queries land on the router versus the subquery
 registry — the terminology engine developers use for this split — see the "Serving tiers" section of
@@ -170,11 +163,10 @@ app's side, it's all just "write the query.")
 
 ## 7. What you now know
 
-A cross-table membership live query is served the moment you write it, by a shared inner set the
-engine registers your query onto — no index to declare, no redeploy. Identical subqueries share one
-node; identical column-sets on an equality predicate share one router. Adding a new user, a new
-list, or a new equality value is data flowing through structure that was already there — not new
-structure.
+A cross-table membership live query is served by a shared inner set the engine maintains for you —
+holding the values that decide membership, not the rows. Identical subqueries share one node;
+identical column-sets on an equality predicate share one router. Adding a new user, a new list, or a
+new equality value is data flowing through structure that was already there — not new structure.
 
-**Next — Episode 4, Aggregations: a live COUNT:** the one place this engine still has a piece you
-configure ahead of time, and what you get for it.
+**Next — Episode 4, Aggregations: a live COUNT:** live totals like an open-todo count per list, and
+the one way they work a little differently from everything you've seen so far.
