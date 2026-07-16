@@ -331,11 +331,11 @@ no checkpoints.
 | `ELECTRIC_IVM_SUBQ_STORAGE_DIR` | per-boot temp dir | explicit spill location (kept on shutdown; the default temp dir is auto-removed). |
 | `ELECTRIC_IVM_SUBQ_STORAGE_CACHE_MIB` | `64` | storage buffer-cache budget, in MiB, TOTAL (dbsp uses the value verbatim, not multiplied by workers/thread-types). Bounds dbsp's own unset-default, which for this circuit's 1-worker layout would be 512 MiB (256 MiB × 1 worker × 2 thread-types) — see docs/bench/mem-attribution-100k.md §2c. |
 | `ELECTRIC_IVM_SUBQ_MIN_STORAGE_KB` | `128` | spine batches above this size page to disk. |
-| `ELECTRIC_IVM_FEED_TRACE` | `1` | `0` drops the feed-relation enumeration copy (halves per-feed memory; dropped shapes leave unreachable entries until stream-fold enumeration lands). |
 
 (The former `ELECTRIC_IVM_DBSP_DIR`/`_CACHE_MIB`/`_MIN_STORAGE_KB`/`_MAX_RSS_MB`/
 `_CHECKPOINT_SECS`/`_INDEXES` storage knobs are deprecated no-ops: there is no on-disk circuit
-state to tune.)
+state to tune. `ELECTRIC_IVM_FEED_TRACE` is likewise removed — the feed relation now lives
+host-side (Phase 2), so there is no enumeration copy left to toggle.)
 
 - **Observability**: `/graph` carries an `arrangements` section — the counts pipelines as
   stable-id nodes (`arr:input:<table>`, `arr:counts:<table>`, with seeded flags) plus a

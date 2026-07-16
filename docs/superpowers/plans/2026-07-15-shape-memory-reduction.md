@@ -63,7 +63,7 @@ MATRIX_SIZES=10000 MATRIX_USERS=100,500,1000 MATRIX_PROJECTS=20 MATRIX_MATERIALI
   pnpm --filter @electric-ivm/bench exec tsx src/shape-mem-matrix.ts
 
 # B2 — scale (100k subscriptions, the blog-post scenario): footprint is the headline
-ELECTRIC_IVM_FEED_TRACE=0 \
+# (FEED_TRACE removed in Phase 2)
 SCALE_ISSUES=100000 SCALE_PROJECTS=2000 SCALE_USERS=100,1000,2500,5000,10000 \
 SCALE_CLIENT_PROCS=4 SCALE_LIVE_RAMP=5000 SCALE_LIVE_PROCS=8 \
   pnpm --filter @electric-ivm/bench exec tsx src/shape-mem-scale.ts

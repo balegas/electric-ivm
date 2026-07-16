@@ -1,5 +1,9 @@
 # Shape memory at scale — 100k subscriptions, 20k live listeners, in-memory vs spill
 
+> **Superseded.** This is a PR-#37-era snapshot. The feed relation now lives host-side
+> (Phase 2) and `ELECTRIC_IVM_FEED_TRACE` has been removed — §3 below is historical. For
+> current numbers see `docs/bench/mem-reduction-log.md` and `docs/memory-model.md`.
+
 Extends `memory-matrix-blogpost.md` to the scales the blog post claims should hold:
 **100,000 shape subscriptions** (10,000 users × 10 shapes, → 50,005 distinct live shapes
 after signature sharing) over a fixed **100k-issue** deployment, all shapes materialized,
@@ -96,7 +100,7 @@ not tuning the spill cache.
 
 ```bash
 cargo build --release -p electric-ivm-engine
-ELECTRIC_IVM_FEED_TRACE=0 \
+# ELECTRIC_IVM_FEED_TRACE=0 removed
 SCALE_ISSUES=100000 SCALE_PROJECTS=2000 SCALE_USERS=100,250,500,1000,2500,5000,10000 \
 SCALE_CLIENT_PROCS=4 SCALE_LIVE_RAMP=5000,10000,20000 SCALE_LIVE_PROCS=8 \
   pnpm --filter @electric-ivm/bench exec tsx src/shape-mem-scale.ts

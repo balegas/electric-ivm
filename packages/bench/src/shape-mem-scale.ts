@@ -11,13 +11,11 @@
 //     memory is sampled again with subscriptions active (engine RSS must not care — live
 //     serving is the streams server's job);
 //   - samples include the durable-streams server's RSS next to the engine's;
-//   - ELECTRIC_IVM_FEED_TRACE passes through to the engine (set 0 to drop the feed-relation
-//     enumeration copy — the "tracing" duplication — and halve the per-feed memory term).
 //
 //   pnpm --filter @electric-ivm/bench exec tsx src/shape-mem-scale.ts
 //   SCALE_ISSUES=100000 SCALE_PROJECTS=2000 SCALE_USERS=1000,2500,5000,10000 \
 //   SCALE_CLIENT_PROCS=4 SCALE_LIVE_SUBS=20000 SCALE_LIVE_PROCS=8 \
-//   ELECTRIC_IVM_FEED_TRACE=0 tsx src/shape-mem-scale.ts
+//   tsx src/shape-mem-scale.ts
 
 import { type ChildProcess, execFile, execFileSync, execSync, spawn } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
@@ -118,7 +116,7 @@ async function createSchemaAndSeed(client: pgpkg.Client, issues: number): Promis
 async function spawnEngine(dsUrl: string, pgUrl: string): Promise<{ url: string; proc: ChildProcess }> {
   const proc = spawn(join(repoRoot(), 'target', 'release', 'electric-ivm-engine'), [], {
     env: {
-      ...process.env, // carries ELECTRIC_IVM_FEED_TRACE through
+      ...process.env,
       ELECTRIC_IVM_DS_URL: dsUrl,
       ELECTRIC_IVM_BIND: '127.0.0.1:0',
       ELECTRIC_IVM_LOG: 'warn',
@@ -429,8 +427,7 @@ async function main() {
   md.push(`# Shape-memory at scale — ${ISSUES} issues, ${MAX_USERS} users, ${requested} subscriptions`)
   md.push('')
   md.push(`Config: projects=${PROJECTS}, memberships/user=${MEMBERSHIPS_PER_USER}, shapes/user=${SHAPES_PER_USER}, ` +
-    `materialized=${MATERIALIZED}, clientProcs=${CLIENT_PROCS}, liveSubs=${LIVE_SUBS}/${LIVE_PROCS} procs, ` +
-    `ELECTRIC_IVM_FEED_TRACE=${process.env.ELECTRIC_IVM_FEED_TRACE ?? '1'}`)
+    `materialized=${MATERIALIZED}, clientProcs=${CLIENT_PROCS}, liveSubs=${LIVE_SUBS}/${LIVE_PROCS} procs`)
   md.push('')
   md.push('| phase | users | subscriptions | live shapes | engine RSS (MiB) | engine footprint (MiB) | ds RSS (MiB) | sq nodes | contributors |')
   md.push('|---|---:|---:|---:|---:|---:|---:|---:|---:|')
