@@ -309,10 +309,17 @@ pub struct SubqueryRegistry {
     next_node_id: i64,
     /// circuit node id -> node signature (maps circuit flip deltas back to nodes).
     node_by_id: HashMap<i64, SubquerySig>,
-    /// Next feed id (per-shape circuit key; monotonic, never reused).
+    /// Next feed id (per-shape key; monotonic, never reused).
     next_feed_id: i64,
     /// circuit feed id -> shape id (maps feed deltas back to shapes).
     feed_by_id: HashMap<i64, String>,
+    /// Host-side per-feed key sets (Task 2.2, dbsp-ds-dh6): the delete gate, moved out of the
+    /// membership circuit. Mutated only under this registry's lock, synchronously (no `.await`),
+    /// at the same emission points as the circuit feed asserts — so the emission decision and the
+    /// bitmap transition are one indivisible step. During increment 2 both this and the circuit
+    /// feed relation are live; a debug-only parity assert in `emit_for_shapes` proves they agree
+    /// before increment 3 cuts the circuit feed input out.
+    feed_sets: crate::subq_feed::FeedSet,
     /// Shared evaluation templates (see [`TemplateGroup`]), keyed by
     /// [`crate::predicate::subquery_template`]'s key.
     pub(crate) templates: HashMap<String, TemplateGroup>,
@@ -374,6 +381,7 @@ impl SubqueryRegistry {
             node_by_id: HashMap::new(),
             next_feed_id: 1,
             feed_by_id: HashMap::new(),
+            feed_sets: crate::subq_feed::FeedSet::new(),
             templates: HashMap::new(),
             pending_seed: Vec::new(),
             pending_shapes: Vec::new(),
@@ -809,12 +817,17 @@ impl SubqueryRegistry {
                 feed_id,
             },
         );
-        // Seed the feed relation with the backfilled pks (deltas discarded: the stream
-        // already carries the snapshot) — replaces the old known_members hand-off.
+        // Seed the feed with the backfilled pks (deltas discarded: the stream already carries the
+        // snapshot) — replaces the old known_members hand-off. This is phase C, under the registry
+        // lock, BEFORE the shape is discoverable by any live delta (the spike's §6 riskiest
+        // transition): the host-side FeedSet is seeded synchronously here, in the same critical
+        // section as the circuit feed relation, so no live delta can slip between "shape
+        // registered" and "feed seeded". During increment 2 both representations are seeded.
         let mut feed_seed = Assertions::default();
         for pk in seeded_pks {
             let pk_id = self.pk_dict.get_or_insert(&pk);
             feed_seed.feeds.push(Tup2(PkKey { id: feed_id, pk: pk_id }, true));
+            self.feed_sets.insert(feed_id, pk_id);
         }
         let _ = self.apply_asserts(feed_seed).await;
         if !pending.buffer.is_empty() {
@@ -899,8 +912,10 @@ impl SubqueryRegistry {
         let sigs: Vec<SubquerySig> = collect_in_leaves(&shape.pred).into_iter().map(|l| l.sig).collect();
         self.remove_shape_edges(&shape.pred, shape_id);
         // Retract the feed's key slice from the circuit (deltas discarded — the stream is
-        // being torn down) and drop the id mapping.
+        // being torn down) and drop the id mapping. Drop the host-side FeedSet too (O(1); keeps
+        // the shadow consistent during increment 2).
         self.feed_by_id.remove(&shape.feed_id);
+        self.feed_sets.drop_feed(shape.feed_id);
         let feeds: Vec<Tup2<PkKey, bool>> = self
             .circuit
             .feed_pk_ids(shape.feed_id)
@@ -1206,6 +1221,12 @@ impl SubqueryRegistry {
         let mut asserts = Assertions::default();
         // shape id -> (member rows to upsert, candidate pk -> row for delete construction)
         let mut staged: Vec<(String, Vec<Row>)> = Vec::new();
+        // Shadow (increment 2): the host-side FeedSet's delete verdicts, recorded as each
+        // assertion is mirrored into the bitmap below, to be parity-checked against the circuit's
+        // feed retractions after the step. Debug-only — the bitmap side effects themselves run in
+        // every build (the FeedSet becomes the source of truth in increment 3).
+        #[cfg(debug_assertions)]
+        let mut bitmap_deletes: std::collections::HashSet<(i64, u32)> = std::collections::HashSet::new();
         for (shape_id, candidates) in groups {
             let Some(shape) = self.shapes.get(&shape_id) else { continue };
             let (pred, feed_id) = (shape.pred.clone(), shape.feed_id);
@@ -1226,6 +1247,16 @@ impl SubqueryRegistry {
                 };
                 if let Some(pk_id) = pk_id {
                     asserts.feeds.push(Tup2(PkKey { id: feed_id, pk: pk_id }, member));
+                    // Mirror the assert into the host-side FeedSet: insert on a member verdict,
+                    // check-and-remove on a non-member. `remove` returning true IS the delete gate
+                    // (the same expression, same lock scope as the emission decision). Record the
+                    // gated deletes for the debug parity check against the circuit below.
+                    if member {
+                        self.feed_sets.insert(feed_id, pk_id);
+                    } else if self.feed_sets.remove(feed_id, pk_id) {
+                        #[cfg(debug_assertions)]
+                        bitmap_deletes.insert((feed_id, pk_id));
+                    }
                 }
                 if member {
                     members.push(row);
@@ -1238,6 +1269,19 @@ impl SubqueryRegistry {
         // the delta leaves the circuit tier — so the wire protocol carries the pk string
         // unchanged and per-stream emission order is preserved (the order-preserving seam).
         let (_, feed_deltas) = self.apply_asserts(asserts).await;
+        // Shadow parity (increment 2, spike §6): the host-side FeedSet's gated deletes must equal
+        // the circuit's feed retractions exactly, on the live path — the regression net proving
+        // the seed/backfill + flip-worker interleave stays equivalent before increment 3 removes
+        // the circuit feed input.
+        #[cfg(debug_assertions)]
+        {
+            let circuit_deletes: std::collections::HashSet<(i64, u32)> =
+                feed_deltas.iter().filter(|d| d.delta < 0).map(|d| (d.feed_id, d.pk_id)).collect();
+            debug_assert_eq!(
+                bitmap_deletes, circuit_deletes,
+                "FeedSet delete verdicts diverged from the circuit's feed retractions"
+            );
+        }
         let mut deletes: HashMap<String, Vec<String>> = HashMap::new();
         for d in feed_deltas {
             if d.delta < 0 {

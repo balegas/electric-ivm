@@ -27,15 +27,11 @@ use crate::heap_size::HeapSize;
 /// Per-feed key sets: `feed_id -> { pk_id }`. `feed_id`s are minted monotonically by the registry
 /// and never reused, so a dropped feed's id can never alias a live one (a fresh `feed_id` always
 /// starts from an absent — hence empty — bitmap).
-// Increment 1 introduces the type with its unit tests but no engine wiring yet; increment 2
-// wires it into `SubqueryRegistry`, at which point this allow is removed.
-#[allow(dead_code)]
 #[derive(Default)]
 pub(crate) struct FeedSet {
     feeds: HashMap<i64, RoaringBitmap>,
 }
 
-#[allow(dead_code)]
 impl FeedSet {
     pub(crate) fn new() -> Self {
         FeedSet { feeds: HashMap::new() }
@@ -73,12 +69,15 @@ impl FeedSet {
     }
 
     /// Number of pks currently in `feed_id` (introspection). Zero for an unknown feed.
+    // Wired into the drop path + introspection in increment 4; the allow is removed there.
+    #[allow(dead_code)]
     pub(crate) fn feed_len(&self, feed_id: i64) -> usize {
         self.feeds.get(&feed_id).map_or(0, |bm| bm.len() as usize)
     }
 
     /// Every pk id currently in `feed_id`, ascending (introspection + tests). Empty for an
     /// unknown feed.
+    #[allow(dead_code)]
     pub(crate) fn feed_pk_ids(&self, feed_id: i64) -> Vec<u32> {
         self.feeds.get(&feed_id).map_or_else(Vec::new, |bm| bm.iter().collect())
     }
