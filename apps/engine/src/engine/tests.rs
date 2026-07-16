@@ -837,17 +837,19 @@ async fn membership_flips_agree_between_refcount_and_contributor_set() {
         "sig".into(), "inner".into(), 0, 1, Arc::new(CompiledPredicate::MatchAll), 1,
     );
     let mut reg_flips: Vec<Vec<Flip>> = Vec::new();
+    // pk ids stand in for the pk strings a=0, b=1 (this test drives the bare circuit directly,
+    // with no registry/dictionary in play).
     for (pk, pv) in [
-        ("a", Some(Value::Int(7))),
-        ("b", Some(Value::Int(7))),
-        ("a", Some(Value::Int(8))),
-        ("b", None),
-        ("a", None),
+        (0u32, Some(Value::Int(7))),
+        (1u32, Some(Value::Int(7))),
+        (0u32, Some(Value::Int(8))),
+        (1u32, None),
+        (0u32, None),
     ] {
         // Absolute assertion: the circuit's upsert map derives the exact retract/insert.
         let asserts = Assertions {
             contributors: vec![crate::value::Tup2(
-                Row(vec![Value::Int(1), Value::Text(pk.into())]),
+                crate::subq_circuit::PkKey { id: 1, pk },
                 match pv {
                     Some(v) => Assert::Insert(v),
                     None => Assert::Delete,
@@ -1070,6 +1072,7 @@ async fn sampler_cardinalities_never_populates_bytes_fields() {
     assert_eq!(card.bytes_membership_circuit, 0, "sampler path must not measure the membership-circuit bytes");
     assert_eq!(card.bytes_circuit_integral, 0, "sampler path must not measure the circuit integral bytes");
     assert_eq!(card.bytes_circuit_snapshots, 0, "sampler path must not measure the circuit snapshot bytes");
+    assert_eq!(card.bytes_pk_dict, 0, "sampler path must not measure the pk dictionary bytes");
     assert_eq!(card.bytes_electric_adapter, 0, "sampler path must not walk the electric adapter TTL registry heap bytes");
 
     // `Engine::mem_bytes` — the on-demand-only counterpart — does populate them (proves the split

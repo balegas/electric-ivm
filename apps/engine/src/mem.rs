@@ -52,6 +52,9 @@ pub struct HeapBytes {
     /// Split of `bytes_membership_circuit` (Task 1.3): the derived MEMBERS relation snapshot
     /// (`(node,value)`), published for `contains`/introspection reads.
     pub bytes_circuit_snapshots: usize,
+    /// The global pk dictionary (Task 2.1): once-per-distinct-pk string storage + forward/reverse
+    /// index. Append-only (no eviction in v1); reported so the string-interning trade is visible.
+    pub bytes_pk_dict: usize,
     pub bytes_electric_adapter: usize,
 }
 
@@ -95,6 +98,10 @@ pub struct Cardinalities {
     pub bytes_circuit_integral: usize,
     /// Derived MEMBERS relation snapshot term of `bytes_membership_circuit`.
     pub bytes_circuit_snapshots: usize,
+    /// The global pk dictionary (Task 2.1): amortized once-per-distinct-pk string storage plus its
+    /// forward/reverse index — the append-only cost of keying the circuit by `u32` pk ids instead
+    /// of heap strings. See `SubqueryRegistry::pk_dict_bytes`.
+    pub bytes_pk_dict: usize,
     /// The `/v1/shape` (Electric-protocol) adapter's TTL handle registry: per-handle cursor
     /// state (known-keys sets, in-flight live-poll map).
     pub bytes_electric_adapter: usize,
@@ -112,6 +119,7 @@ impl Cardinalities {
         self.bytes_membership_circuit = bytes.bytes_membership_circuit;
         self.bytes_circuit_integral = bytes.bytes_circuit_integral;
         self.bytes_circuit_snapshots = bytes.bytes_circuit_snapshots;
+        self.bytes_pk_dict = bytes.bytes_pk_dict;
         self.bytes_electric_adapter = bytes.bytes_electric_adapter;
         self
     }
@@ -210,6 +218,7 @@ pub fn snapshot_json(card: &Cardinalities) -> serde_json::Value {
             "bytes_membership_circuit": card.bytes_membership_circuit,
             "bytes_circuit_integral": card.bytes_circuit_integral,
             "bytes_circuit_snapshots": card.bytes_circuit_snapshots,
+            "bytes_pk_dict": card.bytes_pk_dict,
             "bytes_electric_adapter": card.bytes_electric_adapter,
         },
         "samples": g.samples.load(Ordering::Relaxed),

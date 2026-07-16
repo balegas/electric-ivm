@@ -1,19 +1,21 @@
 //! The membership circuit: subquery inner-set state AND per-feed key sets, powered by dbsp —
 //! the circuit tier's second pipeline family (alongside `arrangements`' counts pipelines).
 //!
-//! One always-on circuit per engine holds two **upsert maps** (dbsp `add_input_map`): the
-//! caller asserts a key's current value *absolutely* (`Insert(v)` / `Delete`), and the
-//! operator — which internally maintains the map's contents — derives the exact
-//! retract/insert deltas itself. No host-side "remember the old value to retract it"
-//! bookkeeping exists anywhere:
+//! One always-on circuit per engine holds two **upsert relations**: the CONTRIBUTORS map (dbsp
+//! `add_input_map`, key→value) and the FEEDS set (dbsp `add_input_set`, key-only presence). The
+//! caller asserts a key's current state *absolutely* (`Insert(v)`/`Delete` for the map; present
+//! `true`/`false` for the set), and the operator — which internally maintains the relation's
+//! contents — derives the exact retract/insert deltas itself. No host-side "remember the old value
+//! to retract it" bookkeeping exists anywhere. Keys are `PkKey { id, pk_id }` — the pk is a `u32`
+//! dictionary id (see [`crate::pk_dict`]), never a heap string:
 //!
 //! ```text
-//! CONTRIBUTORS (node_id, pk) → projected value      [assert: row's current contribution]
+//! CONTRIBUTORS (node_id, pk_id) → projected value   [assert: row's current contribution]
 //!   → map to (node_id, value)                       // weight = contributor count
 //!   ├─ integrate_trace → membership snapshot        // contains()/has_null()/introspection
 //!   └─ distinct → accumulate_output                 // per-step deltas = membership FLIPS
 //!
-//! FEEDS (feed_id, pk) → ()                          [assert: pk's current feed membership]
+//! FEEDS (feed_id, pk_id)                             [assert: pk's current feed membership]
 //!   ├─ integrate_trace → feed snapshot              // drop-time enumeration, introspection
 //!   └─ accumulate_output                            // per-step deltas = THE EMISSIONS:
 //!                                                   //   +1 enter, −1 leave (deletes come
@@ -38,18 +40,45 @@ use dbsp::circuit::CircuitConfig;
 use dbsp::dynamic::DowncastTrait;
 use dbsp::trace::{BatchReader as DynBatchReaderTrait, Cursor};
 use dbsp::typed_batch::{BatchReader, OrdIndexedZSet, OrdZSet, SpineSnapshot};
-use dbsp::{MapHandle, OutputHandle, Runtime};
+use dbsp::{MapHandle, OutputHandle, Runtime, SetHandle};
 use tokio::sync::{mpsc, oneshot};
+
+use feldera_macros::IsNone;
+use rkyv::{Archive, Deserialize, Serialize};
+use size_of::SizeOf;
 
 use crate::value::{Row, Tup2, Value};
 
 /// An absolute assertion into one of the upsert maps: the key's current value, or absence.
 pub type Assert = dbsp::operator::Update<Value, Value>;
 
+/// A circuit relation key: a relation-scoped id — `node_id` for contributors, `feed_id` for feeds
+/// — plus the primary key's global dictionary id (see [`crate::pk_dict::PkDict`]). This replaces
+/// the old `Row([Int(id), Text(pk)])` key: 12 inline bytes with NO per-entry heap string (the
+/// string lives once in the dictionary), which is the memory win driving Task 2.1.
+#[derive(
+    Clone, Copy, Default, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, SizeOf, Archive, Serialize,
+    Deserialize, IsNone,
+)]
+#[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd, Hash))]
+pub struct PkKey {
+    /// `node_id` (contributors) or `feed_id` (feeds). Ordered FIRST, so one id's entries are
+    /// contiguous in the relation — prefix scans seek `PkKey { id, pk: 0 }` and iterate while the
+    /// id matches (`pk: 0` is the least key for any id, `pk` being `u32`).
+    pub id: i64,
+    /// The primary key's dictionary id (`PkDict::get_or_insert`).
+    pub pk: u32,
+}
+
 /// The membership relation snapshot: `(node_id, value)` keys, weight = contributor count.
 type MemberSnapshot = SpineSnapshot<OrdZSet<Row>>;
-/// An upsert map's own integral: `(id, pk) → value`, weight 1 per present key.
-type MapSnapshot = SpineSnapshot<OrdIndexedZSet<Row, Value>>;
+/// The CONTRIBUTORS upsert-map's own integral: `(node_id, pk_id) → value`, weight 1 per present
+/// key (the projected value is carried, so this stays an indexed map).
+type MapSnapshot = SpineSnapshot<OrdIndexedZSet<PkKey, Value>>;
+/// The FEEDS upsert-SET's own integral: `(feed_id, pk_id)` keys, weight 1 per present key. A feed
+/// is a pure presence set (no per-entry value — the old map's value was a constant `Null`), so it
+/// is an `OrdZSet` of `PkKey`: no `Value` stored per entry, the Task 2.1 feed-key memory win.
+type FeedSnapshot = SpineSnapshot<OrdZSet<PkKey>>;
 type Slot<T> = Arc<RwLock<Option<T>>>;
 
 /// One membership flip from a circuit step: `(node, value)` entered (`delta > 0`) or left
@@ -61,12 +90,15 @@ pub struct MemberDelta {
     pub delta: i64,
 }
 
-/// One feed transition from a circuit step: `pk` entered (`delta > 0`) or left (`delta < 0`)
-/// feed `feed_id`. A leave is, by construction, a genuine delete — the pk was a member.
+/// One feed transition from a circuit step: pk id `pk_id` entered (`delta > 0`) or left
+/// (`delta < 0`) feed `feed_id`. A leave is, by construction, a genuine delete — the pk was a
+/// member. The pk is carried as its dictionary id; the emission seam resolves it to the pk string
+/// (via [`crate::pk_dict::PkDict`]) under the registry lock before the delta leaves the circuit
+/// tier.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FeedDelta {
     pub feed_id: i64,
-    pub pk: String,
+    pub pk_id: u32,
     pub delta: i64,
 }
 
@@ -74,10 +106,12 @@ pub struct FeedDelta {
 /// transaction — a single struct so a call site cannot feed one handle and drop the other.
 #[derive(Default)]
 pub struct Assertions {
-    /// `(Row([Int(node_id), Text(pk)]), Insert(projected value) | Delete)`
-    pub contributors: Vec<Tup2<Row, Assert>>,
-    /// `(Row([Int(feed_id), Text(pk)]), Insert(Value::Null) | Delete)`
-    pub feeds: Vec<Tup2<Row, Assert>>,
+    /// `(PkKey { node_id, pk_id }, Insert(projected value) | Delete)`
+    pub contributors: Vec<Tup2<PkKey, Assert>>,
+    /// `(PkKey { feed_id, pk_id }, present)` — `true` asserts membership, `false` retracts it
+    /// (idempotent upsert-set semantics: a duplicate insert or a delete of an absent key nets to
+    /// nothing).
+    pub feeds: Vec<Tup2<PkKey, bool>>,
 }
 
 impl Assertions {
@@ -207,7 +241,7 @@ pub struct MembershipCircuit {
     tx: mpsc::Sender<Cmd>,
     members: Slot<MemberSnapshot>,
     contributors: Slot<MapSnapshot>,
-    feeds: Slot<MapSnapshot>,
+    feeds: Slot<FeedSnapshot>,
 }
 
 impl MembershipCircuit {
@@ -239,7 +273,7 @@ impl MembershipCircuit {
     fn start_full(feed_trace: bool, spill: Option<SpillConfig>) -> Result<MembershipCircuit> {
         let members: Slot<MemberSnapshot> = Slot::default();
         let contributors: Slot<MapSnapshot> = Slot::default();
-        let feeds: Slot<MapSnapshot> = Slot::default();
+        let feeds: Slot<FeedSnapshot> = Slot::default();
         let (m_slot, c_slot, f_slot) = (members.clone(), contributors.clone(), feeds.clone());
         // Spill: with a storage dir configured, the circuit's spines (the upsert maps'
         // integrals, the membership trace) page batches above `min_storage_bytes` to layer
@@ -268,22 +302,23 @@ impl MembershipCircuit {
         }
         let (dbsp, (contrib_in, feed_in, flips_out, feeds_out)) =
             Runtime::init_circuit(config, move |circuit| {
-                // The upsert patch function is unused (we only Insert/Delete, never Update),
-                // but the API requires one; assignment is the natural no-surprise choice.
+                // Contributors are a key→value upsert MAP (the projected value is carried). The
+                // upsert patch function is unused (we only Insert/Delete, never Update), but the
+                // API requires one; assignment is the natural no-surprise choice.
                 let (contrib_stream, contrib_in) =
-                    circuit.add_input_map::<Row, Value, Value, _>(|v, u| *v = u.clone());
-                let (feed_stream, feed_in) =
-                    circuit.add_input_map::<Row, Value, Value, _>(|v, u| *v = u.clone());
+                    circuit.add_input_map::<PkKey, Value, Value, _>(|v, u| *v = u.clone());
+                // Feeds are a key-only upsert SET (presence, no per-entry value).
+                let (feed_stream, feed_in) = circuit.add_input_set::<PkKey>();
 
-                // Contributors: (node,pk)→value ⇒ (node,value) weighted by contributor count.
-                let member_counts = contrib_stream
-                    .map(|(k, v)| Row(vec![k.0.first().cloned().unwrap_or(Value::Null), v.clone()]));
+                // Contributors: (node,pk_id)→value ⇒ (node,value) weighted by contributor count.
+                let member_counts =
+                    contrib_stream.map(|(k, v)| Row(vec![Value::Int(k.id), v.clone()]));
                 member_counts.integrate_trace().apply(move |spine| {
                     *m_slot.write().expect("members slot") = Some(spine.ro_snapshot());
                 });
                 let flips_out = member_counts.distinct().accumulate_output();
 
-                // Both maps publish their own integrals for prefix enumeration (drop paths).
+                // Both relations publish their own integrals for prefix enumeration (drop paths).
                 contrib_stream.integrate_trace().apply(move |spine| {
                     *c_slot.write().expect("contributors slot") = Some(spine.ro_snapshot());
                 });
@@ -292,7 +327,7 @@ impl MembershipCircuit {
                         *f_slot.write().expect("feeds slot") = Some(spine.ro_snapshot());
                     });
                 }
-                // The feed map's own deltas ARE the emissions.
+                // The feed set's own deltas ARE the emissions.
                 let feeds_out = feed_stream.accumulate_output();
                 Ok((contrib_in, feed_in, flips_out, feeds_out))
             })
@@ -367,20 +402,21 @@ impl MembershipCircuit {
         (distinct, vals)
     }
 
-    /// Every `(pk, value)` currently contributed to node `node_id` (drop-path enumeration —
-    /// O(that node's own contributor count) via prefix seek).
-    pub fn contributor_entries(&self, node_id: i64) -> Vec<(String, Value)> {
+    /// Every `(pk_id, value)` currently contributed to node `node_id` (drop-path enumeration —
+    /// O(that node's own contributor count) via prefix seek). pk ids resolve to strings via the
+    /// registry's dictionary if a string is needed (the drop paths key on the id directly).
+    pub fn contributor_entries(&self, node_id: i64) -> Vec<(u32, Value)> {
         map_slice(&self.contributors, node_id)
     }
 
-    /// Every pk currently in feed `feed_id` (shape-drop enumeration + introspection).
-    pub fn feed_pks(&self, feed_id: i64) -> Vec<String> {
-        map_slice(&self.feeds, feed_id).into_iter().map(|(pk, _)| pk).collect()
+    /// Every pk id currently in feed `feed_id` (shape-drop enumeration + introspection).
+    pub fn feed_pk_ids(&self, feed_id: i64) -> Vec<u32> {
+        set_slice(&self.feeds, feed_id)
     }
 
     /// Number of pks currently in feed `feed_id` (introspection).
     pub fn feed_len(&self, feed_id: i64) -> usize {
-        map_slice(&self.feeds, feed_id).len()
+        set_slice(&self.feeds, feed_id).len()
     }
 
     /// Measured byte sizes of the published snapshots (see [`CircuitBytes`]). Cheap: reads the
@@ -434,38 +470,63 @@ fn snap_size<T: BatchReader>(slot: &Slot<T>) -> (usize, usize) {
     }
 }
 
-/// Enumerate one id's slice of an upsert-map integral: `(pk, value)` pairs with positive
-/// weight under keys `[Int(id), Text(pk)]`, via prefix seek.
-fn map_slice(slot: &Slot<MapSnapshot>, id: i64) -> Vec<(String, Value)> {
+/// Enumerate one id's slice of an upsert-map integral: `(pk_id, value)` pairs with positive
+/// weight under keys `PkKey { id, pk_id }`, via prefix seek (`PkKey { id, pk: 0 }` is the least
+/// key for `id`; iterate while `id` matches).
+fn map_slice(slot: &Slot<MapSnapshot>, id: i64) -> Vec<(u32, Value)> {
     let guard = slot.read().expect("map slot");
     let Some(snap) = guard.as_ref() else { return Vec::new() };
     let mut out = Vec::new();
     let mut cursor = snap.inner().cursor();
     {
         use dbsp::dynamic::Erase;
-        let target = Row(vec![Value::Int(id)]);
+        let target = PkKey { id, pk: 0 };
         cursor.seek_key(target.erase());
     }
     while cursor.key_valid() {
-        let key = unsafe { cursor.key().downcast::<Row>() }.clone();
-        if key.0.first() != Some(&Value::Int(id)) {
+        let key = *unsafe { cursor.key().downcast::<PkKey>() };
+        if key.id != id {
             break;
         }
-        let pk = match key.0.get(1) {
-            Some(Value::Text(s)) => s.clone(),
-            _ => {
-                cursor.step_key();
-                continue;
-            }
-        };
         // Net the (value, weight) entries: the present value has weight > 0.
         while cursor.val_valid() {
             if **cursor.weight() > 0 {
                 let v = unsafe { cursor.val().downcast::<Value>() }.clone();
-                out.push((pk.clone(), v));
+                out.push((key.pk, v));
                 break;
             }
             cursor.step_val();
+        }
+        cursor.step_key();
+    }
+    out
+}
+
+/// Enumerate one feed's slice of the feed SET integral: the pk ids with positive net weight under
+/// keys `PkKey { id, pk_id }`, via the same prefix seek as [`map_slice`] (feeds carry no value, so
+/// this is a key-only `OrdZSet` walk).
+fn set_slice(slot: &Slot<FeedSnapshot>, id: i64) -> Vec<u32> {
+    let guard = slot.read().expect("feed slot");
+    let Some(snap) = guard.as_ref() else { return Vec::new() };
+    let mut out = Vec::new();
+    let mut cursor = snap.inner().cursor();
+    {
+        use dbsp::dynamic::Erase;
+        let target = PkKey { id, pk: 0 };
+        cursor.seek_key(target.erase());
+    }
+    while cursor.key_valid() {
+        let key = *unsafe { cursor.key().downcast::<PkKey>() };
+        if key.id != id {
+            break;
+        }
+        let mut w: i64 = 0;
+        while cursor.val_valid() {
+            w += **cursor.weight();
+            cursor.step_val();
+        }
+        if w > 0 {
+            out.push(key.pk);
         }
         cursor.step_key();
     }
@@ -519,24 +580,20 @@ fn drain_flips(handle: &OutputHandle<SpineSnapshot<OrdZSet<Row>>>, out: &mut Vec
 /// A value-change on a held key (never happens — the value is constant `Null`) would net to
 /// zero here; only presence transitions survive.
 fn drain_feed_deltas(
-    handle: &OutputHandle<SpineSnapshot<OrdIndexedZSet<Row, Value>>>,
+    handle: &OutputHandle<SpineSnapshot<OrdZSet<PkKey>>>,
     out: &mut Vec<FeedDelta>,
 ) {
     let batch = handle.concat();
     let mut cursor = batch.inner().cursor();
     while cursor.key_valid() {
-        let key = unsafe { cursor.key().downcast::<Row>() }.clone();
+        let key = *unsafe { cursor.key().downcast::<PkKey>() };
         let mut delta: i64 = 0;
         while cursor.val_valid() {
             delta += **cursor.weight();
             cursor.step_val();
         }
         if delta != 0 {
-            if let (Some(Value::Int(feed_id)), Some(Value::Text(pk))) =
-                (key.0.first(), key.0.get(1))
-            {
-                out.push(FeedDelta { feed_id: *feed_id, pk: pk.clone(), delta });
-            }
+            out.push(FeedDelta { feed_id: key.id, pk_id: key.pk, delta });
         }
         cursor.step_key();
     }
@@ -545,10 +602,10 @@ fn drain_feed_deltas(
 /// The circuit thread: owns the `DBSPHandle`, applies assertion batches, steps, drains.
 fn circuit_thread(
     mut dbsp: dbsp::DBSPHandle,
-    contrib_in: MapHandle<Row, Value, Value>,
-    feed_in: MapHandle<Row, Value, Value>,
+    contrib_in: MapHandle<PkKey, Value, Value>,
+    feed_in: SetHandle<PkKey>,
     flips_out: OutputHandle<SpineSnapshot<OrdZSet<Row>>>,
-    feeds_out: OutputHandle<SpineSnapshot<OrdIndexedZSet<Row, Value>>>,
+    feeds_out: OutputHandle<SpineSnapshot<OrdZSet<PkKey>>>,
     mut rx: mpsc::Receiver<Cmd>,
 ) {
     while let Some(cmd) = rx.blocking_recv() {
@@ -557,8 +614,8 @@ fn circuit_thread(
                 for Tup2(k, upd) in asserts.contributors {
                     contrib_in.push(k, upd);
                 }
-                for Tup2(k, upd) in asserts.feeds {
-                    feed_in.push(k, upd);
+                for Tup2(k, present) in asserts.feeds {
+                    feed_in.push(k, present);
                 }
                 let mut flips = Vec::new();
                 let mut feed_deltas = Vec::new();
@@ -601,11 +658,11 @@ fn circuit_thread(
 mod tests {
     use super::*;
 
-    fn ckey(node: i64, pk: &str) -> Row {
-        Row(vec![Value::Int(node), Value::Text(pk.into())])
+    fn ckey(id: i64, pk: u32) -> PkKey {
+        PkKey { id, pk }
     }
 
-    fn contrib(node: i64, pk: &str, v: Option<Value>) -> Assertions {
+    fn contrib(node: i64, pk: u32, v: Option<Value>) -> Assertions {
         Assertions {
             contributors: vec![Tup2(
                 ckey(node, pk),
@@ -618,13 +675,10 @@ mod tests {
         }
     }
 
-    fn feed(feed_id: i64, pk: &str, present: bool) -> Assertions {
+    fn feed(feed_id: i64, pk: u32, present: bool) -> Assertions {
         Assertions {
             contributors: Vec::new(),
-            feeds: vec![Tup2(
-                ckey(feed_id, pk),
-                if present { Assert::Insert(Value::Null) } else { Assert::Delete },
-            )],
+            feeds: vec![Tup2(ckey(feed_id, pk), present)],
         }
     }
 
@@ -639,27 +693,27 @@ mod tests {
             crate::engine::membership::fold_refcount_flips(g, contribs)
         };
 
-        // a → 7: Enter.
-        let (flips, _) = c.apply(contrib(1, "a", Some(Value::Int(7)))).await;
+        // a → 7: Enter. (pk ids: a=1, b=2, z=3.)
+        let (flips, _) = c.apply(contrib(1, 1, Some(Value::Int(7)))).await;
         assert_eq!(flips, vec![MemberDelta { node_id: 1, value: Value::Int(7), delta: 1 }]);
         assert_eq!(refold(&mut groups, vec![(Value::Int(7), 1)]).len(), 1);
         // b → 7: second contributor, no flip.
-        let (flips, _) = c.apply(contrib(1, "b", Some(Value::Int(7)))).await;
+        let (flips, _) = c.apply(contrib(1, 2, Some(Value::Int(7)))).await;
         assert!(flips.is_empty());
         assert!(refold(&mut groups, vec![(Value::Int(7), 1)]).is_empty());
         // a moves 7→8 in ONE assertion: the map derives retract(7)+insert(8); 7 stays (b).
-        let (flips, _) = c.apply(contrib(1, "a", Some(Value::Int(8)))).await;
+        let (flips, _) = c.apply(contrib(1, 1, Some(Value::Int(8)))).await;
         assert_eq!(flips, vec![MemberDelta { node_id: 1, value: Value::Int(8), delta: 1 }]);
         assert_eq!(refold(&mut groups, vec![(Value::Int(7), -1), (Value::Int(8), 1)]).len(), 1);
         assert!(c.contains(1, &Value::Int(7)) && c.contains(1, &Value::Int(8)));
         // b leaves: Leave(7).
-        let (flips, _) = c.apply(contrib(1, "b", None)).await;
+        let (flips, _) = c.apply(contrib(1, 2, None)).await;
         assert_eq!(flips, vec![MemberDelta { node_id: 1, value: Value::Int(7), delta: -1 }]);
         assert_eq!(refold(&mut groups, vec![(Value::Int(7), -1)]).len(), 1);
         // Idempotence: re-asserting a's current value nets nothing; deleting absent nets nothing.
-        let (flips, _) = c.apply(contrib(1, "a", Some(Value::Int(8)))).await;
+        let (flips, _) = c.apply(contrib(1, 1, Some(Value::Int(8)))).await;
         assert!(flips.is_empty(), "re-asserting the held value must be a no-op");
-        let (flips, _) = c.apply(contrib(1, "z", None)).await;
+        let (flips, _) = c.apply(contrib(1, 3, None)).await;
         assert!(flips.is_empty(), "deleting an absent key must be a no-op");
         c.shutdown().await;
     }
@@ -670,20 +724,21 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn feed_deltas_gate_deletes_structurally() {
         let c = MembershipCircuit::start().unwrap();
+        // pk ids: ghost=100, row1=1.
         // Delete for a never-member pk: NO delta (this was filter_known_members' whole job).
-        let (_, fd) = c.apply(feed(9, "ghost", false)).await;
+        let (_, fd) = c.apply(feed(9, 100, false)).await;
         assert!(fd.is_empty(), "never-member delete must produce nothing");
         // Enter.
-        let (_, fd) = c.apply(feed(9, "row1", true)).await;
-        assert_eq!(fd, vec![FeedDelta { feed_id: 9, pk: "row1".into(), delta: 1 }]);
+        let (_, fd) = c.apply(feed(9, 1, true)).await;
+        assert_eq!(fd, vec![FeedDelta { feed_id: 9, pk_id: 1, delta: 1 }]);
         // Repeat assert: nothing.
-        let (_, fd) = c.apply(feed(9, "row1", true)).await;
+        let (_, fd) = c.apply(feed(9, 1, true)).await;
         assert!(fd.is_empty());
         // Genuine leave.
-        let (_, fd) = c.apply(feed(9, "row1", false)).await;
-        assert_eq!(fd, vec![FeedDelta { feed_id: 9, pk: "row1".into(), delta: -1 }]);
+        let (_, fd) = c.apply(feed(9, 1, false)).await;
+        assert_eq!(fd, vec![FeedDelta { feed_id: 9, pk_id: 1, delta: -1 }]);
         // And gone again: repeat delete nets nothing.
-        let (_, fd) = c.apply(feed(9, "row1", false)).await;
+        let (_, fd) = c.apply(feed(9, 1, false)).await;
         assert!(fd.is_empty());
         c.shutdown().await;
     }
@@ -693,29 +748,30 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn prefix_scans_enumerate_slices() {
         let c = MembershipCircuit::start().unwrap();
+        // pk ids: a=1, b=2, z=3, p=4, q=5, r=6.
         c.apply(Assertions {
             contributors: vec![
-                Tup2(ckey(1, "a"), Assert::Insert(Value::Int(5))),
-                Tup2(ckey(1, "b"), Assert::Insert(Value::Int(6))),
-                Tup2(ckey(2, "z"), Assert::Insert(Value::Int(5))),
+                Tup2(ckey(1, 1), Assert::Insert(Value::Int(5))),
+                Tup2(ckey(1, 2), Assert::Insert(Value::Int(6))),
+                Tup2(ckey(2, 3), Assert::Insert(Value::Int(5))),
             ],
             feeds: vec![
-                Tup2(ckey(7, "p"), Assert::Insert(Value::Null)),
-                Tup2(ckey(7, "q"), Assert::Insert(Value::Null)),
-                Tup2(ckey(8, "r"), Assert::Insert(Value::Null)),
+                Tup2(ckey(7, 4), true),
+                Tup2(ckey(7, 5), true),
+                Tup2(ckey(8, 6), true),
             ],
         })
         .await;
         let mut entries = c.contributor_entries(1);
         entries.sort();
-        assert_eq!(entries, vec![("a".into(), Value::Int(5)), ("b".into(), Value::Int(6))]);
+        assert_eq!(entries, vec![(1, Value::Int(5)), (2, Value::Int(6))]);
         assert_eq!(c.contributor_entries(3), vec![]);
-        let mut pks = c.feed_pks(7);
+        let mut pks = c.feed_pk_ids(7);
         pks.sort();
-        assert_eq!(pks, vec!["p".to_string(), "q".to_string()]);
+        assert_eq!(pks, vec![4, 5]);
         assert_eq!(c.feed_len(8), 1);
         // Deleting via enumeration empties the slice without touching neighbours.
-        let feeds = c.feed_pks(7).into_iter().map(|pk| Tup2(ckey(7, &pk), Assert::Delete)).collect();
+        let feeds = c.feed_pk_ids(7).into_iter().map(|pk| Tup2(ckey(7, pk), false)).collect();
         c.apply(Assertions { contributors: Vec::new(), feeds }).await;
         assert_eq!(c.feed_len(7), 0);
         assert_eq!(c.feed_len(8), 1);
@@ -728,14 +784,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn feed_trace_knob_disables_enumeration_not_emissions() {
         let c = MembershipCircuit::start_with(false).unwrap();
-        let (_, fd) = c.apply(feed(9, "row1", true)).await;
-        assert_eq!(fd, vec![FeedDelta { feed_id: 9, pk: "row1".into(), delta: 1 }]);
-        let (_, fd) = c.apply(feed(9, "row1", false)).await;
-        assert_eq!(fd, vec![FeedDelta { feed_id: 9, pk: "row1".into(), delta: -1 }], "deletes still gate structurally");
-        let (_, fd) = c.apply(feed(9, "ghost", false)).await;
+        // pk ids: row1=1, ghost=100, row2=2.
+        let (_, fd) = c.apply(feed(9, 1, true)).await;
+        assert_eq!(fd, vec![FeedDelta { feed_id: 9, pk_id: 1, delta: 1 }]);
+        let (_, fd) = c.apply(feed(9, 1, false)).await;
+        assert_eq!(fd, vec![FeedDelta { feed_id: 9, pk_id: 1, delta: -1 }], "deletes still gate structurally");
+        let (_, fd) = c.apply(feed(9, 100, false)).await;
         assert!(fd.is_empty(), "never-member gate intact without the trace");
-        c.apply(feed(9, "row2", true)).await;
-        assert_eq!(c.feed_pks(9), Vec::<String>::new(), "no enumeration copy");
+        c.apply(feed(9, 2, true)).await;
+        assert_eq!(c.feed_pk_ids(9), Vec::<u32>::new(), "no enumeration copy");
         assert_eq!(c.feed_len(9), 0);
         c.shutdown().await;
     }
@@ -756,7 +813,7 @@ mod tests {
         .unwrap();
         // Enough contributor entries to force at least one on-disk batch.
         let contributors = (0..2000)
-            .map(|i| Tup2(ckey(1, &format!("pk{i}")), Assert::Insert(Value::Int(i % 50))))
+            .map(|i| Tup2(ckey(1, i as u32), Assert::Insert(Value::Int(i % 50))))
             .collect();
         let (flips, _) = c.apply(Assertions { contributors, feeds: Vec::new() }).await;
         assert_eq!(flips.len(), 50, "50 distinct values entered");
@@ -782,8 +839,8 @@ mod tests {
         let mut a = Assertions::default();
         for i in 0..1000i64 {
             // 1000 contributors over 100 distinct values on one node.
-            a.contributors.push(Tup2(ckey(1, &format!("c{i}")), Assert::Insert(Value::Int(i % 100))));
-            a.feeds.push(Tup2(ckey(9, &format!("f{i}")), Assert::Insert(Value::Null)));
+            a.contributors.push(Tup2(ckey(1, i as u32), Assert::Insert(Value::Int(i % 100))));
+            a.feeds.push(Tup2(ckey(9, i as u32), true));
         }
         c.apply(a).await;
 
@@ -801,6 +858,32 @@ mod tests {
         c.shutdown().await;
     }
 
+    /// Task 2.1 integration expectation: with `u32` pk-id keys, a materialized 1k-row feed's
+    /// membership-circuit bytes (`bytes_membership_circuit` = `total_bytes`) must come in UNDER
+    /// 1000 × 32 B. This is impossible with the old `Row([Int(feed_id), Text(pk)])` keys — each
+    /// heap pk string alone (an 11-char `pk-00000000`, plus `Value`/`Row` overhead) pushed a feed
+    /// entry to ~123 B (measured baseline). The `(feed_id, pk_id)` SET key has no per-entry heap
+    /// and no per-entry value; measured ~24 B/entry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn feed_bytes_per_entry_is_under_32b_with_id_keys() {
+        let c = MembershipCircuit::start_full(true, None).unwrap();
+        let mut a = Assertions::default();
+        for i in 0..1000i64 {
+            a.feeds.push(Tup2(ckey(9, i as u32), true));
+        }
+        c.apply(a).await;
+        let cb = c.snapshot_bytes();
+        assert_eq!(cb.feeds_len, 1000, "1000 live feed entries");
+        let total = cb.total_bytes();
+        assert!(
+            total < 1000 * 32,
+            "materialized 1k-row feed must own < 32 B/entry with u32 pk-id keys, got {} B ({} B/entry)",
+            total,
+            total / 1000
+        );
+        c.shutdown().await;
+    }
+
     /// FEED_TRACE=0 does NOT free operator memory: dbsp shares the feed upsert operator's own
     /// integral with our published `integrate_trace` snapshot (per-stream `TraceId` cache), so
     /// disabling the trace only drops the host-side `ro_snapshot` view (feeds_bytes → 0) while
@@ -811,7 +894,7 @@ mod tests {
         let load = || {
             let mut a = Assertions::default();
             for i in 0..3000i64 {
-                a.feeds.push(Tup2(ckey(9, &format!("f{i}")), Assert::Insert(Value::Null)));
+                a.feeds.push(Tup2(ckey(9, i as u32), true));
             }
             a
         };
@@ -827,8 +910,10 @@ mod tests {
         assert_eq!(off.snapshot_bytes().feeds_bytes, 0, "no published feed view when disabled");
         off.shutdown().await;
 
-        // The host-side feed view is non-trivial, yet the operator memory is within 5% either way.
-        assert!(feeds_view > 100_000, "feed view should be a meaningful number of bytes");
+        // The host-side feed view is non-trivial (a 3000-entry `u32`-keyed feed SET — leaner than
+        // the old string-keyed map, so the threshold is set to the set representation), yet the
+        // operator memory is within 5% either way.
+        assert!(feeds_view > 20_000, "feed view should be a meaningful number of bytes, got {feeds_view}");
         let (hi, lo) = (used_on.max(used_off), used_on.min(used_off));
         assert!(
             hi - lo < hi / 20,
@@ -854,14 +939,14 @@ mod tests {
         const STEPS: i64 = 400;
         let c = MembershipCircuit::start_full(true, None).unwrap();
         let seed = (0..LIVE)
-            .map(|i| Tup2(ckey(7, &format!("k{i}")), Assert::Insert(Value::Int(0))))
+            .map(|i| Tup2(ckey(7, i as u32), Assert::Insert(Value::Int(0))))
             .collect();
         c.apply(Assertions { contributors: seed, feeds: Vec::new() }).await;
 
         let mut max_contrib_len = 0usize;
         for step in 1..=STEPS {
             let contributors = (0..LIVE)
-                .map(|i| Tup2(ckey(7, &format!("k{i}")), Assert::Insert(Value::Int(step))))
+                .map(|i| Tup2(ckey(7, i as u32), Assert::Insert(Value::Int(step))))
                 .collect();
             c.apply(Assertions { contributors, feeds: Vec::new() }).await;
             max_contrib_len = max_contrib_len.max(c.snapshot_bytes().contributors_len);
@@ -890,14 +975,14 @@ mod tests {
         let c = MembershipCircuit::start().unwrap();
         c.apply(Assertions {
             contributors: vec![
-                Tup2(ckey(1, "a"), Assert::Insert(Value::Int(7))),
-                Tup2(ckey(2, "a"), Assert::Insert(Value::Int(7))),
-                Tup2(ckey(1, "n"), Assert::Insert(Value::Null)),
+                Tup2(ckey(1, 1), Assert::Insert(Value::Int(7))),
+                Tup2(ckey(2, 1), Assert::Insert(Value::Int(7))),
+                Tup2(ckey(1, 2), Assert::Insert(Value::Null)),
             ],
             feeds: Vec::new(),
         })
         .await;
-        let (flips, _) = c.apply(contrib(1, "a", None)).await;
+        let (flips, _) = c.apply(contrib(1, 1, None)).await;
         assert_eq!(flips, vec![MemberDelta { node_id: 1, value: Value::Int(7), delta: -1 }]);
         assert!(!c.contains(1, &Value::Int(7)));
         assert!(c.contains(2, &Value::Int(7)), "node 2 unaffected");

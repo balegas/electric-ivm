@@ -73,6 +73,14 @@ impl PkDict {
         id
     }
 
+    /// The id for `pk` if it has already been interned, WITHOUT minting a fresh one. Lets callers
+    /// probe an inverted index keyed by pk id (a pk never interned can have no index entry) without
+    /// polluting the dictionary with ids for pks that are only ever looked up (e.g. a delete for a
+    /// never-member pk).
+    pub fn get(&self, pk: &str) -> Option<u32> {
+        self.forward.read().expect("pk_dict forward").get(pk).copied()
+    }
+
     /// The pk string for a previously-minted `id`. Panics on an id this dictionary never minted —
     /// callers only ever resolve ids that came out of the same dictionary (append-only ⇒ any id it
     /// once returned stays resolvable forever).

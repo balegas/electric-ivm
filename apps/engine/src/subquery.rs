@@ -23,7 +23,8 @@ use crate::value::{Tup2, ZWeight};
 
 use crate::ds::{DsClient, Envelope};
 use crate::heap_size::HeapSize;
-use crate::subq_circuit::{Assert, Assertions, FeedDelta};
+use crate::pk_dict::PkDict;
+use crate::subq_circuit::{Assert, Assertions, FeedDelta, PkKey};
 use crate::predicate::{
     CompiledPredicate, PredicateJson, SubqueryCollector, SubqueryEval, SubquerySig, subquery_sig,
 };
@@ -139,11 +140,12 @@ pub(crate) struct TemplateGroup {
     param_cols: Vec<usize>,
     /// bind literals -> the node serving that bind.
     pub(crate) binds: HashMap<Row, SubquerySig>,
-    /// pk -> nodes of this template currently holding a contribution from that pk. An exact
-    /// inverted index over the nodes' `pk_value` maps (maintained in lockstep by
+    /// pk id -> nodes of this template currently holding a contribution from that pk. An exact
+    /// inverted index over the nodes' contributor sets (maintained in lockstep by
     /// `reconcile_node_row`), so a row that stops matching finds its old bind in O(1) instead
-    /// of scanning every bind.
-    pk_nodes: HashMap<String, HashSet<SubquerySig>>,
+    /// of scanning every bind. Keyed by the pk's dictionary id (see [`crate::pk_dict::PkDict`]),
+    /// not the pk string — the string lives once in the shared dictionary.
+    pk_nodes: HashMap<u32, HashSet<SubquerySig>>,
 }
 
 impl HeapSize for TemplateGroup {
@@ -297,6 +299,11 @@ pub struct SubqueryRegistry {
     /// The membership circuit: every node's value set as one dbsp relation; flip detection is
     /// the circuit's incremental distinct (see `crate::subq_circuit`).
     circuit: crate::subq_circuit::MembershipCircuit,
+    /// The global pk dictionary shared by the circuit tier: every contributor / feed key is
+    /// `(id, pk_id)` where `pk_id = pk_dict.get_or_insert(pk)`. Ids are minted here (when building
+    /// assertions) and resolved back to pk strings here (at the emission seam), so the circuit and
+    /// its indexes never store a heap pk string. One instance per engine (per registry).
+    pk_dict: Arc<PkDict>,
     /// Next circuit node id (monotonic; ids of dropped nodes are never reused, so a stale
     /// snapshot read can never alias a new node's slice).
     next_node_id: i64,
@@ -333,7 +340,9 @@ impl HeapSize for SubqueryRegistry {
     /// `circuit` (the dbsp membership relation) is accounted separately — see
     /// [`SubqueryRegistry::circuit_bytes`]'s `bytes_membership_circuit` measurement — so it is
     /// deliberately excluded here to avoid double-counting the same state under two `/memory`
-    /// fields. `ds` (a client handle) and `schemas` (`Arc`-shared with the engine's compiled
+    /// fields. The `pk_dict` is likewise accounted separately (`bytes_pk_dict`, see
+    /// [`SubqueryRegistry::pk_dict_bytes`]) — `Arc`-shared and reported once. `ds` (a client
+    /// handle) and `schemas` (`Arc`-shared with the engine's compiled
     /// schema) are not uniquely owned; `lanes` holds channel senders, not owned data;
     /// `next_node_id`/`next_feed_id` are inline counters.
     fn heap_bytes(&self) -> usize {
@@ -360,6 +369,7 @@ impl SubqueryRegistry {
             shapes: HashMap::new(),
             circuit: crate::subq_circuit::MembershipCircuit::start()
                 .expect("membership circuit failed to start"),
+            pk_dict: Arc::new(PkDict::new()),
             next_node_id: 1,
             node_by_id: HashMap::new(),
             next_feed_id: 1,
@@ -408,16 +418,17 @@ impl SubqueryRegistry {
         sig: &SubquerySig,
         pk: &str,
         present: Option<Value>,
-    ) -> Option<Tup2<Row, Assert>> {
+    ) -> Option<Tup2<PkKey, Assert>> {
         let (node_id, tkey) = {
             let node = self.nodes.get(sig)?;
             (node.node_id, node.template_key.clone())
         };
-        let key = Row(vec![Value::Int(node_id), Value::Text(pk.to_string())]);
+        let pk_id = self.pk_dict.get_or_insert(pk);
+        let key = PkKey { id: node_id, pk: pk_id };
         match present {
             Some(v) => {
                 if let Some(tpl) = self.templates.get_mut(&tkey) {
-                    tpl.pk_nodes.entry(pk.to_string()).or_default().insert(sig.clone());
+                    tpl.pk_nodes.entry(pk_id).or_default().insert(sig.clone());
                 }
                 Some(Tup2(key, Assert::Insert(v)))
             }
@@ -426,10 +437,10 @@ impl SubqueryRegistry {
                     .templates
                     .get_mut(&tkey)
                     .and_then(|tpl| {
-                        let set = tpl.pk_nodes.get_mut(pk)?;
+                        let set = tpl.pk_nodes.get_mut(&pk_id)?;
                         let had = set.remove(sig);
                         if set.is_empty() {
-                            tpl.pk_nodes.remove(pk);
+                            tpl.pk_nodes.remove(&pk_id);
                         }
                         Some(had)
                     })
@@ -541,6 +552,14 @@ impl SubqueryRegistry {
     /// what each term covers and the (profiler-only) non-published state it does not.
     pub fn circuit_bytes(&self) -> crate::subq_circuit::CircuitBytes {
         self.circuit.snapshot_bytes()
+    }
+
+    /// Estimated owned heap of the global pk dictionary (`bytes_pk_dict` in `GET /memory`) — the
+    /// once-per-distinct-pk string storage plus its forward/reverse index. Accounted separately
+    /// from the registry's own `heap_bytes` (the dictionary is `Arc`-shared and append-only; this
+    /// makes the string-interning trade visible). On-demand only — never on the sampler path.
+    pub fn pk_dict_bytes(&self) -> usize {
+        self.pk_dict.heap_bytes()
     }
 
     /// Per-node topology for the introspection endpoint: signature, inner table, current distinct value
@@ -794,9 +813,8 @@ impl SubqueryRegistry {
         // already carries the snapshot) — replaces the old known_members hand-off.
         let mut feed_seed = Assertions::default();
         for pk in seeded_pks {
-            feed_seed
-                .feeds
-                .push(Tup2(Row(vec![Value::Int(feed_id), Value::Text(pk)]), Assert::Insert(Value::Null)));
+            let pk_id = self.pk_dict.get_or_insert(&pk);
+            feed_seed.feeds.push(Tup2(PkKey { id: feed_id, pk: pk_id }, true));
         }
         let _ = self.apply_asserts(feed_seed).await;
         if !pending.buffer.is_empty() {
@@ -883,11 +901,11 @@ impl SubqueryRegistry {
         // Retract the feed's key slice from the circuit (deltas discarded — the stream is
         // being torn down) and drop the id mapping.
         self.feed_by_id.remove(&shape.feed_id);
-        let feeds: Vec<Tup2<Row, Assert>> = self
+        let feeds: Vec<Tup2<PkKey, bool>> = self
             .circuit
-            .feed_pks(shape.feed_id)
+            .feed_pk_ids(shape.feed_id)
             .into_iter()
-            .map(|pk| Tup2(Row(vec![Value::Int(shape.feed_id), Value::Text(pk)]), Assert::Delete))
+            .map(|pk_id| Tup2(PkKey { id: shape.feed_id, pk: pk_id }, false))
             .collect();
         if !feeds.is_empty() {
             let _ = self.circuit.apply(Assertions { contributors: Vec::new(), feeds }).await;
@@ -913,19 +931,20 @@ impl SubqueryRegistry {
                 collect_in_leaves(&node.pred).into_iter().map(|l| l.sig).collect();
             let node = self.nodes.remove(&sig).expect("node fetched above");
             // The node's contributor slice comes from the circuit's own integral (prefix
-            // scan) — there is no host pk list to drain anymore.
-            for (pk, _v) in self.circuit.contributor_entries(node.node_id) {
+            // scan) — there is no host pk list to drain anymore. Keys are pk ids; the retraction
+            // re-asserts the same id, so no dictionary round-trip is needed here.
+            for (pk_id, _v) in self.circuit.contributor_entries(node.node_id) {
                 if let Some(tpl) = self.templates.get_mut(&node.template_key) {
-                    if let Some(set) = tpl.pk_nodes.get_mut(&pk) {
+                    if let Some(set) = tpl.pk_nodes.get_mut(&pk_id) {
                         set.remove(&sig);
                         if set.is_empty() {
-                            tpl.pk_nodes.remove(&pk);
+                            tpl.pk_nodes.remove(&pk_id);
                         }
                     }
                 }
                 asserts
                     .contributors
-                    .push(Tup2(Row(vec![Value::Int(node.node_id), Value::Text(pk)]), Assert::Delete));
+                    .push(Tup2(PkKey { id: node.node_id, pk: pk_id }, Assert::Delete));
             }
             self.remove_node_entry(&node);
             self.remove_node_edges(&sig, &child_sigs);
@@ -1125,7 +1144,7 @@ impl SubqueryRegistry {
         evals: Vec<(String, Option<(SubquerySig, Value)>)>,
         lsn: u64,
         xid: Option<u64>,
-    ) -> Vec<Tup2<Row, Assert>> {
+    ) -> Vec<Tup2<PkKey, Assert>> {
         let node_applies = |reg: &Self, sig: &SubquerySig| {
             reg.nodes
                 .get(sig)
@@ -1133,10 +1152,12 @@ impl SubqueryRegistry {
         };
         let mut asserts = Vec::new();
         for (pk, target) in evals {
+            // A pk with no interned id was never asserted, so it can hold no contribution — probe
+            // without minting (a never-member delete must not grow the dictionary).
             let holders: Vec<SubquerySig> = self
-                .templates
-                .get(tkey)
-                .and_then(|t| t.pk_nodes.get(&pk))
+                .pk_dict
+                .get(&pk)
+                .and_then(|pk_id| self.templates.get(tkey).and_then(|t| t.pk_nodes.get(&pk_id)))
                 .map(|s| s.iter().cloned().collect())
                 .unwrap_or_default();
             for sig in holders {
@@ -1195,24 +1216,25 @@ impl SubqueryRegistry {
                     Err(_) => continue,
                 };
                 let member = exists && pred.matches_ctx(&row, self);
-                let key = Row(vec![Value::Int(feed_id), Value::Text(pk)]);
-                asserts.feeds.push(Tup2(
-                    key,
-                    if member { Assert::Insert(Value::Null) } else { Assert::Delete },
-                ));
+                let pk_id = self.pk_dict.get_or_insert(&pk);
+                asserts.feeds.push(Tup2(PkKey { id: feed_id, pk: pk_id }, member));
                 if member {
                     members.push(row);
                 }
             }
             staged.push((shape_id, members));
         }
-        // Phase 2: one circuit step for the whole batch; retractions are the deletes.
+        // Phase 2: one circuit step for the whole batch; retractions are the deletes. Resolve
+        // each retracted pk id back to its pk string HERE — still under the registry lock, before
+        // the delta leaves the circuit tier — so the wire protocol carries the pk string
+        // unchanged and per-stream emission order is preserved (the order-preserving seam).
         let (_, feed_deltas) = self.apply_asserts(asserts).await;
         let mut deletes: HashMap<String, Vec<String>> = HashMap::new();
         for d in feed_deltas {
             if d.delta < 0 {
                 if let Some(shape_id) = self.feed_by_id.get(&d.feed_id) {
-                    deletes.entry(shape_id.clone()).or_default().push(d.pk);
+                    let pk = self.pk_dict.resolve(d.pk_id).to_string();
+                    deletes.entry(shape_id.clone()).or_default().push(pk);
                 }
             }
         }
@@ -2010,18 +2032,17 @@ mod tests {
         assert_eq!(reg.shapes["s1"].emitted.load(std::sync::atomic::Ordering::Relaxed), 0);
 
         // Seed pk 1 as a member (backfill hand-off), then the same verdict is a GENUINE leave.
+        // The pk id must match the one `emit_for_shapes` minted for row(1)'s pk string above, so
+        // build the key through the SAME dictionary.
+        let pk_id = reg.pk_dict.get_or_insert("1");
         let mut seed = Assertions::default();
-        seed.feeds
-            .push(Tup2(Row(vec![Value::Int(feed_id), Value::Text("1".into())]), Assert::Insert(Value::Null)));
+        seed.feeds.push(Tup2(PkKey { id: feed_id, pk: pk_id }, true));
         reg.apply_asserts(seed).await;
         let (_, fd) = reg
             .circuit
             .apply(Assertions {
                 contributors: Vec::new(),
-                feeds: vec![Tup2(
-                    Row(vec![Value::Int(feed_id), Value::Text("1".into())]),
-                    Assert::Delete,
-                )],
+                feeds: vec![Tup2(PkKey { id: feed_id, pk: pk_id }, false)],
             })
             .await;
         assert_eq!(fd.len(), 1, "a known member's delete must produce the retraction");
@@ -2032,10 +2053,7 @@ mod tests {
             .circuit
             .apply(Assertions {
                 contributors: Vec::new(),
-                feeds: vec![Tup2(
-                    Row(vec![Value::Int(feed_id), Value::Text("1".into())]),
-                    Assert::Delete,
-                )],
+                feeds: vec![Tup2(PkKey { id: feed_id, pk: pk_id }, false)],
             })
             .await;
         assert!(fd.is_empty(), "repeat delete for an already-removed pk must net nothing");
