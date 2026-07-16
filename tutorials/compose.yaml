@@ -1,0 +1,122 @@
+# The tutorial-series stack — everything any episode needs, boots with episode 1's data.
+#
+#   postgres — the system of record (wal_level=logical), auto-seeded from ./seed on first boot
+#   ds       — durable-streams server (the log: table/<name> in, shape/<id> out)
+#   engine   — the Rust engine: replication ingest + live-query maintenance + GET /v1/shape (7010)
+#   api      — the extended tRPC API (@electric-circuits/client; not used until later episodes)
+#   viz      — the pipeline explorer (browser: https://localhost:5543, plain HTTP: http://localhost:5280)
+#
+#   cd tutorials && docker compose up --build
+#
+# Reset to episode 1's initial state from anywhere in the series:
+#   docker compose down -v && docker compose up
+#
+# Later episodes change database state with SQL scripts (episodes/0N-…/setup.sql), not by
+# editing this file. The engine introspects the table set at startup — an episode script that
+# ADDS tables is always followed by `docker compose restart engine` in the episode text.
+#
+# The ports are offset from the flagship LinearLite demo (which uses 8443 / 5443 / 5180) so the
+# tutorial stack and the demo can run side by side without colliding.
+
+name: electric-circuits-tutorials
+
+services:
+  postgres:
+    image: postgres:16
+    command: ["postgres", "-c", "wal_level=logical"]
+    environment:
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: electric
+    ports:
+      - "${PG_PORT:-5432}:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./seed:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d electric"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  ds:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.ds
+    environment:
+      DS_PORT: 8791
+      DS_DATA_DIR: /data
+      # In-memory durability by default (no fsync-per-append cost); set DS_MEMORY= (empty) for a
+      # deployment that must survive a restart without replaying from Postgres.
+      DS_MEMORY: "${DS_MEMORY-1}"
+    ports:
+      - "${DS_PORT:-8791}:8791"
+    volumes:
+      - ds-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -o /dev/null http://127.0.0.1:8791"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  engine:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.engine
+    environment:
+      ELECTRIC_CIRCUITS_DS_URL: http://ds:8791
+      ELECTRIC_CIRCUITS_PG_URL: postgres://postgres:password@postgres:5432/electric
+      ELECTRIC_CIRCUITS_PG_TABLES: "*"
+      ELECTRIC_CIRCUITS_BIND: 0.0.0.0:7010
+      # Live COUNT groupings are the one thing configured ahead of time (episode 4). Passed
+      # through from your shell so you can set it without editing this file, e.g.:
+      #   ELECTRIC_CIRCUITS_DBSP_COUNTS=todos:list_id+done docker compose up -d engine
+      ELECTRIC_CIRCUITS_DBSP_COUNTS: "${ELECTRIC_CIRCUITS_DBSP_COUNTS-}"
+      # The ds data volume, mounted read-only below, so the engine's storage sampler can `du` it.
+      ELECTRIC_STORAGE_DIR: /ds-data
+    ports:
+      - "${ENGINE_PORT:-7010}:7010"
+    volumes:
+      - ds-data:/ds-data:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ds:
+        condition: service_healthy
+    restart: unless-stopped # e.g. Postgres not ready with tables yet — retry via restart
+
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.node
+    command: ["pnpm", "run", "api"]
+    environment:
+      DS_URL: http://ds:8791
+      ENGINE_URL: http://engine:7010
+      API_PORT: 8790
+    ports:
+      - "${API_PORT:-8790}:8790"
+    depends_on:
+      ds:
+        condition: service_healthy
+      engine:
+        condition: service_started
+
+  viz:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.viz
+    environment:
+      ENGINE_UPSTREAM: engine:7010
+    ports:
+      - "${VIZ_PORT:-5280}:5180"          # plain HTTP (curl/scripts)
+      - "${VIZ_HTTPS_PORT:-5543}:5443"    # HTTPS/HTTP-2 for browser use (offset from the demo's 5443)
+    volumes:
+      - viz-caddy-data:/data              # persist Caddy's internal CA across rebuilds
+    depends_on:
+      engine:
+        condition: service_started
+
+volumes:
+  pg-data:
+  ds-data:
+  viz-caddy-data:
