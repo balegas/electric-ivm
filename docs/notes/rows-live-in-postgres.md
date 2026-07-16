@@ -1,15 +1,19 @@
 # Verified: row state lives in Postgres; the engine queries it on demand
 
 Note for collaborating agents/writers. Every claim below was verified against the code at
-main (post PR #35, feed-relations). File:line references are the proof points.
+main (post the host-side FeedSet move — feeds are no longer a circuit relation). File:line
+references are the proof points.
 
 ## What the engine's state actually contains — keys, never row bodies
 
-- The membership circuit stores two relations: contributors keyed `(node_id, pk) → projected
-  value` and feeds keyed `(feed_id, pk)`. The projected value is ONE column's value (e.g. a
-  `project_id`), not a row. Before the first stateful operator, the pipeline projects away
-  everything else — `subq_circuit.rs:134-140`: the contributor stream maps to
-  `Row([node_id, value])`; row bodies never enter a spine.
+- The membership circuit stores the **contributor** relation only: keyed `(node_id, pk) →
+  projected value`. The projected value is ONE column's value (e.g. a `project_id`), not a row.
+  Before the first stateful operator, the pipeline projects away everything else —
+  `subq_circuit.rs:134-140`: the contributor stream maps to `Row([node_id, value])`; row bodies
+  never enter a spine.
+- The **feed** set — which primary keys are currently in each subscribed feed, i.e. the delete
+  gate — lives **host-side, not in the circuit**: a `HashMap<feed_id, RoaringBitmap>` of pk-ids
+  (`subq_feed.rs`, `FeedSet`). Still keys, never rows.
 - The routing tier holds no rows either: `KeyRouter` is `key_tuple → {shapes}` routing
   metadata only (`engine/executors.rs` — the struct doc says exactly this), and the counts
   circuit holds `(group → count)` pairs (`arrangements.rs` module doc: "Row data lives in

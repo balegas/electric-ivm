@@ -3,8 +3,9 @@
 A port of [ElectricSQL's LinearLite](https://github.com/electric-sql/electric/tree/main/examples/linearlite)
 (a Linear-style issue tracker) to the **electric-circuits** prototype. It demonstrates the prototype's
 model end-to-end: **Postgres is the system of record**, the app writes to Postgres, and the engine
-keeps each filtered view (a *shape*) live by ingesting Postgres **logical replication** and reading
-rows back for backfill.
+keeps each filtered view — a **live query** (called a `shape` in the Electric protocol and in this
+app's client hooks such as `useShape`) — live by ingesting Postgres **logical replication** and
+reading rows back for backfill.
 
 ```
   browser ──writes──▶  Postgres  ──logical replication──▶  engine  ──append──▶  durable-streams
