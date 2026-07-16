@@ -895,9 +895,9 @@ impl Engine {
             }
             None => 0,
         };
-        let (bytes_membership_circuit, bytes_subquery_registry) = {
+        let (circuit_bytes, bytes_subquery_registry) = {
             let reg = self.subqueries.lock().await;
-            (reg.membership_bytes(), reg.heap_bytes())
+            (reg.circuit_bytes(), reg.heap_bytes())
         };
         let bytes_retention = self.lives.lock().unwrap().heap_bytes();
         let bytes_electric_adapter = crate::electric::ttl_registry_heap_bytes().await;
@@ -906,7 +906,9 @@ impl Engine {
             bytes_executors,
             bytes_retention,
             bytes_subquery_registry,
-            bytes_membership_circuit,
+            bytes_membership_circuit: circuit_bytes.total_bytes(),
+            bytes_circuit_integral: circuit_bytes.integral_bytes(),
+            bytes_circuit_snapshots: circuit_bytes.snapshot_bytes(),
             bytes_electric_adapter,
         }
     }

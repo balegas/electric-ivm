@@ -46,6 +46,12 @@ pub struct HeapBytes {
     pub bytes_retention: usize,
     pub bytes_subquery_registry: usize,
     pub bytes_membership_circuit: usize,
+    /// Split of `bytes_membership_circuit` (Task 1.3): the raw upsert-map integrals
+    /// (CONTRIBUTORS + FEEDS `(id,pk)→value` maps — the operators' own input integrals).
+    pub bytes_circuit_integral: usize,
+    /// Split of `bytes_membership_circuit` (Task 1.3): the derived MEMBERS relation snapshot
+    /// (`(node,value)`), published for `contains`/introspection reads.
+    pub bytes_circuit_snapshots: usize,
     pub bytes_electric_adapter: usize,
 }
 
@@ -77,10 +83,18 @@ pub struct Cardinalities {
     /// `pk_nodes` inverted index), shapes, and edges — excludes the membership circuit itself
     /// (see `bytes_membership_circuit`).
     pub bytes_subquery_registry: usize,
-    /// Estimated owned heap of the dbsp membership circuit (subquery inner sets + per-feed key
-    /// sets): key-count × an estimated per-entry size, since dbsp's storage-backed spines don't
-    /// expose exact byte sizes cheaply. See `SubqueryRegistry::mem_totals` for the formula.
+    /// Measured owned/on-disk bytes of the dbsp membership circuit's published snapshots
+    /// (subquery inner sets + per-feed key sets), via dbsp's `BatchReader::approximate_byte_size`
+    /// (exact in-memory columnar bytes when resident, on-disk file size when spilled). Equals
+    /// `bytes_circuit_integral + bytes_circuit_snapshots`. See `SubqueryRegistry::circuit_bytes`.
+    /// NOTE: this covers only the host-published snapshots (which share the operators' own
+    /// integrals via dbsp's trace cache); dbsp's non-published incremental state (z1 delayed
+    /// traces, `distinct` integrals) roughly doubles it and is measurable only via the profiler.
     pub bytes_membership_circuit: usize,
+    /// Raw upsert-map integrals term of `bytes_membership_circuit` (CONTRIBUTORS + FEEDS maps).
+    pub bytes_circuit_integral: usize,
+    /// Derived MEMBERS relation snapshot term of `bytes_membership_circuit`.
+    pub bytes_circuit_snapshots: usize,
     /// The `/v1/shape` (Electric-protocol) adapter's TTL handle registry: per-handle cursor
     /// state (known-keys sets, in-flight live-poll map).
     pub bytes_electric_adapter: usize,
@@ -96,6 +110,8 @@ impl Cardinalities {
         self.bytes_retention = bytes.bytes_retention;
         self.bytes_subquery_registry = bytes.bytes_subquery_registry;
         self.bytes_membership_circuit = bytes.bytes_membership_circuit;
+        self.bytes_circuit_integral = bytes.bytes_circuit_integral;
+        self.bytes_circuit_snapshots = bytes.bytes_circuit_snapshots;
         self.bytes_electric_adapter = bytes.bytes_electric_adapter;
         self
     }
@@ -192,6 +208,8 @@ pub fn snapshot_json(card: &Cardinalities) -> serde_json::Value {
             "bytes_retention": card.bytes_retention,
             "bytes_subquery_registry": card.bytes_subquery_registry,
             "bytes_membership_circuit": card.bytes_membership_circuit,
+            "bytes_circuit_integral": card.bytes_circuit_integral,
+            "bytes_circuit_snapshots": card.bytes_circuit_snapshots,
             "bytes_electric_adapter": card.bytes_electric_adapter,
         },
         "samples": g.samples.load(Ordering::Relaxed),

@@ -153,7 +153,52 @@ fn process_alive(pid: u32) -> bool {
 
 enum Cmd {
     Batch { asserts: Assertions, resp: oneshot::Sender<(Vec<MemberDelta>, Vec<FeedDelta>)> },
+    /// Diagnostic: the whole circuit's operator memory via dbsp's profiler
+    /// (`(total_used_bytes, total_storage_size)`). Heavy (round-trips every worker); test-only.
+    Profile { resp: oneshot::Sender<(usize, usize)> },
     Shutdown { resp: oneshot::Sender<()> },
+}
+
+/// Measured byte sizes of the circuit's **published** `integrate_trace` snapshots — the only
+/// circuit state the host can size without dbsp's (heavy) profiler. Each byte field is dbsp's
+/// [`dbsp::trace::BatchReader::approximate_byte_size`]: exact in-memory columnar bytes (keys +
+/// weights) when the batch is resident, the on-disk file size when the batch is spilled (so
+/// under `ELECTRIC_IVM_SUBQ_STORAGE` these undercount RAM — spilling's whole point). `len` is the
+/// total tuple count across all batches the snapshot pins, **including superseded, not-yet-
+/// compacted `(key,+1)/(key,-1)` pairs** — the direct signal for compaction/pinning growth.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct CircuitBytes {
+    /// The MEMBERS relation snapshot: `(node,value)` keys, weight = contributor count — the
+    /// derived, deduplicated membership state published for `contains`/introspection.
+    pub members_bytes: usize,
+    pub members_len: usize,
+    /// The CONTRIBUTORS upsert-map integral: `(node,pk)→value`, one tuple per contributor.
+    /// dbsp shares this exact spine with the upsert operator's own integral (registered under
+    /// `TraceId(stream)` in the circuit cache), so this is the operator's own integral, not a copy.
+    pub contributors_bytes: usize,
+    pub contributors_len: usize,
+    /// The FEEDS upsert-map integral: `(feed,pk)→()` — likewise the feed upsert operator's own
+    /// integral. Zero when `ELECTRIC_IVM_FEED_TRACE=0` (the published feed snapshot is disabled).
+    pub feeds_bytes: usize,
+    pub feeds_len: usize,
+}
+
+impl CircuitBytes {
+    /// The raw upsert-map integrals (contributors + feeds): the operators' own input integrals,
+    /// one tuple per asserted key. `bytes_circuit_integral` in `GET /memory`.
+    pub fn integral_bytes(&self) -> usize {
+        self.contributors_bytes + self.feeds_bytes
+    }
+    /// The derived membership relation snapshot, published purely for read APIs.
+    /// `bytes_circuit_snapshots` in `GET /memory`.
+    pub fn snapshot_bytes(&self) -> usize {
+        self.members_bytes
+    }
+    /// Total measured membership-circuit owned/on-disk bytes (replaces the old key-count × 88 B
+    /// estimate for `bytes_membership_circuit`).
+    pub fn total_bytes(&self) -> usize {
+        self.integral_bytes() + self.snapshot_bytes()
+    }
 }
 
 /// Handle to the membership circuit. Cheap to clone; the registry and readers share it.
@@ -169,13 +214,19 @@ impl MembershipCircuit {
     /// Build the circuit and start its thread. State is in-memory only — nodes reseed from
     /// Postgres on registration, feeds from shape backfills.
     ///
-    /// `ELECTRIC_IVM_FEED_TRACE=0` disables the published feed-relation trace — the SECOND
-    /// copy of every feed's key set, used only for drop-time retraction and introspection
-    /// (the upsert operator's internal integral, which decides the emissions, is unaffected).
-    /// Disabling roughly halves the per-feed memory term; dropped shapes then leave their
-    /// (unreachable — feed ids are never reused) entries in the operator integral instead of
-    /// retracting them, a documented trade until stream-fold drop enumeration lands
-    /// (bead dbsp-ds-4d8).
+    /// `ELECTRIC_IVM_FEED_TRACE=0` disables the published feed-relation trace — the host-side
+    /// `ro_snapshot` view used only for drop-time retraction and introspection.
+    ///
+    /// NOTE (measured, Task 1.3): this is **not** a memory-halving knob. `feed_stream.
+    /// integrate_trace()` does not build a second copy of the feed key set — dbsp registers the
+    /// feed upsert operator's own integral under `TraceId(stream)` in the circuit cache, and
+    /// `integrate_trace` reuses it, so the published snapshot shares the operator's batches
+    /// (`Arc`-cloned). The profiler's `total_used_bytes` is within ~0.03% with the trace on vs
+    /// off (see `feed_trace_snapshot_shares_operator_integral`); disabling only drops a cheap
+    /// host-side view, saving negligible RAM. The knob's real effect is behavioral: dropped
+    /// shapes then leave their (unreachable — feed ids are never reused) entries in the operator
+    /// integral instead of retracting them, a documented trade until stream-fold drop
+    /// enumeration lands (bead dbsp-ds-4d8).
     pub fn start() -> Result<MembershipCircuit> {
         let feed_trace = std::env::var("ELECTRIC_IVM_FEED_TRACE").map(|v| v != "0").unwrap_or(true);
         Self::start_with(feed_trace)
@@ -334,12 +385,54 @@ impl MembershipCircuit {
         map_slice(&self.feeds, feed_id).len()
     }
 
+    /// Measured byte sizes of the published snapshots (see [`CircuitBytes`]). Cheap: reads the
+    /// three slot snapshots this circuit already holds and sums dbsp's per-batch
+    /// `approximate_byte_size`/`len` — no circuit round-trip, no profiler. Safe on the on-demand
+    /// `GET /memory` path; never call it from the 500 ms sampler.
+    pub fn snapshot_bytes(&self) -> CircuitBytes {
+        let (members_bytes, members_len) = snap_size(&self.members);
+        let (contributors_bytes, contributors_len) = snap_size(&self.contributors);
+        let (feeds_bytes, feeds_len) = snap_size(&self.feeds);
+        CircuitBytes {
+            members_bytes,
+            members_len,
+            contributors_bytes,
+            contributors_len,
+            feeds_bytes,
+            feeds_len,
+        }
+    }
+
+    /// Diagnostic only: the whole circuit's operator memory via dbsp's profiler —
+    /// `(total_used_bytes, total_storage_size)` summed over every stateful operator (all
+    /// integrals, `distinct` state, `z1` traces, upsert feedback). Heavy — round-trips every
+    /// worker through the circuit thread — so this is for tests/attribution, NOT `GET /memory`.
+    pub async fn profile_bytes(&self) -> (usize, usize) {
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(Cmd::Profile { resp: tx }).await.is_err() {
+            return (0, 0);
+        }
+        rx.await.unwrap_or((0, 0))
+    }
+
     /// Stop the circuit thread. State is in-memory only; nothing to persist.
     pub async fn shutdown(&self) {
         let (tx, rx) = oneshot::channel();
         if self.tx.send(Cmd::Shutdown { resp: tx }).await.is_ok() {
             let _ = rx.await;
         }
+    }
+}
+
+/// `(approximate_byte_size, len)` of the snapshot a slot currently holds (0 if unpublished).
+/// `approximate_byte_size` is dbsp's per-batch columnar size summed over the batches the
+/// `ro_snapshot` pins; `len` is the total tuple count across those batches (superseded,
+/// uncompacted `(k,+w)`/`(k,-w)` pairs included). Cheap — no circuit round-trip.
+fn snap_size<T: BatchReader>(slot: &Slot<T>) -> (usize, usize) {
+    let guard = slot.read().expect("snapshot slot");
+    match guard.as_ref() {
+        Some(s) => (s.inner().approximate_byte_size(), s.inner().len()),
+        None => (0, 0),
     }
 }
 
@@ -480,6 +573,21 @@ fn circuit_thread(
                 }
                 let _ = resp.send((flips, feed_deltas));
             }
+            Cmd::Profile { resp } => {
+                let bytes = match dbsp.retrieve_profile() {
+                    Ok(p) => {
+                        let used = p.total_used_bytes().map(|b| b.into_inner() as usize).unwrap_or(0);
+                        let stored =
+                            p.total_storage_size().map(|b| b.into_inner() as usize).unwrap_or(0);
+                        (used, stored)
+                    }
+                    Err(e) => {
+                        tracing::error!("membership circuit: retrieve_profile failed: {e}");
+                        (0, 0)
+                    }
+                };
+                let _ = resp.send(bytes);
+            }
             Cmd::Shutdown { resp } => {
                 let _ = dbsp.kill();
                 let _ = resp.send(());
@@ -616,8 +724,9 @@ mod tests {
         c.shutdown().await;
     }
 
-    /// With the feed trace disabled, emissions (feed deltas) still flow — only the
-    /// enumeration copy is gone: feed_pks/feed_len return empty, halving feed memory.
+    /// With the feed trace disabled, emissions (feed deltas) still flow — only the host-side
+    /// enumeration view is gone: feed_pks/feed_len return empty. (Real memory saved is
+    /// negligible — see `feed_trace_snapshot_shares_operator_integral`.)
     #[tokio::test(flavor = "multi_thread")]
     async fn feed_trace_knob_disables_enumeration_not_emissions() {
         let c = MembershipCircuit::start_with(false).unwrap();
@@ -661,6 +770,120 @@ mod tests {
         assert!(entries > 0, "storage dir must contain spilled state, found {entries} entries");
         c.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `snapshot_bytes` measures real dbsp columnar bytes: zero when empty, non-zero and
+    /// split into the raw upsert-map integrals (contributors + feeds) vs the derived members
+    /// snapshot once populated. This is the measured basis for `GET /memory`'s
+    /// `bytes_circuit_integral` / `bytes_circuit_snapshots` split.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snapshot_bytes_measures_and_splits_relations() {
+        let c = MembershipCircuit::start_full(true, None).unwrap();
+        assert_eq!(c.snapshot_bytes(), CircuitBytes::default(), "empty circuit owns no batch bytes");
+
+        let mut a = Assertions::default();
+        for i in 0..1000i64 {
+            // 1000 contributors over 100 distinct values on one node.
+            a.contributors.push(Tup2(ckey(1, &format!("c{i}")), Assert::Insert(Value::Int(i % 100))));
+            a.feeds.push(Tup2(ckey(9, &format!("f{i}")), Assert::Insert(Value::Null)));
+        }
+        c.apply(a).await;
+
+        let cb = c.snapshot_bytes();
+        // Contributors integral: 1000 live tuples; feeds integral: 1000; members: 100 distinct.
+        assert_eq!(cb.contributors_len, 1000);
+        assert_eq!(cb.feeds_len, 1000);
+        assert_eq!(cb.members_len, 100, "members is the deduplicated (node,value) relation");
+        assert!(cb.contributors_bytes > 0 && cb.feeds_bytes > 0 && cb.members_bytes > 0);
+        // The integral (raw maps) dwarfs the derived membership snapshot.
+        assert_eq!(cb.integral_bytes(), cb.contributors_bytes + cb.feeds_bytes);
+        assert_eq!(cb.snapshot_bytes(), cb.members_bytes);
+        assert!(cb.integral_bytes() > cb.snapshot_bytes());
+        assert_eq!(cb.total_bytes(), cb.integral_bytes() + cb.snapshot_bytes());
+        c.shutdown().await;
+    }
+
+    /// FEED_TRACE=0 does NOT free operator memory: dbsp shares the feed upsert operator's own
+    /// integral with our published `integrate_trace` snapshot (per-stream `TraceId` cache), so
+    /// disabling the trace only drops the host-side `ro_snapshot` view (feeds_bytes → 0) while
+    /// the circuit's real resident bytes (profiler `total_used_bytes`) are unchanged. Guards the
+    /// corrected doc claim on `start_with`'s `feed_trace` knob.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn feed_trace_snapshot_shares_operator_integral() {
+        let load = || {
+            let mut a = Assertions::default();
+            for i in 0..3000i64 {
+                a.feeds.push(Tup2(ckey(9, &format!("f{i}")), Assert::Insert(Value::Null)));
+            }
+            a
+        };
+        let on = MembershipCircuit::start_full(true, None).unwrap();
+        on.apply(load()).await;
+        let (used_on, _) = on.profile_bytes().await;
+        let feeds_view = on.snapshot_bytes().feeds_bytes;
+        on.shutdown().await;
+
+        let off = MembershipCircuit::start_full(false, None).unwrap();
+        off.apply(load()).await;
+        let (used_off, _) = off.profile_bytes().await;
+        assert_eq!(off.snapshot_bytes().feeds_bytes, 0, "no published feed view when disabled");
+        off.shutdown().await;
+
+        // The host-side feed view is non-trivial, yet the operator memory is within 5% either way.
+        assert!(feeds_view > 100_000, "feed view should be a meaningful number of bytes");
+        let (hi, lo) = (used_on.max(used_off), used_on.min(used_off));
+        assert!(
+            hi - lo < hi / 20,
+            "disabling the feed trace changed circuit memory by >5% ({used_on} vs {used_off}); \
+             the integrate_trace snapshot is NOT sharing the upsert integral as documented"
+        );
+    }
+
+    /// Pinning/compaction invariant: churning a FIXED live-key set across many steps must keep
+    /// the published snapshots bounded — dbsp's background merger reclaims the superseded
+    /// `(k,+w)/(k,-w)` tuples despite our per-step `ro_snapshot` (which pins at most one step,
+    /// since each step replaces the slot). If a snapshot pinned pre-compaction batches, the
+    /// spine's `len` would grow ~linearly with the step count instead of staying O(live keys).
+    ///
+    /// We assert on `len` (total tuples across pinned batches, superseded ones included) rather
+    /// than the brief's "snapshot bytes ≤ integral bytes × 1.5": members is a deduplicated
+    /// projection that is *structurally* ≤ the contributor integral, so that ratio holds
+    /// trivially and cannot detect intra-spine pinning. The real risk is superseded-batch
+    /// accumulation, which a growth-vs-steps bound tests directly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snapshots_do_not_pin_precompaction_batches() {
+        const LIVE: i64 = 400;
+        const STEPS: i64 = 400;
+        let c = MembershipCircuit::start_full(true, None).unwrap();
+        let seed = (0..LIVE)
+            .map(|i| Tup2(ckey(7, &format!("k{i}")), Assert::Insert(Value::Int(0))))
+            .collect();
+        c.apply(Assertions { contributors: seed, feeds: Vec::new() }).await;
+
+        let mut max_contrib_len = 0usize;
+        for step in 1..=STEPS {
+            let contributors = (0..LIVE)
+                .map(|i| Tup2(ckey(7, &format!("k{i}")), Assert::Insert(Value::Int(step))))
+                .collect();
+            c.apply(Assertions { contributors, feeds: Vec::new() }).await;
+            max_contrib_len = max_contrib_len.max(c.snapshot_bytes().contributors_len);
+        }
+
+        // Live set is unchanged: still exactly LIVE keys collapsing to 1 distinct value (the
+        // netted-weight view, which ignores superseded uncompacted tuples).
+        assert!(c.contains(7, &Value::Int(STEPS)));
+        assert_eq!(c.values_for_node(7, 0).0, 1, "one live value across all {LIVE} keys");
+        // Compaction bound: the spine never holds more than a small multiple of the live-key
+        // count. A pin/leak would make this ~STEPS × 2 × LIVE (≈320,000). Observed peak ≈ 15×
+        // LIVE; the ×50 threshold is generous headroom for merge-cadence timing variance while
+        // still an order of magnitude below the linear-pin failure mode.
+        let bound = (LIVE as usize) * 50;
+        assert!(
+            max_contrib_len <= bound,
+            "contributor spine grew to {max_contrib_len} tuples over {STEPS} steps (bound {bound}); \
+             superseded batches are being pinned — compaction is blocked"
+        );
+        c.shutdown().await;
     }
 
     /// Same value on two nodes stays isolated per node_id (unchanged from the zset design).
