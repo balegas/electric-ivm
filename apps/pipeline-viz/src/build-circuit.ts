@@ -57,8 +57,9 @@ function buildFull(g: EngineGraph): { nodes: Map<string, RawNode>; edges: RawEdg
         ...(o.state ? { stateId: o.state } : null),
         // The family params arrangement has no incoming data edge: it is populated by shape
         // create/drop (the control plane), not by any stream. Annotate rather than leave it looking
-        // disconnected.
-        ...(o.kind === 'arrange' ? { note: '← shape create / drop' } : null),
+        // disconnected. (Only the family arrange — a subquery shape's feed set is also kind
+        // `arrange` but IS fed by a data edge, the π assertions.)
+        ...(o.kind === 'arrange' && o.hop.startsWith('family:') ? { note: '← shape create / drop' } : null),
         ref: { kind: 'op', opKind: OP_KIND[o.kind], hop: o.hop, label },
       },
     })
@@ -74,15 +75,15 @@ function buildFull(g: EngineGraph): { nodes: Map<string, RawNode>; edges: RawEdg
   return { nodes, edges }
 }
 
-/** The compiled dbsp arrangement pipeline (always present once the always-on circuit is running):
- *  static infrastructure — one input per table, one map_index→integrate_trace arrangement per
- *  index, one weighted_count pipeline per counted table. Drawn as a separate lane it swamps the
- *  canvas (three-plus nodes per table), so instead it is FOLDED onto each table's SOURCE node: the
- *  source carries an "indexed" treatment + an index/counts count badge, and the detail panel
- *  expands the full list. The two consumer-edge kinds still hang off it, re-anchored to the source
- *  node: dashed LOOKUP edges to subquery dependents whose flip re-derivations read an index, and
- *  solid animated SERVING edges to circuit-served shapes and aggregates whose data comes from the
- *  circuit itself. Every arrangement id maps back to `src:<table>` so those edges land there. */
+/** The compiled dbsp counts pipelines (present whenever the counts circuit is running): one input
+ *  per counted table, one map_index(group)→weighted_count pipeline each. Drawn as a separate lane
+ *  it swamps the canvas, so instead it is FOLDED onto each table's SOURCE node: the source carries
+ *  an "indexed" treatment + a counts count badge, and the detail panel expands the full list.
+ *  Consumer edges hang off it, re-anchored to the source node — today that is the solid animated
+ *  SERVING edge to each counts-served aggregate's fold. (The `indexes` field and the dashed LOOKUP
+ *  edges below are legacy: the row-arrangement layer was removed — flip re-derivations go to
+ *  Postgres — so current engines emit `indexes: []` and only `circuit-agg` consumers. The branches
+ *  stay for older engine payloads.) Every pipeline id maps back to `src:<table>`. */
 function addArrangements(g: EngineGraph, nodes: Map<string, RawNode>, edges: RawEdge[]) {
   const arr = g.arrangements
   if (!arr) return
@@ -125,7 +126,8 @@ function addArrangements(g: EngineGraph, nodes: Map<string, RawNode>, edges: Raw
     if (c.dependentKind === 'circuit-shape' || c.dependentKind === 'circuit-agg') {
       // A SERVING edge: the dependent's data comes FROM the circuit (seeded there, maintained
       // there) — not an occasional read. It lands on the dependent's own operator: the fold of a
-      // counts-served aggregate, the membership semijoin (or standalone σ) of a served shape.
+      // counts-served aggregate, or — legacy `circuit-shape` payloads only — the membership
+      // semijoin (or standalone σ) of a cohort-served shape.
       const candidates =
         c.dependentKind === 'circuit-agg'
           ? [`fold:${c.dependentId}`, `snk:${c.dependentId}`]
@@ -141,8 +143,9 @@ function addArrangements(g: EngineGraph, nodes: Map<string, RawNode>, edges: Raw
       })
       continue
     }
-    // A LOOKUP edge feeds the dependent's own operator — a shape's membership semijoin, or a
-    // nested node's inner filter: the exact operators whose flip re-derivations the index serves.
+    // LEGACY (older engine payloads only — current engines never emit shape/node consumers):
+    // a LOOKUP edge feeds the dependent's own operator — a shape's membership semijoin, or a
+    // nested node's inner filter: the operators whose flip re-derivations the index served.
     const target = c.dependentKind === 'shape' ? `sj:${c.dependentId}` : `sqf:${c.dependentId}`
     if (!nodes.has(target)) continue
     edges.push({
@@ -319,10 +322,11 @@ function planGroups(g: EngineGraph): GroupPlan {
       redirect.set(`sqp:${sig}`, distId)
       redirect.set(`dist:${sig}`, distId)
     }
-    // …and the outer chain (membership semijoin → π → sink) to the SINK rep.
+    // …and the outer chain (membership semijoin → π → feed set → sink) to the SINK rep.
     for (const sid of e.ids) {
       redirect.set(`sj:${sid}`, snkId)
       redirect.set(`pi:${sid}`, snkId)
+      redirect.set(`feed:${sid}`, snkId)
       redirect.set(`snk:${sid}`, snkId)
     }
   }

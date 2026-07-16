@@ -119,12 +119,14 @@ function fixture(): EngineGraph {
     op('snk:s2', 'sink', 'shape:s2', 'shape:s2'),
     op('pi:s3', 'project', 'shape:s3'),
     op('snk:s3', 'sink', 'shape:s3', 'shape:s3'),
-    // subquery shapes (s55, s68)
+    // subquery shapes (s55, s68) — π asserts into the feed set, whose check-and-set gates deletes
     op('sj:s55', 'join', 'shape:s55'),
     op('pi:s55', 'project', 'shape:s55'),
+    op('feed:s55', 'arrange', 'shape:s55'),
     op('snk:s55', 'sink', 'shape:s55', 'shape:s55'),
     op('sj:s68', 'join', 'shape:s68'),
     op('pi:s68', 'project', 'shape:s68'),
+    op('feed:s68', 'arrange', 'shape:s68'),
     op('snk:s68', 'sink', 'shape:s68', 'shape:s68'),
     // subquery inner-set nodes
     op('sqf:' + sigA, 'filter', 'node:' + sigA),
@@ -150,10 +152,12 @@ function fixture(): EngineGraph {
     flow('pi:s3', 'snk:s3'),
     flow('d:issues', 'sj:s55'),
     flow('sj:s55', 'pi:s55'),
-    flow('pi:s55', 'snk:s55'),
+    flow('pi:s55', 'feed:s55'),
+    flow('feed:s55', 'snk:s55'),
     flow('d:issues', 'sj:s68'),
     flow('sj:s68', 'pi:s68'),
-    flow('pi:s68', 'snk:s68'),
+    flow('pi:s68', 'feed:s68'),
+    flow('feed:s68', 'snk:s68'),
     flow('d:projects', 'sqf:' + sigA),
     flow('sqf:' + sigA, 'sqp:' + sigA),
     flow('sqp:' + sigA, 'dist:' + sigA),
@@ -210,7 +214,7 @@ describe('circuit grouping', () => {
     // Exactly one sqgroup dist (IN-SET ARRANGE) and one sqgroup sink, standing in for two instances.
     expect(refKinds(grouped).filter((k) => k === 'sqgroup')).toHaveLength(2)
     for (const gone of [
-      'sj:s55', 'pi:s55', 'snk:s55', 'sj:s68', 'pi:s68', 'snk:s68',
+      'sj:s55', 'pi:s55', 'feed:s55', 'snk:s55', 'sj:s68', 'pi:s68', 'feed:s68', 'snk:s68',
       'dist:projects|id|owner=5', 'sqf:projects|id|owner=5', 'dist:projects|id|owner=8',
     ]) {
       expect(ids.has(gone)).toBe(false)

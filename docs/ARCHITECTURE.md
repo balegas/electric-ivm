@@ -79,9 +79,11 @@ Three ideas carry the whole design:
   (`REPLICA IDENTITY FULL`), so no local table state is needed to retract a row. The delta algebra
   is [`dbsp`](https://crates.io/crates/dbsp)'s — `Tup2` and `ZWeight` are dbsp's own, and
   `Value`/`Row` carry the `DBData` derive stack. Routing- and fallback-tier shapes are evaluated
-  by plain Rust (key routing + stateless predicate evaluation; internals doc §1); the shared
-  storage-enabled circuit (§6b) maintains the engine's table arrangements and counts pipelines
-  and serves membership shapes and decomposable COUNT aggregates.
+  by plain Rust (key routing + stateless predicate evaluation; internals doc §1); the circuit
+  tier (§6b) maintains the counts pipelines and the membership circuit's contributor relation,
+  serving decomposable COUNT aggregates and the subquery registry's inner-set state (the
+  per-feed delete gate lives host-side, `subq_feed.rs`). Row arrangements no longer exist —
+  row data lives in Postgres.
 - **Envelope** (`ds.rs`) — the unit on every stream:
   `{ type, key, value, old, headers{ operation, txid, offset, lsn, seq } }`. The ingestor stamps
   `lsn` (transaction **commit** LSN), `txid` (the Postgres **xid**), and `seq` (the change's position
@@ -256,11 +258,11 @@ sequencer feeds every table's deltas into:
   emission — without network under the lock. The engine exposes the in-flight count
   (`GET /replication/lsn` → `pendingFlips`) as the extra convergence-barrier term; it covers both
   undrained flips and enqueued-but-unlanded lane batches.
-- **Absolute emission via the per-feed relation** — the correctness rule that keeps deferred
+- **Absolute emission via the per-feed key set** — the correctness rule that keeps deferred
   flips convergent: for each touched pk the registry asserts the row's *current* membership into
-  the shape's slice of the circuit's **feed relation** (`(feed_id, pk)` upsert map), never a
+  the shape's **feed set** (`subq_feed::FeedSet`, one host-side Roaring bitmap per feed), never a
   history-dependent delta. An `upsert` is delivered for every matching candidate (updates to
-  continuing members flow); a `delete` is delivered **only when the relation actually retracts**,
+  continuing members flow); a `delete` is delivered **only when the check-and-set actually removes**,
   so a "not a member" verdict for a pk the stream never contained is structurally a no-op — the
   never-member spurious delete (the PR #30 wake-storm) cannot be emitted at all. Flip
   propagation runs deferred (out of commit order); absolute assertion converges regardless of
@@ -275,30 +277,33 @@ sequencer feeds every table's deltas into:
 
 ## 6b. The circuit tier: counts pipelines + the membership circuit
 
-The circuit tier is two small, always-in-memory dbsp circuits per engine (O(1) — never per
-shape). **Row data lives in Postgres, never engine-side**; there is no storage layer, no spill,
-no checkpoints.
+The circuit tier is two small dbsp circuits per engine (O(1) — never per shape). **Row data
+lives in Postgres, never engine-side.** The counts circuit is fully in-memory; the membership
+circuit's contributor relation spills to disk by default (a disposable per-boot cache — see its
+bullet). Neither circuit checkpoints: both reseed on boot.
 
 - The **counts circuit** (`arrangements.rs`) maintains the configured counts pipelines
   ((group → count) relations, O(distinct groups)). The sequencer feeds each transaction into it
   and steps it **before** fanning the transaction out, so circuit-served aggregates emit within
   the transaction that changed them.
 - The **membership circuit** (`subq_circuit.rs`, owned by the subquery registry, always on)
-  holds two **upsert maps** (dbsp `add_input_map`; the operator maintains the map and derives
-  exact deltas from absolute assertions). *Contributors* `(node_id, pk) → value`: projected to
+  holds the CONTRIBUTORS **upsert map** (dbsp `add_input_map`; the operator maintains the map
+  and derives exact deltas from absolute assertions): `(node_id, pk_id) → value`, projected to
   `(node_id, value)` weighted by contributor count → `integrate_trace` snapshot (serves
   `contains`/`has_null`/introspection) + `distinct → output` (the step's deltas are the
-  membership **flips**, §6). *Feeds* `(feed_id, pk)`: the map's own output deltas ARE the
-  emissions — deletes come only from retractions (§6). The registry evaluates templates
-  host-side per envelope, under its lock, and awaits the step — intra-transaction ordering is
-  identical to the old in-registry kernel, and reads are read-your-writes. Structure is fixed
-  at construction (two generic inputs); registering templates/nodes/binds/shapes is pure
-  runtime data — no rebuild, ever. State is O(contributing inner rows + feed rows),
-  bind-gated: only subscribed binds hold state, each seeded from Postgres like any backfill.
-  The relations **spill to disk by default** (dbsp's storage backend: spine batches page to
-  layer files under a per-boot temp dir with a bounded buffer cache; without checkpointing
-  the files are a disposable cache, auto-removed at shutdown). `ELECTRIC_IVM_SUBQ_STORAGE=0`
-  keeps them fully in-memory; `ELECTRIC_IVM_SUBQ_STORAGE_DIR` pins an explicit location.
+  membership **flips**, §6). The per-feed key sets — the delete gate — live **host-side**
+  (`subq_feed.rs`, one Roaring bitmap per feed over `u32` pk-dictionary ids): a synchronous
+  check-and-set under the registry lock, ~10–19× lighter than the former in-circuit feed
+  relation (§6). The registry evaluates templates host-side per envelope, under its lock, and
+  awaits the step — intra-transaction ordering is identical to the old in-registry kernel, and
+  reads are read-your-writes. Structure is fixed at construction (one generic input);
+  registering templates/nodes/binds is pure runtime data — no rebuild, ever. State is
+  O(contributing inner rows), bind-gated: only subscribed binds hold state, each seeded from
+  Postgres like any backfill. The contributor relation **spills to disk by default** (dbsp's
+  storage backend: spine batches page to layer files under a per-boot temp dir with a bounded
+  buffer cache; without checkpointing the files are a disposable cache, auto-removed at
+  shutdown). `ELECTRIC_IVM_SUBQ_STORAGE=0` keeps it fully in-memory;
+  `ELECTRIC_IVM_SUBQ_STORAGE_DIR` pins an explicit location.
 
 - **Counts pipelines** — `ELECTRIC_IVM_DBSP_COUNTS=table:col+col,…` compiles, per table (at
   most one spec each), a `map_index(group) → weighted_count` pipeline: a live COUNT per

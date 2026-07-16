@@ -179,12 +179,15 @@ fn circuit_ops_decompose_every_strategy() {
         state: Some("active"),
     };
     let tables = vec!["users".to_string(), "orders".to_string()];
+    let mut counts_agg = gs("s6", "users", None, false, Some(AggFn::Count)); // counts-served aggregate
+    counts_agg.circuit = Some(CircuitPlacement { label: "counts".into(), col: None, counts: true });
     let shapes = vec![
         gs("s1", "users", None, false, None),                    // standalone
         gs("s2", "users", Some(vec!["active"]), false, None),    // family member 1
         gs("s3", "users", Some(vec!["active"]), false, None),    // family member 2 (shared ops)
         gs("s4", "users", None, true, None),                     // subquery shape
-        gs("s5", "users", None, false, Some(AggFn::Count)),      // aggregate
+        gs("s5", "users", None, false, Some(AggFn::Count)),      // aggregate (in-engine fold)
+        counts_agg,
     ];
     let nodes = vec![GraphNode {
         sig: "orders|user_id|".into(),
@@ -213,12 +216,21 @@ fn circuit_ops_decompose_every_strategy() {
         "src:users", "d:users", // table
         "sigma:s1", "pi:s1", "snk:s1", // standalone
         "key:users:active", "arr:users:active", "rjoin:users:active", "snk:s2", "snk:s3", // family
-        "sj:s4", "snk:s4", // subquery shape
+        "sj:s4", "feed:s4", "snk:s4", // subquery shape (feed set gates the deletes)
         "sigma:s5", "fold:s5", "snk:s5", // aggregate
+        "fold:s6", "snk:s6", // counts-served aggregate (no σ — the circuit serves the fold)
         "sqf:orders|user_id|", "dist:orders|user_id|", // inner set
     ] {
         assert!(ids.contains(want), "missing operator {want}");
     }
+    // A counts-served aggregate runs no per-row σ: the fold's input is the counts pipeline's
+    // group deltas (the visualizer's serving edge), not a filtered row delta.
+    assert!(!ids.contains("sigma:s6"), "counts-served aggregate must not emit a σ operator");
+    assert!(edges.iter().any(|e| e.source == "fold:s6" && e.target == "snk:s6"));
+    // The subquery shape's deletes are gated by its host-side feed set (`subq_feed::FeedSet`):
+    // π feeds the gate, the gate feeds the sink.
+    assert!(edges.iter().any(|e| e.source == "pi:s4" && e.target == "feed:s4" && e.kind == "flow"));
+    assert!(edges.iter().any(|e| e.source == "feed:s4" && e.target == "snk:s4" && e.kind == "flow"));
     // Shared family ops emitted once despite two members.
     assert_eq!(ops.iter().filter(|o| o.id == "arr:users:active").count(), 1);
     // Hop ids use the trace namespace; state ids point at real summaries.

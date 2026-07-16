@@ -156,12 +156,15 @@ export const KIND_META: Record<NodeKind, KindMeta> = {
     color: '#7e22ce',
     bg: '#f3e8ff',
     tag: 'ARRANGE · STATE',
-    formula: 'index{key → shapes}',
+    formula: 'index{key → …}',
     stateful: true,
     inside:
-      'The family’s params arrangement: predicate-key tuples → the shapes registered on them. ' +
-      'Adding an equality shape is an index insert, not a new circuit. Holds no table rows — its ' +
-      'chip shows the live key/shape cardinality.',
+      'A maintained keyed relation. For a family it is the params arrangement: predicate-key ' +
+      'tuples → the shapes registered on them (adding an equality shape is an index insert, not a ' +
+      'new circuit). For a subquery shape it is the FEED SET — a host-side per-feed key set ' +
+      '(Roaring bitmap) holding the stream’s current pks: candidates are asserted absolutely, and ' +
+      'a delete is emitted iff the pk was actually present (check-and-set), so a never-member ' +
+      'delete is structurally impossible. Holds no table rows.',
   },
   'op-join': {
     color: '#1d4ed8',
