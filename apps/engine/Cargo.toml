@@ -64,3 +64,8 @@ libc = "0.2.186"
 tower = { version = "0.5", features = ["util"] }
 # start_paused tests for the live long-poll deadline (deterministic virtual time).
 tokio = { version = "1", features = ["full", "test-util"] }
+# SPIKE (Task 2.2, dbsp-ds-dh6 re-litigation): host-side Roaring-bitmap feed-set PoC in
+# src/subq_feed_repr_spike.rs. Already in the tree transitively (dbsp -> roaring 0.11.3);
+# named here only so the ignored measurement test can import it. Delete both together if the
+# spike lands no-go. See docs/notes/2026-07-16-feed-set-representation-spike.md.
+roaring = "0.11"

@@ -37,6 +37,12 @@ pub mod retention;
 pub mod schema;
 pub mod sql;
 pub mod subq_circuit;
+// SPIKE (Task 2.2): measurement-only comparison of the in-circuit feed relation vs a host-side
+// HashMap<feed_id, RoaringBitmap>. Test-only, ignored by default, cheap to delete (this line +
+// src/subq_feed_repr_spike.rs + the roaring dev-dep). See
+// docs/notes/2026-07-16-feed-set-representation-spike.md.
+#[cfg(test)]
+mod subq_feed_repr_spike;
 pub mod subquery;
 pub mod trace;
 pub mod value;
