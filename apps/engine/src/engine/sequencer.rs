@@ -83,8 +83,9 @@ pub(crate) enum SequencerCmd {
     DumpNode { table: String, node_id: String, resp: tokio::sync::oneshot::Sender<Option<serde_json::Value>> },
     /// On-demand owned-heap byte-walk of every table's live executor state (see
     /// `introspection::exec_heap_bytes`) — the memory probe's `bytes_executors` term. Sent only
-    /// from `Engine::mem_cardinalities` (the background sampler / `GET /memory`), never from the
-    /// per-batch write path, so the walk's cost never lands on ingestion.
+    /// from `Engine::mem_bytes` (called only by `GET /memory` — never the 500ms background
+    /// sampler, which calls the cheap `Engine::mem_cardinalities` instead), never from the
+    /// per-batch write path, so the walk's cost never lands on ingestion or on the sampler.
     MemBytes { resp: tokio::sync::oneshot::Sender<usize> },
 }
 

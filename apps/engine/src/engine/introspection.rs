@@ -616,14 +616,14 @@ pub(crate) fn stats_of(exec: &TableExec) -> TableStats {
 
 /// Owned-heap estimate of one table's executor structures: standalone shapes + their
 /// necessary-conjunct index, family routers (which hold the `RoutedShape`s), aggregate folds +
-/// their conjunct index — the memory probe's `bytes_executors` term (see
-/// `Engine::mem_cardinalities`).
+/// their conjunct index — the memory probe's `bytes_executors` term (see `Engine::mem_bytes`).
 ///
 /// **On-demand only.** This walk must never run on the per-batch write path: `stats_of` above
 /// runs inside `publish_all`, which fires after every processed sequencer batch, so anything
-/// computed there is paid on every write. This function is instead invoked exclusively via
-/// `SequencerCmd::MemBytes`, sent only from `Engine::mem_cardinalities` (the 500ms background
-/// sampler and `GET /memory`) — see `sequencer.rs`'s handling of that command.
+/// computed there is paid on every write. It must also never run on the 500ms background sampler
+/// (`mem::spawn_sampler`), which calls the cheap `Engine::mem_cardinalities` only. This function is
+/// instead invoked exclusively via `SequencerCmd::MemBytes`, sent only from `Engine::mem_bytes`
+/// (called only by `GET /memory`) — see `sequencer.rs`'s handling of that command.
 pub(crate) fn exec_heap_bytes(exec: &TableExec) -> usize {
     exec.shapes.heap_bytes()
         + exec.shape_index.heap_bytes()

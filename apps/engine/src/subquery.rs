@@ -512,8 +512,26 @@ impl SubqueryRegistry {
 
     /// Memory-relevant registry totals: maintained nodes, total contributor pks across all nodes (the
     /// dominant per-node state — one entry per inner row producing a value), distinct values, shapes,
-    /// edges, and an owned-heap estimate of the membership circuit itself (`bytes_membership_circuit`).
-    /// Used by the memory probe to attribute subquery state growth.
+    /// and edges. Used by the memory probe to attribute subquery state growth — cheap enough for the
+    /// 500ms background sampler (`mem::spawn_sampler`): everything here is already published/derivable
+    /// per-node index state, the same walk this method did before the byte-level accounting phase.
+    ///
+    /// Does NOT include the membership-circuit byte estimate — see [`Self::membership_bytes`], the
+    /// on-demand-only (`GET /memory`) counterpart that adds the FEEDS-map walk on top of this.
+    pub fn mem_totals(&self) -> (usize, usize, usize, usize, usize) {
+        let mut contributors = 0;
+        let mut distinct = 0;
+        for n in self.nodes.values() {
+            let (d, vals) = self.circuit.values_for_node(n.node_id, usize::MAX);
+            contributors += vals.iter().map(|(_, c)| c).sum::<usize>();
+            distinct += d;
+        }
+        (self.nodes.len(), contributors, distinct, self.shapes.len(), self.edges_count())
+    }
+
+    /// An owned-heap estimate of the membership circuit itself (`bytes_membership_circuit`) — the
+    /// on-demand-only (`GET /memory`) counterpart to [`Self::mem_totals`]. Never called from the
+    /// 500ms background sampler.
     ///
     /// The circuit's dbsp spines don't expose exact byte sizes cheaply (they may be disk-spilled —
     /// see `subq_circuit`'s `SpillConfig` — so there is no single in-memory allocation to measure),
@@ -523,7 +541,7 @@ impl SubqueryRegistry {
     /// `emit_for_shapes`/`drop_subquery_shape` already do), times one entry's estimated footprint: the
     /// key `Row`'s `Vec` allocation (an id `Value::Int` + a stringified-pk `Value::Text`) plus a
     /// typical pk string length. A documented lower-bound estimate, not allocator-exact.
-    pub fn mem_totals(&self) -> (usize, usize, usize, usize, usize, usize) {
+    pub fn membership_bytes(&self) -> usize {
         /// Assumed average length (bytes) of a stringified primary key — the dominant unknown in
         /// the per-entry estimate below (an int pk like `"483920"` or a short uuid segment).
         const EST_AVG_PK_BYTES: usize = 16;
@@ -541,8 +559,7 @@ impl SubqueryRegistry {
             distinct += d;
         }
         let feed_keys: usize = self.shapes.values().map(|s| self.circuit.feed_len(s.feed_id)).sum();
-        let membership_bytes = (contributors + distinct + feed_keys) * ENTRY_BYTES_ESTIMATE;
-        (self.nodes.len(), contributors, distinct, self.shapes.len(), self.edges_count(), membership_bytes)
+        (contributors + distinct + feed_keys) * ENTRY_BYTES_ESTIMATE
     }
 
     /// Per-node topology for the introspection endpoint: signature, inner table, current distinct value

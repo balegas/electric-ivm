@@ -1027,3 +1027,57 @@ async fn emission_lanes_order_and_barrier() {
         assert_eq!(keys, (0..50).collect::<Vec<_>>(), "{stream} landed out of enqueue order");
     }
 }
+
+/// Regression guard for the sampler byte-walk fix: `mem_cardinalities` — the ONLY cardinality path
+/// the 500ms background sampler (`mem::spawn_sampler`) is allowed to call — must never populate any
+/// `bytes_*` field. If a future change re-wires the byte-level `HeapSize` walk (or the
+/// `SequencerCmd::MemBytes` round-trip) into this function, this test catches it: every `bytes_*`
+/// field would stop being its `Default` zero. The expensive walk lives only in `Engine::mem_bytes`,
+/// called exclusively from the `GET /memory` HTTP handler (see `http::get_memory`).
+#[tokio::test(flavor = "multi_thread")]
+async fn sampler_cardinalities_never_populates_bytes_fields() {
+    let ts = users();
+    let engine = Engine::new(DsClient::new("http://127.0.0.1:1"));
+    engine.state.lock().await.tables.insert("users".into(), ts.clone());
+    engine.state.lock().await.shapes.insert(
+        "s1".into(),
+        ShapeRecord {
+            id: "s1".into(),
+            table: "users".into(),
+            stream_path: "shape/s1".into(),
+            changes_only: false,
+            where_json: None,
+            columns: Some(vec!["id".into(), "name".into(), "active".into()]),
+            family_key: None,
+            is_subquery: false,
+            aggregate: None,
+        },
+    );
+
+    let card = engine.mem_cardinalities().await;
+
+    // The cheap counts this path exists to serve are still populated (sanity: not just an
+    // all-zero struct because the engine is empty).
+    assert_eq!(card.shapes, 1);
+
+    // Every bytes_* field must be exactly zero — `mem_cardinalities` must never call
+    // `HeapSize::heap_bytes` or send `SequencerCmd::MemBytes`. Only `Engine::mem_bytes` (called
+    // only by `GET /memory`) is allowed to populate these.
+    assert_eq!(card.bytes_shape_records, 0, "sampler path must not walk ShapeRecord heap bytes");
+    assert_eq!(card.bytes_executors, 0, "sampler path must not round-trip SequencerCmd::MemBytes");
+    assert_eq!(card.bytes_retention, 0, "sampler path must not walk retention lifecycle heap bytes");
+    assert_eq!(card.bytes_subquery_registry, 0, "sampler path must not walk subquery registry heap bytes");
+    assert_eq!(card.bytes_membership_circuit, 0, "sampler path must not compute the membership-circuit byte estimate");
+    assert_eq!(card.bytes_electric_adapter, 0, "sampler path must not walk the electric adapter TTL registry heap bytes");
+
+    // `Engine::mem_bytes` — the on-demand-only counterpart — does populate them (proves the split
+    // isn't just "the fields are dead code"; the walk still exists and works, just gated off the
+    // sampler path).
+    let bytes = engine.mem_bytes().await;
+    assert!(bytes.bytes_shape_records > 0, "mem_bytes should report non-zero owned heap for a populated shape record");
+
+    // And merging them back in (`Cardinalities::with_bytes`, what `GET /memory` does) round-trips.
+    let merged = card.with_bytes(bytes);
+    assert_eq!(merged.bytes_shape_records, merged.bytes_shape_records); // shape carried through
+    assert!(merged.bytes_shape_records > 0);
+}

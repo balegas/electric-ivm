@@ -798,24 +798,19 @@ impl Engine {
     /// Engine-internal cardinalities for the memory probe — the structures whose growth drives RSS:
     /// registered shapes, per-table tailers, shared **family circuits** (the M× join-trace amplifier:
     /// each holds the base table once), standalone per-shape circuits, and the subquery registry's
-    /// nodes/contributor-pks. Read directly from in-memory state (cheap; no tailer round-trip).
+    /// nodes/contributor-pks. Read directly from in-memory state (cheap; no tailer round-trip, no
+    /// byte-walk, no sequencer round-trip).
     ///
-    /// Also reports byte-level self-accounting (Phase 0 of the memory-reduction effort): a
-    /// [`crate::heap_size::HeapSize`] lower-bound owned-heap estimate per major structure. These
-    /// are LOWER BOUNDS (owned heap, not allocator slack) — the gap vs. `process.rss_bytes` is the
-    /// allocator/pinning term this phase is instrumenting to measure.
-    ///
-    /// `bytes_executors` (standalone shapes + their conjunct index, family routers, aggregate
-    /// folds + their index) is the one term this method cannot read out of already-published
-    /// state: those structures are privately owned by the sequencer task's `execs` map, never
-    /// exposed through a shared mutex (unlike `stats`/`node_states`, which are republished after
-    /// every batch specifically so other tasks can read them cheaply). Walking them for real bytes
-    /// is not cheap enough to piggyback on every batch (see `sequencer::publish_all`/`stats_of`),
-    /// so instead this method round-trips a one-off `SequencerCmd::MemBytes` — mirroring the
-    /// `DumpNode` command's pattern (see `dump_node` below) — so the byte-walk itself only ever
-    /// runs on this on-demand path (the background sampler / `GET /memory`), never per batch.
+    /// This is the ONLY cardinality path the 500ms background sampler (`mem::spawn_sampler`) is
+    /// allowed to call. It deliberately never touches `HeapSize::heap_bytes` or sends
+    /// `SequencerCmd::MemBytes` — every `bytes_*` field on the returned [`crate::mem::Cardinalities`]
+    /// is left at its `Default` zero. Byte-level self-accounting (Phase 0 of the memory-reduction
+    /// effort) lives in the sibling [`Self::mem_bytes`], called only by `GET /memory`; see its doc
+    /// comment for why that split exists (a prior regression: this method used to do the walk
+    /// inline, which meant a ~100MB recursive walk + a `MemBytes` sequencer round-trip ran twice a
+    /// second at 50k+ shapes).
     pub async fn mem_cardinalities(&self) -> crate::mem::Cardinalities {
-        let (shapes, tailers, tables, families, family_shapes, standalone, bytes_shape_records, cmd_tx) = {
+        let (shapes, tailers, tables, families, family_shapes, standalone) = {
             let st = self.state.lock().await;
             let mut families = 0usize;
             let mut family_shapes = 0usize;
@@ -831,36 +826,11 @@ impl Engine {
                     standalone += s.standalone;
                 }
             }
-            let bytes_shape_records = st.shapes.heap_bytes();
-            let cmd_tx = st.sequencer.as_ref().map(|seq| seq.cmd_tx.clone());
-            (
-                st.shapes.len(),
-                tables_with_execs,
-                st.tables.len(),
-                families,
-                family_shapes,
-                standalone,
-                bytes_shape_records,
-                cmd_tx,
-            )
+            (st.shapes.len(), tables_with_execs, st.tables.len(), families, family_shapes, standalone)
         };
-        // Byte-walk every table's live executor state, on demand only (see the doc comment
-        // above): ask the sequencer task directly, since it privately owns `execs`.
-        let bytes_executors = match cmd_tx {
-            Some(tx) => {
-                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                if tx.send(SequencerCmd::MemBytes { resp: resp_tx }).is_ok() {
-                    resp_rx.await.unwrap_or(0)
-                } else {
-                    0
-                }
-            }
-            None => 0,
-        };
-        let (sq_nodes, sq_contributors, sq_distinct, sq_shapes, sq_edges, bytes_membership_circuit, bytes_subquery_registry) = {
+        let (sq_nodes, sq_contributors, sq_distinct, sq_shapes, sq_edges) = {
             let reg = self.subqueries.lock().await;
-            let (nodes, contributors, distinct, shapes, edges, membership_bytes) = reg.mem_totals();
-            (nodes, contributors, distinct, shapes, edges, membership_bytes, reg.heap_bytes())
+            reg.mem_totals()
         };
         let shapes_dormant = self
             .lives
@@ -869,8 +839,6 @@ impl Engine {
             .values()
             .filter(|l| matches!(l.state, LifeState::Dormant { .. }))
             .count();
-        let bytes_retention = self.lives.lock().unwrap().heap_bytes();
-        let bytes_electric_adapter = crate::electric::ttl_registry_heap_bytes().await;
         crate::mem::Cardinalities {
             shapes,
             shapes_dormant,
@@ -884,6 +852,56 @@ impl Engine {
             subquery_distinct_values: sq_distinct,
             subquery_shapes: sq_shapes,
             subquery_edges: sq_edges,
+            ..Default::default()
+        }
+    }
+
+    /// On-demand byte-level self-accounting (Phase 0 of the memory-reduction effort): a
+    /// [`crate::heap_size::HeapSize`] lower-bound owned-heap estimate per major structure. These
+    /// are LOWER BOUNDS (owned heap, not allocator slack) — the gap vs. `process.rss_bytes` is the
+    /// allocator/pinning term this phase is instrumenting to measure.
+    ///
+    /// Expensive: locks engine state, round-trips a one-off `SequencerCmd::MemBytes` to the
+    /// sequencer task (mirroring the `DumpNode` command's pattern — see `dump_node` below), locks
+    /// the subquery registry, and walks roughly the engine's entire owned heap (~100MB at 50k
+    /// shapes). Call this ONLY from the `GET /memory` HTTP handler — never from the 500ms
+    /// background sampler (`mem::spawn_sampler`), which calls `mem_cardinalities` instead. Mixing
+    /// this into the sampler's path was exactly the prior regression (+41%/+52% peak/steady RSS at
+    /// 100k subscriptions from twice-a-second byte walks); see `mem::spawn_sampler`'s doc comment.
+    ///
+    /// `bytes_executors` (standalone shapes + their conjunct index, family routers, aggregate
+    /// folds + their index) is the one term this method cannot read out of already-published
+    /// state: those structures are privately owned by the sequencer task's `execs` map, never
+    /// exposed through a shared mutex (unlike `stats`/`node_states`, which are republished after
+    /// every batch specifically so other tasks can read them cheaply). Walking them for real bytes
+    /// is not cheap enough to piggyback on every batch (see `sequencer::publish_all`/`stats_of`),
+    /// so instead this method round-trips the one-off `SequencerCmd::MemBytes` so the byte-walk
+    /// itself only ever runs on this on-demand path, never per batch.
+    pub async fn mem_bytes(&self) -> crate::mem::HeapBytes {
+        let (bytes_shape_records, cmd_tx) = {
+            let st = self.state.lock().await;
+            (st.shapes.heap_bytes(), st.sequencer.as_ref().map(|seq| seq.cmd_tx.clone()))
+        };
+        // Byte-walk every table's live executor state: ask the sequencer task directly, since it
+        // privately owns `execs`.
+        let bytes_executors = match cmd_tx {
+            Some(tx) => {
+                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                if tx.send(SequencerCmd::MemBytes { resp: resp_tx }).is_ok() {
+                    resp_rx.await.unwrap_or(0)
+                } else {
+                    0
+                }
+            }
+            None => 0,
+        };
+        let (bytes_membership_circuit, bytes_subquery_registry) = {
+            let reg = self.subqueries.lock().await;
+            (reg.membership_bytes(), reg.heap_bytes())
+        };
+        let bytes_retention = self.lives.lock().unwrap().heap_bytes();
+        let bytes_electric_adapter = crate::electric::ttl_registry_heap_bytes().await;
+        crate::mem::HeapBytes {
             bytes_shape_records,
             bytes_executors,
             bytes_retention,
