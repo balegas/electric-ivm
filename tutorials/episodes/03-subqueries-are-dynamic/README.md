@@ -163,7 +163,7 @@ already running. There is exactly one place today's engine still asks you to con
 *ahead of time*: live **COUNT** groupings, via the `ELECTRIC_CIRCUITS_DBSP_COUNTS` environment
 variable. That's a config change plus a restart — episode 4 is entirely about it.
 
-(If you want the engine-internals view of how shapes land on the router versus the subquery
+(If you want the engine-internals view of how live queries land on the router versus the subquery
 registry — the terminology engine developers use for this split — see the "Serving tiers" section of
 `docs/ivm-engine-internals.md`. This episode deliberately doesn't use that vocabulary: from your
 app's side, it's all just "write the query.")

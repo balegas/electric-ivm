@@ -232,10 +232,10 @@ impl Config {
             .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
             .unwrap_or(true);
 
-        // The dbsp arrangement circuit is always built — it is mandatory infrastructure, no longer
-        // gated by an on/off flag. The knobs below only tune it (state dir, cache/spill budgets,
-        // extra indexes, counts pipelines); empty `_INDEXES`/`_COUNTS` are valid (the circuit still
-        // builds per-table primary-key arrangements).
+        // The dbsp counts circuit is always built — it is mandatory infrastructure, no longer
+        // gated by an on/off flag. It maintains only the configured COUNT groupings (`_COUNTS`);
+        // row data lives in Postgres, not here. `_INDEXES` is deprecated and ignored (it configured
+        // the removed per-table row arrangements); empty `_INDEXES`/`_COUNTS` are valid.
         let dbsp = DbspConfig {
             // Default dir is keyed by the replication slot: dbsp state is only valid for the
             // database identity it was built from, and parallel engines (conformance harnesses)

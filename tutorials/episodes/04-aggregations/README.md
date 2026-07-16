@@ -67,10 +67,11 @@ printf '%s\n' "$AGG"
 
 ```json
 {"result":{"data":{"shapeId":"<id>","table":"todos",
-  "streamPath":"shape/<id>","streamUrl":"http://localhost:8791/shape/<id>"}}}
+  "streamPath":"shape/<id>","streamUrl":"http://ds:8791/shape/<id>"}}}
 ```
 
-Read its feed from the durable-streams server:
+(`streamUrl` names the durable-streams server by its in-cluster hostname `ds:8791`; from your host
+you reach the same feed at the published port, `http://localhost:8791`.) Read its feed:
 
 ```sh
 SHAPE_ID=$(printf '%s' "$AGG" | sed -n 's/.*"shapeId":"\([^"]*\)".*/\1/p')
@@ -78,7 +79,7 @@ curl -s "http://localhost:8791/shape/$SHAPE_ID?offset=-1"
 ```
 
 ```json
-[{"type":"todos","key":"agg","value":{"value":2,"n":2},"headers":{"operation":"upsert"}}]
+[{"type":"todos","key":"agg","value":{"n":2,"value":2},"headers":{"operation":"upsert"}}]
 ```
 
 Groceries (list 1) has two open todos — *buy milk*, *buy eggs* — so the count is `2` over `n=2`
@@ -104,7 +105,7 @@ curl -s "http://localhost:7010/shapes/$AGG_ID/rows"
 
 ```json
 {"id":"<id>","table":"todos","changesOnly":false,"count":1,"truncated":false,
- "rows":[{"key":"agg","value":{"value":2,"n":2}}]}
+ "rows":[{"key":"agg","value":{"n":2,"value":2}}]}
 ```
 
 On the pipeline explorer, this aggregate's row in the sidebar wears a **`circuit · counts`** badge,
@@ -124,7 +125,7 @@ Re-read either feed and the count is **1**:
 
 ```sh
 curl -s "http://localhost:7010/shapes/$AGG_ID/rows"
-# → {"value":1,"n":1}} for the (1, false) group
+# → {"n":1,"value":1}} for the (1, false) group
 ```
 
 The `(list_id=1, done=false)` group's weighted count dropped by one on that step, and the aggregate
