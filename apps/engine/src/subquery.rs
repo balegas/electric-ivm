@@ -24,7 +24,7 @@ use crate::value::{Tup2, ZWeight};
 use crate::ds::{DsClient, Envelope};
 use crate::heap_size::HeapSize;
 use crate::pk_dict::PkDict;
-use crate::subq_circuit::{Assert, Assertions, FeedDelta, PkKey};
+use crate::subq_circuit::{Assert, Assertions, PkKey};
 use crate::predicate::{
     CompiledPredicate, PredicateJson, SubqueryCollector, SubqueryEval, SubquerySig, subquery_sig,
 };
@@ -393,27 +393,25 @@ impl SubqueryRegistry {
         }
     }
 
-    /// Apply an assertion batch to the membership circuit and map its member deltas back to
-    /// node signatures (feed deltas pass through by feed id). Callers hold the registry lock
-    /// across the await — the circuit thread never takes this lock, and awaiting the step is
-    /// what gives every later membership read read-your-writes over this batch.
-    async fn apply_asserts(
-        &mut self,
-        asserts: Assertions,
-    ) -> (Vec<(SubquerySig, Flip)>, Vec<FeedDelta>) {
+    /// Apply a contributor assertion batch to the membership circuit and map its member deltas
+    /// back to node signatures. Callers hold the registry lock across the await — the circuit
+    /// thread never takes this lock, and awaiting the step is what gives every later membership
+    /// read read-your-writes over this batch. (The delete gate is no longer a circuit relation —
+    /// it lives in [`crate::subq_feed::FeedSet`], mutated synchronously under this same lock.)
+    async fn apply_asserts(&mut self, asserts: Assertions) -> Vec<(SubquerySig, Flip)> {
         if asserts.is_empty() {
-            return (Vec::new(), Vec::new());
+            return Vec::new();
         }
-        let (member_deltas, feed_deltas) = self.circuit.apply(asserts).await;
-        let flips = member_deltas
+        self.circuit
+            .apply(asserts)
+            .await
             .into_iter()
             .filter_map(|d| {
                 let sig = self.node_by_id.get(&d.node_id)?.clone();
                 let dir = if d.delta > 0 { FlipDir::Enter } else { FlipDir::Leave };
                 Some((sig, Flip { value: d.value, dir }))
             })
-            .collect();
-        (flips, feed_deltas)
+            .collect()
     }
 
     /// Build one node's contributor assertion for `pk` and keep the template's `pk_nodes`
@@ -471,7 +469,7 @@ impl SubqueryRegistry {
             asserts.contributors.extend(self.assert_node_row(sig, &pk, pv));
         }
         // Every assertion belongs to `sig`, so the sig on each flip is redundant here.
-        let (flips, _) = self.apply_asserts(asserts).await;
+        let flips = self.apply_asserts(asserts).await;
         flips.into_iter().map(|(_, f)| f).collect()
     }
 
@@ -817,19 +815,15 @@ impl SubqueryRegistry {
                 feed_id,
             },
         );
-        // Seed the feed with the backfilled pks (deltas discarded: the stream already carries the
-        // snapshot) — replaces the old known_members hand-off. This is phase C, under the registry
-        // lock, BEFORE the shape is discoverable by any live delta (the spike's §6 riskiest
-        // transition): the host-side FeedSet is seeded synchronously here, in the same critical
-        // section as the circuit feed relation, so no live delta can slip between "shape
-        // registered" and "feed seeded". During increment 2 both representations are seeded.
-        let mut feed_seed = Assertions::default();
+        // Seed the feed with the backfilled pks (the stream already carries the snapshot) —
+        // replaces the old known_members hand-off. This is phase C, under the registry lock,
+        // BEFORE the shape is discoverable by any live delta (the spike's §6 riskiest transition):
+        // the host-side FeedSet is seeded synchronously here — a `&mut self` op with no `.await` —
+        // so no live delta can slip between "shape registered" and "feed seeded".
         for pk in seeded_pks {
             let pk_id = self.pk_dict.get_or_insert(&pk);
-            feed_seed.feeds.push(Tup2(PkKey { id: feed_id, pk: pk_id }, true));
             self.feed_sets.insert(feed_id, pk_id);
         }
-        let _ = self.apply_asserts(feed_seed).await;
         if !pending.buffer.is_empty() {
             let candidates = crate::engine::membership::latest_rows_by_pk(&ts, &pending.buffer);
             self.emit_for_shapes(&ts, vec![(shape_id.to_string(), candidates)], None).await?;
@@ -911,20 +905,10 @@ impl SubqueryRegistry {
         // Sigs this shape pointed at, then drop the shape's edges.
         let sigs: Vec<SubquerySig> = collect_in_leaves(&shape.pred).into_iter().map(|l| l.sig).collect();
         self.remove_shape_edges(&shape.pred, shape_id);
-        // Retract the feed's key slice from the circuit (deltas discarded — the stream is
-        // being torn down) and drop the id mapping. Drop the host-side FeedSet too (O(1); keeps
-        // the shadow consistent during increment 2).
+        // Drop the shape's whole feed (O(1) — no per-pk enumeration, no circuit round-trip) and
+        // its id mapping. The stream is being torn down; the `feed_id` is never reused.
         self.feed_by_id.remove(&shape.feed_id);
         self.feed_sets.drop_feed(shape.feed_id);
-        let feeds: Vec<Tup2<PkKey, bool>> = self
-            .circuit
-            .feed_pk_ids(shape.feed_id)
-            .into_iter()
-            .map(|pk_id| Tup2(PkKey { id: shape.feed_id, pk: pk_id }, false))
-            .collect();
-        if !feeds.is_empty() {
-            let _ = self.circuit.apply(Assertions { contributors: Vec::new(), feeds }).await;
-        }
         self.decref_nodes(sigs).await;
     }
 
@@ -1035,7 +1019,7 @@ impl SubqueryRegistry {
             let evals = self.template_present(tkey, ts, delta);
             asserts.contributors.extend(self.template_assertions(tkey, evals, lsn, xid));
         }
-        let (flips, _) = self.apply_asserts(asserts).await;
+        let flips = self.apply_asserts(asserts).await;
         for sig in live_sigs {
             let flipped = flips.iter().any(|(s, _)| s == &sig);
             hop(&mut trace, format!("node:{sig}"), if flipped { "passed" } else { "dropped" });
@@ -1199,16 +1183,17 @@ impl SubqueryRegistry {
     }
 
     /// The ONE emission tail (spec §5): evaluate each shape's candidates against the current
-    /// membership snapshot, assert their feed presence absolutely, step the circuit once for
-    /// the whole batch, and deliver — **upserts for every matching candidate** (an update to a
-    /// continuing member must flow; upserts are always safe for readers), **deletes only from
-    /// the feed relation's retractions** (a "not a member" verdict for a pk the stream never
-    /// contained nets to nothing in the map, so the spurious delete that used to wake idle
-    /// long-polls is structurally impossible). Emission is absolute per pk, exactly as before:
+    /// membership snapshot, transition the host-side per-feed key set ([`crate::subq_feed::FeedSet`])
+    /// in the same synchronous step, and deliver — **upserts for every matching candidate** (an
+    /// update to a continuing member must flow; upserts are always safe for readers), **deletes
+    /// only where the feed actually retracts** (`FeedSet::remove` returns true — a "not a member"
+    /// verdict for a pk the stream never contained gates to nothing, so the spurious delete that
+    /// used to wake idle long-polls is structurally impossible). Emission is absolute per pk, so
     /// deferred flip propagation converges regardless of timing.
     ///
-    /// Callers hold the registry lock for the whole call (eval + circuit await + lane
-    /// enqueue), which is what keeps per-stream append order = evaluation order.
+    /// Callers hold the registry lock for the whole call (eval + FeedSet mutation + lane enqueue),
+    /// which is what keeps per-stream append order = evaluation order AND makes each emission
+    /// decision atomic with its bitmap transition (borrow-checker-enforced — no `.await` between).
     /// `candidates` are each shape's touched rows: `(latest row, still-exists)`.
     /// Returns per shape whether anything was delivered (trace hops).
     async fn emit_for_shapes(
@@ -1217,16 +1202,15 @@ impl SubqueryRegistry {
         groups: Vec<(String, Vec<(Row, bool)>)>,
         txid: Option<String>,
     ) -> Result<Vec<(String, bool, i64)>> {
-        // Phase 1: evaluate + build assertions and the member upserts, per shape.
-        let mut asserts = Assertions::default();
-        // shape id -> (member rows to upsert, candidate pk -> row for delete construction)
+        // Phase 1: evaluate each candidate against the current membership snapshot and, in the
+        // SAME synchronous step (no `.await`), transition the host-side FeedSet — building the
+        // member upserts and the gated deletes. A delete is emitted for a shape's pk **iff**
+        // `feed_sets.remove` returns true (the pk was actually in the feed): the check-and-set IS
+        // the emission decision, in one indivisible expression under the registry lock, so the
+        // spurious delete that used to wake idle long-polls is structurally impossible (the
+        // wake-storm gate, PR #30). Upserts are delivered for every current member unconditionally.
         let mut staged: Vec<(String, Vec<Row>)> = Vec::new();
-        // Shadow (increment 2): the host-side FeedSet's delete verdicts, recorded as each
-        // assertion is mirrored into the bitmap below, to be parity-checked against the circuit's
-        // feed retractions after the step. Debug-only — the bitmap side effects themselves run in
-        // every build (the FeedSet becomes the source of truth in increment 3).
-        #[cfg(debug_assertions)]
-        let mut bitmap_deletes: std::collections::HashSet<(i64, u32)> = std::collections::HashSet::new();
+        let mut deletes: HashMap<String, Vec<String>> = HashMap::new();
         for (shape_id, candidates) in groups {
             let Some(shape) = self.shapes.get(&shape_id) else { continue };
             let (pred, feed_id) = (shape.pred.clone(), shape.feed_id);
@@ -1236,70 +1220,22 @@ impl SubqueryRegistry {
                     Ok(pk) => pk,
                     Err(_) => continue,
                 };
-                let member = exists && pred.matches_ctx(&row, self);
-                // Mint only for a genuine member — a never-interned pk can hold no feed-relation
-                // contribution, so asserting `false` for it is a guaranteed no-op (mirrors the
-                // same probe-without-minting rationale in `template_assertions`).
-                let pk_id = if member {
-                    Some(self.pk_dict.get_or_insert(&pk))
-                } else {
-                    self.pk_dict.get(&pk)
-                };
-                if let Some(pk_id) = pk_id {
-                    asserts.feeds.push(Tup2(PkKey { id: feed_id, pk: pk_id }, member));
-                    // Mirror the assert into the host-side FeedSet: insert on a member verdict,
-                    // check-and-remove on a non-member. `remove` returning true IS the delete gate
-                    // (the same expression, same lock scope as the emission decision). Record the
-                    // gated deletes for the debug parity check against the circuit below.
-                    if member {
-                        self.feed_sets.insert(feed_id, pk_id);
-                    } else if self.feed_sets.remove(feed_id, pk_id) {
-                        #[cfg(debug_assertions)]
-                        bitmap_deletes.insert((feed_id, pk_id));
-                    }
-                }
-                if member {
+                if exists && pred.matches_ctx(&row, self) {
+                    // Current member: deliver the upsert and record presence in the feed.
+                    let pk_id = self.pk_dict.get_or_insert(&pk);
+                    self.feed_sets.insert(feed_id, pk_id);
                     members.push(row);
+                } else if let Some(pk_id) = self.pk_dict.get(&pk) {
+                    // Non-member: emit a delete only if the pk was actually in the feed. Probe the
+                    // dictionary WITHOUT minting — a never-interned pk can never have been a
+                    // member, so it gates with no id allocated (the same probe-without-mint
+                    // rationale as `template_assertions`).
+                    if self.feed_sets.remove(feed_id, pk_id) {
+                        deletes.entry(shape_id.clone()).or_default().push(pk);
+                    }
                 }
             }
             staged.push((shape_id, members));
-        }
-        // Phase 2: one circuit step for the whole batch; retractions are the deletes. Resolve
-        // each retracted pk id back to its pk string HERE — still under the registry lock, before
-        // the delta leaves the circuit tier — so the wire protocol carries the pk string
-        // unchanged and per-stream emission order is preserved (the order-preserving seam).
-        let (_, feed_deltas) = self.apply_asserts(asserts).await;
-        // Shadow parity (increment 2, spike §6): the host-side FeedSet's gated deletes must equal
-        // the circuit's feed retractions exactly, on the live path — the regression net proving
-        // the seed/backfill + flip-worker interleave stays equivalent before increment 3 removes
-        // the circuit feed input.
-        #[cfg(debug_assertions)]
-        {
-            let circuit_deletes: std::collections::HashSet<(i64, u32)> =
-                feed_deltas.iter().filter(|d| d.delta < 0).map(|d| (d.feed_id, d.pk_id)).collect();
-            debug_assert_eq!(
-                bitmap_deletes, circuit_deletes,
-                "FeedSet delete verdicts diverged from the circuit's feed retractions"
-            );
-        }
-        let mut deletes: HashMap<String, Vec<String>> = HashMap::new();
-        for d in feed_deltas {
-            if d.delta < 0 {
-                if let Some(shape_id) = self.feed_by_id.get(&d.feed_id) {
-                    // A feed retraction's pk id was minted when the pk was first asserted a
-                    // member (see `emit_for_shapes`'s mint-only-for-members change above), so
-                    // this is unreachable in practice; log-and-skip defensively rather than
-                    // panic on the emission hot path.
-                    match self.pk_dict.resolve(d.pk_id) {
-                        Some(pk) => deletes.entry(shape_id.clone()).or_default().push(pk.to_string()),
-                        None => tracing::warn!(
-                            pk_id = d.pk_id,
-                            feed_id = d.feed_id,
-                            "feed retraction resolved to an unminted pk id; dropping delete"
-                        ),
-                    }
-                }
-            }
         }
         // Phase 3: build + deliver per shape (still under the caller's lock — enqueue order
         // on each stream's FIFO lane is evaluation order).
@@ -2049,12 +1985,14 @@ mod tests {
         assert!(reg.pending_shapes.is_empty());
     }
 
-    /// The per-feed relation is the fix for the live-poll wake-storm bug, now structural:
+    /// The per-feed key set is the fix for the live-poll wake-storm bug, now structural:
     /// `emit_for_shapes` computes an *absolute* membership verdict for every touched pk, but a
-    /// delete envelope is built ONLY from the feed relation's retraction — a "not a member"
-    /// verdict for a pk the stream never contained nets to nothing in the circuit's upsert
-    /// map, so the spurious delete that used to wake every idle long-poll cannot be emitted
-    /// at all (there is no filter left to get out of sync).
+    /// delete envelope is built ONLY where the host-side FeedSet actually retracts — a "not a
+    /// member" verdict for a pk the stream never contained gates to nothing (`remove` returns
+    /// false), so the spurious delete that used to wake every idle long-poll cannot be emitted at
+    /// all (there is no filter left to get out of sync). The end-to-end drop is asserted via
+    /// `emit_for_shapes`; the gate proper (a known member's delete opens, a repeat nets nothing)
+    /// is asserted by poking the FeedSet directly — its verdicts are the delete gate.
     #[tokio::test(flavor = "multi_thread")]
     async fn feed_relation_drops_deletes_for_never_known_pks() {
         use crate::schema::TableDef;
@@ -2095,31 +2033,20 @@ mod tests {
         assert_eq!(reg.shapes["s1"].emitted.load(std::sync::atomic::Ordering::Relaxed), 0);
 
         // Seed pk 1 as a member (backfill hand-off), then the same verdict is a GENUINE leave.
-        // The pk id must match the one `emit_for_shapes` minted for row(1)'s pk string above, so
+        // The pk id must match the one `emit_for_shapes` would probe for row(1)'s pk string, so
         // build the key through the SAME dictionary.
         let pk_id = reg.pk_dict.get_or_insert("1");
-        let mut seed = Assertions::default();
-        seed.feeds.push(Tup2(PkKey { id: feed_id, pk: pk_id }, true));
-        reg.apply_asserts(seed).await;
-        let (_, fd) = reg
-            .circuit
-            .apply(Assertions {
-                contributors: Vec::new(),
-                feeds: vec![Tup2(PkKey { id: feed_id, pk: pk_id }, false)],
-            })
-            .await;
-        assert_eq!(fd.len(), 1, "a known member's delete must produce the retraction");
-        assert_eq!(fd[0].delta, -1);
+        reg.feed_sets.insert(feed_id, pk_id);
+        assert!(
+            reg.feed_sets.remove(feed_id, pk_id),
+            "a known member's delete must gate OPEN (remove returns true → retraction)"
+        );
 
-        // And once retracted, a repeat delete nets nothing again.
-        let (_, fd) = reg
-            .circuit
-            .apply(Assertions {
-                contributors: Vec::new(),
-                feeds: vec![Tup2(PkKey { id: feed_id, pk: pk_id }, false)],
-            })
-            .await;
-        assert!(fd.is_empty(), "repeat delete for an already-removed pk must net nothing");
+        // And once retracted, a repeat delete gates closed again.
+        assert!(
+            !reg.feed_sets.remove(feed_id, pk_id),
+            "repeat delete for an already-removed pk must gate closed (remove returns false)"
+        );
     }
 
     /// Focused regression: `emit_for_shapes` must mint a `pk_dict` id ONLY for a genuine member

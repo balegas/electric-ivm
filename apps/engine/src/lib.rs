@@ -41,12 +41,6 @@ pub mod subq_circuit;
 // the membership circuit (Task 2.2, dbsp-ds-dh6). See subq_feed.rs and
 // docs/notes/2026-07-16-feed-set-representation-spike.md.
 mod subq_feed;
-// SPIKE (Task 2.2): measurement-only comparison of the in-circuit feed relation vs a host-side
-// HashMap<feed_id, RoaringBitmap>. Test-only, ignored by default, cheap to delete (this line +
-// src/subq_feed_repr_spike.rs + the roaring dev-dep). See
-// docs/notes/2026-07-16-feed-set-representation-spike.md.
-#[cfg(test)]
-mod subq_feed_repr_spike;
 pub mod subquery;
 pub mod trace;
 pub mod value;

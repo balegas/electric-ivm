@@ -855,9 +855,8 @@ async fn membership_flips_agree_between_refcount_and_contributor_set() {
                     None => Assert::Delete,
                 },
             )],
-            feeds: Vec::new(),
         };
-        let (member_deltas, _) = circuit.apply(asserts).await;
+        let member_deltas = circuit.apply(asserts).await;
         let flips = member_deltas
             .into_iter()
             .map(|d| Flip {

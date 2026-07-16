@@ -1,37 +1,34 @@
-//! The membership circuit: subquery inner-set state AND per-feed key sets, powered by dbsp —
-//! the circuit tier's second pipeline family (alongside `arrangements`' counts pipelines).
+//! The membership circuit: subquery inner-set state, powered by dbsp — the circuit tier's second
+//! pipeline family (alongside `arrangements`' counts pipelines).
 //!
-//! One always-on circuit per engine holds two **upsert relations**: the CONTRIBUTORS map (dbsp
-//! `add_input_map`, key→value) and the FEEDS set (dbsp `add_input_set`, key-only presence). The
-//! caller asserts a key's current state *absolutely* (`Insert(v)`/`Delete` for the map; present
-//! `true`/`false` for the set), and the operator — which internally maintains the relation's
-//! contents — derives the exact retract/insert deltas itself. No host-side "remember the old value
-//! to retract it" bookkeeping exists anywhere. Keys are `PkKey { id, pk_id }` — the pk is a `u32`
-//! dictionary id (see [`crate::pk_dict`]), never a heap string:
+//! One always-on circuit per engine holds the CONTRIBUTORS **upsert map** (dbsp `add_input_map`,
+//! key→value). The caller asserts a key's current value *absolutely* (`Insert(v)`/`Delete`), and
+//! the operator — which internally maintains the relation's contents — derives the exact
+//! retract/insert deltas itself. No host-side "remember the old value to retract it" bookkeeping
+//! exists anywhere. Keys are `PkKey { id, pk_id }` — the pk is a `u32` dictionary id (see
+//! [`crate::pk_dict`]), never a heap string:
 //!
 //! ```text
 //! CONTRIBUTORS (node_id, pk_id) → projected value   [assert: row's current contribution]
 //!   → map to (node_id, value)                       // weight = contributor count
 //!   ├─ integrate_trace → membership snapshot        // contains()/has_null()/introspection
 //!   └─ distinct → accumulate_output                 // per-step deltas = membership FLIPS
-//!
-//! FEEDS (feed_id, pk_id)                             [assert: pk's current feed membership]
-//!   ├─ integrate_trace → feed snapshot              // drop-time enumeration, introspection
-//!   └─ accumulate_output                            // per-step deltas = THE EMISSIONS:
-//!                                                   //   +1 enter, −1 leave (deletes come
-//!                                                   //   ONLY from here — structural gating)
 //! ```
+//!
+//! The per-feed key sets (the delete gate) used to be a second in-circuit upsert-SET relation;
+//! Task 2.2 (bead dbsp-ds-dh6) moved them OUT to host-side Roaring bitmaps
+//! ([`crate::subq_feed::FeedSet`]) — ~10–19× lighter and needing no spill. This circuit now holds
+//! only contributors.
 //!
 //! Assertions are idempotent by construction (re-asserting the held value nets to nothing;
 //! deleting an absent key nets to nothing), which is what makes deferred, out-of-order flip
 //! propagation convergent without any highwater here — the sequencer's `(lsn, seq)` de-dup
 //! plus absolute assertion give exactly-once effect.
 //!
-//! Structure is fixed at construction: two generic inputs serve every node and every feed,
-//! so registering templates/nodes/binds/shapes is pure runtime data — no rebuild, ever.
-//! Threading mirrors `arrangements`: a dedicated OS thread owns the `DBSPHandle`, fed by a
-//! bounded channel; `apply` awaits the step, giving callers read-your-writes over both
-//! snapshots.
+//! Structure is fixed at construction: one generic input serves every node, so registering
+//! templates/nodes/binds is pure runtime data — no rebuild, ever. Threading mirrors
+//! `arrangements`: a dedicated OS thread owns the `DBSPHandle`, fed by a bounded channel; `apply`
+//! awaits the step, giving callers read-your-writes over the snapshot.
 
 use std::sync::{Arc, RwLock};
 
@@ -40,7 +37,7 @@ use dbsp::circuit::CircuitConfig;
 use dbsp::dynamic::DowncastTrait;
 use dbsp::trace::{BatchReader as DynBatchReaderTrait, Cursor};
 use dbsp::typed_batch::{BatchReader, OrdIndexedZSet, OrdZSet, SpineSnapshot};
-use dbsp::{MapHandle, OutputHandle, Runtime, SetHandle};
+use dbsp::{MapHandle, OutputHandle, Runtime};
 use tokio::sync::{mpsc, oneshot};
 
 use feldera_macros::IsNone;
@@ -75,10 +72,6 @@ type MemberSnapshot = SpineSnapshot<OrdZSet<Row>>;
 /// The CONTRIBUTORS upsert-map's own integral: `(node_id, pk_id) → value`, weight 1 per present
 /// key (the projected value is carried, so this stays an indexed map).
 type MapSnapshot = SpineSnapshot<OrdIndexedZSet<PkKey, Value>>;
-/// The FEEDS upsert-SET's own integral: `(feed_id, pk_id)` keys, weight 1 per present key. A feed
-/// is a pure presence set (no per-entry value — the old map's value was a constant `Null`), so it
-/// is an `OrdZSet` of `PkKey`: no `Value` stored per entry, the Task 2.1 feed-key memory win.
-type FeedSnapshot = SpineSnapshot<OrdZSet<PkKey>>;
 type Slot<T> = Arc<RwLock<Option<T>>>;
 
 /// One membership flip from a circuit step: `(node, value)` entered (`delta > 0`) or left
@@ -90,33 +83,16 @@ pub struct MemberDelta {
     pub delta: i64,
 }
 
-/// One feed transition from a circuit step: pk id `pk_id` entered (`delta > 0`) or left
-/// (`delta < 0`) feed `feed_id`. A leave is, by construction, a genuine delete — the pk was a
-/// member. The pk is carried as its dictionary id; the emission seam resolves it to the pk string
-/// (via [`crate::pk_dict::PkDict`]) under the registry lock before the delta leaves the circuit
-/// tier.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FeedDelta {
-    pub feed_id: i64,
-    pub pk_id: u32,
-    pub delta: i64,
-}
-
-/// One batch of assertions for [`MembershipCircuit::apply`]. Both maps are fed in ONE
-/// transaction — a single struct so a call site cannot feed one handle and drop the other.
+/// One batch of contributor assertions for [`MembershipCircuit::apply`], fed in ONE transaction.
 #[derive(Default)]
 pub struct Assertions {
     /// `(PkKey { node_id, pk_id }, Insert(projected value) | Delete)`
     pub contributors: Vec<Tup2<PkKey, Assert>>,
-    /// `(PkKey { feed_id, pk_id }, present)` — `true` asserts membership, `false` retracts it
-    /// (idempotent upsert-set semantics: a duplicate insert or a delete of an absent key nets to
-    /// nothing).
-    pub feeds: Vec<Tup2<PkKey, bool>>,
 }
 
 impl Assertions {
     pub fn is_empty(&self) -> bool {
-        self.contributors.is_empty() && self.feeds.is_empty()
+        self.contributors.is_empty()
     }
 }
 
@@ -186,7 +162,7 @@ fn process_alive(pid: u32) -> bool {
 }
 
 enum Cmd {
-    Batch { asserts: Assertions, resp: oneshot::Sender<(Vec<MemberDelta>, Vec<FeedDelta>)> },
+    Batch { asserts: Assertions, resp: oneshot::Sender<Vec<MemberDelta>> },
     /// Diagnostic: the whole circuit's operator memory via dbsp's profiler
     /// (`(total_used_bytes, total_storage_size)`). Heavy (round-trips every worker); test-only.
     Profile { resp: oneshot::Sender<(usize, usize)> },
@@ -211,17 +187,14 @@ pub struct CircuitBytes {
     /// `TraceId(stream)` in the circuit cache), so this is the operator's own integral, not a copy.
     pub contributors_bytes: usize,
     pub contributors_len: usize,
-    /// The FEEDS upsert-map integral: `(feed,pk)→()` — likewise the feed upsert operator's own
-    /// integral. Zero when `ELECTRIC_IVM_FEED_TRACE=0` (the published feed snapshot is disabled).
-    pub feeds_bytes: usize,
-    pub feeds_len: usize,
 }
 
 impl CircuitBytes {
-    /// The raw upsert-map integrals (contributors + feeds): the operators' own input integrals,
-    /// one tuple per asserted key. `bytes_circuit_integral` in `GET /memory`.
+    /// The raw contributor upsert-map integral: the operator's own input integral, one tuple per
+    /// asserted key. `bytes_circuit_integral` in `GET /memory`. (Per-feed key sets left the
+    /// circuit in Task 2.2 — see [`crate::subq_feed::FeedSet`], reported as `bytes_feed_sets`.)
     pub fn integral_bytes(&self) -> usize {
-        self.contributors_bytes + self.feeds_bytes
+        self.contributors_bytes
     }
     /// The derived membership relation snapshot, published purely for read APIs.
     /// `bytes_circuit_snapshots` in `GET /memory`.
@@ -241,42 +214,22 @@ pub struct MembershipCircuit {
     tx: mpsc::Sender<Cmd>,
     members: Slot<MemberSnapshot>,
     contributors: Slot<MapSnapshot>,
-    feeds: Slot<FeedSnapshot>,
 }
 
 impl MembershipCircuit {
     /// Build the circuit and start its thread. State is in-memory only — nodes reseed from
-    /// Postgres on registration, feeds from shape backfills.
-    ///
-    /// `ELECTRIC_IVM_FEED_TRACE=0` disables the published feed-relation trace — the host-side
-    /// `ro_snapshot` view used only for drop-time retraction and introspection.
-    ///
-    /// NOTE (measured, Task 1.3): `feed_stream.integrate_trace()` shares the feed upsert
-    /// operator's own integral via dbsp's per-stream `TraceId(stream)` cache, so the published
-    /// snapshot is NOT a second logical copy. However, a ~320 MiB RSS delta was measured at
-    /// 100k subscriptions with the knob off (docs/bench/shape-memory-scale.md §3) and remains
-    /// unexplained — the knob's real-world effect is unresolved, tracked in bead dbsp-ds-2hu.
-    /// Behavioral effect: dropped shapes leave their (unreachable — feed ids are never reused)
-    /// entries in the operator integral instead of retracting them, a documented trade until
-    /// stream-fold drop enumeration lands (bead dbsp-ds-4d8).
+    /// Postgres on registration.
     pub fn start() -> Result<MembershipCircuit> {
-        let feed_trace = std::env::var("ELECTRIC_IVM_FEED_TRACE").map(|v| v != "0").unwrap_or(true);
-        Self::start_with(feed_trace)
+        Self::start_full(spill_config_from_env()?)
     }
 
-    /// [`start`], with the feed-trace choice explicit (tests).
-    pub fn start_with(feed_trace: bool) -> Result<MembershipCircuit> {
-        Self::start_full(feed_trace, spill_config_from_env()?)
-    }
-
-    /// [`start`], with everything explicit.
-    fn start_full(feed_trace: bool, spill: Option<SpillConfig>) -> Result<MembershipCircuit> {
+    /// [`start`], with everything explicit (tests).
+    fn start_full(spill: Option<SpillConfig>) -> Result<MembershipCircuit> {
         let members: Slot<MemberSnapshot> = Slot::default();
         let contributors: Slot<MapSnapshot> = Slot::default();
-        let feeds: Slot<FeedSnapshot> = Slot::default();
-        let (m_slot, c_slot, f_slot) = (members.clone(), contributors.clone(), feeds.clone());
-        // Spill: with a storage dir configured, the circuit's spines (the upsert maps'
-        // integrals, the membership trace) page batches above `min_storage_bytes` to layer
+        let (m_slot, c_slot) = (members.clone(), contributors.clone());
+        // Spill: with a storage dir configured, the circuit's spines (the contributor upsert
+        // map's integral, the membership trace) page batches above `min_storage_bytes` to layer
         // files under `dir`, keeping a bounded in-memory cache — RAM becomes O(cache)
         // instead of O(relation). In-memory (no dir) remains the default.
         let mut config = CircuitConfig::with_workers(1);
@@ -300,15 +253,13 @@ impl MembershipCircuit {
                 sp.dir, sp.min_storage_bytes, sp.cache_mib
             );
         }
-        let (dbsp, (contrib_in, feed_in, flips_out, feeds_out)) =
+        let (dbsp, (contrib_in, flips_out)) =
             Runtime::init_circuit(config, move |circuit| {
                 // Contributors are a key→value upsert MAP (the projected value is carried). The
                 // upsert patch function is unused (we only Insert/Delete, never Update), but the
                 // API requires one; assignment is the natural no-surprise choice.
                 let (contrib_stream, contrib_in) =
                     circuit.add_input_map::<PkKey, Value, Value, _>(|v, u| *v = u.clone());
-                // Feeds are a key-only upsert SET (presence, no per-entry value).
-                let (feed_stream, feed_in) = circuit.add_input_set::<PkKey>();
 
                 // Contributors: (node,pk_id)→value ⇒ (node,value) weighted by contributor count.
                 let member_counts =
@@ -318,18 +269,12 @@ impl MembershipCircuit {
                 });
                 let flips_out = member_counts.distinct().accumulate_output();
 
-                // Both relations publish their own integrals for prefix enumeration (drop paths).
+                // The contributor relation publishes its own integral for prefix enumeration (the
+                // node drop path).
                 contrib_stream.integrate_trace().apply(move |spine| {
                     *c_slot.write().expect("contributors slot") = Some(spine.ro_snapshot());
                 });
-                if feed_trace {
-                    feed_stream.integrate_trace().apply(move |spine| {
-                        *f_slot.write().expect("feeds slot") = Some(spine.ro_snapshot());
-                    });
-                }
-                // The feed set's own deltas ARE the emissions.
-                let feeds_out = feed_stream.accumulate_output();
-                Ok((contrib_in, feed_in, flips_out, feeds_out))
+                Ok((contrib_in, flips_out))
             })
             .map_err(|e| anyhow::anyhow!("membership circuit: init_circuit: {e}"))?;
 
@@ -337,7 +282,7 @@ impl MembershipCircuit {
         std::thread::Builder::new()
             .name("dbsp-subq".into())
             .spawn(move || {
-                circuit_thread(dbsp, contrib_in, feed_in, flips_out, feeds_out, rx);
+                circuit_thread(dbsp, contrib_in, flips_out, rx);
                 // The default spill dir is a per-boot cache (no checkpointing yet): remove it
                 // once the circuit is gone. Explicit dirs are the user's to manage.
                 if let Some(dir) = cleanup_dir {
@@ -346,19 +291,19 @@ impl MembershipCircuit {
             })
             .map_err(|e| anyhow::anyhow!("spawning dbsp-subq thread: {e}"))?;
 
-        Ok(MembershipCircuit { tx, members, contributors, feeds })
+        Ok(MembershipCircuit { tx, members, contributors })
     }
 
-    /// Assert, step, and return the step's (membership flips, feed transitions). After this
-    /// returns, snapshot reads reflect the batch (read-your-writes).
-    pub async fn apply(&self, asserts: Assertions) -> (Vec<MemberDelta>, Vec<FeedDelta>) {
+    /// Assert, step, and return the step's membership flips. After this returns, snapshot reads
+    /// reflect the batch (read-your-writes).
+    pub async fn apply(&self, asserts: Assertions) -> Vec<MemberDelta> {
         if asserts.is_empty() {
-            return (Vec::new(), Vec::new());
+            return Vec::new();
         }
         let (resp_tx, resp_rx) = oneshot::channel();
         if self.tx.send(Cmd::Batch { asserts, resp: resp_tx }).await.is_err() {
             tracing::error!("membership circuit: thread gone; dropping assertions");
-            return (Vec::new(), Vec::new());
+            return Vec::new();
         }
         resp_rx.await.unwrap_or_default()
     }
@@ -409,32 +354,14 @@ impl MembershipCircuit {
         map_slice(&self.contributors, node_id)
     }
 
-    /// Every pk id currently in feed `feed_id` (shape-drop enumeration + introspection).
-    pub fn feed_pk_ids(&self, feed_id: i64) -> Vec<u32> {
-        set_slice(&self.feeds, feed_id)
-    }
-
-    /// Number of pks currently in feed `feed_id` (introspection).
-    pub fn feed_len(&self, feed_id: i64) -> usize {
-        set_slice(&self.feeds, feed_id).len()
-    }
-
     /// Measured byte sizes of the published snapshots (see [`CircuitBytes`]). Cheap: reads the
-    /// three slot snapshots this circuit already holds and sums dbsp's per-batch
+    /// two slot snapshots this circuit holds and sums dbsp's per-batch
     /// `approximate_byte_size`/`len` — no circuit round-trip, no profiler. Safe on the on-demand
     /// `GET /memory` path; never call it from the 500 ms sampler.
     pub fn snapshot_bytes(&self) -> CircuitBytes {
         let (members_bytes, members_len) = snap_size(&self.members);
         let (contributors_bytes, contributors_len) = snap_size(&self.contributors);
-        let (feeds_bytes, feeds_len) = snap_size(&self.feeds);
-        CircuitBytes {
-            members_bytes,
-            members_len,
-            contributors_bytes,
-            contributors_len,
-            feeds_bytes,
-            feeds_len,
-        }
+        CircuitBytes { members_bytes, members_len, contributors_bytes, contributors_len }
     }
 
     /// Diagnostic only: the whole circuit's operator memory via dbsp's profiler —
@@ -502,37 +429,6 @@ fn map_slice(slot: &Slot<MapSnapshot>, id: i64) -> Vec<(u32, Value)> {
     out
 }
 
-/// Enumerate one feed's slice of the feed SET integral: the pk ids with positive net weight under
-/// keys `PkKey { id, pk_id }`, via the same prefix seek as [`map_slice`] (feeds carry no value, so
-/// this is a key-only `OrdZSet` walk).
-fn set_slice(slot: &Slot<FeedSnapshot>, id: i64) -> Vec<u32> {
-    let guard = slot.read().expect("feed slot");
-    let Some(snap) = guard.as_ref() else { return Vec::new() };
-    let mut out = Vec::new();
-    let mut cursor = snap.inner().cursor();
-    {
-        use dbsp::dynamic::Erase;
-        let target = PkKey { id, pk: 0 };
-        cursor.seek_key(target.erase());
-    }
-    while cursor.key_valid() {
-        let key = *unsafe { cursor.key().downcast::<PkKey>() };
-        if key.id != id {
-            break;
-        }
-        let mut w: i64 = 0;
-        while cursor.val_valid() {
-            w += **cursor.weight();
-            cursor.step_val();
-        }
-        if w > 0 {
-            out.push(key.pk);
-        }
-        cursor.step_key();
-    }
-    out
-}
-
 /// Position a dynamic trace cursor at the first key ≥ `target` (a shorter `Row` is a strict
 /// prefix and orders before every same-prefix longer row).
 fn seek(
@@ -576,36 +472,11 @@ fn drain_flips(handle: &OutputHandle<SpineSnapshot<OrdZSet<Row>>>, out: &mut Vec
     }
 }
 
-/// Drain the feed map's accumulated output: the step's feed transitions, net per (feed, pk).
-/// A value-change on a held key (never happens — the value is constant `Null`) would net to
-/// zero here; only presence transitions survive.
-fn drain_feed_deltas(
-    handle: &OutputHandle<SpineSnapshot<OrdZSet<PkKey>>>,
-    out: &mut Vec<FeedDelta>,
-) {
-    let batch = handle.concat();
-    let mut cursor = batch.inner().cursor();
-    while cursor.key_valid() {
-        let key = *unsafe { cursor.key().downcast::<PkKey>() };
-        let mut delta: i64 = 0;
-        while cursor.val_valid() {
-            delta += **cursor.weight();
-            cursor.step_val();
-        }
-        if delta != 0 {
-            out.push(FeedDelta { feed_id: key.id, pk_id: key.pk, delta });
-        }
-        cursor.step_key();
-    }
-}
-
 /// The circuit thread: owns the `DBSPHandle`, applies assertion batches, steps, drains.
 fn circuit_thread(
     mut dbsp: dbsp::DBSPHandle,
     contrib_in: MapHandle<PkKey, Value, Value>,
-    feed_in: SetHandle<PkKey>,
     flips_out: OutputHandle<SpineSnapshot<OrdZSet<Row>>>,
-    feeds_out: OutputHandle<SpineSnapshot<OrdZSet<PkKey>>>,
     mut rx: mpsc::Receiver<Cmd>,
 ) {
     while let Some(cmd) = rx.blocking_recv() {
@@ -614,19 +485,12 @@ fn circuit_thread(
                 for Tup2(k, upd) in asserts.contributors {
                     contrib_in.push(k, upd);
                 }
-                for Tup2(k, present) in asserts.feeds {
-                    feed_in.push(k, present);
-                }
                 let mut flips = Vec::new();
-                let mut feed_deltas = Vec::new();
                 match dbsp.transaction() {
-                    Ok(()) => {
-                        drain_flips(&flips_out, &mut flips);
-                        drain_feed_deltas(&feeds_out, &mut feed_deltas);
-                    }
+                    Ok(()) => drain_flips(&flips_out, &mut flips),
                     Err(e) => tracing::error!("membership circuit: transaction failed: {e}"),
                 }
-                let _ = resp.send((flips, feed_deltas));
+                let _ = resp.send(flips);
             }
             Cmd::Profile { resp } => {
                 let bytes = match dbsp.retrieve_profile() {
@@ -671,14 +535,6 @@ mod tests {
                     None => Assert::Delete,
                 },
             )],
-            feeds: Vec::new(),
-        }
-    }
-
-    fn feed(feed_id: i64, pk: u32, present: bool) -> Assertions {
-        Assertions {
-            contributors: Vec::new(),
-            feeds: vec![Tup2(ckey(feed_id, pk), present)],
         }
     }
 
@@ -694,71 +550,47 @@ mod tests {
         };
 
         // a → 7: Enter. (pk ids: a=1, b=2, z=3.)
-        let (flips, _) = c.apply(contrib(1, 1, Some(Value::Int(7)))).await;
+        let flips = c.apply(contrib(1, 1, Some(Value::Int(7)))).await;
         assert_eq!(flips, vec![MemberDelta { node_id: 1, value: Value::Int(7), delta: 1 }]);
         assert_eq!(refold(&mut groups, vec![(Value::Int(7), 1)]).len(), 1);
         // b → 7: second contributor, no flip.
-        let (flips, _) = c.apply(contrib(1, 2, Some(Value::Int(7)))).await;
+        let flips = c.apply(contrib(1, 2, Some(Value::Int(7)))).await;
         assert!(flips.is_empty());
         assert!(refold(&mut groups, vec![(Value::Int(7), 1)]).is_empty());
         // a moves 7→8 in ONE assertion: the map derives retract(7)+insert(8); 7 stays (b).
-        let (flips, _) = c.apply(contrib(1, 1, Some(Value::Int(8)))).await;
+        let flips = c.apply(contrib(1, 1, Some(Value::Int(8)))).await;
         assert_eq!(flips, vec![MemberDelta { node_id: 1, value: Value::Int(8), delta: 1 }]);
         assert_eq!(refold(&mut groups, vec![(Value::Int(7), -1), (Value::Int(8), 1)]).len(), 1);
         assert!(c.contains(1, &Value::Int(7)) && c.contains(1, &Value::Int(8)));
         // b leaves: Leave(7).
-        let (flips, _) = c.apply(contrib(1, 2, None)).await;
+        let flips = c.apply(contrib(1, 2, None)).await;
         assert_eq!(flips, vec![MemberDelta { node_id: 1, value: Value::Int(7), delta: -1 }]);
         assert_eq!(refold(&mut groups, vec![(Value::Int(7), -1)]).len(), 1);
         // Idempotence: re-asserting a's current value nets nothing; deleting absent nets nothing.
-        let (flips, _) = c.apply(contrib(1, 1, Some(Value::Int(8)))).await;
+        let flips = c.apply(contrib(1, 1, Some(Value::Int(8)))).await;
         assert!(flips.is_empty(), "re-asserting the held value must be a no-op");
-        let (flips, _) = c.apply(contrib(1, 3, None)).await;
+        let flips = c.apply(contrib(1, 3, None)).await;
         assert!(flips.is_empty(), "deleting an absent key must be a no-op");
         c.shutdown().await;
     }
 
-    /// The feed map's deltas are the emissions: enter on first Insert, nothing on repeat,
-    /// leave on Delete of a member, nothing on Delete of a never-member (the wake-storm gate,
-    /// now structural).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn feed_deltas_gate_deletes_structurally() {
-        let c = MembershipCircuit::start().unwrap();
-        // pk ids: ghost=100, row1=1.
-        // Delete for a never-member pk: NO delta (this was filter_known_members' whole job).
-        let (_, fd) = c.apply(feed(9, 100, false)).await;
-        assert!(fd.is_empty(), "never-member delete must produce nothing");
-        // Enter.
-        let (_, fd) = c.apply(feed(9, 1, true)).await;
-        assert_eq!(fd, vec![FeedDelta { feed_id: 9, pk_id: 1, delta: 1 }]);
-        // Repeat assert: nothing.
-        let (_, fd) = c.apply(feed(9, 1, true)).await;
-        assert!(fd.is_empty());
-        // Genuine leave.
-        let (_, fd) = c.apply(feed(9, 1, false)).await;
-        assert_eq!(fd, vec![FeedDelta { feed_id: 9, pk_id: 1, delta: -1 }]);
-        // And gone again: repeat delete nets nothing.
-        let (_, fd) = c.apply(feed(9, 1, false)).await;
-        assert!(fd.is_empty());
-        c.shutdown().await;
-    }
+    // The feed relation's delete-gate semantics (never-member gate, enter, repeat, genuine leave)
+    // moved out of the circuit to `crate::subq_feed::FeedSet` in Task 2.2; its equivalence table is
+    // pinned by `subq_feed::tests::transition_table_matches_circuit_gate`, and the end-to-end gate
+    // by the G2 armor tests in `subquery` (`never_member_delete_is_dropped`,
+    // `genuine_member_delete_is_never_dropped`).
 
-    /// Prefix enumeration serves the drop paths: a node's contributor slice and a feed's pk
-    /// set, each scoped to its own id.
+    /// Prefix enumeration serves the node drop path: a node's contributor slice, scoped to its
+    /// own id. (The per-feed key set is no longer a circuit relation — see `subq_feed`.)
     #[tokio::test(flavor = "multi_thread")]
     async fn prefix_scans_enumerate_slices() {
         let c = MembershipCircuit::start().unwrap();
-        // pk ids: a=1, b=2, z=3, p=4, q=5, r=6.
+        // pk ids: a=1, b=2, z=3.
         c.apply(Assertions {
             contributors: vec![
                 Tup2(ckey(1, 1), Assert::Insert(Value::Int(5))),
                 Tup2(ckey(1, 2), Assert::Insert(Value::Int(6))),
                 Tup2(ckey(2, 3), Assert::Insert(Value::Int(5))),
-            ],
-            feeds: vec![
-                Tup2(ckey(7, 4), true),
-                Tup2(ckey(7, 5), true),
-                Tup2(ckey(8, 6), true),
             ],
         })
         .await;
@@ -766,34 +598,6 @@ mod tests {
         entries.sort();
         assert_eq!(entries, vec![(1, Value::Int(5)), (2, Value::Int(6))]);
         assert_eq!(c.contributor_entries(3), vec![]);
-        let mut pks = c.feed_pk_ids(7);
-        pks.sort();
-        assert_eq!(pks, vec![4, 5]);
-        assert_eq!(c.feed_len(8), 1);
-        // Deleting via enumeration empties the slice without touching neighbours.
-        let feeds = c.feed_pk_ids(7).into_iter().map(|pk| Tup2(ckey(7, pk), false)).collect();
-        c.apply(Assertions { contributors: Vec::new(), feeds }).await;
-        assert_eq!(c.feed_len(7), 0);
-        assert_eq!(c.feed_len(8), 1);
-        c.shutdown().await;
-    }
-
-    /// With the feed trace disabled, emissions (feed deltas) still flow — only the host-side
-    /// enumeration view is gone: feed_pk_ids/feed_len return empty. (Real memory saved is
-    /// negligible — see `feed_trace_snapshot_shares_operator_integral`.)
-    #[tokio::test(flavor = "multi_thread")]
-    async fn feed_trace_knob_disables_enumeration_not_emissions() {
-        let c = MembershipCircuit::start_with(false).unwrap();
-        // pk ids: row1=1, ghost=100, row2=2.
-        let (_, fd) = c.apply(feed(9, 1, true)).await;
-        assert_eq!(fd, vec![FeedDelta { feed_id: 9, pk_id: 1, delta: 1 }]);
-        let (_, fd) = c.apply(feed(9, 1, false)).await;
-        assert_eq!(fd, vec![FeedDelta { feed_id: 9, pk_id: 1, delta: -1 }], "deletes still gate structurally");
-        let (_, fd) = c.apply(feed(9, 100, false)).await;
-        assert!(fd.is_empty(), "never-member gate intact without the trace");
-        c.apply(feed(9, 2, true)).await;
-        assert_eq!(c.feed_pk_ids(9), Vec::<u32>::new(), "no enumeration copy");
-        assert_eq!(c.feed_len(9), 0);
         c.shutdown().await;
     }
 
@@ -801,21 +605,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn spill_mode_preserves_semantics_and_writes_files() {
         let dir = std::env::temp_dir().join(format!("subq-spill-test-{}", std::process::id()));
-        let c = MembershipCircuit::start_full(
-            true,
-            Some(SpillConfig {
-                dir: dir.to_string_lossy().into_owned(),
-                min_storage_bytes: 1, // spill aggressively so even tiny batches hit disk
-                cache_mib: Some(8),
-                auto: false, // the test owns and removes this dir itself
-            }),
-        )
+        let c = MembershipCircuit::start_full(Some(SpillConfig {
+            dir: dir.to_string_lossy().into_owned(),
+            min_storage_bytes: 1, // spill aggressively so even tiny batches hit disk
+            cache_mib: Some(8),
+            auto: false, // the test owns and removes this dir itself
+        }))
         .unwrap();
         // Enough contributor entries to force at least one on-disk batch.
         let contributors = (0..2000)
             .map(|i| Tup2(ckey(1, i as u32), Assert::Insert(Value::Int(i % 50))))
             .collect();
-        let (flips, _) = c.apply(Assertions { contributors, feeds: Vec::new() }).await;
+        let flips = c.apply(Assertions { contributors }).await;
         assert_eq!(flips.len(), 50, "50 distinct values entered");
         assert!(c.contains(1, &Value::Int(7)));
         let (distinct, _) = c.values_for_node(1, 5);
@@ -827,99 +628,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `snapshot_bytes` measures real dbsp columnar bytes: zero when empty, non-zero and
-    /// split into the raw upsert-map integrals (contributors + feeds) vs the derived members
-    /// snapshot once populated. This is the measured basis for `GET /memory`'s
-    /// `bytes_circuit_integral` / `bytes_circuit_snapshots` split.
+    /// `snapshot_bytes` measures real dbsp columnar bytes: zero when empty, non-zero and split
+    /// into the raw contributor upsert-map integral vs the derived members snapshot once
+    /// populated. This is the measured basis for `GET /memory`'s `bytes_circuit_integral` /
+    /// `bytes_circuit_snapshots` split.
     #[tokio::test(flavor = "multi_thread")]
     async fn snapshot_bytes_measures_and_splits_relations() {
-        let c = MembershipCircuit::start_full(true, None).unwrap();
+        let c = MembershipCircuit::start_full(None).unwrap();
         assert_eq!(c.snapshot_bytes(), CircuitBytes::default(), "empty circuit owns no batch bytes");
 
         let mut a = Assertions::default();
         for i in 0..1000i64 {
             // 1000 contributors over 100 distinct values on one node.
             a.contributors.push(Tup2(ckey(1, i as u32), Assert::Insert(Value::Int(i % 100))));
-            a.feeds.push(Tup2(ckey(9, i as u32), true));
         }
         c.apply(a).await;
 
         let cb = c.snapshot_bytes();
-        // Contributors integral: 1000 live tuples; feeds integral: 1000; members: 100 distinct.
+        // Contributors integral: 1000 live tuples; members: 100 distinct.
         assert_eq!(cb.contributors_len, 1000);
-        assert_eq!(cb.feeds_len, 1000);
         assert_eq!(cb.members_len, 100, "members is the deduplicated (node,value) relation");
-        assert!(cb.contributors_bytes > 0 && cb.feeds_bytes > 0 && cb.members_bytes > 0);
-        // The integral (raw maps) dwarfs the derived membership snapshot.
-        assert_eq!(cb.integral_bytes(), cb.contributors_bytes + cb.feeds_bytes);
+        assert!(cb.contributors_bytes > 0 && cb.members_bytes > 0);
+        // The integral (raw contributor map) dwarfs the derived membership snapshot.
+        assert_eq!(cb.integral_bytes(), cb.contributors_bytes);
         assert_eq!(cb.snapshot_bytes(), cb.members_bytes);
         assert!(cb.integral_bytes() > cb.snapshot_bytes());
         assert_eq!(cb.total_bytes(), cb.integral_bytes() + cb.snapshot_bytes());
         c.shutdown().await;
-    }
-
-    /// Task 2.1 integration expectation: with `u32` pk-id keys, a materialized 1k-row feed's
-    /// membership-circuit bytes (`bytes_membership_circuit` = `total_bytes`) must come in UNDER
-    /// 1000 × 32 B. This is impossible with the old `Row([Int(feed_id), Text(pk)])` keys — each
-    /// heap pk string alone (an 11-char `pk-00000000`, plus `Value`/`Row` overhead) pushed a feed
-    /// entry to ~123 B (measured baseline). The `(feed_id, pk_id)` SET key has no per-entry heap
-    /// and no per-entry value; measured ~24 B/entry.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn feed_bytes_per_entry_is_under_32b_with_id_keys() {
-        let c = MembershipCircuit::start_full(true, None).unwrap();
-        let mut a = Assertions::default();
-        for i in 0..1000i64 {
-            a.feeds.push(Tup2(ckey(9, i as u32), true));
-        }
-        c.apply(a).await;
-        let cb = c.snapshot_bytes();
-        assert_eq!(cb.feeds_len, 1000, "1000 live feed entries");
-        let total = cb.total_bytes();
-        assert!(
-            total < 1000 * 32,
-            "materialized 1k-row feed must own < 32 B/entry with u32 pk-id keys, got {} B ({} B/entry)",
-            total,
-            total / 1000
-        );
-        c.shutdown().await;
-    }
-
-    /// FEED_TRACE=0 does NOT free operator memory: dbsp shares the feed upsert operator's own
-    /// integral with our published `integrate_trace` snapshot (per-stream `TraceId` cache), so
-    /// disabling the trace only drops the host-side `ro_snapshot` view (feeds_bytes → 0) while
-    /// the circuit's real resident bytes (profiler `total_used_bytes`) are unchanged. Guards the
-    /// corrected doc claim on `start_with`'s `feed_trace` knob.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn feed_trace_snapshot_shares_operator_integral() {
-        let load = || {
-            let mut a = Assertions::default();
-            for i in 0..3000i64 {
-                a.feeds.push(Tup2(ckey(9, i as u32), true));
-            }
-            a
-        };
-        let on = MembershipCircuit::start_full(true, None).unwrap();
-        on.apply(load()).await;
-        let (used_on, _) = on.profile_bytes().await;
-        let feeds_view = on.snapshot_bytes().feeds_bytes;
-        on.shutdown().await;
-
-        let off = MembershipCircuit::start_full(false, None).unwrap();
-        off.apply(load()).await;
-        let (used_off, _) = off.profile_bytes().await;
-        assert_eq!(off.snapshot_bytes().feeds_bytes, 0, "no published feed view when disabled");
-        off.shutdown().await;
-
-        // The host-side feed view is non-trivial (a 3000-entry `u32`-keyed feed SET — leaner than
-        // the old string-keyed map, so the threshold is set to the set representation), yet the
-        // operator memory is within 5% either way.
-        assert!(feeds_view > 20_000, "feed view should be a meaningful number of bytes, got {feeds_view}");
-        let (hi, lo) = (used_on.max(used_off), used_on.min(used_off));
-        assert!(
-            hi - lo < hi / 20,
-            "disabling the feed trace changed circuit memory by >5% ({used_on} vs {used_off}); \
-             the integrate_trace snapshot is NOT sharing the upsert integral as documented"
-        );
     }
 
     /// Pinning/compaction invariant: churning a FIXED live-key set across many steps must keep
@@ -937,18 +672,18 @@ mod tests {
     async fn snapshots_do_not_pin_precompaction_batches() {
         const LIVE: i64 = 400;
         const STEPS: i64 = 400;
-        let c = MembershipCircuit::start_full(true, None).unwrap();
+        let c = MembershipCircuit::start_full(None).unwrap();
         let seed = (0..LIVE)
             .map(|i| Tup2(ckey(7, i as u32), Assert::Insert(Value::Int(0))))
             .collect();
-        c.apply(Assertions { contributors: seed, feeds: Vec::new() }).await;
+        c.apply(Assertions { contributors: seed }).await;
 
         let mut max_contrib_len = 0usize;
         for step in 1..=STEPS {
             let contributors = (0..LIVE)
                 .map(|i| Tup2(ckey(7, i as u32), Assert::Insert(Value::Int(step))))
                 .collect();
-            c.apply(Assertions { contributors, feeds: Vec::new() }).await;
+            c.apply(Assertions { contributors }).await;
             max_contrib_len = max_contrib_len.max(c.snapshot_bytes().contributors_len);
         }
 
@@ -979,10 +714,9 @@ mod tests {
                 Tup2(ckey(2, 1), Assert::Insert(Value::Int(7))),
                 Tup2(ckey(1, 2), Assert::Insert(Value::Null)),
             ],
-            feeds: Vec::new(),
         })
         .await;
-        let (flips, _) = c.apply(contrib(1, 1, None)).await;
+        let flips = c.apply(contrib(1, 1, None)).await;
         assert_eq!(flips, vec![MemberDelta { node_id: 1, value: Value::Int(7), delta: -1 }]);
         assert!(!c.contains(1, &Value::Int(7)));
         assert!(c.contains(2, &Value::Int(7)), "node 2 unaffected");
