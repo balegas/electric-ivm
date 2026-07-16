@@ -123,6 +123,55 @@ work, not further key compression and not the allocator.
 > now dominated by the **contributor** relation (~60k entries at 100k subs). This doc's
 > measured numbers predate the change; re-measure to quantify the landed RSS reduction.
 
+## 2c. Per-circuit decomposition — the residual is the buffer cache, not circuit state (HEAD bc97f0a, 2026-07-16)
+
+Final measurement of the plan: `GET /debug/dbsp-profile` (new on-demand endpoint; dbsp's
+own profiler, per-operator) captured by the `SCALE_ATTRIBUTION=1` hook at the top
+milestone of a standard Gate-G B2 run (ramped creation to 100k subscriptions, engine at
+`mem/phase-2-feed-keys` bc97f0a = 3cd9956 + the endpoint). Footprint 1104 MB (peak 1109),
+zone live-allocated 998.6 MB, frag 80.1 MB, owned `bytes_*` 98.7 MiB.
+
+**Circuit inventory ground truth:** the engine runs exactly ONE dbsp circuit in this
+workload — the subquery membership circuit. The counts/arrangements circuit was not
+configured (`counts_circuit: null`), and "family"/"standalone" circuits are host-side
+executor structures (no dbsp runtime; sized by `bytes_executors`, 22.2 MiB).
+
+**The membership circuit's entire operator memory is 0.94 MB** (+5.3 MB in storage layer
+files): root integral 0.47 MB / 180,000 records total — exactly 3 traces × 60,000
+contributor entries (contributor upsert integral, members Z1 trace, distinct Z1 trace) —
+plus two 0.4 KB accumulators. Everything else profiles at zero.
+
+**Where the ~0.9 GB actually is (creation-peak footprint 1104 MB):**
+
+| term | MB | evidence |
+|---|---:|---|
+| dbsp storage **buffer cache**, default limit **512 MiB** (`cache_mib` unset → 256 MiB × 1 worker × 2 thread-types, dbsp `runtime.rs`) | **~450** | the only A/B difference vs the 64 MiB-cache run (645/613 MB footprint): 512 − 64 = 448 ≈ measured 454–459 delta; cumulative background cache traffic 314 MB in the dump |
+| live-allocated, other dbsp/runtime (merger + FBuf slab allocators, step/exchange buffers, tokio, ds client, backfill churn) | ~395 | live 998.6 − owned 103.5 − cache ~450 − operators ~1 |
+| owned host metadata (`bytes_*` incl. `bytes_feed_sets` 6.4) | 103.5 | `/memory` |
+| allocator slack (regions − live; zone frag 80.1) | ~90 | vmmap |
+| dbsp operator state (all circuits) | **0.94** | profiler |
+| non-MALLOC | ~10 | vmmap totals |
+
+**Reinterpretation of §2 and §2b:** the "≥454 MB circuit-resident (spillable)" bucket was
+never relation state — it is the **buffer-cache limit difference** between the default
+(512 MiB) and the explicit 64 MiB configuration. Both the Phase-0 "in-memory" runs and
+every Gate-G run since PR #37 actually ran spill-by-default with the 512 MiB default
+cache; the "8× / 17× resident-vs-serialized blow-up" dissolves into cache pages. This is
+why neither the pk dictionary (payload ×5 smaller) nor the FeedSet (relation removed
+outright) moved the headline: **an LRU cache fills to its limit regardless of how small
+its working set gets.**
+
+**O(table-rows) verdict: design claim upheld.** No circuit holds row data: 180k records
+= 3 × contributors (60k), independent of the 100k issue rows; the counts circuit (state
+O(groups)) was not even running. The §2 speculation that "family circuits each hold their
+base table" is refuted — family circuits are host-side (22.2 MiB owned, no dbsp).
+
+**Actionable next step (one line, ~40% of footprint):** default
+`ELECTRIC_IVM_SUBQ_STORAGE_CACHE_MIB` to a bounded value (e.g. 64) instead of inheriting
+dbsp's 512 MiB — the measured 64 MiB-cache configuration held the same workload at
+**645 peak / 613 steady** with 27 MB on disk. The remaining ~395 MB of runtime/buffer
+churn (merger/FBuf slabs, step buffers) is the term after that.
+
 ## 3. Verdict on the three Phase-1 hypotheses
 
 | hypothesis | magnitude at 100k subs | verdict |
