@@ -17,7 +17,7 @@ code-accurate.
 
 ## Locked decisions
 
-1. **Delete for real** (git preserves history — done in Task 2): `tutorials⁄` (whole tree), `docs/building‑app‑pipelines.md`, `docs/linearlite‑circuit‑design.md`, and the tutorial process artifacts under `docs/superpowers/{plans,specs}/*tutorial*`.
+1. **Delete for real** (git preserves history — done in Task 2): `tutorials/` (whole tree), `docs/building-app-pipelines.md`, `docs/linearlite-circuit-design.md`, and the tutorial process artifacts under `docs/superpowers/{plans,specs}/*tutorial*`.
 2. **Full rename `electric-circuits` → `electric-circuits`**, extended to code: npm packages, the Rust crate/binary, Docker image paths, env vars, and all imports/string references. No legacy aliases.
 3. **Blog post out of scope** — `../electric/website/blog/posts/2026-07-14-electric-circuits.md` is a separate track (blog-planner flow, sibling repo).
 4. **Dynamic-first message** — the verb is *write / run*, not *declare*; the circuit is generic always-on infrastructure queries register onto; aggregation's up-front `COUNT` configuration is a one-line detail, never a headline; persistence and CDN caching are not launch doc topics.
@@ -73,15 +73,15 @@ The local checkout directory (`dbsp-ds`) is irrelevant and unchanged.
 
 ## Documentation dispositions
 
-**Delete:** `tutorials⁄` (README + 4 episodes + compose + seed), `docs/building‑app‑pipelines.md`,
-`docs/linearlite‑circuit‑design.md`, `docs/superpowers/plans/2026-07-08-tutorial‑01‑first‑shape.md`,
-`docs/superpowers/specs/2026-07-08-tutorial‑01‑first‑shape-design.md`,
-`docs/superpowers/specs/2026-07-08-tutorial‑03‑expressive-shapes-design.md`. (Done — Task 2.)
+**Delete:** `tutorials/` (README + 4 episodes + compose + seed), `docs/building-app-pipelines.md`,
+`docs/linearlite-circuit-design.md`, `docs/superpowers/plans/2026-07-08-tutorial-01-first-shape.md`,
+`docs/superpowers/specs/2026-07-08-tutorial-01-first-shape-design.md`,
+`docs/superpowers/specs/2026-07-08-tutorial-03-expressive-shapes-design.md`. (Done — Task 2.)
 
 **Rewrite (public, dynamic-first + new vocabulary):**
 
 - `README.md` — new front door. Lede is the app-dev pain hook → the circuit unlock (dynamic-first) → proof. Drop the "Designing the pipeline for your app" section and the static-compile framing entirely; replace with the "write queries, they register" model. Keep the Z-sets-in-60-seconds explainer, the system diagram, the conformance/benchmarks/tests sections, the layout table (with renamed packages), and the "Try it" demo. Replace the memory paragraph's stale `~19 MiB / ~0.8 KiB per shape` figures with the current model (a fixed set of shared dataflows per kind; ~13 KiB per live query at 50k; flat with data).
-- `docs/getting-started.md` → "Getting started: your first live queries". Keep the bare-`curl` walkthrough (it is the honest, SDK-free path), retitle and re-vocabulary, and **remove the pointer to `tutorials⁄`** (done in Task 2).
+- `docs/getting-started.md` → "Getting started: your first live queries". Keep the bare-`curl` walkthrough (it is the honest, SDK-free path), retitle and re-vocabulary, and **remove the pointer to `tutorials/`** (done in Task 2).
 - `docs/shapes-and-subqueries-guide.md` → rename to `docs/live-queries-guide.md`, rewrite with the three nouns; it stays the integration/deployment-sizing guide.
 
 **Create:** `docs/how-queries-become-live.md` — the conceptual doc that *is* the "define your app's
@@ -97,9 +97,9 @@ code-accurate engineering/proof docs; "shape" stays where it names code):**
 user-facing and gets the fuller vocab pass).
 
 **Cross-reference repair (done in Task 2):** every doc that links to a deleted file was fixed. Known
-referrers: `README.md` (linked `building‑app‑pipelines.md`), `docs/getting-started.md` (linked
-`tutorials⁄episodes/01-first-shape`), `AGENTS.md` (referenced the "recipe summary" / pipeline docs),
-`docs/linearlite‑circuit‑design.md` referrers, and any `docs/*` "Companion docs:" headers pointing at
+referrers: `README.md` (linked `building-app-pipelines.md`), `docs/getting-started.md` (linked
+`tutorials/episodes/01-first-shape`), `AGENTS.md` (referenced the "recipe summary" / pipeline docs),
+`docs/linearlite-circuit-design.md` referrers, and any `docs/*` "Companion docs:" headers pointing at
 the removed files. **Decided:** the three-tier serving-model substance from the now-deleted
 pipeline-authoring doc (the compiled/routed/fallback tier table and its cost model) is preserved
 by moving it into `docs/ivm-engine-internals.md` (engineering doc) as a new section — not re-exposed
