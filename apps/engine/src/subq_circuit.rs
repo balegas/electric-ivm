@@ -779,7 +779,7 @@ mod tests {
     }
 
     /// With the feed trace disabled, emissions (feed deltas) still flow — only the host-side
-    /// enumeration view is gone: feed_pks/feed_len return empty. (Real memory saved is
+    /// enumeration view is gone: feed_pk_ids/feed_len return empty. (Real memory saved is
     /// negligible — see `feed_trace_snapshot_shares_operator_integral`.)
     #[tokio::test(flavor = "multi_thread")]
     async fn feed_trace_knob_disables_enumeration_not_emissions() {
