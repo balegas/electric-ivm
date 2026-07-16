@@ -24,6 +24,7 @@ too — rejected iterations steer the combination decisions at phase gates.
 | 0 — instrumented baseline (Phase 0) | `mem/phase-0-attribution` @ dd7a259 | **1116 / 1059 MiB** (run 1: 1130 / 1130; reproduced) | ~11.4 KiB | ~269 B | ~9.7 KiB | PASS (engine:test green 172 tests; vitest green 27 files / 162 tests; electric-conformance `oracle` 1/1 green — no new failures; note: the "13/15" figure describes oracle+subqueries combined, not this suite alone) | PASS (`never_member_delete_is_dropped`, `genuine_member_delete_is_never_dropped` — both green in engine:test) | **REJECT** — headline B2 peak +41% / steady +52% vs baseline; B1 terms ~3× baseline; far beyond the ≤2% rule |
 | 0b — instrumented baseline, sampler fixed (66117f2) | `mem/phase-0-attribution` @ 66117f2 | **1091 / 1107 MiB** | ~11.2 KiB | ~185 B | ~9.5 KiB | PASS (engine:test 173 green incl. new `sampler_cardinalities_never_populates_bytes_fields`; vitest 27 files / 162 tests green; conformance `oracle` 1/1 green) | PASS (both delete-gate tests green, verified at 66117f2) | **ACCEPT vs same-day control** (baseline commit 3213e41, same command: 1111 / 1053 → peak −1.8%, steady +5.1%, within the observed run-to-run spread of the steady cell); the frozen 789/698 row is NOT reproducible under the Gate-G config on today's machine — see the control note |
 | 1 — circuit observability split, Task 1.3 (380a0f9) | `mem/phase-1-host-slimming` @ 380a0f9 | **1125 / 1062 MiB** | ~11.5 KiB | ~204 B | ~9.5 KiB | PASS (engine:test 157 lib + integration green incl. new `snapshots_do_not_pin_precompaction_batches` + `snapshot_bytes_measures_and_splits_relations`; vitest 27 files / 162 tests green; conformance `oracle` 1/1 green) | PASS (both delete-gate tests green at 380a0f9) | **ACCEPT vs 0b** (peak +3.1%, steady −4.1%, B1 reg unchanged — all inside the ~5–7% observed run spread; observability-only diff). FEED_TRACE A/B piggyback: on-vs-off delta ~1% → dbsp-ds-2hu resolved, see notes |
+| 4 — bounded storage cache: 64 MiB default, was dbsp's 512 (ac000ff) | `mem/phase-2-feed-keys` @ ac000ff | **645 / 632 MiB** | **~6.6 KiB** | ~16 B (legacy ΔRSS) / **2.2 B owned** (circuit+dict+feed_sets, column fixed this iteration) | ~8.4 KiB | PASS (engine:test 167 green; vitest 162 green; conformance `oracle` 1/1 green) | PASS (both delete-gate tests green at ac000ff) | **ACCEPT vs it3** — headline **−42% peak / −40% steady** (1104/1053 → 645/632), exactly as predicted by the §2c decomposition; zero ENOBUFS; nothing regressed |
 | 3 — FeedSet: feed relation out of the circuit, Task 2.2 (3cd9956) | `mem/phase-2-feed-keys` @ 3cd9956 | **1104 / 1053 MiB** | ~11.3 KiB | ~16 B (legacy ΔRSS) / **2.2 B/entry owned** (`bytes_feed_sets`) | ~8.6 KiB | PASS (engine:test 164 green; vitest 162 green; conformance `oracle` 1/1 green) | PASS (both delete-gate tests green at 3cd9956 — the gate is now the host-side FeedSet check-and-set) | **ACCEPT vs it2** — target term collapsed everywhere it is visible (B1 materialized Δ 329.2→131.6 MiB, −60%; B1 footprint Δ 296→96 MiB; owned feed cost 6.4 MiB for 3.0 M entries); B2 headline unchanged (+0.2% / +0.7%) → **the 100k footprint was not feed-entry-driven** — see notes |
 | 2 — pk dictionary, Task 2.1 (2e94ddc) | `mem/phase-2-feed-keys` @ 2e94ddc | **1102 / 1046 MiB** | ~11.3 KiB | ~86 B (legacy ΔRSS) / **~9 B owned** (circuit+dict, primary) | ~8.5 KiB | PASS (engine:test 164 green incl. PkDict suite + `never_member_candidate_does_not_mint_pk_dict_id`; vitest 162 green; conformance `oracle` 1/1 green) | PASS (both delete-gate tests green at 2e94ddc) | **ACCEPT vs it1** — target term (owned feed/circuit bytes) collapsed (B1 materialized ΔRSS halved 675.8→329.2 MiB; synced-row 204→86 B legacy; owned ~9 B/row); B2 footprint unchanged (−2.0% / −1.5%, noise) → the 100k footprint is dbsp residency overhead, not key payload — see notes + Phase 2 gate data |
 
@@ -59,6 +60,46 @@ live phase; all configured phases still completed.
 Attribution *ratios* from `mem-attribution-100k.md` (owned-heap vs slack vs circuit) were
 measured with the same tax active in both of its runs and remain directionally valid; the
 absolute footprints there carry the same inflation.
+
+### Iteration 4 notes — bounded storage cache (final iteration); plan summary
+
+Change under test (`ac000ff`): the engine's default dbsp storage cache is now **64 MiB
+total** (dbsp's implicit default was 512 MiB = 256 × workers × 2 thread-types); the
+`ELECTRIC_IVM_SUBQ_STORAGE_CACHE_MIB` override is unchanged. This is the one-line fix the
+§2c decomposition predicted at ~645/613 MB; measured **645 peak / 632 steady** —
+prediction confirmed. B2 attribution @100k: owned 98.7 MiB, circuit operator state
+0.94 MB (+5.3 MB on disk), zone live 546.3 MB, frag 76.5 MB. This iteration also fixed
+the B1 owned-bytes bench column to include `bytes_feed_sets` (it predated Task 2.2), so
+the owned synced-row term is now complete: **2.2 B/row measured end-to-end**.
+
+## Plan summary — cumulative story (same-day series; baseline = the 0b control at 3213e41)
+
+| metric | 0b control (pre-plan engine) | final (it4, ac000ff) | change |
+|---|---:|---:|---:|
+| B2 footprint @100k subs (peak / steady) | 1111 / 1053 MiB | **645 / 632 MiB** | **−42% / −40%** |
+| KiB per subscription | ~11.4 | **~6.6** | −42% |
+| bytes per synced row — owned | ~88 B/key floor (Phase-0 estimate) | **2.2 B (measured)** | −97% |
+| bytes per synced row — legacy ΔRSS | ~185–204 B | **~16 B** | −91% |
+| B1 registration KiB/shape | ~9.5 | **~8.4** | −12% |
+| B1 materialized Δ @10k shapes | 621.5 MiB | **129.5 MiB** | −79% |
+
+Which change bought what: the **pk dictionary (it2)** and **FeedSet (it3)** collapsed the
+logical/per-row terms and the B1-scale (10k-subscription) footprint but could not move
+the 100k headline, because the headline was **dbsp's default 512 MiB buffer cache**
+(found by the per-circuit profiler decomposition, `mem-attribution-100k.md` §2c — total
+dbsp operator state across every circuit is 0.94 MB, no O(table-rows) state anywhere);
+**bounding the cache (it4)** delivered the −42%. Correctness held throughout: all three
+G1 suites and both G2 delete-gate tests green at every iteration.
+
+**What remains at 100k subs (645 MB), per §2c, for future work:** ~380–395 MB other live
+dbsp/runtime (merger + FBuf slab allocators, step/exchange buffers, tokio/ds-client/
+backfill churn) — the next real term; ~100 MiB owned host metadata (subquery registry
+31.7 + executors 22.2 + shape records 20.7 + retention 9.5 + dict 6.3 + feed sets 6.4);
+the bounded 64 MiB cache (tunable); ~76–90 MB allocator slack (below the jemalloc gate).
+Known process debts: the plan's frozen-baseline table is stale/not reproducible (Phase-0
+finding — this summary uses the same-day 0b control instead); the Gate-G B2 command still
+names the removed `ELECTRIC_IVM_FEED_TRACE` knob; intermittent live-phase ENOBUFS
+(pre-existing, seen on the baseline engine too).
 
 ### Iteration 3 notes — FeedSet (Task 2.2); Phase 2 gate data refresh
 

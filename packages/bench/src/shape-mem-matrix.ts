@@ -315,7 +315,8 @@ async function runSize(size: number): Promise<{
   const ownedBytesDelta =
     (after.bytes_membership_circuit ?? 0) -
     (before.bytes_membership_circuit ?? 0) +
-    ((after.bytes_pk_dict ?? 0) - (before.bytes_pk_dict ?? 0))
+    ((after.bytes_pk_dict ?? 0) - (before.bytes_pk_dict ?? 0)) +
+    ((after.bytes_feed_sets ?? 0) - (before.bytes_feed_sets ?? 0)) // Task 2.2 moved feed entries here
 
   engine.proc.kill('SIGKILL')
   await client.end().catch(() => {})
@@ -395,7 +396,8 @@ async function main() {
     log(`| users | shapes | RSS (MiB) | ΔRSS vs init | footprint (MiB) | subquery nodes | contributors | edges | family circuits | owned bytes (KiB) |`)
     log(`|------:|-------:|----------:|-------------:|-----------------:|---------------:|-------------:|------:|----------------:|-------------------:|`)
     for (const s of samples) {
-      const ownedKib = ((s.card.bytes_membership_circuit ?? 0) + (s.card.bytes_pk_dict ?? 0)) / 1024
+      const ownedKib =
+        ((s.card.bytes_membership_circuit ?? 0) + (s.card.bytes_pk_dict ?? 0) + (s.card.bytes_feed_sets ?? 0)) / 1024
       log(
         `| ${s.users} | ${s.shapes} | ${fmt(s.rssMib)} | ${fmt(s.rssMib - base.rssMib)} | ${fmt(s.fpMib)} | ${s.card.subquery_nodes} | ${s.card.subquery_contributors} | ${s.card.subquery_edges} | ${s.card.families} | ${fmt(ownedKib, 1)} |`,
       )
