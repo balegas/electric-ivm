@@ -5,7 +5,6 @@ and consume shapes with **nothing but HTTP** — regular shapes, subqueries, and
 Everything here is bare `curl`; the client SDK (`@electric-circuits/client`) wraps exactly these
 requests. Companion docs: `shapes-and-subqueries-guide.md` (concepts + the SDK),
 `deployment-postgres.md` (production Postgres notes), `ivm-engine-internals.md` (how it works).
-Hands-on learners should start with `tutorials/episodes/01-first-shape/README.md` for a guided walkthrough.
 
 ---
 

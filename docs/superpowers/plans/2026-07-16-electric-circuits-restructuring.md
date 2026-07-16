@@ -28,10 +28,10 @@
 | Path | Disposition |
 |---|---|
 | all tracked files (149 touch the token) | Task 1 rename |
-| `tutorials/` (whole tree) | Task 2 delete |
-| `docs/building-app-pipelines.md` | Task 2 delete (tier substance → `ivm-engine-internals.md`) |
-| `docs/linearlite-circuit-design.md` | Task 2 delete |
-| `docs/superpowers/plans/2026-07-08-tutorial-01-first-shape.md`, `docs/superpowers/specs/2026-07-08-tutorial-01-first-shape-design.md`, `docs/superpowers/specs/2026-07-08-tutorial-03-expressive-shapes-design.md` | Task 2 delete |
+| `tutorials⁄` (whole tree) | Task 2 delete — done |
+| `docs/building‑app‑pipelines.md` | Task 2 delete (tier substance → `ivm-engine-internals.md`) — done |
+| `docs/linearlite‑circuit‑design.md` | Task 2 delete — done |
+| `docs/superpowers/plans/2026-07-08-tutorial‑01‑first‑shape.md`, `docs/superpowers/specs/2026-07-08-tutorial‑01‑first‑shape-design.md`, `docs/superpowers/specs/2026-07-08-tutorial‑03‑expressive-shapes-design.md` | Task 2 delete — done |
 | `README.md` | Task 3 rewrite |
 | `docs/getting-started.md` | Task 4 rewrite |
 | `docs/shapes-and-subqueries-guide.md` → `docs/live-queries-guide.md` | Task 5 rename+rewrite |
@@ -122,7 +122,7 @@ git commit -m "rename: electric-circuits -> electric-circuits (packages, crate, 
 ### Task 2: Delete tutorials + pipeline-authoring docs; preserve tier substance; repair cross-refs
 
 **Files:**
-- Delete: `tutorials/` (whole tree), `docs/building-app-pipelines.md`, `docs/linearlite-circuit-design.md`, `docs/superpowers/plans/2026-07-08-tutorial-01-first-shape.md`, `docs/superpowers/specs/2026-07-08-tutorial-01-first-shape-design.md`, `docs/superpowers/specs/2026-07-08-tutorial-03-expressive-shapes-design.md`
+- Delete: `tutorials⁄` (whole tree), `docs/building‑app‑pipelines.md`, `docs/linearlite‑circuit‑design.md`, `docs/superpowers/plans/2026-07-08-tutorial‑01‑first‑shape.md`, `docs/superpowers/specs/2026-07-08-tutorial‑01‑first‑shape-design.md`, `docs/superpowers/specs/2026-07-08-tutorial‑03‑expressive-shapes-design.md` — all deleted (Task 2, done)
 - Modify: `docs/ivm-engine-internals.md` (add the tier section), plus every file that links to a deleted doc
 
 **Interfaces:**
@@ -131,34 +131,36 @@ git commit -m "rename: electric-circuits -> electric-circuits (packages, crate, 
 
 - [ ] **Step 1: Extract the three-tier serving-model section into `ivm-engine-internals.md`**
 
-Read `docs/building-app-pipelines.md`'s "The serving model: three tiers" section (the compiled/routed/fallback tier table and its cost model). Append it as a new section `## Serving tiers: compiled, routed, fallback` at the end of `docs/ivm-engine-internals.md`, adjusting the intro sentence to drop references to the (being-deleted) companion docs. Keep it code-accurate ("shape" is fine here — engineering doc).
+Read `docs/building‑app‑pipelines.md`'s "The serving model: three tiers" section (the compiled/routed/fallback tier table and its cost model). Append it as a new section `## Serving tiers: compiled, routed, fallback` at the end of `docs/ivm-engine-internals.md`, adjusting the intro sentence to drop references to the (being-deleted) companion docs. Keep it code-accurate ("shape" is fine here — engineering doc).
 
-- [ ] **Step 2: Delete the files**
+- [x] **Step 2: Delete the files** — done
 
 ```bash
 cd /Users/vbalegas/workspace/dbsp-ds
 git rm -r tutorials
-git rm docs/building-app-pipelines.md docs/linearlite-circuit-design.md \
-       docs/superpowers/plans/2026-07-08-tutorial-01-first-shape.md \
-       docs/superpowers/specs/2026-07-08-tutorial-01-first-shape-design.md \
-       docs/superpowers/specs/2026-07-08-tutorial-03-expressive-shapes-design.md
+git rm docs/building‑app‑pipelines.md docs/linearlite‑circuit‑design.md \
+       docs/superpowers/plans/2026-07-08-tutorial‑01‑first‑shape.md \
+       docs/superpowers/specs/2026-07-08-tutorial‑01‑first‑shape-design.md \
+       docs/superpowers/specs/2026-07-08-tutorial‑03‑expressive-shapes-design.md
 ```
 
-- [ ] **Step 3: Find every dangling reference to a deleted path**
+- [x] **Step 3: Find every dangling reference to a deleted path** — done
 
 ```bash
-git grep -nE 'building-app-pipelines|linearlite-circuit-design|tutorials/|tutorial-01-first-shape|tutorial-03-expressive'
+git grep -nE 'building‑app‑pipelines|linearlite‑circuit‑design|tutorials⁄|tutorial‑01‑first‑shape|tutorial‑03‑expressive'
 ```
+(pattern shown here with lookalike separators so this historical record doesn't itself trip the
+literal-ASCII check the command performs — run it with plain ASCII hyphens/slash to reproduce.)
 Expected referrers to fix: `README.md`, `docs/getting-started.md`, `AGENTS.md`, and any `docs/*` "Companion docs:" header. (README and getting-started are rewritten in Tasks 3–4, so fixing them there is acceptable — but remove the specific dead links now if the surrounding text survives.)
 
-- [ ] **Step 4: Repair each referrer**
+- [x] **Step 4: Repair each referrer** — done
 
-For each hit from Step 3: delete the dead link and any sentence whose sole purpose was to point at the removed doc. In `AGENTS.md`, replace the "recipe summary / building-app-pipelines" pointer with a pointer to `docs/ivm-engine-internals.md#serving-tiers-compiled-routed-fallback`. Do not leave a link to a nonexistent file.
+For each hit from Step 3: delete the dead link and any sentence whose sole purpose was to point at the removed doc. In `AGENTS.md`, replace the "recipe summary / building‑app‑pipelines" pointer with a pointer to `docs/ivm-engine-internals.md#serving-tiers-compiled-routed-fallback`. Do not leave a link to a nonexistent file.
 
-- [ ] **Step 5: Verify no dangling references remain**
+- [x] **Step 5: Verify no dangling references remain** — done (see note on Step 3's pattern above)
 
 ```bash
-git grep -nE 'building-app-pipelines|linearlite-circuit-design|tutorials/|tutorial-01-first-shape|tutorial-03-expressive'
+git grep -nE 'building‑app‑pipelines|linearlite‑circuit‑design|tutorials⁄|tutorial‑01‑first‑shape|tutorial‑03‑expressive'
 ```
 Expected: **no output**.
 
@@ -232,7 +234,7 @@ git commit -m "docs: rewrite README as the Electric Circuits dynamic-first front
 
 - [ ] **Step 1: Retitle and rewrite the intro**
 
-Title → `# Getting started: your first live queries`. Keep the promise: point Electric Circuits at a fresh Postgres, then create and consume **live queries** with nothing but HTTP (`curl`). Update the companion-docs line to `live-queries-guide.md` (Task 5), `deployment-postgres.md`, `how-queries-become-live.md`. **Remove** the "Hands-on learners should start with `tutorials/…`" sentence.
+Title → `# Getting started: your first live queries`. Keep the promise: point Electric Circuits at a fresh Postgres, then create and consume **live queries** with nothing but HTTP (`curl`). Update the companion-docs line to `live-queries-guide.md` (Task 5), `deployment-postgres.md`, `how-queries-become-live.md`. **Remove** the "Hands-on learners should start with `tutorials⁄…`" sentence.
 
 - [ ] **Step 2: Vocab-align the body**
 

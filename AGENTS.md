@@ -22,7 +22,6 @@ the project is growing toward).
 | `electric-conformance/` | Electric's own oracle/property/integration tests pointed at our `/v1/shape`. |
 | `docker/` | Containerized stack: `compose.yaml` (postgres + ds + engine + api), `Dockerfile.engine`, `Dockerfile.node`. `pnpm docker:up`. |
 | `apps/pipeline-viz` | Live pipeline explorer (shapes, shared families/nodes, reactive per-node state + index dumps) over `GET /graph` + `/state` + `/trace`. |
-| `tutorials/` | Tutorial series: one compose stack (postgres+ds+engine+api+viz) + per-episode walkthroughs (episodes/01-first-shape, 02-inside-the-pipeline). |
 | `examples/linearlite` | The flagship demo. `scripts/linearlite.sh start <size>` boots everything. |
 
 ## Docs (read these before designing)
@@ -30,14 +29,12 @@ the project is growing toward).
 - `README.md` — the system in one page + the consistency model summary.
 - `docs/ARCHITECTURE.md` — the as-built architecture: ingest, `SnapshotGate` fencing, sharing,
   subquery registry, reliability model, Electric adapter, client layer.
-- `docs/ivm-engine-internals.md` — engine execution strategies + the analytical cost model.
+- `docs/ivm-engine-internals.md` — engine execution strategies + the analytical cost model,
+  including the three-tier serving model (circuit/routing/fallback): see
+  [`docs/ivm-engine-internals.md#serving-tiers-compiled-routed-fallback`](docs/ivm-engine-internals.md#serving-tiers-compiled-routed-fallback).
 - `docs/shapes-and-subqueries-guide.md` — user/integrator guide.
 - `docs/deployment-postgres.md` — Postgres-as-source-of-record setup.
 - Each package has its own `README.md` (surface, commands, env knobs).
-- `docs/building-app-pipelines.md` — how to design a pipeline for an app: the three-tier
-  serving model (circuit/routing/fallback), the recipe, and a worked simple model.
-- `docs/linearlite-circuit-design.md` — how the flagship app's query graph is served
-  (which queries go to which tier); source of the recipe below.
 
 ## Designing dbsp circuits: pipelines vs shapes
 
@@ -147,7 +144,8 @@ The **visualizer** can also attach to any running engine on its own:
 `ELECTRIC_CIRCUITS_ENGINE_URL=http://127.0.0.1:<port> pnpm --filter @electric-circuits/pipeline-viz dev`.
 Its dev server proxies `/engine/*` → the engine control plane, so browser-side `fetch('/engine/graph')`
 etc. work from the page — the backbone of the verification workflow below. A third way is the
-containerized visualizer (`docker/Dockerfile.viz`): `cd tutorials && docker compose up --build` serves
+containerized visualizer (`docker/Dockerfile.viz`): `docker build -f docker/Dockerfile.viz -t
+electric-circuits-viz . && docker run -p 5180:5180 -p 5443:5443 electric-circuits-viz` serves
 `http://localhost:5180` with Caddy proxying `/engine/*` to the engine; set `ENGINE_UPSTREAM` to
 point it at another engine.
 

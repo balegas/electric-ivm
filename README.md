@@ -129,7 +129,7 @@ engine one maintenance path and one append per change.
 
 ## Designing the pipeline for your app
 
-The full treatment is `docs/building-app-pipelines.md`; the model in three sentences:
+The model in three sentences:
 **the circuit serves query families, routing serves query instances, the fallback serves query
 strangers.** A pipeline is compiled at deploy time and keyed by the app's *access cohort*; a
 shape is a selection/union of cohort groups from one pipeline's output, materialized at the
@@ -262,7 +262,7 @@ ELECTRIC_CIRCUITS_ENGINE_URL=http://127.0.0.1:<engine-port> VIZ_PORT=5180 \
 **`examples/linearlite` — the flagship demo app (TS).** A Linear-style issue tracker synced
 entirely through shapes (visibility subqueries, live counts, subset pagination). The demo
 launches the engine with the circuit's counts pipeline configured by default (the live
-browse-header COUNT — see `docs/linearlite-circuit-design.md`): `pnpm demo:linearlite`, or
+browse-header COUNT): `pnpm demo:linearlite`, or
 `scripts/linearlite.sh start large` for a 100k-issue workload.
 
 **`examples/web` — the minimal example (TS).** The smallest end-to-end app using the extended

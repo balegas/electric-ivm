@@ -430,8 +430,9 @@ scales with table size; everything row-scale lives in Postgres.
 
 The flagship example (`examples/linearlite`, verified in-browser at 100k issues) makes a user
 see only issues in projects they're a member of. With the demo's default circuit config this
-shape is circuit-served (`docs/linearlite-circuit-design.md`); the walkthrough below traces
-the registry path — what the same shape costs with the circuit off. It is a subquery shape:
+shape is circuit-served (see "Serving tiers: compiled, routed, fallback" above); the walkthrough
+below traces the registry path — what the same shape costs with the circuit off. It is a
+subquery shape:
 
 ```jsonc
 // issues visible to user u
@@ -550,3 +551,50 @@ executors via a trait so presentation cannot drift from execution.
 - `packages/bench/README.md` — the benchmark runners, including the shape-memory matrix that
   produced the memory-vs-shapes data used above.
 - `docs/shapes-and-subqueries-guide.md` — the user-facing companion to this document.
+
+## Serving tiers: compiled, routed, fallback
+
+Every shape lands in one of three serving tiers. The load-bearing separation is between what
+is *compiled* and what is *routed*:
+
+| Tier | Cardinality | Cost of adding one | Serves |
+|------|-------------|--------------------|--------|
+| **The circuit** | few counts pipelines, fixed at deploy | a config change + restart (counts reseed on boot) | COUNT **families** (templates) |
+| **Routing** | unbounded, changes at runtime | a routing-table entry | query **instances** (parameter combinations) |
+| **Fallback** | unbounded | nothing | query **strangers** (predicates matching no template) |
+
+- The **circuit** compiles one counts pipeline per aggregate family —
+  `map_index(group) → weighted_count` — keyed by *cohort group* (per project, per
+  (project, status), per aggregate group…). Its state is O(distinct groups), held in memory;
+  **row data lives in Postgres, never in the circuit**. Its structure never grows with shapes,
+  users, or parameter combinations — if a design makes it do so, the design is wrong (the
+  circuit-per-shape trap: structure must never scale with subscriptions).
+- A **circuit-served shape** (a COUNT aggregate) is a selection or sum of cohort groups from
+  one pipeline's keyed output, materialized at the delivery edge. Shape cardinality can
+  vastly exceed pipeline cardinality: a count exists per *combination* of projects clients
+  ask for, all fed from the same per-(project, status) pipeline. The sum is correct only when
+  the cohort key **partitions** the table (each row in exactly one group); overlapping groups
+  need dedup at the edge.
+- The **routing tier and fallback** are the engine's dynamic path — `KeyRouter` equality
+  families, the conjunct-indexed standalone path and conjunct-indexed aggregates, standalone
+  three-valued predicate evaluation (with the `AccessLeaf` index), and the subquery registry,
+  which serves **every** membership subquery: single-level and nested, negated or not. Together
+  they serve *any* predicate. The circuit is an optimization in front of them, never a
+  correctness dependency: a brand-new query pattern works immediately at fallback cost, and a
+  COUNT that matters is promoted into the circuit at the next deploy.
+
+### Three kinds of "dynamic", and who serves them
+
+1. **Dynamically created shapes** whose predicate decomposes over a template key
+   (`project_id IN (3,7,9)`, `issue_id = X`) → the routing tier: `KeyRouter` families and the
+   conjunct-indexed standalone path. These are deliberately *not* circuit-served — an indexed
+   route finds a change's shapes in `O(log N)`, whereas a circuit shape would scan every
+   delta linearly.
+2. **Time-varying membership** (`project_id IN (SELECT … WHERE user_id = $me)`) → the
+   subquery registry: one shared inner-set node per distinct subquery, created in two phases
+   (a Postgres backfill under a `REPEATABLE READ` snapshot, `SnapshotGate`-fenced against the
+   live log). Membership-table deltas reconcile the node's contributors; a value flip queries
+   the affected outer rows back from Postgres on the parallel flip-worker pool and emits them
+   absolutely, per pk, through ordered per-stream emission lanes.
+3. **Predicates that cut across every template key** (`title LIKE '%foo%'`, nested or negated
+   subqueries) → fallback.
