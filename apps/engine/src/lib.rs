@@ -37,6 +37,10 @@ pub mod retention;
 pub mod schema;
 pub mod sql;
 pub mod subq_circuit;
+// Host-side per-feed key sets (`HashMap<feed_id, RoaringBitmap>`) — the delete gate, moved out of
+// the membership circuit (Task 2.2, dbsp-ds-dh6). See subq_feed.rs and
+// docs/notes/2026-07-16-feed-set-representation-spike.md.
+mod subq_feed;
 // SPIKE (Task 2.2): measurement-only comparison of the in-circuit feed relation vs a host-side
 // HashMap<feed_id, RoaringBitmap>. Test-only, ignored by default, cheap to delete (this line +
 // src/subq_feed_repr_spike.rs + the roaring dev-dep). See
