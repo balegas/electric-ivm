@@ -72,8 +72,9 @@ pub struct GraphShape {
     pub is_subquery: bool,
     /// Present iff this shape is a scalar aggregation (COUNT/SUM/…).
     pub aggregate: Option<AggInfo>,
-    /// Present iff this shape is **circuit-served** (seeded + maintained by the dbsp pipeline);
-    /// says which cohort form serves it (`all` / `static:<col>` / `dynamic:<col>` / `counts`).
+    /// Present iff this shape is **circuit-served** (seeded + maintained by the dbsp pipeline).
+    /// The only serving class today is `counts` (see `planning.rs`); the cohort forms
+    /// (`all` / `static:` / `dynamic:`) died with the row arrangements.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub circuit: Option<CircuitPlacement>,
     /// Retention lifecycle: `active` | `deactivating` | `dormant` | `reactivating` (`None` while
@@ -144,8 +145,9 @@ pub struct ArrInput {
     pub seeded: bool,
 }
 
-/// One compiled index pipeline of the arrangement circuit — `input → map_index(cols) →
-/// integrate_trace` — with id `arr:index:<table>:<col,col>` (column names, in index order).
+/// **Legacy** — one compiled index pipeline of the removed row-arrangement layer. Row data
+/// lives in Postgres now, so no engine emits these anymore; the type (and the always-empty
+/// `indexes` field) is kept only for payload stability with older visualizer builds.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArrIndex {
@@ -159,19 +161,22 @@ pub struct ArrIndex {
     pub seeded: bool,
 }
 
-/// A live consumer of a compiled index: a subquery dependent whose flip re-derivations are served
-/// from that index's snapshot (`query_candidates` in `subquery.rs`). Unlike the inputs/indexes —
-/// which are fixed at boot — consumers appear and disappear with the shapes/nodes that need them.
+/// A live consumer of a compiled circuit pipeline. Today the only producers are **counts**
+/// pipelines and the only consumers circuit-served COUNT aggregates (`dependent_kind =
+/// "circuit-agg"`); flip re-derivations (`query_candidates` in `subquery.rs`) go to pooled
+/// Postgres queries, not to any arrangement, since the row-arrangement layer was removed.
+/// Unlike the inputs/counts — fixed at boot — consumers appear and disappear with their shapes.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArrConsumer {
-    /// The serving index's node id (an `ArrIndex::id`).
+    /// The serving pipeline's node id (an `ArrCounts::id`; historically an `ArrIndex::id`).
     pub index: String,
-    /// `"shape"` (an outer subquery shape) or `"node"` (a parent node, for nested IN).
+    /// `"circuit-agg"` (a counts-served COUNT aggregate). Older engines also emitted
+    /// `"shape"` / `"node"` for row-arrangement lookups; those payloads no longer occur.
     pub dependent_kind: String,
     /// The dependent's id in this graph: a shape id, or a subquery node signature.
     pub dependent_id: String,
-    /// Column name (in the dependent's queried table) the lookup keys on.
+    /// Column name the lookup keyed on (legacy — empty for counts consumers).
     pub connecting_col: String,
 }
 
@@ -181,9 +186,10 @@ pub struct ArrConsumer {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArrangementGraph {
-    /// Lookups served from arrangement snapshots.
+    /// **Legacy** — always 0. Counted row-arrangement lookups before that layer was removed;
+    /// kept for payload stability with older visualizer builds.
     pub served: u64,
-    /// Lookups that fell back to Postgres (missing index, or table not seeded yet).
+    /// **Legacy** — always 0 (see `served`).
     pub fallback: u64,
     pub inputs: Vec<ArrInput>,
     pub indexes: Vec<ArrIndex>,
@@ -363,8 +369,18 @@ pub(crate) fn circuit_ops(
         let snk_id = format!("snk:{sid}");
 
         if let Some(agg) = &s.aggregate {
-            // apply(): σ over the delta, then the incremental fold; the sink appends on change.
             let fn_label = format!("Σ {}({})", format!("{:?}", agg.func).to_uppercase(), agg.col.as_deref().unwrap_or("*"));
+            if s.circuit.as_ref().is_some_and(|p| p.counts) {
+                // Counts-served: the fold's input is the counts pipeline's group deltas
+                // (`map_index(group) → weighted_count` in the circuit), NOT a σ over row
+                // deltas — no per-row predicate runs for this shape. The visualizer draws the
+                // input as the serving edge from the table's source (its folded arrangements).
+                ops.push(op(&format!("fold:{sid}"), "fold", &shape_hop, Some(shape_hop.clone()), &fn_label));
+                ops.push(op(&snk_id, "sink", &shape_hop, None, &s.stream_path));
+                edges.push(flow(&format!("fold:{sid}"), &snk_id));
+                continue;
+            }
+            // apply(): σ over the delta, then the incremental fold; the sink appends on change.
             ops.push(op(&format!("sigma:{sid}"), "filter", &shape_hop, None, "σ where"));
             ops.push(op(&format!("fold:{sid}"), "fold", &shape_hop, Some(shape_hop.clone()), &fn_label));
             ops.push(op(&snk_id, "sink", &shape_hop, None, &s.stream_path));
@@ -376,13 +392,20 @@ pub(crate) fn circuit_ops(
 
         if s.is_subquery {
             // The outer predicate evaluates with IN-membership against node arrangements — a
-            // semijoin/antijoin; flips arrive on the subquery edges added below.
+            // semijoin/antijoin; flips arrive on the subquery edges added below. Between the
+            // evaluation and the sink sits the shape's FEED SET (`subq_feed::FeedSet`, a
+            // host-side Roaring bitmap per feed): candidates are asserted absolutely, and a
+            // delete is emitted iff the pk was actually present (a synchronous check-and-set
+            // under the registry lock) — a "not a member" verdict for a pk the stream never
+            // contained emits nothing, structurally.
             ops.push(op(&format!("sj:{sid}"), "join", &shape_hop, None, "⋈ membership"));
             ops.push(op(&format!("pi:{sid}"), "project", &shape_hop, None, "π pk → envelope"));
+            ops.push(op(&format!("feed:{sid}"), "arrange", &shape_hop, None, "feed set (delete gate)"));
             ops.push(op(&snk_id, "sink", &shape_hop, Some(shape_hop.clone()), &s.stream_path));
             edges.push(flow(&d, &format!("sj:{sid}")));
             edges.push(flow(&format!("sj:{sid}"), &format!("pi:{sid}")));
-            edges.push(flow(&format!("pi:{sid}"), &snk_id));
+            edges.push(flow(&format!("pi:{sid}"), &format!("feed:{sid}")));
+            edges.push(flow(&format!("feed:{sid}"), &snk_id));
             continue;
         }
 
