@@ -828,7 +828,7 @@ impl Engine {
             }
             (st.shapes.len(), tables_with_execs, st.tables.len(), families, family_shapes, standalone)
         };
-        let (sq_nodes, sq_contributors, sq_distinct, sq_shapes, sq_edges) = {
+        let sq = {
             let reg = self.subqueries.lock().await;
             reg.mem_totals()
         };
@@ -847,11 +847,12 @@ impl Engine {
             families,
             family_shapes,
             standalone,
-            subquery_nodes: sq_nodes,
-            subquery_contributors: sq_contributors,
-            subquery_distinct_values: sq_distinct,
-            subquery_shapes: sq_shapes,
-            subquery_edges: sq_edges,
+            subquery_nodes: sq.nodes,
+            subquery_contributors: sq.contributors,
+            subquery_distinct_values: sq.distinct,
+            subquery_shapes: sq.shapes,
+            subquery_edges: sq.edges,
+            subquery_feed_entries: sq.feed_entries,
             ..Default::default()
         }
     }

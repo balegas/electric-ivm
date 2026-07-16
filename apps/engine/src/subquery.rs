@@ -233,6 +233,18 @@ impl HeapSize for SubqueryShape {
 /// A `TableSchema` lookup shared with the engine's compiled schema.
 pub type SchemaMap = Arc<HashMap<String, TableSchema>>;
 
+/// Cheap, sampler-safe registry cardinalities (see [`SubqueryRegistry::mem_totals`]).
+pub struct MemTotals {
+    pub nodes: usize,
+    /// Total contributor pks across all nodes (the dominant per-node state).
+    pub contributors: usize,
+    pub distinct: usize,
+    pub shapes: usize,
+    pub edges: usize,
+    /// Total pks delivered across all shapes' host-side feed sets (Task 2.2).
+    pub feed_entries: usize,
+}
+
 /// Per-node introspection (served at `GET /subqueries`).
 #[derive(Clone, serde::Serialize)]
 pub struct NodeStat {
@@ -529,13 +541,14 @@ impl SubqueryRegistry {
 
     /// Memory-relevant registry totals: maintained nodes, total contributor pks across all nodes (the
     /// dominant per-node state — one entry per inner row producing a value), distinct values, shapes,
-    /// and edges. Used by the memory probe to attribute subquery state growth — cheap enough for the
-    /// 500ms background sampler (`mem::spawn_sampler`): everything here is already published/derivable
-    /// per-node index state, the same walk this method did before the byte-level accounting phase.
+    /// edges, and total feed entries (pks delivered across all shapes' host-side feed sets). Used by
+    /// the memory probe to attribute subquery state growth — cheap enough for the 500ms background
+    /// sampler (`mem::spawn_sampler`): everything here is already published/derivable per-node index
+    /// state or an O(containers) bitmap-length sum, the same class of walk this method always did.
     ///
-    /// Does NOT include the membership-circuit byte measurement — see [`Self::circuit_bytes`], the
-    /// on-demand-only (`GET /memory`) counterpart that adds the FEEDS-map walk on top of this.
-    pub fn mem_totals(&self) -> (usize, usize, usize, usize, usize) {
+    /// Does NOT include the byte-level measurements (`bytes_membership_circuit`, `bytes_feed_sets`)
+    /// — those are on-demand-only (`GET /memory`); see [`Self::circuit_bytes`].
+    pub fn mem_totals(&self) -> MemTotals {
         let mut contributors = 0;
         let mut distinct = 0;
         for n in self.nodes.values() {
@@ -543,7 +556,14 @@ impl SubqueryRegistry {
             contributors += vals.iter().map(|(_, c)| c).sum::<usize>();
             distinct += d;
         }
-        (self.nodes.len(), contributors, distinct, self.shapes.len(), self.edges_count())
+        MemTotals {
+            nodes: self.nodes.len(),
+            contributors,
+            distinct,
+            shapes: self.shapes.len(),
+            edges: self.edges_count(),
+            feed_entries: self.feed_sets.total_entries(),
+        }
     }
 
     /// Measured owned/on-disk bytes of the membership circuit's published snapshots

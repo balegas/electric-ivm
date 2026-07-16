@@ -68,18 +68,12 @@ impl FeedSet {
         self.feeds.remove(&feed_id);
     }
 
-    /// Number of pks currently in `feed_id` (introspection). Zero for an unknown feed.
-    // Wired into the drop path + introspection in increment 4; the allow is removed there.
-    #[allow(dead_code)]
-    pub(crate) fn feed_len(&self, feed_id: i64) -> usize {
-        self.feeds.get(&feed_id).map_or(0, |bm| bm.len() as usize)
-    }
-
-    /// Every pk id currently in `feed_id`, ascending (introspection + tests). Empty for an
-    /// unknown feed.
-    #[allow(dead_code)]
-    pub(crate) fn feed_pk_ids(&self, feed_id: i64) -> Vec<u32> {
-        self.feeds.get(&feed_id).map_or_else(Vec::new, |bm| bm.iter().collect())
+    /// Total pks across all feeds — the delivered-row cardinality the memory probe reports as
+    /// `subquery_feed_entries` (the analogue of `subquery_contributors`, and what
+    /// `bytes_feed_sets` measures the byte cost of). `RoaringBitmap::len` is O(containers), so this
+    /// is cheap enough for the 500 ms cardinality sampler.
+    pub(crate) fn total_entries(&self) -> usize {
+        self.feeds.values().map(|bm| bm.len() as usize).sum()
     }
 }
 
@@ -139,21 +133,15 @@ mod tests {
         fs.insert(7, 4);
         fs.insert(7, 5);
         fs.insert(8, 6);
-
-        let mut pks = fs.feed_pk_ids(7);
-        pks.sort_unstable();
-        assert_eq!(pks, vec![4, 5]);
-        assert_eq!(fs.feed_len(8), 1);
-        assert_eq!(fs.feed_pk_ids(999), Vec::<u32>::new(), "unknown feed enumerates empty");
-        assert_eq!(fs.feed_len(999), 0);
+        assert_eq!(fs.total_entries(), 3);
+        assert!(fs.contains(7, 4) && fs.contains(7, 5) && fs.contains(8, 6));
+        assert!(!fs.contains(7, 6), "a pk in feed 8 is not in feed 7 (isolation)");
 
         // Drop feed 7: gone entirely, feed 8 untouched.
         fs.drop_feed(7);
-        assert_eq!(fs.feed_len(7), 0);
-        assert_eq!(fs.feed_pk_ids(7), Vec::<u32>::new());
-        assert!(!fs.contains(7, 4));
-        assert_eq!(fs.feed_len(8), 1, "dropping a feed must not touch a neighbour");
-        assert!(fs.contains(8, 6));
+        assert_eq!(fs.total_entries(), 1, "only feed 8's single entry remains");
+        assert!(!fs.contains(7, 4) && !fs.contains(7, 5));
+        assert!(fs.contains(8, 6), "dropping a feed must not touch a neighbour");
     }
 
     /// A remove against a live feed that never held the pk gates (no delete), distinct from a
@@ -164,7 +152,7 @@ mod tests {
         fs.insert(7, 1);
         assert!(!fs.remove(7, 2), "pk never in this live feed gates (remove == false)");
         assert!(!fs.remove(42, 1), "remove against a nonexistent feed gates (remove == false)");
-        assert_eq!(fs.feed_len(42), 0, "a remove miss must not create the feed");
+        assert_eq!(fs.total_entries(), 1, "a remove miss must not create a feed (only 7->1 exists)");
         assert!(!fs.contains(42, 1));
     }
 

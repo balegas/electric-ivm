@@ -74,6 +74,10 @@ pub struct Cardinalities {
     pub subquery_distinct_values: usize,
     pub subquery_shapes: usize,
     pub subquery_edges: usize,
+    /// Total pks delivered across all shapes' host-side per-feed key sets (Task 2.2, the delete
+    /// gate moved out of the membership circuit). The row-count analogue of `subquery_contributors`;
+    /// `bytes_feed_sets` measures its byte cost.
+    pub subquery_feed_entries: usize,
     /// `ShapeRecord`s in the shape registry (`Engine.state.shapes`).
     pub bytes_shape_records: usize,
     /// Per-table executor structures: standalone shapes + their conjunct index, family routers
@@ -142,6 +146,7 @@ struct Gauges {
     subquery_distinct_values: AtomicU64,
     subquery_shapes: AtomicU64,
     subquery_edges: AtomicU64,
+    subquery_feed_entries: AtomicU64,
     samples: AtomicU64,
 }
 
@@ -179,6 +184,7 @@ pub fn publish(card: &Cardinalities) {
     g.subquery_distinct_values.store(card.subquery_distinct_values as u64, Ordering::Relaxed);
     g.subquery_shapes.store(card.subquery_shapes as u64, Ordering::Relaxed);
     g.subquery_edges.store(card.subquery_edges as u64, Ordering::Relaxed);
+    g.subquery_feed_entries.store(card.subquery_feed_entries as u64, Ordering::Relaxed);
     g.samples.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -211,6 +217,7 @@ pub fn snapshot_json(card: &Cardinalities) -> serde_json::Value {
             "subquery_distinct_values": g.subquery_distinct_values.load(Ordering::Relaxed),
             "subquery_shapes": g.subquery_shapes.load(Ordering::Relaxed),
             "subquery_edges": g.subquery_edges.load(Ordering::Relaxed),
+            "subquery_feed_entries": g.subquery_feed_entries.load(Ordering::Relaxed),
             "bytes_shape_records": card.bytes_shape_records,
             "bytes_executors": card.bytes_executors,
             "bytes_retention": card.bytes_retention,
@@ -280,6 +287,7 @@ pub fn init_otel() -> SdkMeterProvider {
     gauge!("engine_subquery_distinct_values", "Distinct values across subquery nodes", subquery_distinct_values, "");
     gauge!("engine_subquery_shapes", "Subquery (cross-table) shapes", subquery_shapes, "");
     gauge!("engine_subquery_edges", "Subquery dependency edges", subquery_edges, "");
+    gauge!("engine_subquery_feed_entries", "Total pks delivered across subquery shapes' feed sets", subquery_feed_entries, "");
 
     // Touch a KeyValue so the import is used even if labels are added later.
     let _ = KeyValue::new("service.name", "electric-ivm-engine");
