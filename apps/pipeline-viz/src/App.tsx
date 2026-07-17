@@ -368,7 +368,9 @@ export default function App() {
     // never flashes from hops — yet it's the node whose weight chip refreshes and where the "via
     // query-back" tag shows. Flash it directly (after the causal path stages) so the derived delta
     // visibly lands there, without fabricating a source→change edge pulse the engine deliberately omits.
-    if (derivedVia(ev)) {
+    // Only a move-IN (net +weight: rows entering scope) does a Postgres query-back. A move-OUT
+    // (net −weight) is deletes emitted from the feed set — no fetch — so no bounce there.
+    if (derivedVia(ev) && (ev.delta ?? []).reduce((acc, dd) => acc + dd.w, 0) > 0) {
       // Picture the query-back as a round trip on the outer source↔Δ edge: the Δ node needs the
       // moved rows, "asks" the source (Postgres), and the rows bounce back. The engine omits this
       // edge from the hop path (the change never flowed through replication), so we add it here as a
