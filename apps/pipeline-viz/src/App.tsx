@@ -370,21 +370,33 @@ export default function App() {
     // visibly lands there, without fabricating a source→change edge pulse the engine deliberately omits.
     // Only a move-IN (net +weight: rows entering scope) does a Postgres query-back. A move-OUT
     // (net −weight) is deletes emitted from the feed set — no fetch — so no bounce there.
-    if (derivedVia(ev) && (ev.delta ?? []).reduce((acc, dd) => acc + dd.w, 0) > 0) {
+    const netW = (ev.delta ?? []).reduce((acc, dd) => acc + dd.w, 0)
+    if (derivedVia(ev) && netW > 0) {
+      const edgesNow = snapshot?.edges ?? edgesRef.current
+      const stepMs = rankDelayMs(1, speedRef.current)
+      const src = `src:${ev.table}`
+      const del = `d:${ev.table}`
       // Picture the query-back as a round trip on the outer source↔Δ edge: the Δ node needs the
       // moved rows, "asks" the source (Postgres), and the rows bounce back. The engine omits this
       // edge from the hop path (the change never flowed through replication), so we add it here as a
       // BOUNCE — honest (a round trip, not a one-way delivery) and right where the "via query-back"
       // tag shows.
-      const edgesNow = snapshot?.edges ?? edgesRef.current
-      const src = `src:${ev.table}`
-      const del = `d:${ev.table}`
-      const e = edgesNow.find((e) => (e.source === src && e.target === del) || (e.source === del && e.target === src))
-      if (e) {
+      const be = edgesNow.find((x) => (x.source === src && x.target === del) || (x.source === del && x.target === src))
+      if (be) {
         // One unhurried round trip (out to the source and back) — ~2.6s at 1× speed.
         const durMs = 2600 / speedRef.current
-        d.edges.set(e.id, { id: d.id, color: '#d97706', label: '', delayMs: 0, durMs, derived: true, bounce: true })
+        d.edges.set(be.id, { id: d.id, color: '#d97706', label: '', delayMs: 0, durMs, derived: true, bounce: true })
         d.totalMs = Math.max(d.totalMs, durMs + 200)
+      }
+      // After the query-back returns, the FETCHED ROWS flow from the Δ node into each join that
+      // gathered them (`d:<table> → sj:<shape>`), carrying the +weight — the join's OTHER input
+      // (membership) pulses via the hop path and is held there by the gate, so this arrives just as
+      // the join fires and it visibly gathers both sides before emitting.
+      for (const je of edgesNow) {
+        if (je.source === del && d.nodes.has(je.target)) {
+          const jf = d.nodes.get(je.target)
+          d.edges.set(je.id, { id: d.id, color: '#16a34a', label: `+${netW}`, delayMs: Math.max(0, (jf?.delayMs ?? 0) - stepMs), durMs: stepMs })
+        }
       }
     }
     if (d.nodes.size === 0 && d.edges.size === 0) return null
