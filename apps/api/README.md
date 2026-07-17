@@ -1,6 +1,6 @@
-# @electric-ivm/api
+# @electric-circuits/api
 
-The extended tRPC API server — the surface `@electric-ivm/client` talks to. It sits beside the
+The extended tRPC API server — the surface `@electric-circuits/client` talks to. It sits beside the
 Rust engine and durable-streams:
 
 - **writes** (`ingest.write`) append State-Protocol envelopes directly to the durable-streams
@@ -26,17 +26,17 @@ The Electric-compatible `GET /v1/shape` endpoint is served by the **engine**, no
 | `subset.live` | mutation | open a changes-only live tail feed on a base predicate (no backfill) |
 | `aggregate.create` | mutation | live scalar COUNT/SUM/AVG/MIN/MAX (`fn`, optional `col`) over a filter |
 
-The predicate input is the shared AST from [`@electric-ivm/protocol`](../../packages/protocol/README.md):
+The predicate input is the shared AST from [`@electric-circuits/protocol`](../../packages/protocol/README.md):
 leaf comparisons, `isNull`, `and`/`or`/`not`, and `IN (SELECT …)` subqueries.
 
 ## Starting a server
 
 ```ts
-import { createApiServer } from '@electric-ivm/api'
+import { createApiServer } from '@electric-circuits/api'
 
 const api = await createApiServer({
   dsUrl: 'http://127.0.0.1:8791',     // durable-streams server
-  engineUrl: 'http://127.0.0.1:7010', // electric-ivm-engine control plane
+  engineUrl: 'http://127.0.0.1:7010', // electric-circuits-engine control plane
   port: 8790,                         // omit for an ephemeral port
   host: '0.0.0.0',                    // default 127.0.0.1
 })

@@ -1,21 +1,21 @@
-# The whole electric-ivm server stack, containerized:
+# The whole electric-circuits server stack, containerized:
 #
 #   postgres  — the system of record (wal_level=logical; the engine creates its replication slot)
 #   ds        — durable-streams server (the log: table/<name> in, shape/<id> out)
 #   engine    — the Rust engine: replication ingest, shape/subquery/aggregation maintenance,
 #               control-plane HTTP + the Electric-compatible GET /v1/shape (port 7010)
-#   api       — the extended tRPC API (shapes/subsets/aggregations for @electric-ivm/client, port 8790)
+#   api       — the extended tRPC API (shapes/subsets/aggregations for @electric-circuits/client, port 8790)
 #
 #   docker compose -f docker/compose.yaml up --build
 #
-# Then point an ElectricSQL client at http://localhost:7010/v1/shape, or @electric-ivm/client at
+# Then point an ElectricSQL client at http://localhost:7010/v1/shape, or @electric-circuits/client at
 # http://localhost:8790 (API) + http://localhost:8791 (streams).
 #
-# Note: the engine introspects the table set at startup (ELECTRIC_IVM_PG_TABLES=* = every public
+# Note: the engine introspects the table set at startup (ELECTRIC_CIRCUITS_PG_TABLES=* = every public
 # table with a primary key). Create your tables first — or `docker compose restart engine` after a
 # migration — for them to be picked up.
 
-name: electric-ivm
+name: electric-circuits
 
 services:
   postgres:
@@ -59,10 +59,10 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.engine
     environment:
-      ELECTRIC_IVM_DS_URL: http://ds:8791
-      ELECTRIC_IVM_PG_URL: postgres://postgres:password@postgres:5432/electric
-      ELECTRIC_IVM_PG_TABLES: "${ELECTRIC_IVM_PG_TABLES:-*}"
-      ELECTRIC_IVM_BIND: 0.0.0.0:7010
+      ELECTRIC_CIRCUITS_DS_URL: http://ds:8791
+      ELECTRIC_CIRCUITS_PG_URL: postgres://postgres:password@postgres:5432/electric
+      ELECTRIC_CIRCUITS_PG_TABLES: "${ELECTRIC_CIRCUITS_PG_TABLES:-*}"
+      ELECTRIC_CIRCUITS_BIND: 0.0.0.0:7010
       # The ds data volume, mounted read-only below, so the engine's storage sampler
       # (electric.storage.used.bytes) can `du` the actual stream data.
       ELECTRIC_STORAGE_DIR: /ds-data

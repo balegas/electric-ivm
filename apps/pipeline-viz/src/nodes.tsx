@@ -12,13 +12,31 @@ import type { NodeStateSummary } from './types'
 function DeltaPeek({ table }: { table: string }) {
   const cap = useLatestDelta(table)
   if (!cap) return <div className="pnode-state pnode-state-empty">—</div>
+  // A derived Δ is a subquery membership move. Move-IN (net +) fetches the rows via a Postgres
+  // query-back; move-OUT (net −) deletes them from the feed set — no query-back.
+  const net = cap.via ? cap.rows.reduce((a, r) => a + r.w, 0) : 0
+  const moveOut = cap.via != null && net < 0
   return (
-    <div className="pnode-state pnode-delta" title="most recent Z-set delta (weights)">
+    <div
+      className="pnode-state pnode-delta"
+      title={
+        cap.via
+          ? moveOut
+            ? `derived from a membership change in ${cap.via} (move-out) — rows deleted from the feed set, no query-back; ${table}'s own replication stream didn't change`
+            : `derived via a query-back from ${cap.via} (move-in) — ${table}'s own replication stream didn't change`
+          : 'most recent Z-set delta (weights)'
+      }
+    >
       {cap.rows.map((r, i) => (
         <span key={i} className={`chip pnode-zw ${r.w > 0 ? 'pnode-zw-pos' : 'pnode-zw-neg'}`}>
           {r.w > 0 ? `+${r.w}` : `−${Math.abs(r.w)}`}
         </span>
       ))}
+      {cap.via ? (
+        <span className="chip pnode-viaqb" title={moveOut ? `move-out from ${cap.via}` : `move-in via query-back from ${cap.via}`}>
+          {moveOut ? '↤ via membership' : '⟲ via query-back'}
+        </span>
+      ) : null}
     </div>
   )
 }

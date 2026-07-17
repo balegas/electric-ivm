@@ -36,8 +36,8 @@ from Caddy's local CA: run `caddy trust` once, or click through the warning.
 Running the visualizer standalone against any engine (front it with caddy yourself for browser use):
 
 ```bash
-ELECTRIC_IVM_ENGINE_URL=http://127.0.0.1:<engine-port> VIZ_PORT=5180 \
-  pnpm --filter @electric-ivm/pipeline-viz dev
+ELECTRIC_CIRCUITS_ENGINE_URL=http://127.0.0.1:<engine-port> VIZ_PORT=5180 \
+  pnpm --filter @electric-circuits/pipeline-viz dev
 caddy reverse-proxy --from https://localhost:5443 --to 127.0.0.1:5180
 ```
 
@@ -49,8 +49,8 @@ dropping them, and a rejoin reactivates them by change-log replay. The productio
 (30 min idle); boot with second-scale knobs to watch it happen:
 
 ```bash
-ELECTRIC_IVM_SHAPE_IDLE_SECS=12 ELECTRIC_IVM_RETENTION_SWEEP_SECS=3 \
-ELECTRIC_IVM_SHAPE_DORMANT_TTL_SECS=3600 scripts/linearlite.sh start small
+ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS=12 ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS=3 \
+ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS=3600 scripts/linearlite.sh start small
 ```
 
 Then switch "Viewing as" users in LinearLite and watch the visualizer: the previous user's routed
@@ -74,7 +74,7 @@ Find the engine URL in the demo log: `grep ENGINE_LISTENING /tmp/el-linearlite.l
 ## Gotchas
 
 - One demo instance at a time; a leftover `tsx start.ts`/`caddy`/engine keeps ports and serves
-  stale code. `scripts/linearlite.sh stop`, else `pkill -f electric-ivm-engine`,
+  stale code. `scripts/linearlite.sh stop`, else `pkill -f electric-circuits-engine`,
   `pkill -f "tsx start.ts"`, `pkill -f caddy`.
 - The demo Postgres is ephemeral (`mkdtemp`) — data does not survive a restart. Leaked ephemeral
   Postgres instances exhaust macOS shared memory (SHMMNI≈32) and make `initdb` fail everywhere;

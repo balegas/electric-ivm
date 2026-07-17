@@ -8,9 +8,9 @@
 #          concurrent live streams (the /trace SSE + engine polling); over plain HTTP/1.1 a
 #          browser hits its ~6-connection-per-host cap and the page freezes silently. HTTP/2
 #          multiplexes them all over one connection. The internal CA is minted on first TLS
-#          use and persisted in the viz-caddy-data volume (see tutorials/compose.yaml), so it
-#          survives rebuilds; click through the browser warning once, or trust the extracted
-#          root CA (tutorials/README.md → "Trusting the visualizer's certificate").
+#          use and persisted in the viz-caddy-data volume, so it survives rebuilds; click
+#          through the browser warning once, or trust the extracted root CA in your OS/browser
+#          trust store.
 (viz) {
 	handle_path /engine/* {
 		reverse_proxy {$ENGINE_UPSTREAM:engine:7010}

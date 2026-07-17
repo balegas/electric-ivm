@@ -4,7 +4,7 @@
 //! The membership circuit (`crate::subq_circuit`) and its registry (`crate::subquery`) key every
 //! relation by primary key. Storing the pk as a heap `String` in each circuit entry AND each
 //! registry index entry — once per relation, per feed/node — was the dominant per-entry cost
-//! (measured ~118 B resident/entry, ~27% of the membership footprint at 100k subscriptions). This
+//! (a large share of the membership footprint). This
 //! dictionary stores each distinct pk string exactly ONCE globally and hands out a `u32` id used
 //! as the in-circuit / in-index key, so a per-feed entry drops to 8 B (its `(feed_id, pk_id)` key)
 //! and the string is amortized across every feed/node that references it.

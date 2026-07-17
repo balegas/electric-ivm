@@ -120,7 +120,7 @@ export const appRouter = t.router({
       ),
   }),
 
-  // Scalar aggregations (COUNT/SUM/AVG/MIN/MAX) over a filter — an electric-ivm extension, maintained
+  // Scalar aggregations (COUNT/SUM/AVG/MIN/MAX) over a filter — an electric-circuits extension, maintained
   // incrementally by the engine and streamed as a single live value.
   aggregate: t.router({
     create: t.procedure

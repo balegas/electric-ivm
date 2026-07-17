@@ -23,7 +23,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Rust engine tests
-        run: cargo test -p electric-ivm-engine
+        run: cargo test -p electric-circuits-engine
 
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4

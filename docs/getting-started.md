@@ -1,17 +1,17 @@
-# Getting started: a new database and your first shapes
+# Getting started: your first live queries
 
-This is the from-zero walkthrough: point electric-ivm at a fresh Postgres database, then create
-and consume shapes with **nothing but HTTP** — regular shapes, subqueries, and aggregations.
-Everything here is bare `curl`; the client SDK (`@electric-ivm/client`) wraps exactly these
-requests. Companion docs: `shapes-and-subqueries-guide.md` (concepts + the SDK),
-`deployment-postgres.md` (production Postgres notes), `ivm-engine-internals.md` (how it works).
-Hands-on learners should start with `tutorials/episodes/01-first-shape/README.md` for a guided walkthrough.
+This is the from-zero walkthrough: point Electric Circuits at a fresh Postgres database, then create
+and consume live queries with **nothing but HTTP** — regular live queries, subqueries, and
+aggregations. Everything here is bare `curl`; the client SDK (`@electric-circuits/client`) wraps
+exactly these requests. Companion docs: [live queries guide](live-queries-guide.md) (concepts + the
+SDK), [deployment-postgres.md](deployment-postgres.md) (production Postgres notes),
+[how queries become live](how-queries-become-live.md) (how it works).
 
 ---
 
 ## 1. The example schema
 
-A tiny issue tracker. Four tables, chosen so we can show every shape form: plain filters
+A tiny issue tracker. Four tables, chosen so we can show every live query form: plain filters
 (`issues`), a cross-table subquery (`project_members` → `issues`), and aggregations (`points`).
 
 ```sql
@@ -51,7 +51,7 @@ Requirements the engine puts on your tables:
 - The engine will run `ALTER TABLE … REPLICA IDENTITY FULL` on each table at startup, so the
   connecting role must own the tables (or be superuser).
 
-Seed a few rows so the shapes below have something to return:
+Seed a few rows so the live queries below have something to return:
 
 ```sql
 INSERT INTO users   VALUES (1, 'alice', true), (2, 'bob', true);
@@ -84,9 +84,9 @@ max_wal_senders = 10
 | service | port | role |
 |---|---|---|
 | `postgres` (16, `wal_level=logical`) | 5432 | system of record — run the DDL above here |
-| `ds` (durable-streams server) | 8791 | the change log; shape feeds are read from here |
-| `engine` (Rust) | 7010 | replication ingest + shape maintenance + `/v1/shape` |
-| `api` (extended API) | 8790 | shapes / subset queries / aggregations |
+| `ds` (durable-streams server) | 8791 | the change log; live query feeds are read from here |
+| `engine` (Rust) | 7010 | replication ingest + live query maintenance + `/v1/shape` |
+| `api` (extended API) | 8790 | live queries / subset queries / aggregations |
 
 ### Option B — three processes by hand
 
@@ -95,27 +95,27 @@ max_wal_senders = 10
 DS_PORT=8791 node docker/ds-server.ts
 
 # 2. the engine, pointed at your database
-export ELECTRIC_IVM_DS_URL="http://127.0.0.1:8791"
-export ELECTRIC_IVM_PG_URL="postgres://user:pass@127.0.0.1:5432/appdb"
-export ELECTRIC_IVM_PG_TABLES="*"        # or "users,projects,project_members,issues"
-export ELECTRIC_IVM_BIND="0.0.0.0:7010"
-target/release/electric-ivm-engine       # prints ENGINE_LISTENING <addr> when ready
+export ELECTRIC_CIRCUITS_DS_URL="http://127.0.0.1:8791"
+export ELECTRIC_CIRCUITS_PG_URL="postgres://user:pass@127.0.0.1:5432/appdb"
+export ELECTRIC_CIRCUITS_PG_TABLES="*"        # or "users,projects,project_members,issues"
+export ELECTRIC_CIRCUITS_BIND="0.0.0.0:7010"
+target/release/electric-circuits-engine       # prints ENGINE_LISTENING <addr> when ready
 
 # 3. the extended API server
 DS_URL=http://127.0.0.1:8791 ENGINE_URL=http://127.0.0.1:7010 API_PORT=8790 \
   node docker/api-server.ts
 ```
 
-`ELECTRIC_IVM_PG_TABLES="*"` (or empty) means *introspect every public table that has a primary
+`ELECTRIC_CIRCUITS_PG_TABLES="*"` (or empty) means *introspect every public table that has a primary
 key*. On boot, per table, the engine: introspects columns/types/pk, sets
 `REPLICA IDENTITY FULL`, ensures the `changes` durable stream, creates the logical
-replication slot (`pgoutput` + a `<slot>_pub` publication, name from `ELECTRIC_IVM_PG_SLOT`,
-default `electric_ivm`),
+replication slot (`pgoutput` + a `<slot>_pub` publication, name from `ELECTRIC_CIRCUITS_PG_SLOT`,
+default `electric_circuits`),
 and starts the ingestor. Nothing else to migrate or install in the database.
 
 The engine's circuit tier — disk-spillable table arrangements, counts pipelines, and circuit
 serving — is always on. Tune it (state dir, cache/spill budgets, which lookup indexes and
-counts pipelines to compile) with the `ELECTRIC_IVM_DBSP_*` variables; the full reference table
+counts pipelines to compile) with the `ELECTRIC_CIRCUITS_DBSP_*` variables; the full reference table
 is in `ARCHITECTURE.md` §6b. The LinearLite demo (`pnpm demo:linearlite`) runs the engine with
 the full circuit configuration by default.
 
@@ -128,15 +128,16 @@ curl http://localhost:7010/replication/lsn   # → {"lsn":"0/0","sync":0} until 
 
 ---
 
-## 3. Your first shape — `GET /v1/shape`
+## 3. Your first live query — `GET /v1/shape`
 
 The engine speaks the Electric wire protocol, so this is the zero-dependency way to consume a
-shape: one endpoint, two request forms (snapshot, then long-poll). Here the `where` is a **SQL
-string**.
+live query: one endpoint, two request forms (snapshot, then long-poll). In the API these are
+created with `client.shape()` and served at `/v1/shape` (the Electric protocol name);
+conceptually we call them **live queries**. Here the `where` is a **SQL string**.
 
 ### Snapshot
 
-`offset=-1` (or omitting `offset`) asks for the shape's current rows:
+`offset=-1` (or omitting `offset`) asks for the live query's current rows:
 
 ```sh
 curl -i -G 'http://localhost:7010/v1/shape' \
@@ -147,7 +148,7 @@ curl -i -G 'http://localhost:7010/v1/shape' \
 
 ```http
 HTTP/1.1 200 OK
-electric-handle: <shape id>
+electric-handle: <handle>
 electric-offset: <tail offset>
 electric-schema: {"id":{"type":"int8","pk_index":0},"project_id":{"type":"int8"},...}
 electric-up-to-date:
@@ -185,7 +186,7 @@ Now write to Postgres from anywhere (`psql`, your app, an ORM):
 UPDATE issues SET status = 'doing' WHERE id = 1000;
 ```
 
-The pending long-poll returns with the delta — here the row *leaves* the shape, so it's a
+The pending long-poll returns with the delta — here the row *leaves* the live query, so it's a
 `delete`:
 
 ```json
@@ -204,8 +205,8 @@ loop with the new offset. If nothing happens within the long-poll window (defaul
 
 If the handle has been evicted (idle for `ELECTRIC_HANDLE_TTL`, default 600 s) you get
 `409 Conflict` with `[{"headers":{"control":"must-refetch"}}]` — restart from `offset=-1` (the
-re-snapshot rejoins the retained shape; the engine keeps idle shapes dormant for days before
-evicting them — see the retention section of `apps/engine/README.md`).
+re-snapshot rejoins the retained live query; the engine keeps idle live queries dormant for days
+before evicting them — see the retention section of `apps/engine/README.md`).
 Malformed requests (unknown table/column, bad `where`) are `400` with `{"message":"…"}`.
 
 ### What the SQL `where` accepts
@@ -237,10 +238,10 @@ curl -i -G 'http://localhost:7010/v1/shape' \
   --data-urlencode "where=project_id IN (SELECT project_id FROM project_members WHERE user_id = 1)"
 ```
 
-This shape is *live across both tables*: add alice to project 20
+This live query *spans both tables*: add alice to project 20
 (`INSERT INTO project_members VALUES (102, 20, 1)`) and every issue of project 20 upserts into
-her shape on the next poll; remove her and they delete. No re-query — the membership table's
-own delta drives it.
+her live query on the next poll; remove her and they delete. No re-query — the membership
+table's own delta drives it.
 
 Subqueries nest recursively:
 
@@ -253,26 +254,26 @@ project_id IN (SELECT project_id FROM project_members
 for every row — same as Postgres.
 
 The subquery grammar is deliberately narrow: `SELECT <one column> FROM <table> [WHERE …]` —
-no joins, no `EXISTS`, no correlated subqueries (see the guide §4 for what to do instead).
-Identical inner subqueries across shapes share **one** maintained inner-set node on the engine,
-automatically — a thousand per-user shapes cost a thousand tiny membership sets, not a thousand
-copies of `issues`.
+no joins, no `EXISTS`, no correlated subqueries (see the live queries guide §4 for what to do
+instead). Identical inner subqueries across live queries share **one** maintained inner-set node
+on the engine, automatically — a thousand per-user live queries cost a thousand tiny membership
+sets, not a thousand copies of `issues`.
 
 ---
 
-## 5. The extended API — shapes as resources, feeds from the log
+## 5. The extended API — live queries as resources, feeds from the log
 
 The extended API (port 8790) is where the API is headed: it adds subset queries and
 aggregations, takes predicates as a **JSON AST** instead of SQL, and separates *creating* a
-shape from *reading* it — you create a shape once and read its feed directly from the
+live query from *reading* it — you create a live query once and read its feed directly from the
 durable-streams server (port 8791), which is what makes de-duplication end-to-end: every client
-of an identical shape tails the same stream.
+of an identical live query tails the same stream.
 
 It's tRPC (v11, no transformer) served at the URL root, so bare HTTP is simple: **mutations are
 `POST /<procedure>` with the raw input as the JSON body; queries are `GET /<procedure>?input=<url-encoded JSON>`**.
 Responses are wrapped in the standard tRPC envelope `{"result":{"data":…}}`.
 
-### Create a shape
+### Create a live query
 
 ```sh
 curl -s -X POST http://localhost:8790/shapes.create \
@@ -296,8 +297,8 @@ curl -s -X POST http://localhost:8790/shapes.create \
 }}}
 ```
 
-Creating the same shape twice (predicate order doesn't matter) returns the **same** stream —
-shapes are ref-counted; delete what you create
+Creating the same live query twice (predicate order doesn't matter) returns the **same** stream —
+live queries are ref-counted; delete what you create
 (`curl -X POST http://localhost:8790/shapes.delete -H 'content-type: application/json' -d '{"id":"<id>"}'`).
 
 ### The predicate JSON AST
@@ -310,7 +311,7 @@ shapes are ref-counted; delete what you create
 | subquery | `{"col":"project_id","in":{"table":"project_members","project":"project_id","where":…},"negated":false}` |
 
 The subquery's inner `where` is itself a predicate and may nest further `in` leaves. The
-visibility shape from §4, as AST:
+visibility live query from §4, as AST:
 
 ```sh
 curl -s -X POST http://localhost:8790/shapes.create \
@@ -339,7 +340,7 @@ curl -i "http://localhost:8791/shape/$SHAPE_ID?offset=$NEXT&live=long-poll"
 
 Each response carries `stream-next-offset` (opaque resume token — always read it back) and
 `stream-up-to-date` (present when you're caught up); a long-poll that times out with no data is
-`204`. The body is a JSON array of State-Protocol envelopes — shape feeds carry **absolute**
+`204`. The body is a JSON array of State-Protocol envelopes — live query feeds carry **absolute**
 membership, just two operations:
 
 ```json
@@ -350,14 +351,14 @@ membership, just two operations:
 ]
 ```
 
-`upsert` = the row is in the shape (entered, or changed while inside); `delete` = it left.
-Applying envelopes in order to a `key → value` map always yields exactly the shape's current
-result set.
+`upsert` = the row is in the live query (entered, or changed while inside); `delete` = it left.
+Applying envelopes in order to a `key → value` map always yields exactly the live query's
+current result set.
 
 ### Subset queries — ordered pages
 
-Shapes have no `ORDER BY`/`LIMIT`; pagination is a one-shot **subset query** (pair it with
-`subset.live` for a shared changes-only tail — see the guide §5):
+Live queries have no `ORDER BY`/`LIMIT`; pagination is a one-shot **subset query** (pair it with
+`subset.live` for a shared changes-only tail — see the live queries guide §5):
 
 ```sh
 curl -s -G 'http://localhost:8790/subset.query' \
@@ -378,7 +379,7 @@ The returned `lsn` positions the page against the live tail: drop tail deltas wi
 ## 6. Aggregations
 
 A live scalar over a predicate — `count`, `sum`, `avg`, `min`, `max` — maintained as an
-incremental fold and delivered on a feed like any shape. Create one:
+incremental fold and delivered on a feed like any live query. Create one:
 
 ```sh
 curl -s -X POST http://localhost:8790/aggregate.create \
@@ -391,8 +392,8 @@ curl -s -X POST http://localhost:8790/aggregate.create \
   }'
 ```
 
-Same `ShapeHandle` response; `col` is required for `sum`/`avg`/`min`/`max` and ignored for
-`count`. The aggregate `where` takes leaf/boolean predicates (no subqueries). Read the feed the
+Same response structure as `shapes.create` above; `col` is required for `sum`/`avg`/`min`/`max`
+and ignored for `count`. The aggregate `where` takes leaf/boolean predicates (no subqueries). Read the feed the
 same way (`GET http://localhost:8791/shape/$SHAPE_ID?offset=-1…`); the running value is a single
 envelope keyed `"agg"`, re-emitted on every change that moves it:
 
@@ -410,8 +411,8 @@ issue 1002's NULL `points` contributes to `n` but not to the sum. Now
 `UPDATE issues SET points = 8 WHERE id = 1002;` and the feed emits
 `{"value":{"value":12,"n":3}}` — one envelope, no re-scan.
 
-Identical aggregations are de-duplicated like shapes: any number of dashboards subscribing to
-the same live count share one fold and one feed.
+Identical aggregations are de-duplicated like live queries: any number of dashboards
+subscribing to the same live count share one fold and one feed.
 
 ---
 
@@ -420,9 +421,9 @@ the same live count share one fold and one feed.
 | you want | request |
 |---|---|
 | health / replication position | `GET :7010/health` · `GET :7010/replication/lsn` |
-| shape, Electric protocol (SQL where) | `GET :7010/v1/shape?table=…&offset=-1[&where=…&columns=…]`, then `…&handle=…&offset=…&live=true` |
-| shape, extended API (JSON AST) | `POST :8790/shapes.create` → handle; `POST :8790/shapes.delete` |
-| read a shape/aggregate feed | `GET :8791/shape/<id>?offset=-1`, then `…?offset=<next>&live=long-poll` |
+| live query, Electric protocol (SQL where) | `GET :7010/v1/shape?table=…&offset=-1[&where=…&columns=…]`, then `…&handle=…&offset=…&live=true` |
+| live query, extended API (JSON AST) | `POST :8790/shapes.create` → handle; `POST :8790/shapes.delete` |
+| read a live query/aggregate feed | `GET :8791/shape/<id>?offset=-1`, then `…?offset=<next>&live=long-poll` |
 | ordered page | `GET :8790/subset.query?input=<json>` (+ `POST :8790/subset.live` for the tail) |
 | live scalar | `POST :8790/aggregate.create` → feed keyed `"agg"`, value `{value,n}` |
 

@@ -1,5 +1,5 @@
 {
-  "name": "@electric-ivm/conformance",
+  "name": "@electric-circuits/conformance",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -7,11 +7,11 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@electric-ivm/protocol": "workspace:*",
-    "@electric-ivm/oracle": "workspace:*",
-    "@electric-ivm/api": "workspace:*",
-    "@electric-ivm/client": "workspace:*",
-    "@electric-ivm/ds-rust": "workspace:*",
+    "@electric-circuits/protocol": "workspace:*",
+    "@electric-circuits/oracle": "workspace:*",
+    "@electric-circuits/api": "workspace:*",
+    "@electric-circuits/client": "workspace:*",
+    "@electric-circuits/ds-rust": "workspace:*",
     "@durable-streams/client": "^0.2.6",
     "@durable-streams/state": "^0.3.1",
     "@tanstack/db": "^0.6.12",

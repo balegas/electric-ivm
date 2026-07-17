@@ -1,4 +1,4 @@
-// Local stress benchmark for electric-ivm. Boots the stack (durable-streams + engine + API, no
+// Local stress benchmark for electric-circuits. Boots the stack (durable-streams + engine + API, no
 // oracle), registers many equality shapes (which share one family circuit), then runs three things
 // concurrently for a fixed duration:
 //   1. a write firehose (bounded in-flight) to measure sustained throughput,
@@ -18,10 +18,10 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 
-import { DurableStreamTestServer } from '@electric-ivm/ds-rust'
-import { createApiServer } from '@electric-ivm/api'
-import { createClient } from '@electric-ivm/client'
-import type { Schema } from '@electric-ivm/protocol'
+import { DurableStreamTestServer } from '@electric-circuits/ds-rust'
+import { createApiServer } from '@electric-circuits/api'
+import { createClient } from '@electric-circuits/client'
+import type { Schema } from '@electric-circuits/protocol'
 
 const execFileP = promisify(execFile)
 // Durable, line-buffered logging so results survive even if the run is backgrounded or killed.
@@ -73,8 +73,8 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const now = () => Number(process.hrtime.bigint() / 1000n) / 1000 // ms, sub-ms precision
 
 async function spawnEngine(dsUrl: string) {
-  const proc = spawn(join(repoRoot(), 'target', 'release', 'electric-ivm-engine'), [], {
-    env: { ...process.env, ELECTRIC_IVM_DS_URL: dsUrl, ELECTRIC_IVM_BIND: '127.0.0.1:0', ELECTRIC_IVM_LOG: 'warn' },
+  const proc = spawn(join(repoRoot(), 'target', 'release', 'electric-circuits-engine'), [], {
+    env: { ...process.env, ELECTRIC_CIRCUITS_DS_URL: dsUrl, ELECTRIC_CIRCUITS_BIND: '127.0.0.1:0', ELECTRIC_CIRCUITS_LOG: 'warn' },
     stdio: ['ignore', 'pipe', 'inherit'],
   })
   const url = await new Promise<string>((resolve, reject) => {
@@ -143,10 +143,10 @@ async function threadCount(pid: number): Promise<number> {
 
 async function main() {
   writeFileSync(OUTFILE, "")
-  log(`\n=== electric-ivm bench: ${SHAPES} shapes, ${SUBS} subscribers, ${DURATION}s load, conc=${CONC} ===\n`)
+  log(`\n=== electric-circuits bench: ${SHAPES} shapes, ${SUBS} subscribers, ${DURATION}s load, conc=${CONC} ===\n`)
   // Engine must be built in release for a meaningful benchmark.
-  if (!existsSync(join(repoRoot(), 'target', 'release', 'electric-ivm-engine'))) {
-    console.error('Build the release engine first: cargo build --release -p electric-ivm-engine')
+  if (!existsSync(join(repoRoot(), 'target', 'release', 'electric-circuits-engine'))) {
+    console.error('Build the release engine first: cargo build --release -p electric-circuits-engine')
     process.exit(1)
   }
 

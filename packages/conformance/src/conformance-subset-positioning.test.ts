@@ -6,8 +6,8 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import pgpkg from 'pg'
-import type { Row, Schema, StreamEnvelope } from '@electric-ivm/protocol'
-import { lsnToU64, mergeFeedDelta, type SubsetView } from '@electric-ivm/client'
+import type { Row, Schema, StreamEnvelope } from '@electric-circuits/protocol'
+import { lsnToU64, mergeFeedDelta, type SubsetView } from '@electric-circuits/client'
 import { bootHarness, drainEngine, type Harness } from './harness.js'
 
 const schema: Schema = {

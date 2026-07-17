@@ -6,7 +6,7 @@
 // Text ordering uses lowercase-ASCII + empty string only, matching the collation-safe domain the
 // existing fuzz already proves agrees between Rust byte ordering and pglite.
 
-import type { Row, Schema, ShapeDef } from '@electric-ivm/protocol'
+import type { Row, Schema, ShapeDef } from '@electric-circuits/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { formatCompare } from './compare.js'
 import { applyOp, bootHarness, drainEngine, type Harness, waitForConvergence } from './harness.js'

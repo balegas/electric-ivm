@@ -53,22 +53,22 @@ use crate::pg::SnapshotGate;
 ///
 /// | Env var | Default | Meaning |
 /// |---|---|---|
-/// | `ELECTRIC_IVM_SHAPE_IDLE_SECS` | `1800` (30 min) | Idle time (no reads, refcount 0) before an active shape goes dormant. `0` disables dormancy. |
-/// | `ELECTRIC_IVM_SHAPE_DORMANT_TTL_SECS` | `604800` (7 days) | Time a shape may stay dormant before it is evicted. `0` disables the TTL layer. |
-/// | `ELECTRIC_IVM_MAX_SHAPES` | `10000` | Total shape-count cap; over it, least-recently-read dormant shapes are evicted. `0` = unlimited. |
-/// | `ELECTRIC_IVM_SHAPE_DISK_BUDGET_MB` | `0` (disabled) | Cap on tracked shape-stream bytes; over it, least-recently-read dormant shapes are evicted. |
-/// | `ELECTRIC_IVM_RETENTION_SWEEP_SECS` | `60` | Sweep interval of the background retention task. |
+/// | `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` | `1800` (30 min) | Idle time (no reads, refcount 0) before an active shape goes dormant. `0` disables dormancy. |
+/// | `ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS` | `604800` (7 days) | Time a shape may stay dormant before it is evicted. `0` disables the TTL layer. |
+/// | `ELECTRIC_CIRCUITS_MAX_SHAPES` | `10000` | Total shape-count cap; over it, least-recently-read dormant shapes are evicted. `0` = unlimited. |
+/// | `ELECTRIC_CIRCUITS_SHAPE_DISK_BUDGET_MB` | `0` (disabled) | Cap on tracked shape-stream bytes; over it, least-recently-read dormant shapes are evicted. |
+/// | `ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS` | `60` | Sweep interval of the background retention task. |
 #[derive(Clone, Debug)]
 pub struct RetentionConfig {
-    /// Active → dormant idle threshold (`ELECTRIC_IVM_SHAPE_IDLE_SECS`, default 30 min; 0 = never).
+    /// Active → dormant idle threshold (`ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`, default 30 min; 0 = never).
     pub idle_timeout: Duration,
-    /// Dormant → evicted hygiene TTL (`ELECTRIC_IVM_SHAPE_DORMANT_TTL_SECS`, default 7 days; 0 = never).
+    /// Dormant → evicted hygiene TTL (`ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS`, default 7 days; 0 = never).
     pub dormant_ttl: Duration,
-    /// Total shape-count cap (`ELECTRIC_IVM_MAX_SHAPES`, default 10000; 0 = unlimited).
+    /// Total shape-count cap (`ELECTRIC_CIRCUITS_MAX_SHAPES`, default 10000; 0 = unlimited).
     pub max_shapes: usize,
-    /// Shape-stream disk budget in bytes (`ELECTRIC_IVM_SHAPE_DISK_BUDGET_MB`, default 0 = disabled).
+    /// Shape-stream disk budget in bytes (`ELECTRIC_CIRCUITS_SHAPE_DISK_BUDGET_MB`, default 0 = disabled).
     pub disk_budget_bytes: u64,
-    /// Background sweep interval (`ELECTRIC_IVM_RETENTION_SWEEP_SECS`, default 60s).
+    /// Background sweep interval (`ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS`, default 60s).
     pub sweep_interval: Duration,
 }
 
@@ -92,14 +92,14 @@ impl RetentionConfig {
     pub fn from_env() -> Self {
         let d = RetentionConfig::default();
         RetentionConfig {
-            idle_timeout: Duration::from_secs(env_u64("ELECTRIC_IVM_SHAPE_IDLE_SECS", d.idle_timeout.as_secs())),
+            idle_timeout: Duration::from_secs(env_u64("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", d.idle_timeout.as_secs())),
             dormant_ttl: Duration::from_secs(env_u64(
-                "ELECTRIC_IVM_SHAPE_DORMANT_TTL_SECS",
+                "ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS",
                 d.dormant_ttl.as_secs(),
             )),
-            max_shapes: env_u64("ELECTRIC_IVM_MAX_SHAPES", d.max_shapes as u64) as usize,
-            disk_budget_bytes: env_u64("ELECTRIC_IVM_SHAPE_DISK_BUDGET_MB", 0).saturating_mul(1024 * 1024),
-            sweep_interval: Duration::from_secs(env_u64("ELECTRIC_IVM_RETENTION_SWEEP_SECS", 60).max(1)),
+            max_shapes: env_u64("ELECTRIC_CIRCUITS_MAX_SHAPES", d.max_shapes as u64) as usize,
+            disk_budget_bytes: env_u64("ELECTRIC_CIRCUITS_SHAPE_DISK_BUDGET_MB", 0).saturating_mul(1024 * 1024),
+            sweep_interval: Duration::from_secs(env_u64("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS", 60).max(1)),
         }
     }
 }

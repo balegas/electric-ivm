@@ -1,5 +1,5 @@
 {
-  "name": "@electric-ivm/docker",
+  "name": "@electric-circuits/docker",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -8,8 +8,8 @@
     "api": "tsx api-server.ts"
   },
   "dependencies": {
-    "@electric-ivm/ds-rust": "workspace:*",
-    "@electric-ivm/api": "workspace:*"
+    "@electric-circuits/ds-rust": "workspace:*",
+    "@electric-circuits/api": "workspace:*"
   },
   "devDependencies": {
     "tsx": "^4.19.2"

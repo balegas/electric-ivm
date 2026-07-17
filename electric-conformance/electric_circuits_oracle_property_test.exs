@@ -1,8 +1,8 @@
 defmodule Electric.Integration.ElectricIvmOraclePropertyTest do
   @moduledoc """
-  The Electric oracle PROPERTY test, run against electric-ivm's `/v1/shape` adapter. Reuses Electric's
+  The Electric oracle PROPERTY test, run against electric-circuits's `/v1/shape` adapter. Reuses Electric's
   own `WhereClauseGenerator.shapes_gen/1` + `StandardSchema` (DDL/seed/mutation generators) and
-  `OracleHarness.test_against_oracle/4` — only the sync server under test is swapped for electric-ivm.
+  `OracleHarness.test_against_oracle/4` — only the sync server under test is swapped for electric-circuits.
 
   Two-phase boot: the launcher starts an ephemeral Postgres and announces its URL; we apply
   StandardSchema's exact DDL+seed; the launcher then introspects + starts the engine + adapter and
@@ -27,10 +27,10 @@ defmodule Electric.Integration.ElectricIvmOraclePropertyTest do
 
   setup do
     lite_dir =
-      System.get_env("ELECTRIC_IVM_DIR") || Path.expand("../../../../../dbsp-ds", __DIR__)
+      System.get_env("ELECTRIC_CIRCUITS_DIR") || Path.expand("../../../../../dbsp-ds", __DIR__)
 
     cmd =
-      "cd #{lite_dir} && exec env ADAPTER_WAIT_TABLE=level_3_tags pnpm --filter @electric-ivm/bench exec tsx src/electric-adapter.ts"
+      "cd #{lite_dir} && exec env ADAPTER_WAIT_TABLE=level_3_tags pnpm --filter @electric-circuits/bench exec tsx src/electric-adapter.ts"
 
     port = Port.open({:spawn, "bash -lc '#{cmd}'"}, [:binary, :exit_status, line: 100_000])
 
@@ -62,7 +62,7 @@ defmodule Electric.Integration.ElectricIvmOraclePropertyTest do
   end
 
   @tag timeout: 600_000
-  property "electric-ivm converges with the Postgres oracle across generated shapes + mutations", ctx do
+  property "electric-circuits converges with the Postgres oracle across generated shapes + mutations", ctx do
     shape_count = env_int("ORACLE_SHAPE_COUNT", 4)
     batch_count = env_int("ORACLE_BATCH_COUNT", 3)
     txns_per_batch = env_int("ORACLE_TXNS_PER_BATCH", 1)
@@ -96,9 +96,9 @@ defmodule Electric.Integration.ElectricIvmOraclePropertyTest do
         end
 
       {^port, {:exit_status, status}} ->
-        flunk("electric-ivm launcher exited early (status #{status}) while waiting for #{prefix}")
+        flunk("electric-circuits launcher exited early (status #{status}) while waiting for #{prefix}")
     after
-      timeout -> flunk("timed out waiting for '#{prefix}' from electric-ivm launcher")
+      timeout -> flunk("timed out waiting for '#{prefix}' from electric-circuits launcher")
     end
   end
 

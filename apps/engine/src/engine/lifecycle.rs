@@ -236,7 +236,7 @@ impl Engine {
     }
 
     /// Create a scalar **aggregation** shape (COUNT/SUM/AVG/MIN/MAX over `where`), maintained
-    /// incrementally. An electric-ivm extension — not part of the Electric-compatible API. Rejects
+    /// incrementally. An electric-circuits extension — not part of the Electric-compatible API. Rejects
     /// subquery predicates (use a plain filter); SUM/AVG/MIN/MAX require a column.
     pub async fn create_aggregate(
         &self,
@@ -841,7 +841,7 @@ impl Engine {
             metrics().retention_pressure.fetch_add(1, Ordering::Relaxed);
             tracing::error!(
                 "retention: {} shapes exceed max_shapes={} but nothing dormant is left to evict — \
-                 every shape is actively subscribed or recently read; raise ELECTRIC_IVM_MAX_SHAPES or lower the idle timeout",
+                 every shape is actively subscribed or recently read; raise ELECTRIC_CIRCUITS_MAX_SHAPES or lower the idle timeout",
                 snapshot.len(),
                 cfg.max_shapes
             );
@@ -850,7 +850,7 @@ impl Engine {
             metrics().retention_pressure.fetch_add(1, Ordering::Relaxed);
             tracing::error!(
                 "retention: shape streams exceed the disk budget ({} bytes) but nothing dormant is left to evict — \
-                 raise ELECTRIC_IVM_SHAPE_DISK_BUDGET_MB or lower the idle timeout",
+                 raise ELECTRIC_CIRCUITS_SHAPE_DISK_BUDGET_MB or lower the idle timeout",
                 cfg.disk_budget_bytes
             );
         }

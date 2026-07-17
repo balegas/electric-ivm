@@ -1,4 +1,4 @@
-//! electric-ivm query engine.
+//! electric-circuits query engine.
 //!
 //! Takes change events from the ordered change log and fans each change out to registered shapes,
 //! across a three-tier serving model. The **circuit** ([`arrangements`]) is always-on infrastructure
@@ -6,7 +6,7 @@
 //! arrangements and counts pipelines, serves point lookups (subquery re-derivations) from local
 //! snapshots, and serves membership shapes and decomposable COUNT aggregates end to end — seeding
 //! and move-in/out come from arrangement snapshots instead of Postgres backfills. The circuit only
-//! serves a shape whose connecting column has a configured index (`ELECTRIC_IVM_DBSP_INDEXES` /
+//! serves a shape whose connecting column has a configured index (`ELECTRIC_CIRCUITS_DBSP_INDEXES` /
 //! `_COUNTS`); everything else falls through to the tiers below. The **routing tier**: equality
 //! shapes are routed by key (a `key -> shapes` index per template), and indexed standalone
 //! predicates by necessary conjunct — the hot path holds **no table data**, only per-shape metadata.

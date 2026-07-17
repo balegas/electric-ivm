@@ -30,12 +30,29 @@ function TravelDot({ pulse, path }: { pulse: EdgePulse; path: string }) {
     const total = p.getTotalLength()
     const t0 = performance.now()
     let raf = 0
+    // A query-back BOUNCE makes ONE round trip between the two endpoints instead of travelling
+    // once — the Δ node "asks" the source (out to k=0) and the moved rows come back (return to
+    // k=1). Otherwise the dot travels once, source → target. If `holdMs` is set the target is a join:
+    // after travelling, the dot HOLDS at the target (gating) until the join fires.
+    const travelMs = pulse.durMs
+    const holdMs = pulse.holdMs ?? 0
+    const endMs = travelMs + holdMs
     const tick = (now: number) => {
-      const k = Math.min(1, (now - t0) / pulse.durMs)
+      const elapsed = now - t0
+      const f = Math.min(1, elapsed / travelMs) // travel fraction; after travelMs the dot sits at the target
+      let k: number
+      if (pulse.bounce) {
+        const phase = f * 2 // two legs: out and back
+        k = Math.abs((phase % 2) - 1) // triangle: 1 → 0 → 1 (starts/ends at the target = Δ node)
+      } else {
+        k = f
+      }
       const pt = p.getPointAtLength(total * k)
       g.setAttribute('transform', `translate(${pt.x}, ${pt.y})`)
       g.style.opacity = '1'
-      if (k < 1) raf = requestAnimationFrame(tick)
+      // Gated: arrived at the join, waiting for it to fire — the waiting ring animates via CSS.
+      g.setAttribute('data-held', holdMs > 0 && elapsed >= travelMs ? '1' : '0')
+      if (elapsed < endMs) raf = requestAnimationFrame(tick)
     }
     raf = requestAnimationFrame(tick)
     return () => cancelAnimationFrame(raf)
@@ -45,8 +62,16 @@ function TravelDot({ pulse, path }: { pulse: EdgePulse; path: string }) {
     <>
       {/* invisible copy of the edge path, used only to measure travel positions */}
       <path ref={measureRef} d={path} fill="none" stroke="none" />
-      <g ref={groupRef} style={{ opacity: 0 }}>
-        <circle r={5} fill={pulse.color} opacity={0.95} />
+      <g ref={groupRef} style={{ opacity: 0 }} data-held="0">
+        {/* A "waiting" ring shown only while the dot is gated at a join (data-held=1), pulsing out. */}
+        {pulse.holdMs ? <circle className="gate-ring" r={5} fill="none" stroke={pulse.color} strokeWidth={1.5} /> : null}
+        {/* Derived (query-back) moves get a hollow ring, matching the dashed edge, so the dot reads
+            as "carried in from another table" rather than the table's own solid data delta. */}
+        {pulse.derived ? (
+          <circle r={5} fill="#fff" stroke={pulse.color} strokeWidth={2} opacity={0.95} />
+        ) : (
+          <circle r={5} fill={pulse.color} opacity={0.95} />
+        )}
         {pulse.label ? (
           <text fontSize={11} fontWeight={700} fill={pulse.color} dy={-8}>
             {pulse.label}
@@ -79,9 +104,9 @@ export function PulseEdge(props: EdgeProps) {
     } else {
       timers.push(setTimeout(() => setStaged(pulse.id), pulse.delayMs))
     }
-    timers.push(setTimeout(() => setStaged(null), pulse.delayMs + pulse.durMs + LINGER_MS))
+    timers.push(setTimeout(() => setStaged(null), pulse.delayMs + pulse.durMs + (pulse.holdMs ?? 0) + LINGER_MS))
     return () => timers.forEach(clearTimeout)
-  }, [pulse?.id, pulse?.delayMs, pulse?.durMs])
+  }, [pulse?.id, pulse?.delayMs, pulse?.durMs, pulse?.holdMs])
 
   const show = pulse != null && staged === pulse.id
   return (
@@ -92,6 +117,9 @@ export function PulseEdge(props: EdgeProps) {
         style={{
           ...data.baseStyle,
           ...(pulse ? { stroke: pulse.color, strokeWidth: 2.5, opacity: 1 } : {}),
+          // A query-back-derived move-in/out dashes the lit path — this data crossed from another
+          // table's change via a Postgres query-back, not this edge's own stream.
+          ...(pulse?.derived ? { strokeDasharray: '6 4' } : {}),
           // The recolor is delayed to the pulse's stage so the path lights up as the dot leaves.
           transition: pulse ? `stroke 0.2s ${pulse.delayMs}ms` : 'stroke 0.2s',
         }}

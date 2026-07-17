@@ -1,5 +1,5 @@
-import { createClient } from '@electric-ivm/client'
-import type { Predicate, ShapeDef, SubsetDef } from '@electric-ivm/protocol'
+import { createClient } from '@electric-circuits/client'
+import type { Predicate, ShapeDef, SubsetDef } from '@electric-circuits/protocol'
 import { type Priority, schema, type Status } from './schema'
 
 // The browser talks to the API and reads shape streams through the Vite dev proxy

@@ -13,7 +13,7 @@
 // A separate probe creates a *materialized* visibility shape (with backfill) to measure the backfill
 // working set as a function of deployment size.
 //
-//   pnpm --filter @electric-ivm/bench exec tsx src/shape-mem-matrix.ts
+//   pnpm --filter @electric-circuits/bench exec tsx src/shape-mem-matrix.ts
 //   MATRIX_SIZES=1000,10000,100000  MATRIX_USERS=10,25,50,100  MATRIX_PROJECTS=20 tsx src/shape-mem-matrix.ts
 
 import { type ChildProcess, execFileSync, execSync, spawn } from 'node:child_process'
@@ -22,7 +22,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { DurableStreamTestServer } from '@electric-ivm/ds-rust'
+import { DurableStreamTestServer } from '@electric-circuits/ds-rust'
 import pgpkg from 'pg'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -47,7 +47,7 @@ const COMMENTS_PER_ISSUE = process.env.MATRIX_COMMENTS ? Number(process.env.MATR
 const CONC = numEnv('MATRIX_CONC', 24) // concurrent shape-creation requests
 const OUT = process.env.MATRIX_OUT ?? join(repoRoot(), 'docs', 'bench', 'shape-memory-matrix.md')
 
-const SLOT = 'electric_ivm_shapemem'
+const SLOT = 'electric_circuits_shapemem'
 const STATUSES = ['backlog', 'todo', 'in_progress', 'done', 'canceled']
 const PRIORITIES = ['none', 'low', 'medium', 'high', 'urgent']
 const MAX_USERS = Math.max(...USER_MILESTONES)
@@ -62,8 +62,8 @@ interface Sample {
 }
 
 function mustHaveBin() {
-  if (!existsSync(join(repoRoot(), 'target', 'release', 'electric-ivm-engine'))) {
-    console.error('build first: cargo build --release -p electric-ivm-engine')
+  if (!existsSync(join(repoRoot(), 'target', 'release', 'electric-circuits-engine'))) {
+    console.error('build first: cargo build --release -p electric-circuits-engine')
     process.exit(1)
   }
 }
@@ -153,16 +153,16 @@ async function createSchemaAndSeed(client: pgpkg.Client, issues: number): Promis
 }
 
 async function spawnEngine(dsUrl: string, pgUrl: string): Promise<{ url: string; proc: ChildProcess }> {
-  const proc = spawn(join(repoRoot(), 'target', 'release', 'electric-ivm-engine'), [], {
+  const proc = spawn(join(repoRoot(), 'target', 'release', 'electric-circuits-engine'), [], {
     env: {
       ...process.env,
-      ELECTRIC_IVM_DS_URL: dsUrl,
-      ELECTRIC_IVM_BIND: '127.0.0.1:0',
-      ELECTRIC_IVM_LOG: 'warn',
-      ELECTRIC_IVM_PG_URL: pgUrl,
-      ELECTRIC_IVM_PG_TABLES: 'issues,projects,users,project_members,comments',
-      ELECTRIC_IVM_PG_SLOT: SLOT,
-      ELECTRIC_IVM_PG_POLL_MS: '50',
+      ELECTRIC_CIRCUITS_DS_URL: dsUrl,
+      ELECTRIC_CIRCUITS_BIND: '127.0.0.1:0',
+      ELECTRIC_CIRCUITS_LOG: 'warn',
+      ELECTRIC_CIRCUITS_PG_URL: pgUrl,
+      ELECTRIC_CIRCUITS_PG_TABLES: 'issues,projects,users,project_members,comments',
+      ELECTRIC_CIRCUITS_PG_SLOT: SLOT,
+      ELECTRIC_CIRCUITS_PG_POLL_MS: '50',
     },
     stdio: ['ignore', 'pipe', 'inherit'],
   })
@@ -366,8 +366,8 @@ async function main() {
   log(`\`bytes_circuit_snapshots\`, \`bytes_pk_dict\`, \`bytes_subquery_registry\`, ...) — exact-ish and immune`)
   log(`to allocator/compression noise, unlike ΔRSS.`)
   log('')
-  log(`**Reproduce.** \`cargo build --release -p electric-ivm-engine\` then`)
-  log('`MATRIX_SIZES=1000,10000,100000 MATRIX_USERS=100,250,500,1000 pnpm --filter @electric-ivm/bench shape-mem`.')
+  log(`**Reproduce.** \`cargo build --release -p electric-circuits-engine\` then`)
+  log('`MATRIX_SIZES=1000,10000,100000 MATRIX_USERS=100,250,500,1000 pnpm --filter @electric-circuits/bench shape-mem`.')
   log('')
   log(`Config this run: projects=${PROJECTS}, users=${MAX_USERS}, memberships/user=${MEMBERSHIPS_PER_USER}, comments/issue=${COMMENTS_PER_ISSUE}, shapes/user=${SHAPES_PER_USER}, user milestones=${USER_MILESTONES.join(',')}.`)
   log('')
@@ -429,14 +429,14 @@ async function main() {
   log(`## Findings`)
   log('')
   log(`1. **Baseline RSS is independent of deployment size** (~${fmt(summary.reduce((a, s) => a + s.initRss, 0) / Math.max(1, summary.length))} MiB at 1k / 10k / 100k issues). The engine keeps *no copy* of the table — it backfills from a Postgres snapshot and tails replication — so startup memory does not scale with the row count.`)
-  log(`2. **Per-shape registration memory is small (≈0.7–0.9 KiB/shape)** and ~constant across all deployment sizes — see the "KiB/shape" column. Even **10,000** changes-only shapes grow RSS by under 10 MiB. Subquery nodes, contributor pks, and edges grow linearly with shapes but cheaply (a node holds only its inner-set contributor pks — here the user's ${MEMBERSHIPS_PER_USER} membership rows — not issues).`)
+  log(`2. **Per-shape registration memory is small** and ~constant across all deployment sizes — see the "KiB/shape" column. Even many thousands of changes-only shapes grow RSS only modestly. Subquery nodes, contributor pks, and edges grow linearly with shapes but cheaply (a node holds only its inner-set contributor pks — here the user's ${MEMBERSHIPS_PER_USER} membership rows — not issues).`)
   log(`3. **Family circuits stay at a small constant** (a handful — one per equality *template*, not per shape): all board-status shapes share one family (key column \`status\`), all "my tasks" shapes another (\`username\`), and all per-issue comment shapes one more (\`issue_id\` on the comments table). So thousands of equality shapes collapse onto ~3 circuits — the family-sharing win.`)
-  log(`4. **Backfill is the deployment-size-sensitive cost.** A *materialized* shape's one-off backfill working set scales ~linearly with the number of *visible* rows — see the "bytes/visible-row" columns above (~2 KiB/row peak at 10k and 100k on the legacy ΔRSS variant; the 1k row is below RSS/allocator resolution, so treat small-N ΔRSS backfill deltas as noise). This is transient read-batch + serialization memory, not retained table state.`)
+  log(`4. **Backfill is the deployment-size-sensitive cost.** A *materialized* shape's one-off backfill working set scales ~linearly with the number of *visible* rows — see the "bytes/visible-row" columns above (a small, bounded per-visible-row peak on the legacy ΔRSS variant; the smallest deployment is below RSS/allocator resolution, so treat small-N ΔRSS backfill deltas as noise). This is transient read-batch + serialization memory, not retained table state.`)
   log(`5. **Caveat — allocator slack & RSS noise.** RSS is a coarse, non-monotonic signal: after a large backfill it sometimes settles near the peak and sometimes below the pre-backfill baseline, because the system allocator decides when to return freed pages to the OS. Sub-MiB deltas are within noise. For steady-state sizing, measure after warmup or build with jemalloc + background reclamation; rely on the OTel *cardinality* gauges (nodes, contributors, family circuits) to read retained structural state independent of allocator slack.`)
-  log(`6. **The "owned-bytes" column is the more trustworthy per-synced-row number.** It is computed from the engine's self-accounted \`bytes_membership_circuit\` + \`bytes_pk_dict\` deltas (owned-heap bytes, exact-ish) rather than process RSS, so it is immune to the allocator/compression noise in Finding 5 — the right signal for judging per-feed-entry memory work (e.g. the recent shrink from ~123 B to ~24 B per feed entry). The "footprint peak" column (macOS \`/usr/bin/footprint\`, compression-inclusive) is the ΔRSS variant's more reliable process-level counterpart, following the same pattern as \`shape-mem-scale.ts\`.`)
+  log(`6. **The "owned-bytes" column is the more trustworthy per-synced-row number.** It is computed from the engine's self-accounted \`bytes_membership_circuit\` + \`bytes_pk_dict\` deltas (owned-heap bytes, exact-ish) rather than process RSS, so it is immune to the allocator/compression noise in Finding 5 — the right signal for judging per-feed-entry memory work (e.g. the recent large reduction in per-feed-entry memory). The "footprint peak" column (macOS \`/usr/bin/footprint\`, compression-inclusive) is the ΔRSS variant's more reliable process-level counterpart, following the same pattern as \`shape-mem-scale.ts\`.`)
   log('')
   log(`**Takeaway for deployment sizing.** Budget memory by *concurrent backfill working set* (≈ peak`)
-  log(`visible-rows-per-shape × 2 KiB, summed over shapes backfilling at once), not by total shape count or`)
+  log(`visible-rows-per-shape × a small per-row constant, summed over shapes backfilling at once), not by total shape count or`)
   log(`total issues. A steady fleet of many shapes over a large table is cheap; bursts of large materialized`)
   log(`backfills are the spike to provision for. Changes-only / subset feeds avoid the backfill spike entirely.`)
   log('')

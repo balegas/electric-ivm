@@ -10,8 +10,8 @@
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
-use electric_ivm_engine::config::{self, StatsdTarget};
-use electric_ivm_engine::statsd::{self, Statsd};
+use electric_circuits_engine::config::{self, StatsdTarget};
+use electric_circuits_engine::statsd::{self, Statsd};
 
 /// Drain all datagrams that arrive within `window`, returning them newline-unsplit.
 fn collect(sock: UdpSocket, window: Duration) -> Vec<String> {

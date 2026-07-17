@@ -1,11 +1,11 @@
-# @electric-ivm/oracle
+# @electric-circuits/oracle
 
 The reference implementation that [conformance](../conformance/README.md) compares the real system
-against: an actual Postgres that receives the same change events as electric-ivm and answers
+against: an actual Postgres that receives the same change events as electric-circuits and answers
 `SELECT * FROM <table> WHERE <predicate>` for any shape. The conformance invariant is that the
 client-materialized shape set equals this oracle's result set for the same op stream.
 
-The oracle is built entirely from the [`@electric-ivm/protocol`](../protocol/README.md) compilers —
+The oracle is built entirely from the [`@electric-circuits/protocol`](../protocol/README.md) compilers —
 `tableDDL` creates the tables, `changeEventToDML` applies each change (upsert/delete by pk), and
 `shapeSelectSql` compiles the shape's predicate AST to a parameterized `WHERE`. Postgres itself is
 the semantics: NULL three-valued logic, `IN (SELECT …)`, ordering — nothing is re-implemented.
@@ -22,7 +22,7 @@ interface Oracle {
 ```
 
 - **`createOracle(schema)`** — in-memory [PGlite](https://pglite.dev) (`memory://`). Standalone
-  truth for library-mode tests: changes are applied to the oracle *and* to electric-ivm, then the
+  truth for library-mode tests: changes are applied to the oracle *and* to electric-circuits, then the
   two are compared.
 - **`createPgOracle(schema, connectionString)`** — a real Postgres connection. Used by the
   Postgres-mode harness, where the *same* database is both the write source (changes flow
@@ -34,7 +34,7 @@ interface Oracle {
 ## Usage
 
 ```ts
-import { createOracle } from '@electric-ivm/oracle'
+import { createOracle } from '@electric-circuits/oracle'
 
 const oracle = await createOracle(schema)
 await oracle.applyChange('todos', { op: 'insert', pk: 1, row: { id: 1, title: 'x', done: false } })

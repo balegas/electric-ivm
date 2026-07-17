@@ -5,8 +5,8 @@
 // filter) and never fans out across ranges. This is our extension of Electric's static Subset: same
 // non-materialized query-back, plus a single-range live tail.
 
-import type { AppRouter } from '@electric-ivm/api'
-import type { Predicate, Row, Schema, StreamEnvelope, SubsetDef, SubsetResult, Value } from '@electric-ivm/protocol'
+import type { AppRouter } from '@electric-circuits/api'
+import type { Predicate, Row, Schema, StreamEnvelope, SubsetDef, SubsetResult, Value } from '@electric-circuits/protocol'
 import { stream } from '@durable-streams/client'
 import { createCollection, type Collection } from '@tanstack/db'
 import type { createTRPCClient } from '@trpc/client'

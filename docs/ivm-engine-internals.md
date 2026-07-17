@@ -38,8 +38,8 @@ Three layers, one idea — *maintain query results incrementally as the database
 reasoning about cost. State that scales with row count lives in Postgres, full stop; the
 engine keeps only per-shape metadata, the counts pipelines' (group → count) relations, and,
 for subqueries, a shared set of *inner-query result values*.
-Baseline engine RSS is ~19 MiB whether the database has 1,000 or 100,000 rows
-(measured by the shape-memory matrix benchmark in `packages/bench`).
+Baseline engine RSS is flat with database size, whether the database has 1,000 or 100,000 rows
+(measured by the shape-memory matrix benchmark in `packages/bench`; fresh benchmarks pending).
 
 ### What dbsp is here
 
@@ -241,7 +241,7 @@ subqueries).
 2. **For each flipped value `v` of node `N`:** for every edge on `N`, the affected dependent
    rows are exactly those with `col = v`. Query them (`SELECT … WHERE col = v`) and either
    reconcile a parent node (recurse) or re-evaluate the outer shape predicate. This propagation
-   runs **deferred, on a semaphore-bounded worker pool** (`ELECTRIC_IVM_FLIP_WORKERS`) — the
+   runs **deferred, on a semaphore-bounded worker pool** (`ELECTRIC_CIRCUITS_FLIP_WORKERS`) — the
    sequencer only collects the flips; the query-backs run concurrently against pooled Postgres
    and never hold the registry lock. Evaluation and the **enqueue** of the resulting envelopes
    happen atomically under the lock, and per-stream FIFO emission lanes make append order equal
@@ -317,13 +317,13 @@ and disk?**
 
 The headline, measured (shape-memory matrix benchmark, `packages/bench`): a steady fleet of *many* shapes
 over a *large* table is cheap; the only deployment-size-sensitive cost is the **transient
-backfill working set** of a *materialized* shape.
+backfill working set** of a *materialized* shape. (fresh benchmarks pending)
 
 ### 4.1 What is shared vs per-shape vs per-user
 
 | construct | granularity | cost driver |
 |---|---|---|
-| Engine baseline (no shapes) | global | constant ~19 MiB, **independent of table size** (no table copy) |
+| Engine baseline (no shapes) | global | a small constant, **independent of table size** (no table copy) |
 | `KeyRouter` (family) | per **template** (key-column set) | a handful; *not* per shape and *not* per user |
 | Routing entry | per **shape** | one `(key_tuple, stream_path, seed_lsn)` |
 | `StandaloneShape` | per **shape** | one predicate + metadata; per-change eval cost |
@@ -333,34 +333,31 @@ backfill working set** of a *materialized* shape.
 | Per-shape stream | per **shape** | one `shape/<id>` durable stream (storage, not engine RAM) |
 
 "Per user" is not a first-class concept in the engine — it shows up as *the shapes a user
-opens*. The LinearLite model opens ~10 shapes/user. In the matrix run, **1,000 users → 10,000
-shapes → 1,000 subquery nodes, 6,000 contributors, 1,000 edges, but still only 3 family
-circuits.** The router count is flat in users; node/contributor/edge counts grow linearly in
-users but with a tiny constant (a node holds the user's ~6 membership rows, not any issues).
+opens*. In the matrix run, growing the user count grew shapes, subquery nodes, contributors, and
+edges proportionally, but family circuit count stayed flat at a small constant. The router count
+is flat in users; node/contributor/edge counts grow linearly in users but with a tiny constant
+(a node holds only the user's own membership rows, not any issues).
 
 ### 4.2 Memory: the numbers
 
-From the shape-memory matrix run (Postgres mode, OTel RSS probe):
+From the shape-memory matrix run (Postgres mode, OTel RSS probe): (fresh benchmarks pending)
 
-- **Baseline RSS is independent of deployment size:** ~18.7 MiB at 1k issues, ~19.0 at 10k,
-  ~18.7 at 100k. The engine keeps no table copy.
-- **Per-shape registration is ~0.7–0.9 KiB/shape and constant across deployment sizes.** Even
-  10,000 changes-only shapes grow RSS by **< 10 MiB**.
-- **Family circuits stay at a small constant** (3 here) no matter how many equality shapes
-  share them.
+- **Baseline RSS is independent of deployment size** across 1k, 10k, and 100k issues. The engine
+  keeps no table copy.
+- **Per-shape registration is a small, bounded per-shape cost and constant across deployment
+  sizes.** Even a large fleet of changes-only shapes grows RSS by only a small amount.
+- **Family circuits stay at a small constant** no matter how many equality shapes share them.
 - **Backfill is the deployment-size-sensitive cost:** a *materialized* shape's one-off backfill
-  working set scales ~linearly with the number of *visible* rows, ≈ **2 KiB/visible-row** peak
-  (e.g. a 12,000-visible-issue visibility shape over a 100k-issue DB peaks ~22 MiB above
-  baseline, then settles). This is transient read-batch + JSON serialization memory, **not
-  retained state**.
+  working set scales ~linearly with the number of *visible* rows (transient read-batch + JSON
+  serialization memory, **not retained state**, released once the backfill settles).
 
 So engine memory is, to first order:
 
 ```
-RSS ≈ baseline(~19 MiB)
-    + ~0.8 KiB × (#shapes)
+RSS ≈ baseline (flat with database size)
+    + a small, bounded per-shape cost × (#shapes)
     + Σ over nodes (inner-set size × pk size)        // shared, tiny for visibility-style subqueries
-    + peak concurrent backfill working set (~2 KiB × visible-rows-per-shape, transient)
+    + peak concurrent backfill working set (bounded per visible row, transient)
 ```
 
 ### 4.3 Sizing rule
@@ -369,8 +366,8 @@ RSS ≈ baseline(~19 MiB)
 of many shapes over a large table is cheap; a *burst of large materialized backfills* is the
 spike to provision for. Two levers reduce the spike:
 
-- **`changes-only` / subset feeds skip the backfill entirely** — they pay only registration
-  (~0.8 KiB) and live deltas.
+- **`changes-only` / subset feeds skip the backfill entirely** — they pay only a small,
+  bounded registration cost and live deltas.
 - The **`columns` projection** narrows each backfilled/synced row to the columns a view needs
   (the pk is always kept), cutting both the backfill working set and the synced payload.
 
@@ -397,9 +394,9 @@ For one table change:
   flip) — the inherent cost any correct incremental subquery maintenance pays.
 
 The append/storage path — not engine compute — is the throughput ceiling under max load
-(telemetry shows < 1 ms p99 internal per-change cost at 100k shapes). The flush coalesces per
-stream and parallelizes across streams (CAP=32) precisely because HTTP round-trips to storage
-dominate.
+(telemetry shows internal per-change compute cost stays small even at a large shape count). The
+flush coalesces per stream and parallelizes across streams (CAP=32) precisely because HTTP
+round-trips to storage dominate.
 
 ### 4.5 Disk
 
@@ -430,8 +427,9 @@ scales with table size; everything row-scale lives in Postgres.
 
 The flagship example (`examples/linearlite`, verified in-browser at 100k issues) makes a user
 see only issues in projects they're a member of. With the demo's default circuit config this
-shape is circuit-served (`docs/linearlite-circuit-design.md`); the walkthrough below traces
-the registry path — what the same shape costs with the circuit off. It is a subquery shape:
+shape is circuit-served (see "Serving tiers: compiled, routed, fallback" above); the walkthrough
+below traces the registry path — what the same shape costs with the circuit off. It is a
+subquery shape:
 
 ```jsonc
 // issues visible to user u
@@ -449,8 +447,8 @@ the registry path — what the same shape costs with the circuit off. It is a su
   `project_id` values. **~6 pks, not any issues.**
 - One edge `(this shape, project_id, node, negated=false)`.
 - One routing/shape entry + one `shape/<id>` stream.
-- If materialized: a backfill of the *visible* issues (~2 KiB/visible-row, transient). If
-  `changes-only`, no backfill.
+- If materialized: a backfill of the *visible* issues (a small, bounded per-row cost, transient).
+  If `changes-only`, no backfill.
 
 **Live cost (membership changes — user added to a project):**
 
@@ -465,11 +463,12 @@ the registry path — what the same shape costs with the circuit off. It is a su
 `new.project_id ∈ node` and `old.project_id ∈ node` → emits `upsert`/`delete` accordingly.
 `O(1)` node lookups, no inner-table query.
 
-**Scaling tally (the matrix's 1,000-user run):** 1,000 such shapes → 1,000 nodes, 6,000
-contributors, 1,000 edges, ~8 MiB total RSS growth, **3** family circuits for the *other*
-(equality) shapes those users open. The visibility subquery is per-user by nature (each user's
-membership set differs, so each gets its own node), but each node is tiny and the per-change
-cost is bounded by the fan-out of the specific project that changed.
+**Scaling tally (a matrix run with many such users):** nodes, contributors, and edges all grow
+linearly with the number of such shapes, with a small total RSS growth and family circuit count
+staying at a small constant for the *other* (equality) shapes those users open. The visibility
+subquery is per-user by nature (each user's membership set differs, so each gets its own node),
+but each node is tiny and the per-change cost is bounded by the fan-out of the specific project
+that changed. (fresh benchmarks pending)
 
 ---
 
@@ -538,7 +537,7 @@ executors via a trait so presentation cannot drift from execution.
 | `apps/engine/src/electric.rs` / `http.rs` | `/v1/shape` Electric adapter + control-plane HTTP |
 | `apps/engine/src/metrics.rs` / `mem.rs` | counters, latency histograms, OTel memory/cardinality gauges |
 | `apps/engine/src/retention.rs` | shape retention: the active / dormant / evicted lifecycle + layered dormant-only eviction |
-| `apps/engine/src/config.rs` | boot config: `ELECTRIC_IVM_*` env + Electric fleet-surface mapping |
+| `apps/engine/src/config.rs` | boot config: `ELECTRIC_CIRCUITS_*` env + Electric fleet-surface mapping |
 | `apps/engine/src/params.rs` | Electric `params[N]` / `$N` substitution for `/v1/shape` |
 | `apps/engine/src/statsd.rs` | StatsD (datadog wire) telemetry for the benchmarking fleet |
 | `apps/engine/src/trace.rs` | per-envelope pipeline trace broadcast (`GET /trace` SSE, feeds the explorer) |
@@ -549,4 +548,51 @@ executors via a trait so presentation cannot drift from execution.
   adapters) and the speedup backlog.
 - `packages/bench/README.md` — the benchmark runners, including the shape-memory matrix that
   produced the memory-vs-shapes data used above.
-- `docs/shapes-and-subqueries-guide.md` — the user-facing companion to this document.
+- `docs/live-queries-guide.md` — the user-facing companion to this document.
+
+## Serving tiers: compiled, routed, fallback
+
+Every shape lands in one of three serving tiers. The load-bearing separation is between what
+is *compiled* and what is *routed*:
+
+| Tier | Cardinality | Cost of adding one | Serves |
+|------|-------------|--------------------|--------|
+| **The circuit** | few counts pipelines, fixed at deploy | a config change + restart (counts reseed on boot) | COUNT **families** (templates) |
+| **Routing** | unbounded, changes at runtime | a routing-table entry | query **instances** (parameter combinations) |
+| **Fallback** | unbounded | nothing | query **strangers** (predicates matching no template) |
+
+- The **circuit** compiles one counts pipeline per aggregate family —
+  `map_index(group) → weighted_count` — keyed by *cohort group* (per project, per
+  (project, status), per aggregate group…). Its state is O(distinct groups), held in memory;
+  **row data lives in Postgres, never in the circuit**. Its structure never grows with shapes,
+  users, or parameter combinations — if a design makes it do so, the design is wrong (the
+  circuit-per-shape trap: structure must never scale with subscriptions).
+- A **circuit-served shape** (a COUNT aggregate) is a selection or sum of cohort groups from
+  one pipeline's keyed output, materialized at the delivery edge. Shape cardinality can
+  vastly exceed pipeline cardinality: a count exists per *combination* of projects clients
+  ask for, all fed from the same per-(project, status) pipeline. The sum is correct only when
+  the cohort key **partitions** the table (each row in exactly one group); overlapping groups
+  need dedup at the edge.
+- The **routing tier and fallback** are the engine's dynamic path — `KeyRouter` equality
+  families, the conjunct-indexed standalone path and conjunct-indexed aggregates, standalone
+  three-valued predicate evaluation (with the `AccessLeaf` index), and the subquery registry,
+  which serves **every** membership subquery: single-level and nested, negated or not. Together
+  they serve *any* predicate. The circuit is an optimization in front of them, never a
+  correctness dependency: a brand-new query pattern works immediately at fallback cost, and a
+  COUNT that matters is promoted into the circuit at the next deploy.
+
+### Three kinds of "dynamic", and who serves them
+
+1. **Dynamically created shapes** whose predicate decomposes over a template key
+   (`project_id IN (3,7,9)`, `issue_id = X`) → the routing tier: `KeyRouter` families and the
+   conjunct-indexed standalone path. These are deliberately *not* circuit-served — an indexed
+   route finds a change's shapes in `O(log N)`, whereas a circuit shape would scan every
+   delta linearly.
+2. **Time-varying membership** (`project_id IN (SELECT … WHERE user_id = $me)`) → the
+   subquery registry: one shared inner-set node per distinct subquery, created in two phases
+   (a Postgres backfill under a `REPEATABLE READ` snapshot, `SnapshotGate`-fenced against the
+   live log). Membership-table deltas reconcile the node's contributors; a value flip queries
+   the affected outer rows back from Postgres on the parallel flip-worker pool and emits them
+   absolutely, per pk, through ordered per-stream emission lanes.
+3. **Predicates that cut across every template key** (`title LIKE '%foo%'`, nested or negated
+   subqueries) → fallback.

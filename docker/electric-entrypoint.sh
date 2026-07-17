@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Entrypoint for the single fleet-conformance electric-ivm image (see docs/fleet-conformance.md).
+# Entrypoint for the single fleet-conformance electric-circuits image (see docs/fleet-conformance.md).
 #
 # It supervises two processes inside one container:
 #   1. durable-streams server (docker/ds-server.ts) — bound to 127.0.0.1 on an internal port,
 #      the append log the engine writes to and clients read from.
-#   2. the Rust engine (electric-ivm-engine) — binds 0.0.0.0:$ELECTRIC_PORT and serves
+#   2. the Rust engine (electric-circuits-engine) — binds 0.0.0.0:$ELECTRIC_PORT and serves
 #      /v1/shape + /v1/health.
 #
 # Env translation: the fleet sets Electric's documented vars (DATABASE_URL, ELECTRIC_PORT,
 # ELECTRIC_STORAGE, ...). Newer engine builds read ELECTRIC_* directly; to also work with the
-# current engine we export the equivalent ELECTRIC_IVM_* fallbacks here (only when unset), so
+# current engine we export the equivalent ELECTRIC_CIRCUITS_* fallbacks here (only when unset), so
 # both engines behave identically. This redundancy is intentional.
 #
 # Supervision: if either child exits, the other is killed and the container exits with that code.
@@ -17,18 +17,18 @@
 # the whole thing down cleanly. Works as PID 1 or PID!=1.
 set -euo pipefail
 
-log() { echo "[electric-ivm] $*"; }
+log() { echo "[electric-circuits] $*"; }
 
 # --- resolve config ---------------------------------------------------------
 
 PORT="${ELECTRIC_PORT:-3000}"
-DS_PORT="${ELECTRIC_IVM_DS_INTERNAL_PORT:-8791}"
+DS_PORT="${ELECTRIC_CIRCUITS_DS_INTERNAL_PORT:-8791}"
 DS_HOST="127.0.0.1"
 
-# Postgres URL: prefer an explicit ELECTRIC_IVM_PG_URL, else the fleet's DATABASE_URL.
-PG_URL="${ELECTRIC_IVM_PG_URL:-${DATABASE_URL:-}}"
+# Postgres URL: prefer an explicit ELECTRIC_CIRCUITS_PG_URL, else the fleet's DATABASE_URL.
+PG_URL="${ELECTRIC_CIRCUITS_PG_URL:-${DATABASE_URL:-}}"
 if [ -z "$PG_URL" ]; then
-  log "FATAL: neither DATABASE_URL nor ELECTRIC_IVM_PG_URL is set — nothing to replicate from."
+  log "FATAL: neither DATABASE_URL nor ELECTRIC_CIRCUITS_PG_URL is set — nothing to replicate from."
   exit 64
 fi
 
@@ -54,24 +54,24 @@ else
   STORAGE_DESC="FAST_FILE (data: $DS_DATA_DIR)"
 fi
 
-# durable-streams binds loopback on an internal port; the engine reaches it via ELECTRIC_IVM_DS_URL.
+# durable-streams binds loopback on an internal port; the engine reaches it via ELECTRIC_CIRCUITS_DS_URL.
 export DS_HOST DS_PORT
 export BIND_HOST="$DS_HOST"
-: "${ELECTRIC_IVM_DS_URL:=http://${DS_HOST}:${DS_PORT}}"
-export ELECTRIC_IVM_DS_URL
+: "${ELECTRIC_CIRCUITS_DS_URL:=http://${DS_HOST}:${DS_PORT}}"
+export ELECTRIC_CIRCUITS_DS_URL
 
 # Engine fallbacks (only set what the caller didn't). A newer engine reads ELECTRIC_* directly;
 # these keep the current engine working with the same inputs.
-export ELECTRIC_IVM_PG_URL="$PG_URL"
-: "${ELECTRIC_IVM_BIND:=0.0.0.0:${PORT}}"
-export ELECTRIC_IVM_BIND
-: "${ELECTRIC_IVM_PG_TABLES:=*}"
-export ELECTRIC_IVM_PG_TABLES
-if [ -n "${ELECTRIC_LOG_LEVEL:-}" ] && [ -z "${ELECTRIC_IVM_LOG:-}" ]; then
-  export ELECTRIC_IVM_LOG="$ELECTRIC_LOG_LEVEL"
+export ELECTRIC_CIRCUITS_PG_URL="$PG_URL"
+: "${ELECTRIC_CIRCUITS_BIND:=0.0.0.0:${PORT}}"
+export ELECTRIC_CIRCUITS_BIND
+: "${ELECTRIC_CIRCUITS_PG_TABLES:=*}"
+export ELECTRIC_CIRCUITS_PG_TABLES
+if [ -n "${ELECTRIC_LOG_LEVEL:-}" ] && [ -z "${ELECTRIC_CIRCUITS_LOG:-}" ]; then
+  export ELECTRIC_CIRCUITS_LOG="$ELECTRIC_LOG_LEVEL"
 fi
-if [ -n "${ELECTRIC_REPLICATION_STREAM_ID:-}" ] && [ -z "${ELECTRIC_IVM_PG_SLOT:-}" ]; then
-  export ELECTRIC_IVM_PG_SLOT="electric_slot_${ELECTRIC_REPLICATION_STREAM_ID}"
+if [ -n "${ELECTRIC_REPLICATION_STREAM_ID:-}" ] && [ -z "${ELECTRIC_CIRCUITS_PG_SLOT:-}" ]; then
+  export ELECTRIC_CIRCUITS_PG_SLOT="electric_slot_${ELECTRIC_REPLICATION_STREAM_ID}"
 fi
 
 # --- boot log (redacted) ----------------------------------------------------
@@ -79,11 +79,11 @@ fi
 redact_url() { echo "$1" | sed -E 's#(://[^:/@]+:)[^@/]*@#\1***@#'; }
 log "starting fleet-conformance image"
 log "  DATABASE_URL       = $(redact_url "$PG_URL")"
-log "  ELECTRIC_PORT      = $PORT (engine bind $ELECTRIC_IVM_BIND)"
+log "  ELECTRIC_PORT      = $PORT (engine bind $ELECTRIC_CIRCUITS_BIND)"
 log "  ELECTRIC_STORAGE   = $STORAGE_DESC"
 log "  ELECTRIC_INSTANCE_ID = ${ELECTRIC_INSTANCE_ID:-<generated>}"
 log "  ELECTRIC_STATSD_HOST = ${ELECTRIC_STATSD_HOST:-<off>}"
-log "  ds internal url    = $ELECTRIC_IVM_DS_URL"
+log "  ds internal url    = $ELECTRIC_CIRCUITS_DS_URL"
 [ -n "${ELECTRIC_SECRET:-}" ] && log "  ELECTRIC_SECRET    = *** (auth required)"
 
 # --- helpers ----------------------------------------------------------------
@@ -163,7 +163,7 @@ fi
 # --- start engine -----------------------------------------------------------
 
 log "starting engine on 0.0.0.0:${PORT} ..."
-electric-ivm-engine &
+electric-circuits-engine &
 ENGINE_PID=$!
 
 rc=0; wait_tcp "127.0.0.1" "$PORT" 20 "$ENGINE_PID" || rc=$?

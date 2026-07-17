@@ -102,7 +102,7 @@ pub struct Engine {
     retention: Arc<RetentionConfig>,
     /// Set once the background retention sweeper has been spawned (lazy, idempotent).
     retention_started: Arc<std::sync::atomic::AtomicBool>,
-    /// dbsp arrangement settings (`ELECTRIC_IVM_DBSP*`), set before `setup_postgres`.
+    /// dbsp arrangement settings (`ELECTRIC_CIRCUITS_DBSP*`), set before `setup_postgres`.
     dbsp_cfg: Arc<std::sync::Mutex<Option<crate::config::DbspConfig>>>,
     /// The dbsp arrangement layer, once started (see [`crate::arrangements`]).
     arrangements: Arc<std::sync::Mutex<Option<crate::arrangements::Arrangements>>>,
@@ -132,7 +132,7 @@ struct SubqueryHandle {
 }
 
 /// Spawn the flip-propagation dispatcher: FlipWork batches run **concurrently**, bounded by a
-/// semaphore (`ELECTRIC_IVM_FLIP_WORKERS`, default 8) — the Postgres round-trips are the
+/// semaphore (`ELECTRIC_CIRCUITS_FLIP_WORKERS`, default 8) — the Postgres round-trips are the
 /// dominant cost and are independent across batches. Correctness does not depend on
 /// propagation order: membership evaluation happens under the registry lock and the resulting
 /// envelopes are **enqueued under that same lock** into per-stream FIFO emission lanes
@@ -145,7 +145,7 @@ fn spawn_flip_propagator(
     pending: Arc<std::sync::atomic::AtomicI64>,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
 ) {
-    let workers: usize = std::env::var("ELECTRIC_IVM_FLIP_WORKERS")
+    let workers: usize = std::env::var("ELECTRIC_CIRCUITS_FLIP_WORKERS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8)
@@ -318,7 +318,7 @@ impl Engine {
         // pendingFlips counter so the convergence barrier covers queued batches.
         let lanes = emission::EmissionLanes::spawn(
             ds.clone(),
-            std::env::var("ELECTRIC_IVM_EMIT_LANES").ok().and_then(|v| v.parse().ok()).unwrap_or(8),
+            std::env::var("ELECTRIC_CIRCUITS_EMIT_LANES").ok().and_then(|v| v.parse().ok()).unwrap_or(8),
             pending_flips.clone(),
         );
         subqueries.try_lock().expect("fresh registry").set_lanes(lanes);
@@ -371,25 +371,25 @@ impl Engine {
         let Some(cfg) = self.dbsp_cfg.lock().unwrap().clone() else { return Ok(()) };
         if !cfg.indexes.is_empty() {
             tracing::warn!(
-                "ELECTRIC_IVM_DBSP_INDEXES is deprecated and ignored: row data lives in Postgres \
+                "ELECTRIC_CIRCUITS_DBSP_INDEXES is deprecated and ignored: row data lives in Postgres \
                  (lookups are pooled queries); the circuit holds counts pipelines only"
             );
         }
         if cfg.cache_mib.is_some() || cfg.max_rss_bytes.is_some() {
             tracing::warn!(
-                "ELECTRIC_IVM_DBSP_{{CACHE_MIB,MIN_STORAGE_KB,MAX_RSS_MB,CHECKPOINT_SECS,DIR}} are \
+                "ELECTRIC_CIRCUITS_DBSP_{{CACHE_MIB,MIN_STORAGE_KB,MAX_RSS_MB,CHECKPOINT_SECS,DIR}} are \
                  deprecated no-ops: the circuit is in-memory counts only (no storage layer)"
             );
         }
-        if std::env::var("ELECTRIC_IVM_FEED_TRACE").is_ok() {
+        if std::env::var("ELECTRIC_CIRCUITS_FEED_TRACE").is_ok() {
             tracing::warn!(
-                "ELECTRIC_IVM_FEED_TRACE is deprecated and ignored: the feed relation now lives host-side"
+                "ELECTRIC_CIRCUITS_FEED_TRACE is deprecated and ignored: the feed relation now lives host-side"
             );
         }
         let mut counts: Vec<crate::arrangements::CountSpec> = Vec::new();
         for (t, cols) in &cfg.counts {
             let Some(ts) = schemas.get(t) else {
-                tracing::warn!("ELECTRIC_IVM_DBSP_COUNTS: unknown table {t}; skipping");
+                tracing::warn!("ELECTRIC_CIRCUITS_DBSP_COUNTS: unknown table {t}; skipping");
                 continue;
             };
             let resolved: Option<Vec<usize>> =
@@ -398,7 +398,7 @@ impl Engine {
                 Some(group_cols) => {
                     counts.push(crate::arrangements::CountSpec { table: t.clone(), group_cols })
                 }
-                None => tracing::warn!("ELECTRIC_IVM_DBSP_COUNTS: unknown column in {t}:{cols:?}; skipping"),
+                None => tracing::warn!("ELECTRIC_CIRCUITS_DBSP_COUNTS: unknown column in {t}:{cols:?}; skipping"),
             }
         }
         if counts.is_empty() {
@@ -901,11 +901,11 @@ impl Engine {
     ///
     /// Expensive: locks engine state, round-trips a one-off `SequencerCmd::MemBytes` to the
     /// sequencer task (mirroring the `DumpNode` command's pattern — see `dump_node` below), locks
-    /// the subquery registry, and walks roughly the engine's entire owned heap (~100MB at 50k
-    /// shapes). Call this ONLY from the `GET /memory` HTTP handler — never from the 500ms
-    /// background sampler (`mem::spawn_sampler`), which calls `mem_cardinalities` instead. Mixing
-    /// this into the sampler's path was exactly the prior regression (+41%/+52% peak/steady RSS at
-    /// 100k subscriptions from twice-a-second byte walks); see `mem::spawn_sampler`'s doc comment.
+    /// the subquery registry, and walks roughly the engine's entire owned heap. Call this ONLY
+    /// from the `GET /memory` HTTP handler — never from the 500ms background sampler
+    /// (`mem::spawn_sampler`), which calls `mem_cardinalities` instead. Mixing this into the
+    /// sampler's path was exactly the prior regression (a large peak/steady RSS increase from
+    /// twice-a-second byte walks); see `mem::spawn_sampler`'s doc comment.
     ///
     /// `bytes_executors` (standalone shapes + their conjunct index, family routers, aggregate
     /// folds + their index) is the one term this method cannot read out of already-published

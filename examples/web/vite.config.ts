@@ -11,7 +11,7 @@ export default defineConfig({
   plugins: [react()],
   // Workspace packages export raw .ts from src/; process them through the pipeline instead of
   // pre-bundling, and let Vite read files from the repo root (they're symlinked there).
-  optimizeDeps: { exclude: ['@electric-ivm/client', '@electric-ivm/protocol', '@electric-ivm/api'] },
+  optimizeDeps: { exclude: ['@electric-circuits/client', '@electric-circuits/protocol', '@electric-circuits/api'] },
   server: {
     port: 5173,
     fs: { allow: [repoRoot] },

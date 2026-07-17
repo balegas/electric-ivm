@@ -1,5 +1,5 @@
-import type { AggregateSubscription, SubsetSubscription } from '@electric-ivm/client'
-import type { AggregateDef, Row, ShapeDef, SubsetDef } from '@electric-ivm/protocol'
+import type { AggregateSubscription, SubsetSubscription } from '@electric-circuits/client'
+import type { AggregateDef, Row, ShapeDef, SubsetDef } from '@electric-circuits/protocol'
 import { createCollection, type Collection } from '@tanstack/db'
 import { useLiveQuery } from '@tanstack/react-db'
 import { useCallback, useEffect, useRef, useState } from 'react'

@@ -1,7 +1,7 @@
-// electric-ivm client: a thin wrapper over a typed tRPC client plus stream-db
+// electric-circuits client: a thin wrapper over a typed tRPC client plus stream-db
 // (`@durable-streams/state/db`) for materializing a shape into a live TanStack DB collection.
 
-import type { AppRouter } from '@electric-ivm/api'
+import type { AppRouter } from '@electric-circuits/api'
 import type {
   AggregateDef,
   Op,
@@ -13,7 +13,7 @@ import type {
   SubsetResult,
   TableDef,
   Value,
-} from '@electric-ivm/protocol'
+} from '@electric-circuits/protocol'
 import { stream } from '@durable-streams/client'
 import { createStateSchema, createStreamDB } from '@durable-streams/state/db'
 import { createTRPCClient, httpBatchLink } from '@trpc/client'
@@ -83,7 +83,7 @@ export interface ElectricIvmClient {
    * never stores the page; a change is matched against one base predicate, never fanned across ranges.
    */
   subset(def: SubsetDef): Promise<SubsetSubscription>
-  /** Open a live scalar **aggregation** over a filtered set (electric-ivm extension). */
+  /** Open a live scalar **aggregation** over a filtered set (electric-circuits extension). */
   aggregate(def: AggregateDef): Promise<AggregateSubscription>
   close(): Promise<void>
 }

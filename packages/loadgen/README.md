@@ -1,8 +1,8 @@
-# @electric-ivm/loadgen
+# @electric-circuits/loadgen
 
 A headless load generator that simulates users of the LinearLite issue tracker to observe **engine
 memory, CPU, and disk** across workload sizes. No rendering, no DOM — each user is a state machine that
-drives the real `@electric-ivm/client` for reads and writes to **Postgres** (the system of record) for
+drives the real `@electric-circuits/client` for reads and writes to **Postgres** (the system of record) for
 mutations. Designed to run many users from one node, and to scale out across client nodes with Docker
 when a single machine's connection limits get in the way.
 
@@ -31,10 +31,10 @@ measurable) + engine + API, seeds, runs, samples, reports, and tears everything 
 
 ```bash
 # defaults: 20 users, 2000 seed issues, 60s
-pnpm --filter @electric-ivm/loadgen loadgen
+pnpm --filter @electric-circuits/loadgen loadgen
 
 # a bigger workload
-USERS=100 SEED_ISSUES=20000 DURATION_S=90 pnpm --filter @electric-ivm/loadgen loadgen
+USERS=100 SEED_ISSUES=20000 DURATION_S=90 pnpm --filter @electric-circuits/loadgen loadgen
 ```
 
 Output: a per-second CSV (`results/metrics-<label>.csv`) and a printed + JSON summary
@@ -50,7 +50,7 @@ Runs one `all`-mode job per USERS size and prints a comparison table (RSS / CPU 
 shapes / subquery nodes / … vs. workload size):
 
 ```bash
-SWEEP_USERS=10,50,150 SEED_ISSUES=10000 DURATION_S=45 pnpm --filter @electric-ivm/loadgen sweep
+SWEEP_USERS=10,50,150 SEED_ISSUES=10000 DURATION_S=45 pnpm --filter @electric-circuits/loadgen sweep
 ```
 
 ## Config (env)
@@ -87,7 +87,7 @@ nodes multiply the ceiling. The infra runs once (on the host); clients connect t
 ```bash
 # 1. Host: boot the infra bound to all interfaces with fixed ports, and keep it up + sample metrics.
 BIND_HOST=0.0.0.0 API_PORT=8790 DS_PORT=8791 PG_PORT=8792 SEED_ISSUES=20000 \
-  LOADGEN_MODE=infra pnpm --filter @electric-ivm/loadgen loadgen
+  LOADGEN_MODE=infra pnpm --filter @electric-circuits/loadgen loadgen
 
 # 2. Scale client nodes (each = one container/network namespace):
 cd packages/loadgen/docker

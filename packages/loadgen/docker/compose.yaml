@@ -2,7 +2,7 @@
 #
 #   1. On the host, boot the infra bound to all interfaces with fixed ports:
 #        BIND_HOST=0.0.0.0 API_PORT=8790 DS_PORT=8791 PG_PORT=8792 SEED_ISSUES=20000 \
-#          pnpm --filter @electric-ivm/loadgen loadgen   # LOADGEN_MODE defaults to `all`; use LOADGEN_MODE=infra
+#          pnpm --filter @electric-circuits/loadgen loadgen   # LOADGEN_MODE defaults to `all`; use LOADGEN_MODE=infra
 #      (LOADGEN_MODE=infra keeps it up + samples server metrics while clients connect.)
 #
 #   2. Scale client nodes (each its own container/network namespace):

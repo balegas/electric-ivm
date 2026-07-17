@@ -11,7 +11,7 @@
 // the `emitted` counter (`GET /state/node?id=shape:<id>`) rather than long-poll timing: a write
 // that matches only shape A must not move shape B's counter at all, not "eventually settle".
 
-import type { Schema } from '@electric-ivm/protocol'
+import type { Schema } from '@electric-circuits/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { applyOp, bootHarness, drainEngine, type Harness } from './harness.js'
 

@@ -4,7 +4,7 @@
 # and /v1/health), wired together by docker/electric-entrypoint.sh.
 #
 # Build context is the repo root:
-#   docker build -f docker/Dockerfile.electric -t electric-ivm-electric .
+#   docker build -f docker/Dockerfile.electric -t electric-circuits-electric .
 
 # --- stage 1: build the Rust engine -----------------------------------------
 FROM rust:1-bookworm AS engine-build
@@ -17,12 +17,12 @@ COPY apps/engine/Cargo.toml apps/engine/Cargo.toml
 RUN mkdir -p apps/engine/src \
  && echo 'fn main() {}' > apps/engine/src/main.rs \
  && echo '' > apps/engine/src/lib.rs \
- && cargo build --release -p electric-ivm-engine \
- && rm -rf apps/engine/src target/release/electric-ivm-engine target/release/deps/electric_ivm_engine-*
+ && cargo build --release -p electric-circuits-engine \
+ && rm -rf apps/engine/src target/release/electric-circuits-engine target/release/deps/electric_circuits_engine-*
 COPY apps/engine apps/engine
 # touch so cargo re-fingerprints our crate (mtime) and rebuilds it from the real sources.
 RUN touch apps/engine/src/main.rs apps/engine/src/lib.rs \
- && cargo build --release -p electric-ivm-engine
+ && cargo build --release -p electric-circuits-engine
 
 # --- stage 2: build the durable-streams-server binary (see docker/Dockerfile.ds) --------------
 FROM rust:1.83-slim AS ds-build
@@ -54,11 +54,11 @@ ENV APP_ROOT=/app \
     PATH=/repo/node_modules/.bin:$PATH
 
 COPY --from=node-deps /repo /repo
-COPY --from=engine-build /repo/target/release/electric-ivm-engine /usr/local/bin/electric-ivm-engine
+COPY --from=engine-build /repo/target/release/electric-circuits-engine /usr/local/bin/electric-circuits-engine
 COPY --from=ds-build /usr/local/cargo/bin/durable-streams-server /usr/local/bin/durable-streams-server
 COPY docker/electric-entrypoint.sh /usr/local/bin/electric-entrypoint.sh
 
-RUN chmod +x /usr/local/bin/electric-entrypoint.sh /usr/local/bin/electric-ivm-engine /usr/local/bin/durable-streams-server \
+RUN chmod +x /usr/local/bin/electric-entrypoint.sh /usr/local/bin/electric-circuits-engine /usr/local/bin/durable-streams-server \
  && mkdir -p /app \
  && chown -R node:node /app
 

@@ -6,7 +6,7 @@
 //    declared columns, and only the NON-pk columns by value (the pk is compared as a string
 //    key). Non-pk columns keep their JS types on both sides (text/bool/number).
 
-import type { Row } from '@electric-ivm/protocol'
+import type { Row } from '@electric-circuits/protocol'
 
 export interface CompareResult {
   equal: boolean

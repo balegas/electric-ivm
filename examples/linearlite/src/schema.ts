@@ -1,6 +1,6 @@
-import type { Schema } from '@electric-ivm/protocol'
+import type { Schema } from '@electric-circuits/protocol'
 
-// LinearLite mapped onto electric-ivm's model: a shape is one table + a WHERE over that table's own
+// LinearLite mapped onto electric-circuits's model: a shape is one table + a WHERE over that table's own
 // columns, with value types int | float | text | bool and a single-column primary key. The original
 // uses uuid ids and timestamptz; we use integer ids (Linear-style issue numbers) and epoch-millis
 // integers for timestamps (so `created`/`modified` are filterable and sortable with lt/gt).

@@ -9,7 +9,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import pgpkg from 'pg'
-import type { Row, Schema, StreamEnvelope } from '@electric-ivm/protocol'
+import type { Row, Schema, StreamEnvelope } from '@electric-circuits/protocol'
 import { bootHarness, drainEngine, type Harness } from './harness.js'
 
 const schema: Schema = {
@@ -22,9 +22,9 @@ let h: Harness
 beforeEach(async () => {
   h = await bootHarness(schema, {
     engineEnv: {
-      ELECTRIC_IVM_SHAPE_IDLE_SECS: '1',
-      ELECTRIC_IVM_SHAPE_DORMANT_TTL_SECS: '4',
-      ELECTRIC_IVM_RETENTION_SWEEP_SECS: '1',
+      ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '1',
+      ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS: '4',
+      ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
     },
   })
 })

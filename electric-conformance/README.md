@@ -1,8 +1,8 @@
 # Electric protocol conformance
 
 Runs ElectricSQL's **own** oracle harness (`Support.OracleHarness` / `ShapeChecker` — its
-comparison-against-Postgres logic) against electric-ivm's `GET /v1/shape` adapter, driven by Electric's
-official Elixir `Electric.Client`. This proves electric-ivm speaks Electric's wire protocol.
+comparison-against-Postgres logic) against electric-circuits's `GET /v1/shape` adapter, driven by Electric's
+official Elixir `Electric.Client`. This proves electric-circuits speaks Electric's wire protocol.
 
 ## Run
 
@@ -20,7 +20,7 @@ Both boot our stack (durable-streams + engine + adapter) via `packages/bench/src
 point Electric's official `Electric.Client` at it, and run Electric's own `OracleHarness`/`ShapeChecker`.
 The property test additionally reuses Electric's `WhereClauseGenerator` + `StandardSchema` (DDL/seed/
 mutation generators); the launcher's two-phase mode (`ADAPTER_WAIT_TABLE`) lets the test apply
-StandardSchema's exact schema+seed before the engine introspects. `ELECTRIC_IVM_DIR` overrides the path.
+StandardSchema's exact schema+seed before the engine introspects. `ELECTRIC_CIRCUITS_DIR` overrides the path.
 Tunables: `ORACLE_RUNS`, `ORACLE_SHAPE_COUNT`, `ORACLE_BATCH_COUNT`, `ORACLE_MUTATIONS_PER_TXN`.
 
 ## Adapter behavior notes (`/v1/shape`)
@@ -56,10 +56,10 @@ Tunables: `ORACLE_RUNS`, `ORACLE_SHAPE_COUNT`, `ORACLE_BATCH_COUNT`, `ORACLE_MUT
 
 ## Electric's subquery integration tests (`subquery_move_out_test.exs`, `subquery_dependency_update_test.exs`)
 
-These are Electric's **hand-written** subquery integration tests, run against electric-ivm via a setup
+These are Electric's **hand-written** subquery integration tests, run against electric-circuits via a setup
 swap: `el_ivm_setup.ex` (`el_ivm_pg` + `el_ivm_client`) replaces `with_unique_db` + `with_complete_stack`
 + `with_electric_client` with our launcher-booted stack (engine introspects all tables via
-`ELECTRIC_IVM_PG_TABLES=*`); **the test bodies and assertions are unchanged**. Run with
+`ELECTRIC_CIRCUITS_PG_TABLES=*`); **the test bodies and assertions are unchanged**. Run with
 `electric-conformance/run.sh subqueries`.
 
 **Result: 13 / 15 pass.** The 13 cover the real subquery behaviors — synthetic move-out deletes (parent
@@ -67,11 +67,11 @@ deactivation/deletion), move-in via a different parent, negated move-in/out, dep
 moves between premium orgs with no spurious deletes), combined-condition move-in, resume-preserves-move-out,
 and the stale-tag no-spurious-delete case. The **2 failures both assert Electric's row-`tags` mechanism**
 (`assert %{headers: %{tags: [_]}}` / `assert new_tags != initial_tags`) — an Electric-internal protocol
-detail electric-ivm deliberately doesn't emit (we use absolute membership emission, not row tags). They
+detail electric-circuits deliberately doesn't emit (we use absolute membership emission, not row tags). They
 are not membership/correctness failures.
 
 ## Status — ✅ passing (oracle)
-The Electric oracle property test passes against electric-ivm across the **full** standard schema
+The Electric oracle property test passes against electric-circuits across the **full** standard schema
 (`level_1..4` + composite-PK `*_tags`) and the full generated grammar: comparisons (`= <> < > <= >=`),
 `LIKE`/`NOT LIKE`, `BETWEEN`/`NOT BETWEEN`, `IN (list)`, 1/2/3-level `IN (SELECT …)` subqueries, tag
 subqueries, `NOT IN`, and `AND`/`OR`/`NOT` compositions — all converging vs the Postgres oracle through

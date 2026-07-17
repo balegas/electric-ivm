@@ -1,10 +1,10 @@
 # AGENTS.md
 
-Guidance for AI agents working in **electric-ivm** — an Electric-style reactive sync engine. App
+Guidance for AI agents working in **electric-circuits** — an Electric-style reactive sync engine. App
 writes go to **Postgres**; a Rust engine turns logical-replication changes into **live shapes**
 (incrementally maintained, fully de-duplicated); **durable streams** is the log between them. Two
 client surfaces: the Electric-compatible `GET /v1/shape` (works with the ElectricSQL TS client) and
-the extended `@electric-ivm/client` API (shapes + subset queries + live aggregations — the surface
+the extended `@electric-circuits/client` API (shapes + subset queries + live aggregations — the surface
 the project is growing toward).
 
 ## Layout
@@ -22,7 +22,6 @@ the project is growing toward).
 | `electric-conformance/` | Electric's own oracle/property/integration tests pointed at our `/v1/shape`. |
 | `docker/` | Containerized stack: `compose.yaml` (postgres + ds + engine + api), `Dockerfile.engine`, `Dockerfile.node`. `pnpm docker:up`. |
 | `apps/pipeline-viz` | Live pipeline explorer (shapes, shared families/nodes, reactive per-node state + index dumps) over `GET /graph` + `/state` + `/trace`. |
-| `tutorials/` | Tutorial series: one compose stack (postgres+ds+engine+api+viz) + per-episode walkthroughs (episodes/01-first-shape, 02-inside-the-pipeline). |
 | `examples/linearlite` | The flagship demo. `scripts/linearlite.sh start <size>` boots everything. |
 
 ## Docs (read these before designing)
@@ -30,14 +29,12 @@ the project is growing toward).
 - `README.md` — the system in one page + the consistency model summary.
 - `docs/ARCHITECTURE.md` — the as-built architecture: ingest, `SnapshotGate` fencing, sharing,
   subquery registry, reliability model, Electric adapter, client layer.
-- `docs/ivm-engine-internals.md` — engine execution strategies + the analytical cost model.
-- `docs/shapes-and-subqueries-guide.md` — user/integrator guide.
+- `docs/ivm-engine-internals.md` — engine execution strategies + the analytical cost model,
+  including the three-tier serving model (circuit/routing/fallback): see
+  [`docs/ivm-engine-internals.md#serving-tiers-compiled-routed-fallback`](docs/ivm-engine-internals.md#serving-tiers-compiled-routed-fallback).
+- `docs/live-queries-guide.md` — user/integrator guide.
 - `docs/deployment-postgres.md` — Postgres-as-source-of-record setup.
 - Each package has its own `README.md` (surface, commands, env knobs).
-- `docs/building-app-pipelines.md` — how to design a pipeline for an app: the three-tier
-  serving model (circuit/routing/fallback), the recipe, and a worked simple model.
-- `docs/linearlite-circuit-design.md` — how the flagship app's query graph is served
-  (which queries go to which tier); source of the recipe below.
 
 ## Designing dbsp circuits: pipelines vs shapes
 
@@ -78,8 +75,8 @@ The recipe for capturing an app's query set in one circuit:
 ## Build & test
 
 ```bash
-pnpm engine:build          # cargo build -p electric-ivm-engine
-pnpm engine:test           # cargo test  -p electric-ivm-engine   (fast)
+pnpm engine:build          # cargo build -p electric-circuits-engine
+pnpm engine:test           # cargo test  -p electric-circuits-engine   (fast)
 pnpm test                  # vitest run — full suite incl. conformance (~60s; boots its own PG)
 pnpm test:conformance      # just the conformance package
 pnpm test:fuzz             # random-predicate fuzz vs oracle
@@ -119,7 +116,7 @@ projects scale with it (users ~√issues). Boots PG + ds + engine + API + web UI
 explorer; `stop` tears down cleanly; `status` reports. One instance at a time (teardown is
 pattern-based). Ports: `DEMO_HTTPS_PORT` (8443), `DEMO_VIZ_PORT` (5180), `DEMO_VIZ=0` to skip.
 
-`packages/loadgen` — `USERS=100 SEED_ISSUES=20000 DURATION_S=90 pnpm --filter @electric-ivm/loadgen
+`packages/loadgen` — `USERS=100 SEED_ISSUES=20000 DURATION_S=90 pnpm --filter @electric-circuits/loadgen
 loadgen`; `SWEEP_USERS=…` for comparison tables; Docker client scaling in `packages/loadgen/docker/`.
 The streams layer is the Rust durable-streams server (group-commit WAL — appends batch under
 concurrency); `DS_MEMORY=1` still removes durability entirely for max-throughput runs
@@ -140,14 +137,15 @@ Fixed URLs: LinearLite `http://localhost:5174` (HTTPS/HTTP-2 `https://localhost:
 `http://localhost:5180` (`https://localhost:5443`). Ephemeral ports for the rest — grep the log:
 `postgres →`, `engine →`, `api →`. `DEMO_SEED_COUNT=<n>` scales the faker seed (default 512 issues).
 Data resets every run. **Restarting:** kill the previous run first or Vite silently binds 5175 —
-`pkill -f electric-ivm-engine; pkill -f caddy; pkill -f linearlite/start.ts`, then relaunch (if a
+`pkill -f electric-circuits-engine; pkill -f caddy; pkill -f linearlite/start.ts`, then relaunch (if a
 port lingers: `lsof -ti :5174 -ti :5180 | xargs kill`).
 
 The **visualizer** can also attach to any running engine on its own:
-`ELECTRIC_IVM_ENGINE_URL=http://127.0.0.1:<port> pnpm --filter @electric-ivm/pipeline-viz dev`.
+`ELECTRIC_CIRCUITS_ENGINE_URL=http://127.0.0.1:<port> pnpm --filter @electric-circuits/pipeline-viz dev`.
 Its dev server proxies `/engine/*` → the engine control plane, so browser-side `fetch('/engine/graph')`
 etc. work from the page — the backbone of the verification workflow below. A third way is the
-containerized visualizer (`docker/Dockerfile.viz`): `cd tutorials && docker compose up --build` serves
+containerized visualizer (`docker/Dockerfile.viz`): `docker build -f docker/Dockerfile.viz -t
+electric-circuits-viz . && docker run -p 5180:5180 -p 5443:5443 electric-circuits-viz` serves
 `http://localhost:5180` with Caddy proxying `/engine/*` to the engine; set `ENGINE_UPSTREAM` to
 point it at another engine.
 
@@ -177,7 +175,7 @@ Use the Playwright MCP browser to drive both apps; keep LinearLite and the visua
 Retention interplay while testing: an open LinearLite tab holds subscriptions (refcount ≥ 1), which
 blocks dormancy for its shapes; `GET /shapes/{id}` is deliberately NOT a retention touch, so
 polling it never keeps a shape alive. To exercise dormancy/eviction fast, boot with second-scale
-knobs (`ELECTRIC_IVM_SHAPE_IDLE_SECS=1 ELECTRIC_IVM_RETENTION_SWEEP_SECS=1 …`) — see
+knobs (`ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS=1 ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS=1 …`) — see
 `packages/conformance/src/conformance-retention.test.ts` for the canonical sequence.
 
 ### Testing checklist before claiming done
@@ -188,14 +186,14 @@ which ran and why the rest could not) before closing the task.**
 
 ```bash
 pnpm engine:test                          # Rust unit + integration (fast)
-ELECTRIC_IVM_ENGINE_PREBUILT=1 pnpm test  # full vitest suite incl. oracle conformance (set the var iff you already built)
+ELECTRIC_CIRCUITS_ENGINE_PREBUILT=1 pnpm test  # full vitest suite incl. oracle conformance (set the var iff you already built)
 ASDF_ELIXIR_VERSION=1.18.4-otp-28 ASDF_ERLANG_VERSION=28.1 \
   ./electric-conformance/run.sh oracle    # Electric's own oracle vs /v1/shape (needs elixir + ../electric)
 ```
 
 The vitest suite includes `packages/conformance` — the engine-vs-oracle harness — and runs
 against the always-on circuit on every run (there is no off mode). The
-`ELECTRIC_IVM_DBSP_INDEXES`/`_COUNTS` tunables decide which shapes the circuit actually serves
+`ELECTRIC_CIRCUITS_DBSP_INDEXES`/`_COUNTS` tunables decide which shapes the circuit actually serves
 versus which fall through to the routing/fallback tiers. The `electric-conformance` line is
 Electric's *own* oracle suite pointed at our `/v1/shape` — a separate tier from our conformance
 package; run both. (The ASDF pins matter: `../electric` asks for an Elixir that may not be
@@ -279,7 +277,7 @@ canvas update, screenshot.
 - **The demo boots an _ephemeral_ Postgres each run** (`mkdtemp`); data does not persist. **Kill
   stale demos before restarting** — a leftover `tsx start.ts`/`caddy` keeps the ports and serves
   stale code, which reads as a mysterious schema mismatch. `scripts/linearlite.sh stop`, or
-  `pkill -f electric-ivm-engine`, `pkill -f "tsx start.ts"`, `pkill -f caddy`. If two demos run,
+  `pkill -f electric-circuits-engine`, `pkill -f "tsx start.ts"`, `pkill -f caddy`. If two demos run,
   scope kills by port (`ps -o ppid= -p $(lsof -ti :<httpsPort>)`) — a SIGKILL mid-shutdown leaks
   the ephemeral Postgres.
 - **Vite binds IPv6 `[::1]` only** — prefer the `https://localhost:8443` Caddy proxy (HTTP/2 also

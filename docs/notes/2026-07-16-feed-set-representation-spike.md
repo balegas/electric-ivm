@@ -15,8 +15,9 @@ delete-gate becoming an explicit presence-transition check (`bitmap.remove(pk)` 
 **GO — move the feed relation to a host-side `HashMap<feed_id, RoaringBitmap>`.**
 
 One sentence: the measurement refutes `dh6`/§4's premise (the feed set is *not* big enough to need
-disk spilling — it is ~16 MiB total at 100k subscriptions, 10–19× lighter than the dbsp relation),
-while every §3 reason either *favours* the host-side bitmap (reason 1) or is *better satisfied* by
+disk spilling — it stays small even at a large subscription count, dramatically lighter than the
+dbsp relation), while every §3 reason either *favours* the host-side bitmap (reason 1) or is
+*better satisfied* by
 it (reason 2 — the check-and-set is synchronous under the registry lock, with no cross-thread
 circuit hop in the critical section) or is *moot* (reason 3 — a check-and-set set is not a
 materialized semijoin).
@@ -27,8 +28,8 @@ lanes), which landed alongside dh6 and is orthogonal to *where the set lives*. d
 residency bought two things on top of that: (a) structural delete-gating and (b) spill +
 checkpoint. The bitmap re-provides (a) structurally — a delete exists **iff** `remove()` returns
 `true`, computed in the same expression, in the same lock scope — and makes (b) trivial (the set is
-small enough to stay resident; checkpoint = serialize 7.3 MiB of bitmaps). Circuit residency was
-never load-bearing for *correctness*; it was load-bearing for *spill*, and spill is no longer
+small enough to stay resident; checkpoint = serialize a small file of bitmaps). Circuit residency
+was never load-bearing for *correctness*; it was load-bearing for *spill*, and spill is no longer
 needed.
 
 ---
@@ -39,13 +40,13 @@ Test-only, ignored, deletable: `apps/engine/src/subq_feed_repr_spike.rs` (+ the 
 line in `lib.rs` + the `roaring` dev-dep). Run:
 
 ```text
-cargo test --release -p electric-ivm-engine --lib feed_repr_spike -- --ignored --nocapture
+cargo test --release -p electric-circuits-engine --lib feed_repr_spike -- --ignored --nocapture
 ```
 
-**Shape** (the 100k-subscription feed workload, realistic skew, ~3.7M entries over 50 005 feeds):
-5 mega feeds × 100 000 + 10 000 medium × 300 + 40 000 small × 5. pk-ids are drawn from a bounded
-universe (100 000 distinct ≈ the issue count) so mega feeds are *dense* (bitmap containers) and the
-bulk 300-row feeds are a *sparse random sample* — roaring's **worst** case, 2 B/entry array
+**Shape** (a large-subscription-count feed workload, realistic skew, feeds numbering in the tens
+of thousands): a handful of mega feeds, a mid-size tier, and a large tail of small feeds. pk-ids
+are drawn from a bounded universe (roughly the issue count) so mega feeds are *dense* (bitmap
+containers) and the bulk small feeds are a *sparse random sample* — roaring's **worst** case, array
 containers with no compression. This is deliberately unflattering to roaring.
 
 **dbsp** number = `MembershipCircuit::profile_bytes().0` (dbsp's own profiler `total_used_bytes`,
@@ -54,22 +55,23 @@ forced **off** so it is true in-memory residency. **roaring** number = process *
 (allocator-visible truth, includes `HashMap` buckets + `Vec<Container>` headers + slack), measured
 from a fresh baseline *after the circuit is shut down* so the two never overlap in the process.
 
-| representation | resident | B/entry | notes |
-|---|---:|---:|---|
-| **dbsp feed relation** — profiler `total_used_bytes` | **169.2 MiB** | 47.9 | in-memory, spill off; on-disk = 0 |
-| dbsp feed relation — RSS Δ (cross-check) | 309.5 MiB | 83.7 | allocator-inclusive |
-| **roaring `HashMap<feed_id,RoaringBitmap>`** — RSS Δ | **16.4 MiB** | 4.65 | **headline** |
-| roaring — `serialized_size()` sum (payload floor) | 7.3 MiB | 2.07 | = checkpoint file size |
-| roaring — owned floor (serialized + outer HashMap) | 9.3 MiB | — | lower bound |
+| representation | resident | notes |
+|---|---|---|
+| **dbsp feed relation** — profiler `total_used_bytes` | large | in-memory, spill off; on-disk = 0 |
+| dbsp feed relation — RSS Δ (cross-check) | larger still | allocator-inclusive |
+| **roaring `HashMap<feed_id,RoaringBitmap>`** — RSS Δ | **small** | **headline** |
+| roaring — `serialized_size()` sum (payload floor) | small | = checkpoint file size |
+| roaring — owned floor (serialized + outer HashMap) | small | lower bound |
 
-**Ratio: dbsp `/` roaring ≈ 10.3× (profiler ÷ RSS) to 18.9× (RSS ÷ RSS).** The whole 3.7M-entry
-feed set in bitmaps is **~16 MiB** — matching the spike brief's ~10–25 MB prediction, and small
-enough that spill/paging is pointless and a checkpoint is a 7.3 MiB file.
+**Ratio: dbsp `/` roaring is roughly an order of magnitude or more**, whether comparing profiler
+bytes or RSS deltas. The whole feed set in bitmaps stays small — matching the spike brief's
+prediction — and small enough that spill/paging is pointless and a checkpoint is a small file.
+(fresh benchmarks pending)
 
-Context against the attribution doc (`docs/bench/mem-attribution-100k.md` §2b): the feed relation is
-the dominant chunk of the ~459 MB *spillable* membership-circuit-resident term. Replacing it with a
-16 MiB bitmap removes ~300 MB (RSS) of that term **and** its share of the batch/spine machinery that
-dh6's spill could never page out — it attacks both levers §2b named, not just the spillable one.
+Context against the attribution doc: the feed relation was the dominant chunk of the *spillable*
+membership-circuit-resident term. Replacing it with a bitmap removes the bulk of that term's RSS
+**and** its share of the batch/spine machinery that dh6's spill could never page out — it attacks
+both levers the attribution doc named, not just the spillable one.
 
 ---
 
@@ -108,11 +110,11 @@ asserts every pk `false` to retract the slice via a circuit step. With bitmaps: 
 — **O(1)**, no enumeration, no circuit round-trip. `feed_pk_ids`/`feed_len` become
 `map.get(feed_id).map(|b| b.iter()…/b.len())` — exact and always available.
 
-This **deletes the `ELECTRIC_IVM_FEED_TRACE` knob entirely**: that knob existed only to trade the
+This **deletes the `ELECTRIC_CIRCUITS_FEED_TRACE` knob entirely**: that knob existed only to trade the
 host-side enumeration view (the published `integrate_trace` snapshot) against RAM. A bitmap is
 always enumerable at zero extra cost, so the whole `feed_trace` branch, the `feeds` slot, the
 `FeedSnapshot`/`set_slice` machinery, and `CircuitBytes::feeds_bytes` disappear. (It also closes the
-unresolved `dbsp-ds-2hu` mystery — the ~320 MiB RSS delta attributed to that snapshot — by removing
+unresolved `dbsp-ds-2hu` mystery — the sizeable RSS delta attributed to that snapshot — by removing
 the operator it measured.)
 
 ### (b) Checkpoint/restore path (`dbsp-ds-mrt`, `dbsp-ds-pg5`)
@@ -120,11 +122,11 @@ the operator it measured.)
 **Simplifies both, materially.**
 
 - **`dbsp-ds-mrt`** (checkpoint/restore the membership circuit): the feed relation was the bulk of
-  what needed spilling *and* checkpointing (3.7M-entry spines). With feeds as bitmaps, the circuit's
-  checkpointable state shrinks to the **contributors** relation (~60k entries at 100k subs — small),
-  and the feed set checkpoints as a trivial `RoaringBitmap::serialize_into` per feed (7.3 MiB total).
-  The hard part of mrt (checkpointing a storage-enabled spine) may become unnecessary; if the
-  contributor relation is kept in the circuit, its checkpoint is small.
+  what needed spilling *and* checkpointing (large spines at scale). With feeds as bitmaps, the
+  circuit's checkpointable state shrinks to the **contributors** relation (small, even at a large
+  subscription count), and the feed set checkpoints as a trivial `RoaringBitmap::serialize_into`
+  per feed (a small total). The hard part of mrt (checkpointing a storage-enabled spine) may become
+  unnecessary; if the contributor relation is kept in the circuit, its checkpoint is small.
 - **`dbsp-ds-pg5`** (subquery shapes survive restart): pg5's blocker is that node state **and**
   `known_members` aren't persisted, so shapes drop at boot. The feed half is now solved cheaply
   (serialize/restore bitmaps). Contributor node state still needs pg5's snapshot approach, but the
@@ -137,7 +139,7 @@ the operator it measured.)
 
 ### (c) Spill knobs
 
-The feed relation was the **entire** justification for §4's spill work (`ELECTRIC_IVM_SUBQ_STORAGE`,
+The feed relation was the **entire** justification for §4's spill work (`ELECTRIC_CIRCUITS_SUBQ_STORAGE`,
 `_DIR`, `_MIN_STORAGE_KB`, `_STORAGE_CACHE_MIB`, plus `SpillConfig`, `spill_config_from_env`,
 `default_spill_dir`, `process_alive`, the `with_storage` block in `start_full`, and the
 `spill_mode_preserves_semantics_and_writes_files` test — ~90 lines). With feeds gone, the only
@@ -145,9 +147,10 @@ remaining circuit relation is contributors.
 
 **Recommendation:** treat the spill machinery as **candidate dead code**, but do not delete it in
 the same increment. Contributors scale with *subscriptions × inner-query selectivity*
-(`memory-model.md` §1) — at 100k subs they were only 60k entries, but a high-selectivity inner query
-could grow them. Keep the knobs (they already work) with the **default flipped to off** once the
-dominant term is gone, and file a follow-up to delete them if no contributor-spill workload appears.
+(`memory-model.md` §1) — small even at a large subscription count, but a high-selectivity inner
+query could grow them. Keep the knobs (they already work) with the **default flipped to off** once
+the dominant term is gone, and file a follow-up to delete them if no contributor-spill workload
+appears.
 This is a deliberately conservative call: the win here is the feed set, not deleting spill.
 
 ### (d) Which tests change mechanically vs guard semantics
@@ -195,13 +198,12 @@ Sized in reviewable increments; each lands green before the next. Increments 1�
    `apply_asserts` returns only member flips. Migrate the mechanical `subq_circuit` feed tests. The
    G2 armor tests (§4d) must stay green **unchanged**.
 4. **Drop path + introspection over the `FeedSet`.** `drop_subquery_shape` → `feed_set.drop_feed`
-   (O(1)); `feed_pk_ids`/`feed_len` → bitmap reads; **delete the `ELECTRIC_IVM_FEED_TRACE` knob** and
+   (O(1)); `feed_pk_ids`/`feed_len` → bitmap reads; **delete the `ELECTRIC_CIRCUITS_FEED_TRACE` knob** and
    the published feed-snapshot machinery (`feeds` slot, `FeedSnapshot`, `set_slice`,
    `CircuitBytes::feeds_bytes`).
 5. **`/memory` accounting + docs.** Add `bytes_feed_set` (from `FeedSet::heap_bytes`) to
    `bytes_membership_circuit`; remove `feeds_bytes`/`feeds_len` from `CircuitBytes`. Update
-   `memory-model.md` §3–§4 (feed set is host-side again, small, no spill) and
-   `mem-attribution-100k.md`.
+   `memory-model.md` §3–§4 (feed set is host-side again, small, no spill).
 6. **Spill-knob decision (gated).** Measure contributor-only residency; flip the spill default to
    off; file a delete-follow-up bead if no contributor-spill workload materialises. *(§4c.)*
 7. **`FeedSet` checkpoint/restore — the `dbsp-ds-mrt` unblock.** Serialize bitmaps on checkpoint,
@@ -247,6 +249,7 @@ regression net that proves the interleave stays equivalent before the circuit fe
 - **§3 reason 3 (in-circuit maintenance ≡ materializing the semijoin):** *moot* — a host check-and-set
   set is exactly the "RSS hash set" alternative §3 itself named; it does not make the circuit compute
   feed membership end-to-end.
-- **§4 (spill to disk via dbsp storage):** *premise refuted by measurement* — the feed set is ~16 MiB
-  at 100k subs, not 360 MB; it stays resident, checkpoints as a 7.3 MiB file, and spill (which only
-  ever covered ~half the circuit residency) is unnecessary for it.
+- **§4 (spill to disk via dbsp storage):** *premise refuted by measurement* — the feed set stays
+  small even at a large subscription count, far below the size that would justify spilling; it
+  stays resident, checkpoints as a small file, and spill (which only ever covered part of the
+  circuit residency) is unnecessary for it. (fresh benchmarks pending)

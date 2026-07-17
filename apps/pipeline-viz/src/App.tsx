@@ -11,7 +11,7 @@ import { predicateLabel } from './predicate-label'
 import { recordShapeChanges } from './shape-change-store'
 import { shapeSql } from './shape-sql'
 import { applyStateStaggered, getAuthoritative, replayStateTransition, seedState } from './state-store'
-import { eventDecor, mergeDecor, rankDelayMs, type Decor, type FlashKind, type HopExpand } from './trace-anim'
+import { derivedVia, eventDecor, mergeDecor, rankDelayMs, type Decor, type FlashKind, type HopExpand } from './trace-anim'
 import type { EngineGraph, GraphShape, NodeStateSummary, TraceEvent, TraceMessage } from './types'
 import { useTrace } from './useTrace'
 import { WhereEditor } from './WhereEditor'
@@ -363,6 +363,42 @@ export default function App() {
       snapshot?.expand ?? expandRef.current,
       speedRef.current,
     )
+    // A query-back-derived move-in/out: the outer Δ node (`d:<outer>`) is NOT on the event's hop
+    // path (the rows entered via a Postgres query-back, not this table's own replication), so it
+    // never flashes from hops — yet it's the node whose weight chip refreshes and where the "via
+    // query-back" tag shows. Flash it directly (after the causal path stages) so the derived delta
+    // visibly lands there, without fabricating a source→change edge pulse the engine deliberately omits.
+    // Only a move-IN (net +weight: rows entering scope) does a Postgres query-back. A move-OUT
+    // (net −weight) is deletes emitted from the feed set — no fetch — so no bounce there.
+    const netW = (ev.delta ?? []).reduce((acc, dd) => acc + dd.w, 0)
+    if (derivedVia(ev) && netW > 0) {
+      const edgesNow = snapshot?.edges ?? edgesRef.current
+      const stepMs = rankDelayMs(1, speedRef.current)
+      const src = `src:${ev.table}`
+      const del = `d:${ev.table}`
+      // Picture the query-back as a round trip on the outer source↔Δ edge: the Δ node needs the
+      // moved rows, "asks" the source (Postgres), and the rows bounce back. The engine omits this
+      // edge from the hop path (the change never flowed through replication), so we add it here as a
+      // BOUNCE — honest (a round trip, not a one-way delivery) and right where the "via query-back"
+      // tag shows.
+      const be = edgesNow.find((x) => (x.source === src && x.target === del) || (x.source === del && x.target === src))
+      if (be) {
+        // One unhurried round trip (out to the source and back) — ~2.6s at 1× speed.
+        const durMs = 2600 / speedRef.current
+        d.edges.set(be.id, { id: d.id, color: '#d97706', label: '', delayMs: 0, durMs, derived: true, bounce: true })
+        d.totalMs = Math.max(d.totalMs, durMs + 200)
+      }
+      // After the query-back returns, the FETCHED ROWS flow from the Δ node into each join that
+      // gathered them (`d:<table> → sj:<shape>`), carrying the +weight — the join's OTHER input
+      // (membership) pulses via the hop path and is held there by the gate, so this arrives just as
+      // the join fires and it visibly gathers both sides before emitting.
+      for (const je of edgesNow) {
+        if (je.source === del && d.nodes.has(je.target)) {
+          const jf = d.nodes.get(je.target)
+          d.edges.set(je.id, { id: d.id, color: '#16a34a', label: `+${netW}`, delayMs: Math.max(0, (jf?.delayMs ?? 0) - stepMs), durMs: stepMs })
+        }
+      }
+    }
     if (d.nodes.size === 0 && d.edges.size === 0) return null
     // Record when the dot reaches each node (rank delay == arrival), keyed by the node's state-summary
     // id. The state event that immediately follows this delta reveals those chips on that schedule.
@@ -631,8 +667,8 @@ export default function App() {
     >
       <aside className="sidebar">
         <div className="brand">
-          <div className="brand-title">electric-ivm</div>
-          <div className="brand-sub">dbsp pipeline visualizer</div>
+          <div className="brand-title">electric-circuits</div>
+          <div className="brand-sub">Circuit visualizer</div>
         </div>
 
         <div className="viewtabs">

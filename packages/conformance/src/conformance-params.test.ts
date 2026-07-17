@@ -5,7 +5,7 @@
 // Asserts correct rows for two param values (proving distinct params never collide onto one shape),
 // a nested/depth-2 subquery hitting a second table's backfill, and the Electric-style 400s.
 
-import type { Schema } from '@electric-ivm/protocol'
+import type { Schema } from '@electric-circuits/protocol'
 import pgpkg from 'pg'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { applyOp, bootHarness, drainEngine, type Harness } from './harness.js'

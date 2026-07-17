@@ -1,5 +1,5 @@
-import { createClient } from '@electric-ivm/client'
-import type { ShapeDef } from '@electric-ivm/protocol'
+import { createClient } from '@electric-circuits/client'
+import type { ShapeDef } from '@electric-circuits/protocol'
 import { schema } from './schema'
 
 // The browser talks to the API and reads shape streams through the Vite dev proxy

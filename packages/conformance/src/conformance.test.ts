@@ -1,7 +1,7 @@
-// End-to-end conformance: drive electric-ivm through the real tRPC API + streamdb client and
+// End-to-end conformance: drive electric-circuits through the real tRPC API + streamdb client and
 // assert the materialized shape set equals the pglite oracle for the same op stream.
 
-import type { Schema, ShapeDef } from '@electric-ivm/protocol'
+import type { Schema, ShapeDef } from '@electric-circuits/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { compareShapeSets, formatCompare } from './compare.js'
 import { applyOp, bootHarness, drainEngine, type Harness, waitForConvergence } from './harness.js'

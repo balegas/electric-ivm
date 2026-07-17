@@ -1,15 +1,15 @@
 [package]
-name = "electric-ivm-engine"
+name = "electric-circuits-engine"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 
 [lib]
-name = "electric_ivm_engine"
+name = "electric_circuits_engine"
 path = "src/lib.rs"
 
 [[bin]]
-name = "electric-ivm-engine"
+name = "electric-circuits-engine"
 path = "src/main.rs"
 
 [dependencies]

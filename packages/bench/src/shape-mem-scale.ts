@@ -12,7 +12,7 @@
 //     serving is the streams server's job);
 //   - samples include the durable-streams server's RSS next to the engine's;
 //
-//   pnpm --filter @electric-ivm/bench exec tsx src/shape-mem-scale.ts
+//   pnpm --filter @electric-circuits/bench exec tsx src/shape-mem-scale.ts
 //   SCALE_ISSUES=100000 SCALE_PROJECTS=2000 SCALE_USERS=1000,2500,5000,10000 \
 //   SCALE_CLIENT_PROCS=4 SCALE_LIVE_SUBS=20000 SCALE_LIVE_PROCS=8 \
 //   tsx src/shape-mem-scale.ts
@@ -26,7 +26,7 @@ import { promisify } from 'node:util'
 
 const execFileP = promisify(execFile)
 
-import { DurableStreamTestServer } from '@electric-ivm/ds-rust'
+import { DurableStreamTestServer } from '@electric-circuits/ds-rust'
 import pgpkg from 'pg'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -58,13 +58,13 @@ const OUT = process.env.SCALE_OUT ?? join(repoRoot(), 'docs', 'bench', 'shape-me
 // bench output dir next to the existing raw tables. Zero behavior change when unset.
 const ATTRIBUTION = process.env.SCALE_ATTRIBUTION === '1'
 const ATTRIBUTION_LABEL =
-  process.env.SCALE_ATTRIBUTION_LABEL ?? (process.env.ELECTRIC_IVM_SUBQ_STORAGE_DIR ? 'spill' : 'inmemory')
+  process.env.SCALE_ATTRIBUTION_LABEL ?? (process.env.ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR ? 'spill' : 'inmemory')
 // Defaults to the `raw/` dir next to wherever SCALE_OUT's markdown table lands; override
 // independently so a custom SCALE_OUT (e.g. to avoid clobbering the curated results doc) doesn't
 // also relocate the attribution dump.
 const ATTRIBUTION_DIR = process.env.SCALE_ATTRIBUTION_DIR ?? join(dirname(OUT), 'raw')
 const MAX_USERS = Math.max(...USER_MILESTONES)
-const SLOT = 'electric_ivm_shapescale'
+const SLOT = 'electric_circuits_shapescale'
 const STATUSES = ['backlog', 'todo', 'in_progress', 'done', 'canceled']
 const MIB = 1024 * 1024
 
@@ -114,17 +114,17 @@ async function createSchemaAndSeed(client: pgpkg.Client, issues: number): Promis
 }
 
 async function spawnEngine(dsUrl: string, pgUrl: string): Promise<{ url: string; proc: ChildProcess }> {
-  const proc = spawn(join(repoRoot(), 'target', 'release', 'electric-ivm-engine'), [], {
+  const proc = spawn(join(repoRoot(), 'target', 'release', 'electric-circuits-engine'), [], {
     env: {
       ...process.env,
-      ELECTRIC_IVM_DS_URL: dsUrl,
-      ELECTRIC_IVM_BIND: '127.0.0.1:0',
-      ELECTRIC_IVM_LOG: 'warn',
-      ELECTRIC_IVM_PG_URL: pgUrl,
-      ELECTRIC_IVM_PG_TABLES: 'issues,projects,users,project_members,comments',
-      ELECTRIC_IVM_PG_SLOT: SLOT,
-      ELECTRIC_IVM_PG_POLL_MS: '50',
-      ELECTRIC_IVM_MAX_SHAPES: String(numEnv('SCALE_MAX_SHAPES', 200000)),
+      ELECTRIC_CIRCUITS_DS_URL: dsUrl,
+      ELECTRIC_CIRCUITS_BIND: '127.0.0.1:0',
+      ELECTRIC_CIRCUITS_LOG: 'warn',
+      ELECTRIC_CIRCUITS_PG_URL: pgUrl,
+      ELECTRIC_CIRCUITS_PG_TABLES: 'issues,projects,users,project_members,comments',
+      ELECTRIC_CIRCUITS_PG_SLOT: SLOT,
+      ELECTRIC_CIRCUITS_PG_POLL_MS: '50',
+      ELECTRIC_CIRCUITS_MAX_SHAPES: String(numEnv('SCALE_MAX_SHAPES', 200000)),
     },
     stdio: ['ignore', 'pipe', 'inherit'],
   })
@@ -175,7 +175,7 @@ async function engineMemory(engineUrl: string): Promise<{ rss: number; card: Rec
 /// `bytes_*` self-accounting fields from Task 0.1), `vmmap --summary` (MALLOC region totals — the
 /// allocator-owned virtual memory, as opposed to owned-heap bytes we self-account), and
 /// `footprint` (macOS phys-footprint breakdown, compression-inclusive). Written next to the
-/// existing raw tables so `docs/bench/mem-attribution-100k.md` can be built from them by hand.
+/// existing raw tables so a future memory-attribution write-up can be built from them by hand.
 async function writeAttributionSnapshot(engineUrl: string, pid: number | undefined, outDir: string, label: string): Promise<void> {
   mkdirSync(outDir, { recursive: true })
   const prefix = join(outDir, `attribution-${label}`)
@@ -321,8 +321,8 @@ function chunks<T>(arr: T[], n: number): T[][] {
 // --- main -----------------------------------------------------------------------------------------
 
 async function main() {
-  if (!existsSync(join(repoRoot(), 'target', 'release', 'electric-ivm-engine'))) {
-    throw new Error('build first: cargo build --release -p electric-ivm-engine')
+  if (!existsSync(join(repoRoot(), 'target', 'release', 'electric-circuits-engine'))) {
+    throw new Error('build first: cargo build --release -p electric-circuits-engine')
   }
   const ds = new DurableStreamTestServer({ port: 0, longPollTimeout: 25000 })
   const dsUrl = await ds.start()

@@ -1,5 +1,5 @@
 {
-  "name": "@electric-ivm/api",
+  "name": "@electric-circuits/api",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -10,7 +10,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@electric-ivm/protocol": "workspace:*",
+    "@electric-circuits/protocol": "workspace:*",
     "@trpc/server": "^11.18.0",
     "zod": "^4.4.3"
   }

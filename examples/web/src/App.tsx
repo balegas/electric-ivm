@@ -2,7 +2,7 @@ import type { Collection } from '@tanstack/db'
 import { useLiveQuery } from '@tanstack/react-db'
 import { useEffect, useState } from 'react'
 
-import type { ShapeMaterialization } from '@electric-ivm/client'
+import type { ShapeMaterialization } from '@electric-circuits/client'
 
 import { getShapes, type Shapes } from './shapes'
 
@@ -50,7 +50,7 @@ export function App(): JSX.Element {
   useEffect(() => {
     getShapes().then(setShapes)
   }, [])
-  if (!shapes) return <div className="loading">Connecting to electric-ivm…</div>
+  if (!shapes) return <div className="loading">Connecting to electric-circuits…</div>
   return <Board shapes={shapes} />
 }
 
@@ -73,7 +73,7 @@ function Board({ shapes }: { shapes: Shapes }): JSX.Element {
   return (
     <div className="app">
       <header>
-        <h1>electric-ivm</h1>
+        <h1>electric-circuits</h1>
         <p>
           A reactive database: writes go to <strong>Postgres</strong> → captured via logical
           replication → a dbsp filter circuit per shape → materialized live in the browser with{' '}

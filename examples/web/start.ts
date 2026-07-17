@@ -10,9 +10,9 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { DurableStreamTestServer } from '@electric-ivm/ds-rust'
-import { type ApiServer, createApiServer } from '@electric-ivm/api'
-import { changeEventToDML, tableDDL } from '@electric-ivm/protocol'
+import { DurableStreamTestServer } from '@electric-circuits/ds-rust'
+import { type ApiServer, createApiServer } from '@electric-circuits/api'
+import { changeEventToDML, tableDDL } from '@electric-circuits/protocol'
 import pgpkg from 'pg'
 import { createServer as createViteServer, type Plugin, type ViteDevServer } from 'vite'
 
@@ -28,7 +28,7 @@ function repoRoot(): string {
   throw new Error('repo root not found')
 }
 
-const SLOT = 'electric_ivm_web'
+const SLOT = 'electric_circuits_web'
 
 // Resources to tear down (in reverse order) on shutdown or partial-boot failure.
 let pgDir: string | undefined
@@ -74,7 +74,7 @@ process.on('SIGINT', () => void shutdown(0))
 process.on('SIGTERM', () => void shutdown(0))
 
 const TITLES = [
-  'Ship electric-ivm',
+  'Ship electric-circuits',
   'Write the docs',
   'Buy milk',
   'Refactor the parser',
@@ -157,17 +157,17 @@ try {
   const dsUrl = await ds.start()
   console.log('durable-streams →', dsUrl)
 
-  execFileSync('cargo', ['build', '-p', 'electric-ivm-engine'], { cwd: repoRoot(), stdio: 'inherit' })
-  engineProc = spawn(join(repoRoot(), 'target', 'debug', 'electric-ivm-engine'), [], {
+  execFileSync('cargo', ['build', '-p', 'electric-circuits-engine'], { cwd: repoRoot(), stdio: 'inherit' })
+  engineProc = spawn(join(repoRoot(), 'target', 'debug', 'electric-circuits-engine'), [], {
     env: {
       ...process.env,
-      ELECTRIC_IVM_DS_URL: dsUrl,
-      ELECTRIC_IVM_BIND: '127.0.0.1:0',
-      ELECTRIC_IVM_LOG: 'warn',
-      ELECTRIC_IVM_PG_URL: pgUrl,
-      ELECTRIC_IVM_PG_TABLES: Object.keys(schema.tables).join(','),
-      ELECTRIC_IVM_PG_SLOT: SLOT,
-      ELECTRIC_IVM_PG_POLL_MS: '25',
+      ELECTRIC_CIRCUITS_DS_URL: dsUrl,
+      ELECTRIC_CIRCUITS_BIND: '127.0.0.1:0',
+      ELECTRIC_CIRCUITS_LOG: 'warn',
+      ELECTRIC_CIRCUITS_PG_URL: pgUrl,
+      ELECTRIC_CIRCUITS_PG_TABLES: Object.keys(schema.tables).join(','),
+      ELECTRIC_CIRCUITS_PG_SLOT: SLOT,
+      ELECTRIC_CIRCUITS_PG_POLL_MS: '25',
     },
     stdio: ['ignore', 'pipe', 'inherit'],
   })
@@ -194,7 +194,7 @@ try {
   // Postgres is the system of record: browser writes become real DML; the engine sees them via the
   // replication slot and updates the live shapes. No tRPC write path.
   const pgWritePlugin: Plugin = {
-    name: 'electric-ivm-pg-write',
+    name: 'electric-circuits-pg-write',
     configureServer(server) {
       server.middlewares.use('/pg/write', (req, res) => {
         if (req.method !== 'POST') {

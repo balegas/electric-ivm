@@ -1183,6 +1183,36 @@ body,
   border-color: rgba(220, 38, 38, 0.4);
   background: rgba(254, 226, 226, 0.9);
 }
+/* A Δ change whose weights arrived via a subquery query-back, not this table's own replication —
+   dashed amber to match the dashed derived pulse on the canvas; this is a derived delta, not a
+   direct change on this table. */
+.pnode-viaqb {
+  color: #b45309;
+  border: 1px dashed rgba(180, 83, 9, 0.55);
+  background: rgba(254, 243, 199, 0.85);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+/* The "waiting" ring on a travelling dot while it is gated at a join (edges.tsx sets data-held=1
+   on the group once the dot has arrived and is waiting for the join to fire). */
+.gate-ring {
+  opacity: 0;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+g[data-held='1'] .gate-ring {
+  animation: gate-wait 0.85s ease-out infinite;
+}
+@keyframes gate-wait {
+  0% {
+    opacity: 0.75;
+    transform: scale(0.7);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(2.3);
+  }
+}
 
 /* "Inside this operator" explainer in the detail panel */
 .dp-inside {

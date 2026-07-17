@@ -1,15 +1,15 @@
 // Global test setup: build the engine once (so parallel workers don't race the cargo lock) and boot
 // one ephemeral Postgres with logical replication enabled. Each harness then creates its own database
 // + slot inside it (logical slots are per-database), so test files stay isolated. The admin
-// connection string is exported via ELECTRIC_IVM_TEST_PG_URL (inherited by forked workers).
+// connection string is exported via ELECTRIC_CIRCUITS_TEST_PG_URL (inherited by forked workers).
 import { execFileSync } from 'node:child_process'
 import { appendFileSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 export default function setup() {
-  execFileSync('cargo', ['build', '-p', 'electric-ivm-engine'], { stdio: 'inherit' })
-  process.env.ELECTRIC_IVM_ENGINE_PREBUILT = '1'
+  execFileSync('cargo', ['build', '-p', 'electric-circuits-engine'], { stdio: 'inherit' })
+  process.env.ELECTRIC_CIRCUITS_ENGINE_PREBUILT = '1'
 
   const dir = mkdtempSync(join(tmpdir(), 'el-pg-'))
   const data = join(dir, 'data')
@@ -36,7 +36,7 @@ export default function setup() {
   }
   if (!started) throw new Error('failed to start ephemeral postgres for tests')
 
-  process.env.ELECTRIC_IVM_TEST_PG_URL = `postgres://postgres@127.0.0.1:${port}/postgres`
+  process.env.ELECTRIC_CIRCUITS_TEST_PG_URL = `postgres://postgres@127.0.0.1:${port}/postgres`
 
   return () => {
     try {

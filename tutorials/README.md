@@ -1,34 +1,62 @@
-# electric-ivm — a hands-on tutorial series
+# Electric Circuits — a hands-on tutorial series
 
-Modern applications need to continuously synchronize backend changes to the client in real time. The usual ways to do this are to poll the database repeatedly, or to assemble caches and queues and hope they stay consistent. A **sync engine** replaces all of that: it keeps subsets of your database (Postgres in our case) continuously up to date wherever they're needed, streaming every change out in real time over plain HTTP. Postgres stays the single source of truth; the sync engine is the pipe that keeps everything downstream in step with it.
+Modern applications need to keep the client continuously in step with the backend. The usual ways to
+do that are polling, or hand-rolled caches and queues that drift out of sync. **Electric Circuits**
+replaces all of that: your app keeps writing to Postgres with ordinary SQL, and Postgres stays the
+single source of truth — but every query your app needs becomes a **live query**, a result the engine
+keeps up to date forever, delivered to you as a **Stream** of `insert`/`update`/`delete` messages. No
+polling, no cache invalidation.
 
-The unit of sync is a **shape**. A shape is a subset of your Postgres data — the rows of a table that match a `where` clause (and, if you like, only some of their columns). You declare the shape once and the engine hands you its rows, then keeps them live: every insert, update, or delete that affects the shape is pushed to you as it happens. You sync only the data you actually need, and it never goes stale. (Shapes come from [ElectricSQL](https://electric.ax), whose shape protocol this engine speaks.)
+Behind every live query is a **circuit**: a small, fixed set of always-on dataflows — one per *kind*
+of query (filtering, membership, aggregation) — that your queries register onto rather than build.
+That's what makes registering a new query cheap, and it's what this series shows you, from the
+terminal, one step at a time, with a live window into what the engine is actually doing.
 
-**electric-ivm** is an experiment: a reimagining of Electric in Rust that swaps its hand-rolled shape-matching for a **general-purpose incremental view maintenance (IVM) engine**. This allows more expressive shapes, so a shape on the backend stays close to what the client actually queries. It's built on **DBSP** ([paper](https://arxiv.org/abs/2203.16684), VLDB 2023), which compiles a query into a circuit of operators over streams of changes and maintains even rich queries incrementally. That's what this series is about.
+## The three public nouns
 
-This series teaches that engine the way you'd actually poke at it — from a terminal, one small step at a time — and gives you a window into what it's doing while you do it.
+Three words carry the whole series:
+
+- **Streams** — the durable, replayable log every live query's changes travel over.
+- **Circuits** — the fixed, shared dataflows (built on DBSP) that maintain live queries incrementally.
+- **Live queries** — the result you actually get: current rows, then every change that affects them,
+  forever.
+
+In the API, live queries are created with `client.shape()` and served at `/v1/shape` (the Electric
+protocol name this engine also speaks).
 
 ## What you'll learn
 
-By the end of the series you'll understand how a **DBSP-style incremental view maintenance** system works, not as theory but as something you've driven by hand: how a query becomes a running dataflow pipeline, why a change flows through that pipeline exactly once, and why an update is secretly a retraction plus an insertion. Early episodes cover a single live shape and the operators inside it; later ones reach into cross-table queries, aggregations, and pipelines shared between clients.
-
-You don't need to know DBSP going in. You do need to be comfortable running commands in a shell and reading a bit of SQL.
+By the end of the series you'll understand how Electric Circuits turns a query into something live —
+not as theory, but as something you've driven by hand: how a live query becomes a running circuit of
+operators, why a change flows through it exactly once, why an update is secretly a retraction plus an
+insertion, and how cross-table membership queries and live aggregations actually work today. You don't
+need to know DBSP going in. You do need to be comfortable running commands in a shell and reading a
+bit of SQL.
 
 ## How the series works
 
 Three tools, and you'll use all three in most episodes:
 
-- **the shell** (`curl`) — you create and read shapes over plain HTTP. No SDK, no client library; just requests you can read.
-- **`psql`** — you make changes the ordinary way, from your host, with SQL `INSERT`/`UPDATE`/`DELETE` straight against the tutorial's Postgres, exactly as a real app would.
-- **the pipeline visualizer** — a browser view that draws the engine's *actual* running pipeline. The nodes, counters, and edges you see aren't a diagram someone drew; they come from the engine's own introspection endpoints. When you write a row, you watch the change travel the pipeline live. It isn't view-only, either: from the browser you can **create a shape** (a table picker plus a schema-aware `WHERE` editor), delete shapes, and **add or delete rows** on any table node — the very actions the episodes drive with `curl` and `psql`, routed through the viz's engine proxy. The episodes still *lead* with `curl` and `psql`, because those teach the wire protocol and the real-app write path; the viz is the convenience alongside them, and each episode points it out where it fits. Open it over HTTPS (`https://localhost:5543`) — the page holds several live streams at once, and browsers throttle those over plain HTTP.
+- **the shell (`curl`)** — you create and read live queries over plain HTTP. No SDK, no client
+  library; just requests you can read.
+- **`psql`** — you make changes the ordinary way, from your host, with SQL `INSERT`/`UPDATE`/`DELETE`
+  straight against the tutorial's Postgres, exactly as a real app would.
+- **the pipeline explorer** — a browser view that draws the engine's *actual* running circuit. The
+  nodes, counters, and edges you see aren't a diagram someone drew; they come from the engine's own
+  introspection endpoints (`/graph`, `/state`, `/trace`). When you write a row, you watch the change
+  travel the circuit live.
 
-Everything runs locally in Docker — one Postgres, the engine, a durable-streams log, and the visualizer — so you can break things freely and reset to a clean slate whenever you like.
+Each episode leads with `curl` and `psql`, because those teach the wire protocol and the real-app
+write path; the explorer is there alongside them so you can see what the engine did, not just what it
+returned.
 
 ## Before you start
 
-You'll need **Docker** (with Compose), a **terminal**, a **browser**, and **`psql`** — the PostgreSQL client, for making writes against the database (`brew install libpq` on macOS, or your distro's `postgresql-client`).
+You'll need **Docker** (with Compose), a **terminal**, a **browser**, and **`psql`** — the PostgreSQL
+client (`brew install libpq` on macOS, or your distro's `postgresql-client`).
 
-Don't want to install `psql`? Every `psql` command in the series also runs inside the stack — just swap the host connection for a container exec:
+Don't want to install `psql`? Every `psql` command in the series also runs inside the stack — just
+swap the host connection for a container exec:
 
 ```sh
 # host (what the episodes show):
@@ -45,16 +73,41 @@ From this directory:
 docker compose up --build
 ```
 
-Give it a minute the first time (it builds the engine). Episode 1 walks through what each container is and how to check it's healthy — start there.
+Give it a minute the first time (it builds the engine). Five containers come up:
 
-## Trusting the visualizer's certificate
+| service | role |
+|---|---|
+| `postgres` | the system of record, auto-seeded from `./seed` on first boot |
+| `ds` | the durable-streams server — every live query's Stream lives here |
+| `engine` | the Rust engine: replication ingest, circuits, `/v1/shape`, and the introspection endpoints |
+| `api` | the extended API (tRPC) — not used until episode 4 |
+| `viz` | the pipeline explorer |
 
-The visualizer is served over HTTPS with a certificate signed by Caddy's own internal CA, which your browser doesn't know about — so the first time you open `https://localhost:5543` it warns that the connection isn't private. The connection is still encrypted; you can just click through the warning and carry on.
+| you want | address |
+|---|---|
+| engine control HTTP (`/health`, `/v1/shape`, `/graph`, …) | `http://localhost:7010` |
+| pipeline explorer (browser) | `https://localhost:5543` |
+| pipeline explorer (plain HTTP, for curl/scripts) | `http://localhost:5280` |
+| extended API | `http://localhost:8790` |
+| durable streams | `http://localhost:8791` |
+| Postgres | `localhost:5432` |
 
-To remove the warning for good, trust the CA once. The CA persists across container rebuilds (it lives in the `viz-caddy-data` volume), so trusting it once sticks. Extract the root certificate from the running `viz` container, then add it to your system trust store:
+(These ports are deliberately offset from the flagship LinearLite demo's, so both stacks can run at
+once without colliding.)
+
+Episode 1 walks through checking each of these is healthy — start there.
+
+## Trusting the explorer's certificate
+
+The explorer is served over HTTPS with a certificate signed by Caddy's own internal CA, which your
+browser doesn't know about — so the first time you open `https://localhost:5543` it warns that the
+connection isn't private. The connection is still encrypted; click through the warning and carry on.
+
+To remove the warning for good, trust the CA once. It persists across container rebuilds (it lives in
+the `viz-caddy-data` volume), so trusting it sticks:
 
 ```sh
-# extract the root CA the visualizer signs with
+# extract the root CA the explorer signs with
 docker compose cp viz:/data/caddy/pki/authorities/local/root.crt ./viz-local-ca.crt
 # trust it (macOS — prompts for your admin password)
 sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ./viz-local-ca.crt
@@ -64,16 +117,24 @@ Reopen `https://localhost:5543` and the warning is gone.
 
 ## The episodes
 
-1. **[Your first live shape](episodes/01-first-shape/README.md)** — create one shape with a single HTTP request, watch the engine build its pipeline, and watch one write flow through it end to end.
-2. **[Inside the pipeline](episodes/02-inside-the-pipeline/README.md)** — the same shape, exploded into the DBSP circuit the engine really executes: deltas, weights, and why an update is a retraction plus an insertion.
-3. **[Pipelines, shapes, and strangers](episodes/03-serving-model/README.md)** — step out of one shape into the app's whole query graph: deploy a static compiled pipeline for a todo model and watch the three-tier serving model at work — pipelines serve families, routing serves instances, the fallback serves strangers — with shapes latching onto the pipeline (and letting go) live on the canvas.
-4. **[Extending the pipeline (and rebuilding it)](episodes/04-extending-the-pipeline/README.md)** — add a cohort dimension the pipeline doesn't serve yet, watch its shape fall to the fallback tier, then change the config and rebuild the circuit: the arrangements reseed from Postgres, the shapes replay from the durable catalog, and that fallback shape is promoted to circuit-served — the line between what ships with a deploy and what flows at runtime, drawn by hand.
+1. **[Your first live query](episodes/01-first-live-query/README.md)** — create one live query with a
+   single HTTP request, watch the engine build its circuit, and watch one write flow through it end to
+   end.
+2. **[Inside the circuit: deltas and weights](episodes/02-inside-the-circuit/README.md)** — the same
+   live query, exploded into the DBSP operators the engine actually runs: deltas, weights, and why an
+   update is a retraction plus an insertion.
+3. **[Cross-table live queries with subqueries](episodes/03-subqueries-are-dynamic/README.md)**
+   — a membership live query across two tables, maintained by a shared inner-set node; equality live
+   queries sharing a router automatically.
+4. **[Aggregations: a live COUNT](episodes/04-aggregations/README.md)** — a live per-list open-todo
+   count, maintained incrementally — the one place today's engine still has a piece you configure
+   ahead of time.
 
 Each episode picks up from the last.
 
 ## Resetting
 
-To wipe all state and return to Episode 1's starting point from anywhere in the series:
+To wipe all state and return to episode 1's starting point from anywhere in the series:
 
 ```sh
 docker compose down -v && docker compose up
