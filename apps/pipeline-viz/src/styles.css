@@ -1193,6 +1193,26 @@ body,
   font-weight: 600;
   letter-spacing: 0.01em;
 }
+/* The "waiting" ring on a travelling dot while it is gated at a join (edges.tsx sets data-held=1
+   on the group once the dot has arrived and is waiting for the join to fire). */
+.gate-ring {
+  opacity: 0;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+g[data-held='1'] .gate-ring {
+  animation: gate-wait 0.85s ease-out infinite;
+}
+@keyframes gate-wait {
+  0% {
+    opacity: 0.75;
+    transform: scale(0.7);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(2.3);
+  }
+}
 
 /* "Inside this operator" explainer in the detail panel */
 .dp-inside {

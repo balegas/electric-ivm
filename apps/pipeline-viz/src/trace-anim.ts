@@ -62,6 +62,9 @@ export interface EdgePulse {
    *  once — the pooled Postgres query-back that fetched the moved rows, pictured on the outer
    *  source↔Δ edge. Implies `derived` styling (dashed amber, hollow dot). */
   bounce?: boolean
+  /** The target is a join (≥2 data inputs): after arriving, the dot HOLDS at the node for this long
+   *  — gating — until the join fires (its inputs gathered), then the downstream pulse releases. */
+  holdMs?: number
 }
 
 /** True when this event's causal root is a DIFFERENT table than the one it is "about" — i.e. a
@@ -96,18 +99,21 @@ export type HopExpand = (hop: string) => string[]
 /** Longest-path rank of every flashed node over the traced sub-DAG (edges whose both endpoints
  *  flashed). Roots (no traced in-edge — the sources) are rank 0. The pipeline graph is acyclic;
  *  a defensive iteration cap keeps a malformed input from spinning. */
-function stageRanks(flashed: Set<string>, edges: Edge[]): Map<string, number> {
+function stageRanks(flashed: Set<string>, edges: Edge[], gateNodes: Set<string>): Map<string, number> {
   const out = new Map<string, number>()
   const adj: Array<[string, string]> = []
   for (const e of edges) {
     if (flashed.has(e.source) && flashed.has(e.target)) adj.push([e.source, e.target])
   }
   for (const id of flashed) out.set(id, 0)
-  // Bellman-Ford-style relaxation to the longest path; ranks are tiny (pipeline depth ≤ ~6).
+  // Bellman-Ford-style relaxation to the longest path; ranks are tiny (pipeline depth ≤ ~6). A join
+  // (`gateNodes`) costs an EXTRA rank on top of its input edge: the input dot travels one rank to
+  // reach it, then waits one more before the join fires — the gate — so a join visibly gathers its
+  // inputs before emitting (and downstream shifts with it, since everything is rank-staged).
   for (let pass = 0; pass < 12; pass++) {
     let changed = false
     for (const [u, v] of adj) {
-      const d = out.get(u)! + 1
+      const d = out.get(u)! + (gateNodes.has(v) ? 2 : 1)
       if (d > out.get(v)! && d < 24) {
         out.set(v, d)
         changed = true
@@ -138,7 +144,17 @@ export function eventDecor(ev: TraceEvent, edges: Edge[], present: Set<string>, 
   const label = ev.delta.length === 0 ? '' : ev.delta.length > 1 && w === 0 ? '±1' : w > 0 ? '+1' : '−1'
   const color = w > 0 ? '#16a34a' : w < 0 ? '#dc2626' : '#0ea5e9'
 
-  const ranks = stageRanks(new Set(kinds.keys()), edges)
+  // A "join" gathers ≥2 DATA inputs (arrangement-read `state` edges don't count — they're lookups,
+  // not streams). Detected from the FULL graph so a single-sided delta still gates.
+  const dataInDeg = new Map<string, number>()
+  for (const e of edges) {
+    if ((e.data as { kind?: string } | undefined)?.kind === 'state') continue
+    dataInDeg.set(e.target, (dataInDeg.get(e.target) ?? 0) + 1)
+  }
+  const gateNodes = new Set<string>()
+  for (const [n, c] of dataInDeg) if (c >= 2) gateNodes.add(n)
+
+  const ranks = stageRanks(new Set(kinds.keys()), edges, gateNodes)
   const nodes = new Map<string, NodeFlash>()
   let maxRank = 0
   for (const [id, kind] of kinds) {
@@ -150,6 +166,7 @@ export function eventDecor(ev: TraceEvent, edges: Edge[], present: Set<string>, 
   const id = decorSeq++
   const derived = isDerivedEvent(ev)
   const stepMs = rankDelayMs(1, speed)
+  const MAX_HOLD_MS = rankDelayMs(4, speed) // fallback cap so a gated dot never waits absurdly long
   const pulses = new Map<string, EdgePulse>()
   for (const e of edges) {
     // A `state` edge is a READ (a join/filter consulting an arrangement), not a data stream — its
@@ -158,7 +175,14 @@ export function eventDecor(ev: TraceEvent, edges: Edge[], present: Set<string>, 
     if ((e.data as { kind?: string } | undefined)?.kind === 'state') continue
     if (nodes.has(e.source) && nodes.has(e.target)) {
       // The dot leaves when its source rank flashes and arrives at the target's rank.
-      pulses.set(e.id, { id, color, label, delayMs: rankDelayMs(ranks.get(e.source) ?? 0, speed), durMs: stepMs, derived: derived || undefined })
+      const delayMs = rankDelayMs(ranks.get(e.source) ?? 0, speed)
+      // Into a join: hold the dot at the node until it fires (its extra-ranked flash time), gating.
+      let holdMs: number | undefined
+      if (gateNodes.has(e.target)) {
+        const h = Math.min(Math.max(0, rankDelayMs(ranks.get(e.target) ?? 0, speed) - (delayMs + stepMs)), MAX_HOLD_MS)
+        if (h > 0) holdMs = h
+      }
+      pulses.set(e.id, { id, color, label, delayMs, durMs: stepMs, derived: derived || undefined, holdMs })
     }
   }
   return { nodes, edges: pulses, id, totalMs: rankDelayMs(maxRank + 1, speed) }
