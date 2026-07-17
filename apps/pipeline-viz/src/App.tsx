@@ -53,13 +53,12 @@ const LIFECYCLE_SETTLE_MS = 1000
 /** Node wrapper adding the trace flash overlay around the base renderer. The flash is staged
  *  (`flashDelay`): downstream nodes light up only when the travelling delta reaches them. */
 function FlashNode(props: NodeProps) {
-  const d = props.data as VizNodeData & { flash?: FlashKind | 'new'; flashDelay?: number; flashDerived?: boolean }
+  const d = props.data as VizNodeData & { flash?: FlashKind | 'new'; flashDelay?: number }
   const style = d.flashDelay ? ({ '--flash-delay': `${d.flashDelay}ms` } as React.CSSProperties) : undefined
   return (
-    <div className={d.flash ? `flash flash-${d.flash}${d.flashDerived ? ' flash-derived' : ''}` : undefined} style={style}>
+    <div className={d.flash ? `flash flash-${d.flash}` : undefined} style={style}>
       {d.flash === 'drop' ? <span className="flash-x">✕ dropped</span> : null}
       {d.flash === 'new' ? <span className="flash-star">★ new</span> : null}
-      {d.flashDerived ? <span className="flash-qb">⟲ query-back</span> : null}
       <PipelineNode {...props} />
     </div>
   )
@@ -370,14 +369,19 @@ export default function App() {
     // query-back" tag shows. Flash it directly (after the causal path stages) so the derived delta
     // visibly lands there, without fabricating a source→change edge pulse the engine deliberately omits.
     if (derivedVia(ev)) {
-      const present = snapshot?.present ?? presentRef.current
-      const outerDelta = `d:${ev.table}`
-      if (present.has(outerDelta)) {
-        // Flash it immediately (delay 0) so the derived delta visibly lands the moment it arrives,
-        // rather than after the (possibly off-screen) membership path finishes staging. Keep the
-        // decor alive long enough for the "⟲ query-back" marker's ~2s fade.
-        d.nodes.set(outerDelta, { kind: 'pass', delayMs: 0, rank: 0, derived: true })
-        d.totalMs = Math.max(d.totalMs, 1000)
+      // Picture the query-back as a round trip on the outer source↔Δ edge: the Δ node needs the
+      // moved rows, "asks" the source (Postgres), and the rows bounce back. The engine omits this
+      // edge from the hop path (the change never flowed through replication), so we add it here as a
+      // BOUNCE — honest (a round trip, not a one-way delivery) and right where the "via query-back"
+      // tag shows.
+      const edgesNow = snapshot?.edges ?? edgesRef.current
+      const src = `src:${ev.table}`
+      const del = `d:${ev.table}`
+      const e = edgesNow.find((e) => (e.source === src && e.target === del) || (e.source === del && e.target === src))
+      if (e) {
+        const durMs = 1600 / speedRef.current
+        d.edges.set(e.id, { id: d.id, color: '#d97706', label: '', delayMs: 0, durMs, derived: true, bounce: true })
+        d.totalMs = Math.max(d.totalMs, durMs + 200)
       }
     }
     if (d.nodes.size === 0 && d.edges.size === 0) return null
@@ -559,7 +563,7 @@ export default function App() {
             const df = decor?.nodes.get(n.id)
             const flash = df?.kind ?? (freshIds?.has(n.id) ? ('new' as const) : undefined)
             if (!flash) return n
-            return { ...n, data: { ...(n.data as VizNodeData), flash, flashDelay: df?.delayMs ?? 0, flashDerived: df?.derived } }
+            return { ...n, data: { ...(n.data as VizNodeData), flash, flashDelay: df?.delayMs ?? 0 } }
           })
         : nodes
     // Edges ALWAYS use the pulse type — flipping an edge's `type` when a decoration appears would

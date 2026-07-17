@@ -32,10 +32,6 @@ export interface NodeFlash {
   /** The rank this delay was computed from — lets a later replay re-derive delayMs at whatever
    *  speed is active THEN, instead of replaying frozen at the speed captured live. */
   rank: number
-  /** This flash is a query-back-derived move-in/out landing on the outer Δ node — rendered with a
-   *  distinct amber ring + "query-back" marker, since the change entered via a Postgres query-back,
-   *  not this table's replication stream (so no source→change edge pulses into it). */
-  derived?: boolean
 }
 
 export interface Decor {
@@ -62,6 +58,10 @@ export interface EdgePulse {
   /** The whole event is a query-back-derived move-in/out (§ isDerivedEvent) — rendered dashed so
    *  the derived propagation reads distinctly from a table's own replication stream. */
   derived?: boolean
+  /** A query-back "round trip": the dot ping-pongs between the two endpoints instead of travelling
+   *  once — the pooled Postgres query-back that fetched the moved rows, pictured on the outer
+   *  source↔Δ edge. Implies `derived` styling (dashed amber, hollow dot). */
+  bounce?: boolean
 }
 
 /** True when this event's causal root is a DIFFERENT table than the one it is "about" — i.e. a

@@ -30,12 +30,23 @@ function TravelDot({ pulse, path }: { pulse: EdgePulse; path: string }) {
     const total = p.getTotalLength()
     const t0 = performance.now()
     let raf = 0
+    // A query-back BOUNCE ping-pongs between the two endpoints (a few round trips) instead of
+    // travelling once — the Δ node "asks" the source and the moved rows come back. Otherwise the
+    // dot travels once, source → target.
+    const BOUNCE_CYCLES = 2
     const tick = (now: number) => {
-      const k = Math.min(1, (now - t0) / pulse.durMs)
+      const f = (now - t0) / pulse.durMs // elapsed fraction over the whole duration
+      let k: number
+      if (pulse.bounce) {
+        const phase = Math.min(f, 1) * BOUNCE_CYCLES * 2 // half-legs elapsed
+        k = Math.abs((phase % 2) - 1) // triangle: 1 → 0 → 1 → 0 → 1 (starts/ends at the target = Δ node)
+      } else {
+        k = Math.min(1, f)
+      }
       const pt = p.getPointAtLength(total * k)
       g.setAttribute('transform', `translate(${pt.x}, ${pt.y})`)
       g.style.opacity = '1'
-      if (k < 1) raf = requestAnimationFrame(tick)
+      if (f < 1) raf = requestAnimationFrame(tick)
     }
     raf = requestAnimationFrame(tick)
     return () => cancelAnimationFrame(raf)

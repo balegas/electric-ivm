@@ -1019,27 +1019,6 @@ body,
   padding: 1px 7px;
   animation: flash-fadeout 2.5s forwards;
 }
-/* A query-back-derived move-in/out landing on the outer Δ node: amber ring (matching the "via
-   query-back" tag) instead of pass-green, plus a floating "⟲ query-back" marker at top-left — the
-   change arrived via a Postgres query-back, not this table's replication, so nothing pulses in. */
-.flash-derived {
-  --flash: #d97706;
-}
-.flash-qb {
-  animation-delay: var(--flash-delay, 0ms) !important;
-  position: absolute;
-  top: -16px;
-  left: -6px;
-  z-index: 10;
-  font-size: 10px;
-  font-weight: 800;
-  color: #fff;
-  background: #d97706;
-  border-radius: 999px;
-  padding: 1px 7px;
-  white-space: nowrap;
-  animation: flash-fadeout 2s forwards;
-}
 
 /* inline "show details" control — the primary way to open a shape's detail panel from the list.
    Kept gently visible (not hover-only like delete) so it stays discoverable. `margin-left: auto`
