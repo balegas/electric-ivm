@@ -55,6 +55,25 @@ export interface EdgePulse {
   delayMs: number
   /** Dot travel time along this edge. */
   durMs: number
+  /** The whole event is a query-back-derived move-in/out (§ isDerivedEvent) — rendered dashed so
+   *  the derived propagation reads distinctly from a table's own replication stream. */
+  derived?: boolean
+}
+
+/** True when this event's causal root is a DIFFERENT table than the one it is "about" — i.e. a
+ *  subquery membership move-in/out: the engine roots the hop path at the inner/membership table
+ *  (`hops[0] = table:<inner>`) while `ev.table` names the OUTER table the moved rows belong to. The
+ *  outer table's own replication stream did NOT change; the rows arrived via a pooled Postgres
+ *  query-back. Same signal the delta peek uses to tag the outer Δ node "via query-back". */
+export function isDerivedEvent(ev: TraceEvent): boolean {
+  const first = ev.hops[0]?.node
+  return !!first && first.startsWith('table:') && first !== `table:${ev.table}`
+}
+
+/** The table the change actually entered through for a derived event (the inner/membership table),
+ *  or null for a normal same-table change. */
+export function derivedVia(ev: TraceEvent): string | null {
+  return isDerivedEvent(ev) ? ev.hops[0]!.node.slice('table:'.length) : null
 }
 
 let decorSeq = 1
@@ -125,6 +144,7 @@ export function eventDecor(ev: TraceEvent, edges: Edge[], present: Set<string>, 
   }
 
   const id = decorSeq++
+  const derived = isDerivedEvent(ev)
   const stepMs = rankDelayMs(1, speed)
   const pulses = new Map<string, EdgePulse>()
   for (const e of edges) {
@@ -134,7 +154,7 @@ export function eventDecor(ev: TraceEvent, edges: Edge[], present: Set<string>, 
     if ((e.data as { kind?: string } | undefined)?.kind === 'state') continue
     if (nodes.has(e.source) && nodes.has(e.target)) {
       // The dot leaves when its source rank flashes and arrives at the target's rank.
-      pulses.set(e.id, { id, color, label, delayMs: rankDelayMs(ranks.get(e.source) ?? 0, speed), durMs: stepMs })
+      pulses.set(e.id, { id, color, label, delayMs: rankDelayMs(ranks.get(e.source) ?? 0, speed), durMs: stepMs, derived: derived || undefined })
     }
   }
   return { nodes, edges: pulses, id, totalMs: rankDelayMs(maxRank + 1, speed) }

@@ -13,12 +13,26 @@ function DeltaPeek({ table }: { table: string }) {
   const cap = useLatestDelta(table)
   if (!cap) return <div className="pnode-state pnode-state-empty">—</div>
   return (
-    <div className="pnode-state pnode-delta" title="most recent Z-set delta (weights)">
+    <div
+      className="pnode-state pnode-delta"
+      title={
+        cap.via
+          ? `most recent Z-set delta (weights) — derived via a query-back triggered by a change on ${cap.via}; ${table}'s own replication stream didn't change`
+          : 'most recent Z-set delta (weights)'
+      }
+    >
       {cap.rows.map((r, i) => (
         <span key={i} className={`chip pnode-zw ${r.w > 0 ? 'pnode-zw-pos' : 'pnode-zw-neg'}`}>
           {r.w > 0 ? `+${r.w}` : `−${Math.abs(r.w)}`}
         </span>
       ))}
+      {/* This Δ arrived via a pooled Postgres query-back (a subquery move-in/out), not this table's
+          own replication stream — tagged so the fresh weight chip doesn't read as a direct change. */}
+      {cap.via ? (
+        <span className="chip pnode-viaqb" title={`entered via a query-back from ${cap.via}`}>
+          ⟲ via query-back
+        </span>
+      ) : null}
     </div>
   )
 }

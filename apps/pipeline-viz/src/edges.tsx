@@ -46,7 +46,13 @@ function TravelDot({ pulse, path }: { pulse: EdgePulse; path: string }) {
       {/* invisible copy of the edge path, used only to measure travel positions */}
       <path ref={measureRef} d={path} fill="none" stroke="none" />
       <g ref={groupRef} style={{ opacity: 0 }}>
-        <circle r={5} fill={pulse.color} opacity={0.95} />
+        {/* Derived (query-back) moves get a hollow ring, matching the dashed edge, so the dot reads
+            as "carried in from another table" rather than the table's own solid data delta. */}
+        {pulse.derived ? (
+          <circle r={5} fill="#fff" stroke={pulse.color} strokeWidth={2} opacity={0.95} />
+        ) : (
+          <circle r={5} fill={pulse.color} opacity={0.95} />
+        )}
         {pulse.label ? (
           <text fontSize={11} fontWeight={700} fill={pulse.color} dy={-8}>
             {pulse.label}
@@ -92,6 +98,9 @@ export function PulseEdge(props: EdgeProps) {
         style={{
           ...data.baseStyle,
           ...(pulse ? { stroke: pulse.color, strokeWidth: 2.5, opacity: 1 } : {}),
+          // A query-back-derived move-in/out dashes the lit path — this data crossed from another
+          // table's change via a Postgres query-back, not this edge's own stream.
+          ...(pulse?.derived ? { strokeDasharray: '6 4' } : {}),
           // The recolor is delayed to the pulse's stage so the path lights up as the dot leaves.
           transition: pulse ? `stroke 0.2s ${pulse.delayMs}ms` : 'stroke 0.2s',
         }}

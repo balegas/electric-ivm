@@ -7,12 +7,17 @@
 
 import { useSyncExternalStore } from 'react'
 
+import { derivedVia } from './trace-anim'
 import type { TraceEvent } from './types'
 
 /** The reconstructed Z-set of one change: its weighted rows and when it was captured. */
 export interface CapturedDelta {
   rows: { row: Record<string, unknown>; w: number }[]
   at: number
+  /** For a subquery move-in/out, the inner/membership table the change entered through — this Δ
+   *  arrived via a pooled Postgres query-back, not this table's own replication stream. null for a
+   *  normal same-table change. Drives the "via query-back" tag on the Δ node's inline peek. */
+  via: string | null
 }
 
 const latest = new Map<string, CapturedDelta>()
@@ -32,7 +37,7 @@ function subscribe(l: () => void): () => void {
  *  so subscribed components re-render. */
 export function recordDelta(ev: TraceEvent): void {
   if (!ev.delta || ev.delta.length === 0) return
-  latest.set(ev.table, { rows: ev.delta, at: Date.now() })
+  latest.set(ev.table, { rows: ev.delta, at: Date.now(), via: derivedVia(ev) })
   notify()
 }
 
