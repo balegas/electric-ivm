@@ -11,7 +11,7 @@ import { predicateLabel } from './predicate-label'
 import { recordShapeChanges } from './shape-change-store'
 import { shapeSql } from './shape-sql'
 import { applyStateStaggered, getAuthoritative, replayStateTransition, seedState } from './state-store'
-import { eventDecor, mergeDecor, rankDelayMs, type Decor, type FlashKind, type HopExpand } from './trace-anim'
+import { derivedVia, eventDecor, mergeDecor, rankDelayMs, type Decor, type FlashKind, type HopExpand } from './trace-anim'
 import type { EngineGraph, GraphShape, NodeStateSummary, TraceEvent, TraceMessage } from './types'
 import { useTrace } from './useTrace'
 import { WhereEditor } from './WhereEditor'
@@ -53,12 +53,13 @@ const LIFECYCLE_SETTLE_MS = 1000
 /** Node wrapper adding the trace flash overlay around the base renderer. The flash is staged
  *  (`flashDelay`): downstream nodes light up only when the travelling delta reaches them. */
 function FlashNode(props: NodeProps) {
-  const d = props.data as VizNodeData & { flash?: FlashKind | 'new'; flashDelay?: number }
+  const d = props.data as VizNodeData & { flash?: FlashKind | 'new'; flashDelay?: number; flashDerived?: boolean }
   const style = d.flashDelay ? ({ '--flash-delay': `${d.flashDelay}ms` } as React.CSSProperties) : undefined
   return (
-    <div className={d.flash ? `flash flash-${d.flash}` : undefined} style={style}>
+    <div className={d.flash ? `flash flash-${d.flash}${d.flashDerived ? ' flash-derived' : ''}` : undefined} style={style}>
       {d.flash === 'drop' ? <span className="flash-x">✕ dropped</span> : null}
       {d.flash === 'new' ? <span className="flash-star">★ new</span> : null}
+      {d.flashDerived ? <span className="flash-qb">⟲ query-back</span> : null}
       <PipelineNode {...props} />
     </div>
   )
@@ -363,6 +364,22 @@ export default function App() {
       snapshot?.expand ?? expandRef.current,
       speedRef.current,
     )
+    // A query-back-derived move-in/out: the outer Δ node (`d:<outer>`) is NOT on the event's hop
+    // path (the rows entered via a Postgres query-back, not this table's own replication), so it
+    // never flashes from hops — yet it's the node whose weight chip refreshes and where the "via
+    // query-back" tag shows. Flash it directly (after the causal path stages) so the derived delta
+    // visibly lands there, without fabricating a source→change edge pulse the engine deliberately omits.
+    if (derivedVia(ev)) {
+      const present = snapshot?.present ?? presentRef.current
+      const outerDelta = `d:${ev.table}`
+      if (present.has(outerDelta)) {
+        // Flash it immediately (delay 0) so the derived delta visibly lands the moment it arrives,
+        // rather than after the (possibly off-screen) membership path finishes staging. Keep the
+        // decor alive long enough for the "⟲ query-back" marker's ~2s fade.
+        d.nodes.set(outerDelta, { kind: 'pass', delayMs: 0, rank: 0, derived: true })
+        d.totalMs = Math.max(d.totalMs, 1000)
+      }
+    }
     if (d.nodes.size === 0 && d.edges.size === 0) return null
     // Record when the dot reaches each node (rank delay == arrival), keyed by the node's state-summary
     // id. The state event that immediately follows this delta reveals those chips on that schedule.
@@ -542,7 +559,7 @@ export default function App() {
             const df = decor?.nodes.get(n.id)
             const flash = df?.kind ?? (freshIds?.has(n.id) ? ('new' as const) : undefined)
             if (!flash) return n
-            return { ...n, data: { ...(n.data as VizNodeData), flash, flashDelay: df?.delayMs ?? 0 } }
+            return { ...n, data: { ...(n.data as VizNodeData), flash, flashDelay: df?.delayMs ?? 0, flashDerived: df?.derived } }
           })
         : nodes
     // Edges ALWAYS use the pulse type — flipping an edge's `type` when a decoration appears would

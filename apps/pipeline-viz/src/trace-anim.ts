@@ -32,6 +32,10 @@ export interface NodeFlash {
   /** The rank this delay was computed from — lets a later replay re-derive delayMs at whatever
    *  speed is active THEN, instead of replaying frozen at the speed captured live. */
   rank: number
+  /** This flash is a query-back-derived move-in/out landing on the outer Δ node — rendered with a
+   *  distinct amber ring + "query-back" marker, since the change entered via a Postgres query-back,
+   *  not this table's replication stream (so no source→change edge pulses into it). */
+  derived?: boolean
 }
 
 export interface Decor {
