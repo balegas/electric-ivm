@@ -632,7 +632,7 @@ export default function App() {
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-title">electric-circuits</div>
-          <div className="brand-sub">dbsp pipeline visualizer</div>
+          <div className="brand-sub">Circuit visualizer</div>
         </div>
 
         <div className="viewtabs">
