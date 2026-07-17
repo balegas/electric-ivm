@@ -379,7 +379,8 @@ export default function App() {
       const del = `d:${ev.table}`
       const e = edgesNow.find((e) => (e.source === src && e.target === del) || (e.source === del && e.target === src))
       if (e) {
-        const durMs = 1600 / speedRef.current
+        // One unhurried round trip (out to the source and back) — ~2.6s at 1× speed.
+        const durMs = 2600 / speedRef.current
         d.edges.set(e.id, { id: d.id, color: '#d97706', label: '', delayMs: 0, durMs, derived: true, bounce: true })
         d.totalMs = Math.max(d.totalMs, durMs + 200)
       }
