@@ -309,6 +309,12 @@ pub struct SubqueryRegistry {
     staged_edges: Vec<Edge>,
     /// Registered outer subquery shapes by engine shape id.
     pub shapes: HashMap<String, SubqueryShape>,
+    /// Necessary-conjunct index over `shapes`, bucketed by outer table — what makes an outer-table
+    /// delta cost `O(candidates)` instead of a scan over every registered subquery shape. Kept in
+    /// lockstep with `shapes` by [`install_shape`](Self::install_shape) /
+    /// [`drop_subquery_shape`](Self::drop_subquery_shape); see [`crate::subq_index`] for the
+    /// old-image ∪ new-image probe rule that keeps absolute emission correct.
+    shape_index: crate::subq_index::SubqueryShapeIndex,
     /// The membership circuit: every node's value set as one dbsp relation; flip detection is
     /// the circuit's incremental distinct (see `crate::subq_circuit`).
     circuit: crate::subq_circuit::MembershipCircuit,
@@ -371,6 +377,7 @@ impl HeapSize for SubqueryRegistry {
             + self.edges.heap_bytes()
             + self.staged_edges.heap_bytes()
             + self.shapes.heap_bytes()
+            + self.shape_index.heap_bytes()
             + self.node_by_id.heap_bytes()
             + self.feed_by_id.heap_bytes()
             + self.templates.heap_bytes()
@@ -388,6 +395,7 @@ impl SubqueryRegistry {
             edges: HashMap::new(),
             staged_edges: Vec::new(),
             shapes: HashMap::new(),
+            shape_index: crate::subq_index::SubqueryShapeIndex::default(),
             circuit: crate::subq_circuit::MembershipCircuit::start()
                 .expect("membership circuit failed to start"),
             pk_dict: Arc::new(PkDict::new()),
@@ -516,8 +524,13 @@ impl SubqueryRegistry {
     /// Does any node's inner table or any shape's outer table equal `table`? (Fast skip for tailers of
     /// tables not involved in any subquery.)
     pub fn touches(&self, table: &str) -> bool {
-        self.nodes.values().any(|n| n.inner_table == table)
-            || self.shapes.values().any(|s| s.outer_table == table)
+        // Called once per replicated envelope, so the shape half is answered by the conjunct
+        // index's table buckets in O(1) rather than a scan over every registered shape — the same
+        // reason step 2 of `on_table_delta` is indexed. Nodes are shared (one per distinct inner
+        // query, orders of magnitude fewer than shapes) and `pending_shapes` holds only in-flight
+        // creates, so those two stay linear.
+        self.shape_index.has_table(table)
+            || self.nodes.values().any(|n| n.inner_table == table)
             || self.pending_shapes.iter().any(|p| p.outer_table == table)
     }
 
@@ -841,20 +854,16 @@ impl SubqueryRegistry {
             .context("finish_create: unknown outer table")?;
         let feed_id = self.next_feed_id;
         self.next_feed_id += 1;
-        self.feed_by_id.insert(feed_id, shape_id.to_string());
-        self.shapes.insert(
-            shape_id.to_string(),
-            SubqueryShape {
-                shape_id: shape_id.to_string(),
-                outer_table: pending.outer_table.clone(),
-                stream_path: pending.stream_path.clone(),
-                pred: pending.pred.clone(),
-                out_cols: pending.out_cols.clone(),
-                gate: outer_gate,
-                emitted: std::sync::atomic::AtomicU64::new(seeded),
-                feed_id,
-            },
-        );
+        self.install_shape(SubqueryShape {
+            shape_id: shape_id.to_string(),
+            outer_table: pending.outer_table.clone(),
+            stream_path: pending.stream_path.clone(),
+            pred: pending.pred.clone(),
+            out_cols: pending.out_cols.clone(),
+            gate: outer_gate,
+            emitted: std::sync::atomic::AtomicU64::new(seeded),
+            feed_id,
+        });
         // Seed the feed with the backfilled pks (the stream already carries the snapshot) —
         // replaces the old known_members hand-off. This is phase C, under the registry lock,
         // BEFORE the shape is discoverable by any live delta (the spike's §6 riskiest transition):
@@ -869,6 +878,30 @@ impl SubqueryRegistry {
             self.emit_for_shapes(&ts, vec![(shape_id.to_string(), candidates)], None).await?;
         }
         Ok(work)
+    }
+
+    /// Install a fully-built outer shape. The shapes map, the feed-id reverse map and the
+    /// necessary-conjunct index MUST move together — an index entry outliving its shape is a
+    /// wasted probe, but a shape with no index entry is invisible to every later delta (silently
+    /// dropped envelopes). One call site so they cannot drift, and one synchronous `&mut self`
+    /// step so no live delta can observe a half-installed shape. Registration is only reachable
+    /// from `finish_create`, the atomic tail of shape creation: a create that fails earlier
+    /// (`abort_create`) never got here, so there is nothing for it to roll back.
+    fn install_shape(&mut self, shape: SubqueryShape) {
+        self.feed_by_id.insert(shape.feed_id, shape.shape_id.clone());
+        self.shape_index.insert(&shape.shape_id, &shape.outer_table, &shape.pred);
+        self.shapes.insert(shape.shape_id.clone(), shape);
+    }
+
+    /// The subquery shapes on `table` that a change described by `delta` can possibly move —
+    /// exactly the set [`on_table_delta`](Self::on_table_delta) step 2 visits, exposed for tests
+    /// and introspection so "shapes visited per change" is assertable.
+    ///
+    /// `delta` must be the RAW Z-set delta (old `-1` images included), not the per-pk latest fold:
+    /// the candidate set is the union over old ∪ new images, which is what keeps a move-out's
+    /// absolute delete alive. See [`crate::subq_index`].
+    pub(crate) fn outer_candidates(&self, table: &str, delta: &[Tup2<Row, ZWeight>]) -> Vec<String> {
+        self.shape_index.candidates(table, delta)
     }
 
     /// Abort an in-flight create (phase B failed): drop the pending entry and roll back the
@@ -945,6 +978,10 @@ impl SubqueryRegistry {
         // Sigs this shape pointed at, then drop the shape's edges.
         let sigs: Vec<SubquerySig> = collect_in_leaves(&shape.pred).into_iter().map(|l| l.sig).collect();
         self.remove_shape_edges(&shape.pred, shape_id);
+        // Un-file it from the conjunct index in the same step it leaves `shapes` (the inverse of
+        // `install_shape`) — a posting for a shape that no longer exists would route deltas at a
+        // dead stream path.
+        self.shape_index.remove(shape_id);
         // Drop the shape's whole feed (O(1) — no per-pk enumeration, no circuit round-trip) and
         // its id mapping. The stream is being torn down; the `feed_id` is never reused.
         self.feed_by_id.remove(&shape.feed_id);
@@ -1071,12 +1108,22 @@ impl SubqueryRegistry {
         // 2. Subquery shapes whose outer table is this table: one batch of candidates across
         // every shape — assertions feed the circuit in ONE step, its feed deltas are the
         // deletes, matching candidates are the upserts.
-        let shape_ids: Vec<String> = self
-            .shapes
-            .iter()
-            .filter(|(_, s)| s.outer_table == table)
-            .map(|(id, _)| id.clone())
-            .collect();
+        // Candidates come from the necessary-conjunct index (`crate::subq_index`), bucketed by
+        // outer table: a shape whose conjunct no image in this delta satisfies provably cannot
+        // change membership for any touched pk, so visiting it would be a full predicate eval
+        // that can only conclude "nothing". The probe unions the delta's OLD (`-1`) and NEW
+        // (`+1`) images, which is what keeps a move-out's absolute delete alive — see the module
+        // docs of `subq_index` for the argument. With a trace subscriber attached the index is
+        // bypassed (like the standalone/aggregate tiers) so every shape node still reports a hop.
+        let shape_ids: Vec<String> = if trace.is_some() {
+            self.shapes
+                .iter()
+                .filter(|(_, s)| s.outer_table == table)
+                .map(|(id, _)| id.clone())
+                .collect()
+        } else {
+            self.outer_candidates(&table, delta)
+        };
         let mut groups: Vec<(String, Vec<(Row, bool)>)> = Vec::new();
         for id in shape_ids {
             if self.shapes.get(&id).is_some_and(|s| s.gate.should_skip(lsn, xid)) {
@@ -2044,21 +2091,11 @@ mod tests {
         let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
         // A shape whose predicate never matches (Not(MatchAll)): every candidate verdict is
         // "not a member".
-        let feed_id = reg.next_feed_id;
-        reg.next_feed_id += 1;
-        reg.feed_by_id.insert(feed_id, "s1".into());
-        reg.shapes.insert(
-            "s1".into(),
-            SubqueryShape {
-                shape_id: "s1".into(),
-                outer_table: "t".into(),
-                stream_path: "shape/s1".into(),
-                pred: Arc::new(CompiledPredicate::Not(Box::new(CompiledPredicate::MatchAll))),
-                out_cols: None,
-                gate: crate::pg::SnapshotGate::passthrough(),
-                emitted: std::sync::atomic::AtomicU64::new(0),
-                feed_id,
-            },
+        insert_outer_shape(
+            &mut reg,
+            "s1",
+            "t",
+            CompiledPredicate::Not(Box::new(CompiledPredicate::MatchAll)),
         );
         let row = |id: i64| Row(vec![Value::Int(id), Value::Int(0)]);
 
@@ -2076,6 +2113,7 @@ mod tests {
         // The pk id must match the one `emit_for_shapes` would probe for row(1)'s pk string, so
         // build the key through the SAME dictionary.
         let pk_id = reg.pk_dict.get_or_insert("1");
+        let feed_id = reg.shapes["s1"].feed_id;
         reg.feed_sets.insert(feed_id, pk_id);
         assert!(
             reg.feed_sets.remove(feed_id, pk_id),
@@ -2106,22 +2144,7 @@ mod tests {
         // forever against an unreachable URL.
         let (ds_url, _store) = spawn_fake_ds().await;
         let mut reg = SubqueryRegistry::new(DsClient::new(&ds_url), None);
-        let feed_id = reg.next_feed_id;
-        reg.next_feed_id += 1;
-        reg.feed_by_id.insert(feed_id, "s1".into());
-        reg.shapes.insert(
-            "s1".into(),
-            SubqueryShape {
-                shape_id: "s1".into(),
-                outer_table: "t".into(),
-                stream_path: "shape/s1".into(),
-                pred: Arc::new(CompiledPredicate::MatchAll),
-                out_cols: None,
-                gate: crate::pg::SnapshotGate::passthrough(),
-                emitted: std::sync::atomic::AtomicU64::new(0),
-                feed_id,
-            },
-        );
+        insert_outer_shape(&mut reg, "s1", "t", CompiledPredicate::MatchAll);
         let row = |id: i64| Row(vec![Value::Int(id), Value::Int(0)]);
         assert_eq!(reg.pk_dict.len(), 0);
 
@@ -2133,7 +2156,10 @@ mod tests {
         assert_eq!(reg.pk_dict.len(), 0, "a never-member delete candidate must not mint a pk_dict id");
 
         // A non-matching (but existing) candidate for another brand-new pk (43) must likewise
-        // skip minting: swap in a never-matching predicate for this check.
+        // skip minting: swap in a never-matching predicate for this check. (Poking `pred` in
+        // place would desync the conjunct index — safe ONLY because this test calls
+        // `emit_for_shapes` directly and never probes the index. Production always re-files
+        // through `install_shape`.)
         reg.shapes.get_mut("s1").unwrap().pred =
             Arc::new(CompiledPredicate::Not(Box::new(CompiledPredicate::MatchAll)));
         reg.emit_for_shapes(&ts, vec![("s1".to_string(), vec![(row(43), true)])], None)
@@ -2221,25 +2247,146 @@ mod tests {
     /// Registers a shape whose predicate is `project_id IN (node sig)` — the outer half of the
     /// brief's example, wired to a membership node inserted with [`insert_test_node`].
     fn insert_membership_shape(reg: &mut SubqueryRegistry, shape_id: &str, sig: &SubquerySig, project_col: usize) {
+        insert_outer_shape(
+            reg,
+            shape_id,
+            "issues",
+            CompiledPredicate::InSubquery { col: project_col, sig: sig.clone(), negated: false },
+        );
+    }
+
+    /// Register an outer shape with an arbitrary predicate through the SAME installation path
+    /// production uses (`install_shape`), so the necessary-conjunct index is populated exactly as
+    /// `finish_create` would populate it.
+    fn insert_outer_shape(
+        reg: &mut SubqueryRegistry,
+        shape_id: &str,
+        outer_table: &str,
+        pred: CompiledPredicate,
+    ) {
         let feed_id = reg.next_feed_id;
         reg.next_feed_id += 1;
-        reg.feed_by_id.insert(feed_id, shape_id.to_string());
-        reg.shapes.insert(
-            shape_id.to_string(),
-            SubqueryShape {
-                shape_id: shape_id.to_string(),
-                outer_table: "issues".into(),
-                stream_path: format!("shape/{shape_id}"),
-                pred: Arc::new(CompiledPredicate::InSubquery {
-                    col: project_col,
-                    sig: sig.clone(),
-                    negated: false,
-                }),
-                out_cols: None,
-                gate: crate::pg::SnapshotGate::passthrough(),
-                emitted: std::sync::atomic::AtomicU64::new(0),
-                feed_id,
+        reg.install_shape(SubqueryShape {
+            shape_id: shape_id.to_string(),
+            outer_table: outer_table.into(),
+            stream_path: format!("shape/{shape_id}"),
+            pred: Arc::new(pred),
+            out_cols: None,
+            gate: crate::pg::SnapshotGate::passthrough(),
+            emitted: std::sync::atomic::AtomicU64::new(0),
+            feed_id,
+        });
+    }
+
+    /// A realistic LinearLite-style outer predicate: `project_id = k AND project_id IN (SELECT …)`.
+    /// `access_leaf` lifts the equality as the necessary conjunct; the `IN` leaf is not row-local
+    /// and can never be one.
+    fn keyed_membership_pred(project_id: i64, sig: &SubquerySig) -> CompiledPredicate {
+        CompiledPredicate::And(vec![
+            CompiledPredicate::Cmp {
+                col: 1,
+                op: crate::predicate::LeafOp::Eq,
+                value: Value::Int(project_id),
             },
+            CompiledPredicate::InSubquery { col: 1, sig: sig.clone(), negated: false },
+        ])
+    }
+
+    /// bead dbsp-ds-g5p, regression 1/2 — **THE correctness trap of the conjunct index.**
+    ///
+    /// Outer membership is emitted ABSOLUTELY (§3.3): every touched pk gets its *current*
+    /// verdict, and a move-out is a delete the feed gate opens. So a candidate probe that only
+    /// looked at the row's NEW image would skip the shape the row just LEFT — and the delete
+    /// would never be built. The probe must union the old (`-1`) and new (`+1`) images of the
+    /// delta; this test moves a row out of the indexed conjunct's value and demands the delete.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn move_out_delete_survives_the_conjunct_index() {
+        let ts = issues_ts();
+        let (ds_url, store) = spawn_fake_ds().await;
+        let mut reg = SubqueryRegistry::new(DsClient::new(&ds_url), None);
+        let sig: SubquerySig = "project_members|project_id|L(user_id,Eq,1)".into();
+        insert_test_node(&mut reg, &sig);
+        // User 1 is a member of BOTH projects, so the only thing that moves the row is the
+        // indexed equality conjunct — isolating exactly what the index decides.
+        reg.apply_node_evals(
+            &sig,
+            vec![("pm-1".into(), Some(Value::Int(100))), ("pm-2".into(), Some(Value::Int(200)))],
+        )
+        .await;
+        insert_outer_shape(&mut reg, "s100", "issues", keyed_membership_pred(100, &sig));
+        insert_outer_shape(&mut reg, "s200", "issues", keyed_membership_pred(200, &sig));
+
+        // Enter s100: issue 1 lands in project 100.
+        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), 1)], 1, None, None, None).await.unwrap();
+        assert_eq!(ops_for(&store, "shape/s100"), vec!["upsert"]);
+
+        // The move: UPDATE project_id 100 -> 200, as `apply_envelope` builds it (old `-1`, new
+        // `+1`). The NEW image fails s100's indexed conjunct entirely — s100 is only reachable
+        // through the old image.
+        let delta = vec![Tup2(issue(1, 100), -1), Tup2(issue(1, 200), 1)];
+        assert!(
+            reg.outer_candidates("issues", &delta).contains(&"s100".to_string()),
+            "the shape the row LEFT must be a candidate — via the delta's old image"
+        );
+        reg.on_table_delta(&ts, &delta, 2, None, None, None).await.unwrap();
+        assert_eq!(
+            ops_for(&store, "shape/s100"),
+            vec!["upsert", "delete"],
+            "the move-out delete must still be emitted after the index skips non-candidates"
+        );
+        assert_eq!(ops_for(&store, "shape/s200"), vec!["upsert"], "and the move-in upsert lands");
+    }
+
+    /// bead dbsp-ds-g5p, regression 2/2 — per-change cost is `O(candidates)`, not
+    /// `O(#subquery shapes)`. `on_table_delta` step 2 visits exactly `outer_candidates`, so
+    /// asserting on that set IS asserting shapes-visited. Also pins the two other bucketing
+    /// properties: shapes on another outer table are never even considered, and a shape with no
+    /// indexable conjunct (a bare `IN`, or a `NOT IN` under a negation) stays an unconditional
+    /// candidate — skipping those would be unsound.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn outer_candidates_do_not_scale_with_shape_count() {
+        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+        let sig: SubquerySig = "project_members|project_id|L(user_id,Eq,1)".into();
+        insert_test_node(&mut reg, &sig);
+
+        const N: i64 = 500;
+        for k in 0..N {
+            insert_outer_shape(&mut reg, &format!("s{k}"), "issues", keyed_membership_pred(k, &sig));
+        }
+        // A shape on a DIFFERENT outer table: the `shapes.iter().filter(outer_table == table)`
+        // global scan this replaces would have walked past all of these.
+        insert_outer_shape(&mut reg, "other", "comments", keyed_membership_pred(7, &sig));
+        assert_eq!(reg.shapes.len(), N as usize + 1);
+
+        let cands = reg.outer_candidates("issues", &[Tup2(issue(1, 7), 1)]);
+        assert_eq!(cands, vec!["s7".to_string()], "1 of {N} shapes visited, not {N}");
+
+        // Un-indexable predicates must stay unconditional candidates.
+        insert_outer_shape(
+            &mut reg,
+            "bare_in",
+            "issues",
+            CompiledPredicate::InSubquery { col: 1, sig: sig.clone(), negated: false },
+        );
+        insert_outer_shape(
+            &mut reg,
+            "not_in",
+            "issues",
+            CompiledPredicate::Not(Box::new(keyed_membership_pred(7, &sig))),
+        );
+        let mut cands = reg.outer_candidates("issues", &[Tup2(issue(1, 4242), 1)]);
+        cands.sort();
+        assert_eq!(
+            cands,
+            vec!["bare_in".to_string(), "not_in".to_string()],
+            "a predicate with no necessary conjunct can never be skipped"
+        );
+
+        // Dropping a shape un-files it: no stale candidate, and the freed id is safe to re-mint.
+        reg.drop_subquery_shape("s7").await;
+        assert!(
+            reg.outer_candidates("issues", &[Tup2(issue(1, 7), 1)]).iter().all(|s| s != "s7"),
+            "a dropped shape must leave no index entry behind"
         );
     }
 

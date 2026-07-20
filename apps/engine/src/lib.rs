@@ -41,6 +41,7 @@ pub mod subq_circuit;
 // the membership circuit (Task 2.2, dbsp-ds-dh6). See subq_feed.rs and
 // docs/notes/2026-07-16-feed-set-representation-spike.md.
 mod subq_feed;
+mod subq_index;
 pub mod subquery;
 pub mod trace;
 pub mod value;
