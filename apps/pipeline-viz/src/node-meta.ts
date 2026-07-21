@@ -64,7 +64,7 @@ export const KIND_META: Record<NodeKind, KindMeta> = {
   sqnode: {
     color: '#7e22ce',
     bg: '#f3e8ff',
-    tag: 'IN-SET ARRANGE · STATE',
+    tag: 'IN-SET DISTINCT · STATE',
     formula: 'distinct(π(proj) · σ(where) · inner)',
     stateful: true,
     inside:
@@ -92,7 +92,7 @@ export const KIND_META: Record<NodeKind, KindMeta> = {
   agg: {
     color: '#0d9488',
     bg: '#ccfbf1',
-    tag: 'Σ FOLD · STATE',
+    tag: 'γ FOLD · STATE',
     formula: 'fold(Σ value·w over σ(where))',
     stateful: true,
     inside:
@@ -192,7 +192,7 @@ export const KIND_META: Record<NodeKind, KindMeta> = {
   'op-fold': {
     color: '#0d9488',
     bg: '#ccfbf1',
-    tag: 'Σ FOLD · STATE',
+    tag: 'γ FOLD · STATE',
     formula: 'fold(Σ value·w)',
     stateful: true,
     inside:
@@ -256,7 +256,7 @@ export const KIND_META: Record<NodeKind, KindMeta> = {
   'arr-counts': {
     color: '#6d28d9',
     bg: '#ede9fe',
-    tag: 'DBSP COUNTS · Σ STATE',
+    tag: 'DBSP COUNTS · γ STATE',
     formula: 'map_index(group) · weighted_count',
     stateful: true,
     inside:
