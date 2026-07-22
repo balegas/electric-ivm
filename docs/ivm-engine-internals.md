@@ -269,7 +269,7 @@ fetched by a keyed query-back on flip.
 | Predicate | `a=1 AND b=2` | ranges, OR, NOT, ≠ | `col [NOT] IN (SELECT …)` |
 | State retained | `O(#shapes)` routing entries | none | `O(inner-set)` pks, **shared** |
 | Shared across shapes? | yes — 1 router / template | no (but no state to share) | yes — 1 node / `sig` |
-| Per-change compute | `O(log N)` routed | output-sensitive via conjunct index (`O(K)` fallback for un-indexable predicates) | node reconcile + keyed query-back per flipped value |
+| Per-change compute | `O(log N)` routed | output-sensitive via conjunct index (`O(K)` fallback for un-indexable predicates) | inner change: node reconcile + keyed query-back per flipped value. outer change: conjunct-index-routed to `O(candidates)` shapes (old ∪ new image probe) |
 | Table copies | 0 | 0 | 0 |
 
 ### 3.5 Full shape de-duplication (the sharing layer above the strategies)
@@ -389,9 +389,17 @@ For one table change:
   on every change — that fallback list is the remaining `O(K)` term to watch.
 - **Subquery:** an inner change reconciles the node (`O(1)` per changed inner row) and, per
   *flipped value*, runs one keyed `SELECT … WHERE col = v` per dependent edge plus a re-eval.
-  An outer change is `matches_ctx` = `O(1)` node lookups per subquery leaf. The pathological
-  case is a very low-selectivity inner value referenced by many outer rows (large fan-out on
-  flip) — the inherent cost any correct incremental subquery maintenance pays.
+  An outer change is routed by a **necessary-conjunct index over the outer shapes**
+  (`subq_index.rs`, the same `access_leaf` extraction the standalone tier uses), bucketed by
+  outer table with `RoaringBitmap` posting lists over interned shape ids — so it visits
+  `O(candidates)` shapes, not `O(#subquery shapes on the table)`, then pays one `matches_ctx`
+  (`O(1)` node lookups per subquery leaf) per candidate. The probe unions the delta's **old and
+  new row images** (the `-1`/`+1` tuples): outer membership is emitted absolutely (§3.3), so a
+  move-out whose new image fails the indexed conjunct must still reach `emit_for_shapes` to have
+  its delete built — the old image is what keeps it a candidate. Shapes with no indexable
+  conjunct (a bare/`NOT IN` `IN` leaf, top-level OR/NOT) stay unconditional candidates. The
+  pathological case is a very low-selectivity inner value referenced by many outer rows (large
+  fan-out on flip) — the inherent cost any correct incremental subquery maintenance pays.
 
 The append/storage path — not engine compute — is the throughput ceiling under max load
 (telemetry shows internal per-change compute cost stays small even at a large shape count). The

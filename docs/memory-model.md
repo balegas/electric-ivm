@@ -69,6 +69,20 @@ no spill. §3–§4 below.
 (The Electric `/v1/shape` adapter additionally keeps a TTL-evicted per-handle key set in
 `electric.rs` for protocol filtering — same order, handle-scoped, dropped on idle.)
 
+### Across subquery shapes — the outer-shape conjunct index
+
+| structure | cardinality | scales with |
+|---|---|---|
+| `SubqueryShapeIndex` (`subq_index.rs`): per-outer-table `RoaringBitmap` posting lists keyed by necessary conjunct, over interned `u32` shape ids | **O(#subquery shapes)** total | number of registered subquery shapes |
+
+The routing structure that makes an outer-table change cost `O(candidates)` instead of
+`O(#subquery shapes on the table)`. One entry per shape — a couple of bits in a posting list
+plus a `Placement` record (its table + extracted conjunct) — so it is a small per-shape term,
+not a per-feed-row one. Shape ids are interned exactly as `pk_dict` interns pks (forward map +
+reverse `Vec`), except ids of dropped shapes are reused via a free list. Included in
+`bytes_subquery_registry` (posting-list payloads counted by `RoaringBitmap::serialized_size`,
+the same owned-floor convention as `bytes_feed_sets`).
+
 ### Deliberately NOT in the engine, ever
 
 | data | where it lives | why |
