@@ -369,7 +369,7 @@ pub(crate) fn circuit_ops(
         let snk_id = format!("snk:{sid}");
 
         if let Some(agg) = &s.aggregate {
-            let fn_label = format!("Σ {}({})", format!("{:?}", agg.func).to_uppercase(), agg.col.as_deref().unwrap_or("*"));
+            let fn_label = format!("{}({})", format!("{:?}", agg.func).to_uppercase(), agg.col.as_deref().unwrap_or("*"));
             if s.circuit.as_ref().is_some_and(|p| p.counts) {
                 // Counts-served: the fold's input is the counts pipeline's group deltas
                 // (`map_index(group) → weighted_count` in the circuit), NOT a σ over row

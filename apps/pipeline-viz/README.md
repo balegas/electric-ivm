@@ -11,7 +11,7 @@ of every node** on the canvas.
   the same ids, so nothing is reconstructed client-side — what flashes is what ran, and the
   counts you see are the engine's counters.
 - **dbsp circuit** — the exploded operator dataflow, **emitted by the engine** (`/graph`'s
-  `operators`/`opEdges`): source → Δ → σ/↦/arrange/⋈/distinct/Σ → π → sink, one box per real
+  `operators`/`opEdges`): source → Δ → σ/↦/arrange/⋈/distinct/γ → π → sink, one box per real
   execution step. Each operator carries the trace-hop id it animates under and (for the
   state-bearing operator only) the state-summary id its chips show — declared bindings, not
   client-side guesses. Dashed edges are stateful arrangements feeding joins; shared structure
@@ -26,9 +26,9 @@ In the Logical view each node card carries its dbsp identity and its live state:
 - **↦⋈ route join · STATE** — the shared equality router: an arrangement of predicate keys →
   shapes, one per family (`WHERE k = const` compiles to an index entry, not a circuit). Chips:
   live routing-index keys + routed shapes.
-- **IN-set arrange · STATE** — a shared subquery inner set (`value → contributing pks`), one per
+- **IN-set distinct · STATE** — a shared subquery inner set (`value → contributing pks`), one per
   distinct `IN (SELECT …)`. Chips: distinct values + refcount.
-- **Σ fold · STATE** — a scalar aggregation maintained as an incremental fold. Chips: the current
+- **γ fold · STATE** — a scalar aggregation maintained as an incremental fold. Chips: the current
   value (live), matching-row count, and the MIN/MAX retraction-multiset size.
 - **shape out · π** — the per-shape output stream (grouped by pk into upsert/delete envelopes).
   Chip: envelopes emitted (backfill + live).

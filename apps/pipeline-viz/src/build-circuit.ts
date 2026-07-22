@@ -204,7 +204,7 @@ function restrictToSelection(
 //   2. Subquery templates: subquery shapes whose maintained pipeline is structurally identical
 //      (same outer table, predicate template, projection) — differing only in their bound parameter
 //      and thus their materialized inner set — fold their inner-set chain (`sqf`/`sqp`/`dist`) into
-//      one stacked IN-SET ARRANGE and their outer chain (`sj`/`pi`/`snk`) into one stacked SINK.
+//      one stacked IN-SET DISTINCT and their outer chain (`sj`/`pi`/`snk`) into one stacked SINK.
 // Both dimensions reduce to the same mechanism: a `redirect` map (collapsed operator id → the
 // representative node that stands in for it) plus the representative nodes themselves. `collapse`
 // then drops the collapsed operators, adds the representatives, and rewrites every edge endpoint
@@ -316,7 +316,7 @@ function planGroups(g: EngineGraph): GroupPlan {
         ref,
       },
     })
-    // The inner-set chain (σ inner where → π proj → distinct) collapses to the IN-SET ARRANGE rep…
+    // The inner-set chain (σ inner where → π proj → distinct) collapses to the IN-SET DISTINCT rep…
     for (const sig of sigs) {
       redirect.set(`sqf:${sig}`, distId)
       redirect.set(`sqp:${sig}`, distId)

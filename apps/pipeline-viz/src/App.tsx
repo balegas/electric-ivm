@@ -890,8 +890,8 @@ export default function App() {
             <span className="lg lg-table">table · Δ source</span>
             <span className="lg lg-filter">σ filter</span>
             <span className="lg lg-family">↦⋈ route join</span>
-            <span className="lg lg-sqnode">IN-set arrange</span>
-            <span className="lg lg-agg">Σ aggregate</span>
+            <span className="lg lg-sqnode">IN-set distinct</span>
+            <span className="lg lg-agg">γ aggregate</span>
             <span className="lg lg-shape">shape out</span>
             {graph?.arrangements ? (
               <span className="lg lg-serve" title="a chip on the card: the shape's data is seeded + maintained by the dbsp circuit">
@@ -905,9 +905,9 @@ export default function App() {
             <span className="lg lg-delta">Δ change</span>
             <span className="lg lg-filter">σ filter</span>
             <span className="lg lg-index">↦ key</span>
-            <span className="lg lg-sqnode">arrange (state)</span>
+            <span className="lg lg-sqnode">distinct (state)</span>
             <span className="lg lg-join">⋈ join</span>
-            <span className="lg lg-agg">Σ fold</span>
+            <span className="lg lg-agg">γ fold</span>
             <span className="lg lg-shape">π · sink</span>
             {graph?.arrangements ? <span className="lg lg-arr">dbsp index</span> : null}
             {graph?.arrangements ? <span className="lg lg-arr-counts">dbsp counts</span> : null}

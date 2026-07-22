@@ -690,7 +690,7 @@ body,
     box-shadow: 0 0 0 0 rgba(16, 185, 129, 0);
   }
 }
-/* Aggregation detail: the prominent live scalar stat (teal, matching the Σ node). */
+/* Aggregation detail: the prominent live scalar stat (teal, matching the γ node). */
 .dp-agg {
   margin: 2px 0 10px;
   padding: 8px 12px 9px;
