@@ -1,5 +1,6 @@
 {
   "name": "@electric-circuits/protocol",
+  "description": "The shared contract: JSON types, predicate and SQL compilers used by the TS packages and mirrored by the Rust engine.",
   "version": "0.0.0",
   "private": true,
   "type": "module",

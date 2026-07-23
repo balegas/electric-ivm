@@ -1,5 +1,6 @@
 [package]
 name = "electric-circuits-engine"
+description = "The Electric Circuits engine: ingests Postgres logical replication and keeps live queries (joins, aggregates, subqueries) incrementally in sync via dbsp circuits, serving the Electric wire protocol."
 edition.workspace = true
 version.workspace = true
 license.workspace = true

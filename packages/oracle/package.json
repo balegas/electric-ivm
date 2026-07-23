@@ -1,5 +1,6 @@
 {
   "name": "@electric-circuits/oracle",
+  "description": "Reference implementation of shape semantics that the conformance suite compares the real system against.",
   "version": "0.0.0",
   "private": true,
   "type": "module",

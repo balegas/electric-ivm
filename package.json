@@ -1,5 +1,6 @@
 {
   "name": "electric-circuits",
+  "description": "Monorepo for Electric Circuits — live queries for Postgres: a Rust engine ingests logical replication and keeps every query result (joins, aggregates, subqueries) in sync, speaking the Electric protocol plus an extended API.",
   "version": "0.0.0",
   "private": true,
   "type": "module",

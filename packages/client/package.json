@@ -1,5 +1,6 @@
 {
   "name": "@electric-circuits/client",
+  "description": "Browser/Node client for the extended electric-circuits API: a typed tRPC client adding subset queries and live aggregations on top of the Electric client.",
   "version": "0.0.0",
   "private": true,
   "type": "module",
