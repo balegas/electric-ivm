@@ -1,5 +1,6 @@
 {
   "name": "@electric-circuits/bench",
+  "description": "Benchmark and measurement tooling — every runner boots the full stack (Postgres, engine, durable-streams) and measures it end to end.",
   "version": "0.0.0",
   "private": true,
   "type": "module",

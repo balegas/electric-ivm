@@ -1,5 +1,6 @@
 {
   "name": "@electric-circuits/conformance",
+  "description": "End-to-end conformance suite: asserts the real stack (Postgres, engine, wire protocol) agrees with the oracle on every shape.",
   "version": "0.0.0",
   "private": true,
   "type": "module",

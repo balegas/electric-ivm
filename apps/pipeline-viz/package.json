@@ -1,5 +1,6 @@
 {
   "name": "@electric-circuits/pipeline-viz",
+  "description": "Web GUI attached to a running engine that visualizes the dbsp pipeline it is executing, live.",
   "version": "0.0.0",
   "private": true,
   "type": "module",

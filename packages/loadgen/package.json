@@ -1,5 +1,6 @@
 {
   "name": "@electric-circuits/loadgen",
+  "description": "Headless load generator that simulates LinearLite users to observe engine behavior and cost under realistic load.",
   "version": "0.0.0",
   "private": true,
   "type": "module",
