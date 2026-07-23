@@ -178,7 +178,7 @@ So the feed set does **not** move to disk. It stays a host-side bitmap, and the 
 (`ELECTRIC_CIRCUITS_SUBQ_STORAGE_*`) now covers only the **contributor** relation still in the
 circuit — kept because a high-selectivity inner query could grow it, with the default a
 candidate to flip off (a separate, gated follow-up; see the spike §4c). Checkpoint/restore of
-the feed bitmaps and the contributor relation (beads **dbsp-ds-mrt** / **dbsp-ds-pg5**) is now
+the feed bitmaps and the contributor relation (a tracked follow-up) is now
 *simpler*: the bulk of what needed checkpointing was the feed set, which serialises trivially,
 and a checkpoint taken under the registry lock is consistent by construction (same
 SnapshotGate/xid-fencing discipline the counts tier uses). Full analysis:
